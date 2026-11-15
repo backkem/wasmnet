@@ -32,7 +32,8 @@ For embedders:
   `wasm32`, devices transpiled with jco, the stepping protocol, and why a browser run repeats
   itself without matching the native run byte for byte.
 
-What is known to be wrong or unbounded today: [known-issues.md](known-issues.md).
+What is known to be wrong or unbounded today: [known-issues.md](known-issues.md). Which parts
+of the API are the core and which still move: [stability.md](stability.md).
 
 Elsewhere: [upstream/smoltcp.md](upstream/smoltcp.md) lists what we found in smoltcp and the
 patches we carry; the runnable example is

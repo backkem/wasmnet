@@ -24,7 +24,8 @@ here so that nobody has to find these the hard way. Each entry names where the c
 - **Few tests here.** Operator events, stoppable runs, frame rules, transmit hooks, cable
   models, network extensions, control calls and the merging of two sites' recordings are used
   and tested by an embedder outside this repository. In this repository only the site-sync
-  decoder has tests of its own. Treat that surface as unstable, as the README says.
+  decoder has tests of its own. Treat that surface as unstable
+  ([stability.md](stability.md)).
 - **`Network` is large.** About ninety methods on one type; the core and the embedder surface
   are told apart only by their doc comments.
 - **The browser binding reports errors as strings** (`wasmnet_web::Network::link`, the

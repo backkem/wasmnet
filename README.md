@@ -1,21 +1,33 @@
-# wasmnet
+<h1 align="center">wasmnet</h1>
 
-**A whole IP network in one process, made of WebAssembly components.**
+<p align="center">
+  <b>A whole IP network in one process.</b><br>
+  Hosts, switches and routers as WebAssembly components, on virtual time.<br>
+  <a href="https://backkem.github.io/wasmnet/">Try it in your browser</a>
+</p>
 
-**Try it in your browser:** <https://backkem.github.io/wasmnet/> (two hosts, a switch and one
-HTTP GET, in the tab; Chromium-based browsers; [`web/`](web)).
+---
 
-Hosts, switches and routers are components. Links carry real Ethernet frames. Time is
-virtual, entropy is seeded, and nothing touches the machine's own network stack.
-Same seed, same bytes: every run, every machine.
+Plug hosts into a switch, give the links a latency, and run. What comes out is what a real
+network would give you: ARP, SYN, SYN-ACK, `GET / HTTP/1.1`, in a capture Wireshark opens.
+Except that this network lives in one process, touches nothing on your machine, and does
+exactly the same thing every time.
+
+- 🔁 **Same seed, same bytes.** Time is virtual and entropy is seeded. A run repeats exactly,
+  captures and logs included, on every machine.
+- 📡 **Real protocols on real frames.** Ethernet, ARP and NDP, IPv4 and IPv6, TCP and UDP, DHCP,
+  DNS, mDNS, HTTP. Every link writes a pcap.
+- 🧩 **Ordinary programs.** Apps are plain WASI 0.3 code on `wasi:sockets`. They do not know
+  they are simulated.
+- 🧱 **Nothing leaks.** No TAP device, no host sockets, no wall clock. Components have no
+  ambient authority, so the sandbox keeps the promise.
+- 🌐 **In a tab too.** The same simulator and devices run in a browser, live.
 
 ```text
   http-get                                               http-server
      │ wasi:sockets@0.3                                       │ wasi:sockets@0.3
   netstack (smoltcp) ──100 µs──  switch  ──150 µs──  netstack (smoltcp)
 ```
-
-Capture any link and Wireshark shows the real thing: ARP, SYN, SYN-ACK, `GET / HTTP/1.1`.
 
 ## Quick start
 
@@ -26,8 +38,8 @@ cargo xtask build                           # the components and the composed no
 cargo run -p wasmnet-host --example http    # two hosts, a switch, one GET
 ```
 
-The example prints what every device reported, stamped in virtual nanoseconds, and writes
-one pcap-ng per link to `target/http/`.
+It prints what every device reported, stamped in virtual nanoseconds, and writes one pcap-ng
+per link to `target/http/`.
 
 ## In ten lines
 
@@ -47,58 +59,45 @@ The full version is [`crates/wasmnet-host/examples/http.rs`](crates/wasmnet-host
 
 ## What's in the box
 
-| Path | What |
+| Path | What it does |
 |---|---|
-| `crates/wasmnet-core` | The simulator: virtual clock, event queue, patch panel, link model, pcap taps, journal. No wasmtime; builds for `wasm32`. |
-| `crates/wasmnet-host` | The wasmtime backend: one store per device, deterministic WASI, a compile cache. |
-| `crates/wasmnet-web` | The browser backend: the simulator on `wasm32-unknown-unknown`, devices supplied by JavaScript, a small network API over bytes. Live and best-effort, not byte-identical to native runs. |
-| `crates/wasmnet-wire` | `no_std` wire helpers: MAC addresses, Ethernet, pcap-ng, DHCP and DNS codecs. |
-| `crates/wasmnet-app-kit` | What the apps share: their bindings, config keys, socket address conversions. |
-| `components/` | `netstack` (smoltcp behind `wasi:sockets@0.3`), `switch`, `router`, `wan-port`, and three test fixtures (`blaster`, `reflector`, `clock-probe`). |
-| `components/apps/` | Ordinary WASI 0.3 programs: DHCP, DNS and mDNS servers, an HTTP server, client and load balancer, ping, traceroute, UDP echo. |
-| `compositions/` | `wac` files that plug apps into a netstack to make a node. |
-| `wit/` | The contracts. `wasmnet:link` is the wire; everything else stands on it. |
-| `web/` | The browser example: a TypeScript binding for `wasmnet-web` on the codelib-web host kit, and the HTTP example as a page. `cargo xtask web` builds it (needs Node 24 and a Chromium to test). |
-| `docs/design/` | How it works: virtual time, event order, multi-site runs, socket extensions, the browser. |
+| [`crates/wasmnet-host`](crates/wasmnet-host) | Runs a network on wasmtime: one store per device, deterministic WASI. Start here. |
+| [`crates/wasmnet-core`](crates/wasmnet-core) | The simulator itself: virtual clock, event queue, patch panel, link model, pcap taps. No wasmtime. |
+| [`crates/wasmnet-web`](crates/wasmnet-web) | The simulator for a browser, with [`web/`](web): a TypeScript binding and the page behind the link above. |
+| [`components/`](components) | `netstack` (smoltcp behind `wasi:sockets@0.3`), `switch`, `router`, `wan-port`. |
+| [`components/apps/`](components/apps) | DHCP, DNS and mDNS servers, an HTTP server, client and load balancer, ping, traceroute, UDP echo. |
+| [`compositions/`](compositions) | `wac` files that plug apps into a netstack to make a node. |
+| [`wit/`](wit) | The contracts. `wasmnet:link` is the wire; everything else stands on it. |
 
-## House rules
+## The rules it keeps
 
 1. **Determinism.** Clocks, entropy and scheduling are host imports, served from virtual time
-   and a seed. No wall clock, no threads in the simulation, no `HashMap` order in the output.
+   and a seed.
 2. **Packets are the truth.** Devices talk only in Ethernet frames over `wasmnet:link`.
 3. **The host is a dumb backplane.** If it parses an IP header, it belongs in a component.
-4. **Standards at the surface.** Apps import `wasi:sockets@0.3` and do not know they are
-   simulated. What WASI lacks lives in the small `wasmnet:sockets-ext`.
+4. **Standards at the surface.** Apps import `wasi:sockets@0.3`; what WASI lacks lives in the
+   small `wasmnet:sockets-ext`.
 
-## Testing
+## Going deeper
+
+- [docs/](docs/README.md): how it works, with a reading order, and how to write a device or
+  an app.
+- [docs/design/configuration.md](docs/design/configuration.md): every config key.
+- [docs/known-issues.md](docs/known-issues.md): what we know is wrong today.
+- [docs/stability.md](docs/stability.md): which parts of the API are the core, and which move.
+- [CONTRIBUTING.md](CONTRIBUTING.md): building, testing and the rules a change keeps.
 
 ```sh
 cargo test --workspace     # wire, simulator, host, and end-to-end runs of real nodes
 cargo xtask test-guest     # every component's own tests, executed inside wasmtime
+cargo xtask web --test     # the browser page, in headless Chromium (needs Node 24 and a Chromium)
 ```
 
 ## Status
 
-Experimental. Version 0.0.0: the Rust API and the WIT still move. Built on Rust 1.98.1 and
-wasmtime 50.0.1, both pinned.
-
-### Embedder surface, unstable
-
-Two tiers. What the examples and tests here exercise is the core: building and running a
-network, its records and captures, the components and apps. The rest is public for embedders
-that build tooling on the core. It works and is exercised by such an embedder's own tests, not
-by tests in this repository, and it may change between versions without notice; rustdoc and
-the design notes mark it **embedder surface, unstable**:
-
-- operator events (`Op`, `Network::add_op`, `run_stoppable`, frame rules, the transmit hook,
-  the component resolver for dynamic topology);
-- multi-site runs (`wasmnet_core::sites` and the `Network` methods for them) and the
-  `wasmnet:wan` carrier contract;
-- the extension points (`wasmnet_core::ext`, `HostExtension`, `ControlHandler`,
-  `HostBuilder::unmetered_engine` and `Host::load_unmetered`);
-- the netstack's snapshot interface (`wasmnet:netstack/state`, `snapshot.paused`);
-- the HTTP apps' event-stream routes and `POST /echo` (`http-server`) and forward proxy
-  (`http-get`).
+Experimental, version 0.0.0: the Rust API and the WIT still move. A browser run is live and
+repeats itself, but is not byte-identical to a native one. Built on Rust 1.98.1 and wasmtime
+50.0.1, both pinned.
 
 ## License
 
