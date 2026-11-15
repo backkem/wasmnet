@@ -1,0 +1,75 @@
+/// WAN links between sites: the **carrier** contract.
+///
+/// A simulation can run split across **sites** (processes, machines, browser tabs). A link whose
+/// ends are on different sites is a **WAN link**. The sites keep their virtual clocks in lockstep
+/// with **site sync**, which lives in the simulation core (`wasmnet-core`), not in components: it
+/// exchanges versioned, binary site-sync messages (WAN frames stamped with their causal event
+/// key, null messages, the join handshake).
+///
+/// A **carrier** only moves those messages between two sites. It never parses them, never sees
+/// virtual time, and is never part of the deterministic simulation: whatever the real network
+/// does (delay, loss, reordering) changes how fast a lockstep simulation runs, never its results.
+/// So a carrier is the one place that touches a real network, and it is the explicit, documented
+/// exception to "no ambient authority": the host grants real `wasi:sockets` (and real
+/// `wasi:clocks`, for retransmission timers) to the carrier component it was told to load, scoped
+/// to the configured addresses, and never to a simulated device.
+///
+/// A carrier can be a component over `wasi:sockets` (UDP, or QUIC over `quinn-proto`), or, in a
+/// browser, the runtime itself over WebRTC DataChannels. The in-process channel used in tests is
+/// host plumbing and does not go through this WIT.
+///
+/// 0.1.0: the reliable, ordered message channel lockstep needs. An unreliable datagram
+/// channel for realtime mode will be an addition.
+///
+/// Embedder surface, unstable: no component here implements it yet, and it may change between
+/// versions without notice.
+package wasmnet:wan@0.1.0;
+
+interface carrier {
+    /// Why a channel could not be opened or failed.
+    variant error {
+        /// An address did not parse, or is not one the host allowed this carrier to use.
+        invalid-address(string),
+        /// The peer site did not answer the handshake in time.
+        timed-out,
+        /// The peer closed the channel (or stopped answering for good).
+        closed,
+        /// Anything else from the network stack, as text.
+        io(string),
+    }
+
+    /// A reliable, ordered channel to one peer site, carrying opaque messages.
+    ///
+    /// Messages arrive exactly once, whole and in the order they were sent, however the carrier
+    /// splits them on the wire (a message may be larger than any datagram). The carrier adds its
+    /// own framing, acknowledgements and retransmissions; none of that is visible here.
+    ///
+    /// Site sync makes one call at a time on a channel (lockstep alternates: send a window's
+    /// messages, then receive until the horizon moves), so a carrier need not support
+    /// overlapping calls in 0.1.0.
+    resource channel {
+        /// Queues one message for the peer. Returns once the carrier has taken it (not once the
+        /// peer has it): ownership of the bytes passes to the carrier.
+        send: async func(message: list<u8>) -> result<_, error>;
+
+        /// The next message from the peer, waiting (in real time) until one arrives.
+        receive: async func() -> result<list<u8>, error>;
+
+        /// Waits until every sent message is acknowledged by the peer, then closes the channel.
+        close: async func() -> result<_, error>;
+    }
+
+    /// Opens the channel between this site and the peer site: binds `local` and handshakes with
+    /// `peer`, both in the carrier's own address syntax (`ip:port` for UDP). Both sites call
+    /// this, in any order; it returns once the peer has answered.
+    open: async func(local: string, peer: string) -> result<channel, error>;
+}
+
+/// A carrier over the base network: standard `wasi:sockets` and a real monotonic clock, nothing
+/// else (no simulation capability: no `wasmnet:link`, no virtual time).
+world socket-carrier {
+    import wasi:sockets/types@0.3.0;
+    import wasi:sockets/ip-name-lookup@0.3.0;
+    import wasi:clocks/monotonic-clock@0.3.0;
+    export carrier;
+}

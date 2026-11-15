@@ -1,0 +1,69 @@
+[workspace]
+resolver = "3"
+# Components are listed one by one: a `components/*` glob would also match `components/apps`,
+# which holds the app crates but is not a package itself.
+members = [
+    "crates/*",
+    "components/blaster",
+    "components/clock-probe",
+    "components/netstack",
+    "components/reflector",
+    "components/router",
+    "components/switch",
+    "components/wan-port",
+    "components/apps/*",
+    "xtask",
+]
+# Plain `cargo build`/`cargo test` stay native: components are wasm32-wasip2 artifacts, built
+# and composed with `cargo xtask build`, and tested with
+# `cargo test --target wasm32-wasip2 -p <component>`.
+default-members = ["crates/*"]
+# The vendored smoltcp is patched in below, never a workspace member (no lints, no tests).
+exclude = ["third_party"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.98"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/backkem/wasmnet"
+publish = false
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+# Keep target/ small: full debug info for every wasmtime/cranelift test binary costs many GB.
+# Line tables still give useful backtraces.
+[profile.dev]
+debug = "line-tables-only"
+
+# Optimised dependencies in dev builds: an unoptimised wasmtime/Cranelift compiles components
+# 12-16x slower.
+[profile.dev.package."*"]
+opt-level = 3
+
+[workspace.dependencies]
+# Host runtime: exact pins.
+wasmtime = { version = "=50.0.1", default-features = false, features = ["cranelift", "runtime", "std", "async", "component-model", "component-model-async", "addr2line", "parallel-compilation"] }
+wasmtime-wasi = { version = "=50.0.1", default-features = false, features = ["p2", "p3"] }
+# Guest bindings: must agree with the host on the async ABI. wasmtime 49 tests against 0.61.1;
+# wasmtime 50 runs the same guests unchanged.
+wit-bindgen = { version = "=0.61.1", default-features = false }
+wasip2 = { version = "=2.0.0", default-features = false }
+wasip3 = { version = "=0.8.0", default-features = false }
+thiserror = "2"
+# Property tests (native and inside wasmtime). No fork/timeout features: those need processes.
+proptest = { version = "1.11", default-features = false, features = ["std"] }
+etherparse = "0.21"
+sha2 = "0.10"
+# HTTP/1.1 head parsing in the http-server and http-get apps (guests; no_std core).
+httparse = { version = "1.10", default-features = false }
+
+# smoltcp 0.14.0 with two patches: neighbor discovery is rate-limited per address, not per
+# interface, and the interface and socket state can be read and restored for snapshots
+# (docs/upstream/smoltcp.md). The pristine crate plus the patches lives in third_party/smoltcp;
+# the version stays =0.14.0 so dropping a patch is one line once upstream has the fix.
+[patch.crates-io]
+smoltcp = { path = "third_party/smoltcp" }

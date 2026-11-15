@@ -1,0 +1,30 @@
+[package]
+name = "wasmnet-mdns-responder"
+version = "0.0.0"
+description = "A Multicast DNS responder (RFC 6762) for one host name, as a WASI 0.3 app."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# A wasmnet app (world `wasmnet:app/app`): a Multicast DNS responder (RFC 6762) for
+# the node's host name: it probes, announces and answers A/AAAA questions for `<name>.local`, over
+# `wasi:sockets@0.3.0` UDP and `wasmnet:sockets-ext/{multicast,interfaces}`. `src/lib.rs` is the
+# pure state machine (guest-tested in wasmtime); `src/component.rs` the glue (two sockets, a
+# daemon).
+
+[lib]
+# The artifact is named after the component, not the package: `mdns_responder.wasm`.
+name = "mdns_responder"
+crate-type = ["cdylib"]
+
+[dependencies]
+# What the apps share: bindings, config keys, address conversions.
+wasmnet-app-kit = { path = "../../../crates/wasmnet-app-kit" }
+wasmnet-wire = { path = "../../../crates/wasmnet-wire" }
+thiserror.workspace = true
+wit-bindgen = { workspace = true, features = ["macros", "realloc", "async"] }
+wasip3 = { workspace = true, features = ["std"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,67 @@
+[package]
+name = "wasmnet-netstack"
+version = "0.0.0"
+description = "A smoltcp IP stack as an async device: wasmnet:link below, wasi:sockets.3 and wasmnet:sockets-ext above."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# An async wasmnet:link device (world `wasmnet:netstack/netstack`): a smoltcp IP stack on
+# Medium::Ethernet with static IPv4/IPv6 that also exports `wasi:sockets@0.3.0` (UDP, TCP and
+# name lookup) and `wasmnet:sockets-ext` to the apps composed with it
+# (`docs/design/socket-extensions.md`).
+# `src/lib.rs` and its modules are pure logic, unit-tested inside wasmtime with
+# `cargo test --target wasm32-wasip2 -p wasmnet-netstack`; `src/component.rs` is the wit-bindgen glue
+# and the driver task, left out of test builds.
+#
+# Also a library (the rlib): an embedder that exports more than the world depends on it with
+# `default-features = false`, invokes `netstack::export_netstack!` for the world and reads the
+# live stack through `netstack::debug`.
+
+[lib]
+# The artifact is named after the component, not the package: `netstack.wasm`.
+name = "netstack"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["export"]
+# Exports the world from this crate's own cdylib (`netstack.wasm`). Off for an embedder, which
+# invokes `export_netstack!` itself. Only on wasm targets: a native cdylib cannot carry WIT
+# export names.
+export = []
+
+[dependencies]
+wasmnet-wire = { path = "../../crates/wasmnet-wire" }
+thiserror.workspace = true
+# `start` spawns the driver task, and `receive` (another component-model task) wakes it.
+wit-bindgen = { workspace = true, features = ["macros", "realloc", "async", "async-spawn", "inter-task-wakeup"] }
+# Virtual `wasi:clocks@0.3` (now, wait-until) and the seeded `wasi:random@0.3`.
+wasip3 = { workspace = true, features = ["std"] }
+# The feature set: no `std` (Instant::now footgun), no `log`, no `phy-*`. IGMP/MLD come from
+# `proto-ipv*` + `multicast`. `auto-icmp-echo-reply` makes the stack answer pings by itself.
+# `iface-max-addr-count-4`: IPv4 + IPv6 link-local + IPv6 global (+1 spare); smoltcp's default is 2.
+# `socket-dhcpv4`: the DHCP client behind `ipv4 = "dhcp"`; a stack without a DHCP socket
+# behaves exactly as if the feature were off.
+# `iface-max-multicast-group-count-16`: smoltcp's default of 4 groups is used up by the
+# solicited-node groups and two mDNS groups; apps may join more.
+smoltcp = { version = "=0.14.0", default-features = false, features = [
+    "alloc",
+    "medium-ethernet",
+    "proto-ipv4",
+    "proto-ipv6",
+    "multicast",
+    "socket-tcp",
+    "socket-udp",
+    "socket-icmp",
+    "socket-dhcpv4",
+    "auto-icmp-echo-reply",
+    "iface-max-addr-count-4",
+    "iface-max-multicast-group-count-16",
+    # Our vendored patch (`docs/upstream/smoltcp-0002-snapshot-state.patch`): read and restore
+    # the interface state and socket slots for quiescent snapshots (`src/snapshot.rs`).
+    "snapshot",
+] }
+
+[lints]
+workspace = true

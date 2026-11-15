@@ -1,0 +1,18 @@
+// node-udp-echo-client = the netstack + the udp-echo-client app.
+//
+// Same shape as udp-echo-server.wac (the one explained there); the client also resolves names through the netstack's
+// `wasi:sockets/ip-name-lookup` (the node's `hosts.<name>` table).
+package wasmnet:node-udp-echo-client;
+
+let net = new wasmnet:netstack { ... };
+
+let client = new app:udp-echo-client {
+    "wasi:sockets/types@0.3.0": net["wasi:sockets/types@0.3.0"],
+    "wasi:sockets/ip-name-lookup@0.3.0": net["wasi:sockets/ip-name-lookup@0.3.0"],
+    ...
+};
+
+export net["wasmnet:link/device@0.1.0"];
+export net["wasmnet:link/lifecycle@0.1.0"];
+export net["wasmnet:link/counters@0.1.0"];
+export client["wasi:cli/run@0.3.0"] as "app-udp-echo-client";

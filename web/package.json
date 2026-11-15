@@ -1,0 +1,21 @@
+{
+  "name": "wasmnet-web",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "wasmnet in the browser: a TypeScript binding for the wasmnet-web simulator module, on the codelib-web host kit, and the HTTP example as a page.",
+  "license": "MIT OR Apache-2.0",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "serve": "node scripts/serve.mjs dist 8080 /wasmnet/",
+    "test": "node test/run.mjs"
+  },
+  "devDependencies": {
+    "codelib-web": "file:vendor/codelib-web-0.1.2.tgz",
+    "playwright-core": "1.64.0",
+    "typescript": "7.0.2"
+  }
+}

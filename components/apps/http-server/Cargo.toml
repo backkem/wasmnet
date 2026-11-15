@@ -1,0 +1,33 @@
+[package]
+name = "wasmnet-http-server"
+version = "0.0.0"
+description = "A small HTTP/1.1 server as a WASI 0.3 app: static routes from config, keep-alive, generated bodies."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# A wasmnet app (world `wasmnet:app/app`): a tiny HTTP/1.1 server and an ordinary
+# WASI 0.3 program. It listens on `wasi:sockets@0.3.0` TCP, serves static routes from config
+# plus a `/big?n=<bytes>` generator, keeps connections alive, serves several at once, and runs
+# forever (a daemon). `src/lib.rs` is the pure logic (config, request parsing with `httparse`,
+# routing, the body generator; guest-tested in wasmtime); `src/component.rs` is the glue.
+
+[lib]
+# The artifact is named after the component, not the package: `http_server.wasm`.
+name = "http_server"
+crate-type = ["cdylib"]
+
+[dependencies]
+# What the apps share: bindings, config keys, address conversions.
+wasmnet-app-kit = { path = "../../../crates/wasmnet-app-kit" }
+wasmnet-wire = { path = "../../../crates/wasmnet-wire" }
+thiserror.workspace = true
+httparse.workspace = true
+# The `run` export is an async func; connections are futures polled by `run` itself (no spawn).
+wit-bindgen = { workspace = true, features = ["macros", "realloc", "async"] }
+# The standard WASI 0.3 bindings: sockets and clocks, exactly as on any WASI host.
+wasip3 = { workspace = true, features = ["std"] }
+
+[lints]
+workspace = true

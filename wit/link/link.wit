@@ -1,0 +1,191 @@
+/// The wire contract between the wasmnet host (the patch panel) and every device on the network.
+///
+/// Model: the host owns every wire. A device never imports another device. It exports `device`
+/// (frames *in*) and imports `wire` (frames *out*). All time is virtual: the host passes `now`
+/// explicitly, and a device's view of time never moves inside a single call.
+///
+/// Re-entrancy: the host never calls into a device while that device is inside a call to the host,
+/// and no import in this package ever calls back into any device. A frame transmitted at `now`
+/// arrives at the peer no earlier than `now + link latency`, as a separate `receive` call.
+///
+/// Ordering: the host runs one discrete-event queue ordered by virtual time, then a causal key
+/// (docs/design/event-order.md). Calls into a device happen in that order, so the same network and the same seed always produce the same calls.
+///
+/// Push in, push out, and no `stream<frame>`: see docs/design/async-under-virtual-time.md.
+package wasmnet:link@0.1.0;
+
+interface types {
+    /// A device-local port number. Ports are numbered by the device (see `device.ports`).
+    type port-id = u32;
+
+    /// Virtual time in nanoseconds since the start of the simulation. It never goes backwards.
+    type instant = u64;
+
+    /// One complete Ethernet frame without preamble or FCS:
+    /// `dst(6) src(6) [802.1Q tag(4)] ethertype(2) payload`.
+    /// There is no minimum-size padding requirement (a 42-byte ARP frame is fine).
+    type frame = list<u8>;
+
+    /// Static description of one port.
+    record port-info {
+        /// The port number used in `receive`, `link-state` and `wire.transmit`. Unique per device.
+        id: port-id,
+        /// Human-readable name for diagnostics and pcap interface names (`eth0`, `gi0/1`).
+        name: string,
+        /// The port's own MAC address (exactly 6 bytes) if it has one. A switch port has none.
+        mac: option<list<u8>>,
+        /// Largest payload after the Ethernet header (the IP MTU, normally 1500). Unless the
+        /// network overrides it, a link's MTU is the smaller of its two ports' MTUs.
+        mtu: u32,
+    }
+}
+
+/// Imported by every device: the outgoing half of the patch panel.
+interface wire {
+    use types.{port-id, frame};
+
+    /// Queues `frame` for transmission on `port` and returns immediately.
+    ///
+    /// - Timing: the frame enters the wire at the `now` of the call that is currently running
+    ///   (the `now` passed to `receive`/`poll`/`link-state`, or virtual clock time for async
+    ///   devices). The peer receives it at `now + latency` as its own, later `receive` call.
+    /// - Ownership: the host takes the bytes. The device keeps nothing.
+    /// - Re-entrancy: never calls into any device, including this one. It may be called any number
+    ///   of times from inside any export call or async task.
+    /// - Errors: there are none. The host silently drops (and counts) a frame on an unwired or
+    ///   down port, and a frame whose payload exceeds the link MTU, like a NIC with no carrier.
+    ///   A frame still in flight when its link goes down is lost. An L2 link drops instead of
+    ///   applying backpressure.
+    transmit: func(port: port-id, frame: frame);
+}
+
+/// Imported by every device: structured diagnostics. The host stamps each record with the
+/// current virtual time and the device's name and keeps it in the network's journal.
+///
+/// Both functions are synchronous and never yield, so they are safe to call from any export call
+/// or async task, including while a netstack driver holds its own state (unlike
+/// `eprintln!`, whose stdout/stderr write is a yield point). They never call back into a device.
+/// A device should keep the volume reasonable: every record is kept for the whole run.
+interface log {
+    /// Severity of a log line.
+    enum level {
+        trace,
+        debug,
+        info,
+        warn,
+        error,
+    }
+
+    /// Records one human-readable log line (no trailing newline needed).
+    log: func(level: level, message: string);
+
+    /// Records one structured event. `kind` is a kebab-case name (`mac-learned`, `mac-aged`,
+    /// `arp-resolved`). `fields` are key/value pairs. Keys are kebab-case, unique within the
+    /// event, and values are plain strings such as `02:00:00:00:00:01` or `3`.
+    event: func(kind: string, fields: list<tuple<string, string>>);
+}
+
+/// Exported by every device: the incoming half of the patch panel, plus timers for stepped devices.
+interface device {
+    use types.{port-id, frame, instant, port-info};
+
+    /// Describes the device's ports.
+    ///
+    /// - Timing: the host calls this exactly once, right after instantiation and before any
+    ///   other export (and before any link is wired, so the host can validate port numbers).
+    ///   The device's configuration (`wasi:config/store`) is readable at this point. The answer
+    ///   must not change afterwards.
+    /// - Ownership: the host owns the returned list.
+    ports: func() -> list<port-info>;
+
+    /// Delivers one frame that arrived on `port` at virtual time `now`.
+    ///
+    /// - Timing: `now` is the arrival time (transmit time plus link latency). The device may call
+    ///   `wire.transmit` from inside this call, and those frames leave at `now`.
+    /// - Ownership: the device owns `frame`.
+    /// - Re-entrancy: never called while another *link* export of this device is running, and
+    ///   never from inside one of the device's own imports. For an async device this must only
+    ///   enqueue and wake a task. It must not block. In a composed node (netstack + apps)
+    ///   other calls are in flight at the same time: the apps' `run` and their socket calls.
+    /// - After one or more `receive`/`link-state` calls at an instant, the host calls `poll(now)` at
+    ///   that same instant (after every other event already queued for it), so the device can
+    ///   report a new deadline.
+    /// - Malformed frames must be dropped (and counted), never trapped on.
+    receive: func(now: instant, port: port-id, frame: frame);
+
+    /// Advances the device's timers to `now` and returns the next instant at which it wants to be
+    /// polled, or `none` if it has nothing scheduled.
+    ///
+    /// - Timing: the host calls `poll(now)` once when the device starts, at every deadline the
+    ///   device returned, and after `receive`/`link-state` (see above). A new answer replaces the
+    ///   previous deadline. A deadline at or before `now` means "again at this instant", and the
+    ///   host bounds how many times that may happen per instant.
+    /// - The device may call `wire.transmit` from inside this call.
+    /// - Async devices (world `async-device`) that keep time through `wasi:clocks` return `none`.
+    poll: func(now: instant) -> option<instant>;
+
+    /// Reports a carrier change on `port` at virtual time `now`.
+    ///
+    /// - Every port starts down. The host calls `link-state(now, port, true)` when a link is
+    ///   attached to the port (for links created before the network runs, at the device's first
+    ///   instant, after `ports` and before the first `poll`). A link can also go down and up
+    ///   again at scripted instants; both ends then get `link-state` at that instant.
+    /// - Only actual changes are reported: never `up` twice in a row for the same port.
+    /// - Frames transmitted on a down port are dropped by the host.
+    link-state: func(now: instant, port: port-id, up: bool);
+}
+
+/// Exported by async devices (nodes): starts their long-lived tasks.
+interface lifecycle {
+    /// Spawns the device's long-lived tasks (for example a network stack loop and its timers on
+    /// virtual `wasi:clocks`) and returns once they are ready.
+    ///
+    /// - Timing: called once, after `ports` and before any `receive`. Frames that arrive before
+    ///   it returns are queued by the host in order.
+    /// - The spawned tasks keep running after `start` returns, and may call `wire.transmit` at
+    ///   any time. A task woken from `receive` needs wit-bindgen's `inter-task-wakeup` feature.
+    /// - It must return. A `start` that never returns is reported as a deadlock.
+    start: async func();
+}
+
+/// Optionally exported by any device: a read-only snapshot of its counters, for tooling.
+///
+/// This is a *control call*: the host makes it into a live device, between runs (for example
+/// after the network went quiescent), at its current virtual instant. It is not part of the
+/// frame path, so it never changes what a network does.
+interface counters {
+    /// Returns the device's counters as `(name, value)` pairs in a stable order. Names are
+    /// kebab-case (`rx-frames`, `timers-armed`).
+    ///
+    /// - Timing: any time after `ports`. Sync, and it must not block, transmit, log or wake a
+    ///   task: reading counters must not perturb the device.
+    /// - Ownership: the host owns the returned list.
+    counters: func() -> list<tuple<string, u64>>;
+}
+
+/// A stepped device: switch, router, NAT, hub, tap or impairment box. It is synchronous, gets time
+/// only through `now` arguments and reports its next deadline from `poll`.
+///
+/// Configuration: the per-device key/value config is served read-only through
+/// `wasi:config/store` (`get(key)`, `get-all()` in sorted key order). It never changes during a run.
+world stepped-device {
+    import wire;
+    import log;
+    import wasi:config/store@0.2.0-rc.1;
+    export device;
+}
+
+/// An async device (a node: netstack plus apps). It is the same `device` contract plus `start`.
+/// It keeps time through virtual `wasi:clocks` (served by the host) rather than through `poll`.
+world async-device {
+    include stepped-device;
+    export lifecycle;
+}
+
+/// An async device that also exports `counters` (the netstack). The host also binds this
+/// world, as the superset of all of them: `lifecycle` and `counters` are looked up per instance
+/// and are optional.
+world counted-async-device {
+    include async-device;
+    export counters;
+}

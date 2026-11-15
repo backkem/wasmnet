@@ -1,0 +1,14 @@
+[package]
+name = "wasmnet-det-cbor"
+version = "0.0.0"
+description = "Deterministic CBOR (RFC 8949 §4.2), the subset wasmnet's infrastructure API specs use: no_std, no dependencies."
+# Explicit, not inherited, so the crate can move into a workspace of its own unchanged.
+edition = "2024"
+rust-version = "1.98"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+
+[lints.rust]
+unsafe_code = "deny"

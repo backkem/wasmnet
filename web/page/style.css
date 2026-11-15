@@ -1,0 +1,260 @@
+:root {
+  --bg: #fbfbf9;
+  --fg: #1d2420;
+  --muted: #5d6a63;
+  --line: #dfe3df;
+  --panel: #ffffff;
+  --accent: #226b5a;
+  --accent-fg: #ffffff;
+  --event: #1f5f9e;
+  --warn: #8a5a00;
+  --error: #b42318;
+  --mono: ui-monospace, 'Cascadia Mono', 'SF Mono', Menlo, Consolas, monospace;
+  color-scheme: light dark;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #131715;
+    --fg: #e3e8e4;
+    --muted: #96a39c;
+    --line: #2b322e;
+    --panel: #1a1f1c;
+    --accent: #5fbfa4;
+    --accent-fg: #0d1210;
+    --event: #84b8ef;
+    --warn: #e0b45c;
+    --error: #f08b80;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0 auto;
+  max-width: 64rem;
+  padding: 1.5rem 1rem 3rem;
+  background: var(--bg);
+  color: var(--fg);
+  font: 16px/1.5 system-ui, -apple-system, 'Segoe UI', sans-serif;
+}
+
+a {
+  color: var(--accent);
+}
+
+code,
+pre {
+  font-family: var(--mono);
+  font-size: 0.875rem;
+}
+
+h1 {
+  margin: 0 0 0.25rem;
+  font-size: 1.75rem;
+}
+
+h1 span {
+  color: var(--muted);
+  font-weight: 400;
+}
+
+h2 {
+  margin: 1.75rem 0 0.5rem;
+  font-size: 1.125rem;
+}
+
+.hint {
+  color: var(--muted);
+  font-size: 0.875rem;
+  font-weight: 400;
+}
+
+.tagline {
+  margin: 0;
+  color: var(--muted);
+}
+
+.topology {
+  margin: 1.25rem 0;
+}
+
+.topology pre {
+  margin: 0;
+  padding: 0.75rem 1rem;
+  overflow-x: auto;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+
+.topology figcaption {
+  margin-top: 0.5rem;
+  color: var(--muted);
+  font-size: 0.875rem;
+}
+
+.notice {
+  margin: 1rem 0;
+  padding: 0.75rem 1rem;
+  border: 1px solid var(--line);
+  border-left: 4px solid var(--accent);
+  border-radius: 6px;
+  background: var(--panel);
+}
+
+.notice.warn {
+  border-left-color: var(--warn);
+}
+
+.notice[hidden] {
+  display: none;
+}
+
+.controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 0.75rem;
+  margin: 1rem 0;
+}
+
+.controls input {
+  width: 12rem;
+  padding: 0.4rem 0.6rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--fg);
+  font: inherit;
+  font-family: var(--mono);
+}
+
+.controls button {
+  padding: 0.4rem 1.25rem;
+  border: 0;
+  border-radius: 6px;
+  background: var(--accent);
+  color: var(--accent-fg);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.controls button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.status {
+  flex-basis: 100%;
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.875rem;
+}
+
+body[data-state='error'] .status,
+body[data-state='failed'] .status {
+  color: var(--error);
+}
+
+.journal {
+  max-height: 28rem;
+  margin: 0;
+  padding: 0.5rem 0;
+  overflow: auto;
+  list-style: none;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font-family: var(--mono);
+  font-size: 0.8125rem;
+  line-height: 1.45;
+}
+
+.journal:empty {
+  display: none;
+}
+
+.journal li {
+  padding: 0 0.75rem;
+  white-space: pre;
+}
+
+.journal li.event {
+  color: var(--event);
+}
+
+.journal li.warn {
+  color: var(--warn);
+}
+
+.journal li.error {
+  color: var(--error);
+}
+
+.outcome:empty {
+  display: none;
+}
+
+.outcome[data-kind='failed'] {
+  color: var(--error);
+}
+
+.captures {
+  padding-left: 1.25rem;
+  font-size: 0.9375rem;
+}
+
+.captures a {
+  font-family: var(--mono);
+}
+
+footer {
+  margin-top: 2.5rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 0.875rem;
+}
+
+@media (max-width: 40rem) {
+  body {
+    padding-top: 1rem;
+  }
+
+  h1 {
+    font-size: 1.4rem;
+  }
+
+  .topology pre {
+    font-size: 0.6875rem;
+  }
+
+  .journal {
+    font-size: 0.75rem;
+  }
+}
+
+/* The notices page. */
+.notices {
+  overflow-wrap: anywhere;
+}
+
+.notices .licence {
+  font-size: 0.9rem;
+  font-weight: 400;
+  color: var(--muted);
+}
+
+.notices pre {
+  padding: 0.75rem;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+  font-size: 0.8rem;
+  white-space: pre-wrap;
+}

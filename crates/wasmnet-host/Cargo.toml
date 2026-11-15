@@ -1,0 +1,31 @@
+[package]
+name = "wasmnet-host"
+version = "0.0.0"
+description = "The wasmtime backend of wasmnet-core: devices as Wasm components in their own stores, deterministic virtual WASI, a precompiled-component cache and a command runner."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+wasmtime.workspace = true
+wasmtime-wasi.workspace = true
+thiserror.workspace = true
+wasmnet-wire = { path = "../wasmnet-wire" }
+# The runtime-agnostic sim core: this crate is its wasmtime backend.
+wasmnet-core = { path = "../wasmnet-core" }
+# Content keys of the precompiled-component cache.
+sha2.workspace = true
+# wasmtime-wasi's p2 `Pollable` trait is declared with `#[async_trait]`.
+async-trait = "0.1"
+# Captured stdio: the byte type of wasmtime-wasi's p2 streams, and the AsyncWrite trait
+# its p3 stdout writes into (no tokio runtime is used).
+bytes = "1"
+tokio = { version = "1", default-features = false, features = ["rt"] }
+
+[dev-dependencies]
+# The end-to-end tests read TCP segments off the frame log.
+etherparse.workspace = true
+
+[lints]
+workspace = true

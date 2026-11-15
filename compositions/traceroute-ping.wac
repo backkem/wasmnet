@@ -1,0 +1,28 @@
+// node-traceroute-ping = the netstack + the traceroute app + the ping app: a
+// host with both diagnostic tools.
+//
+// One netstack instance serves both apps: traceroute's UDP sockets and their ICMP errors
+// (`sockets-ext/udp`), ping's ICMP echo sockets (`sockets-ext/icmp`).
+package wasmnet:node-traceroute-ping;
+
+let net = new wasmnet:netstack { ... };
+
+let tracer = new app:traceroute {
+    "wasi:sockets/types@0.3.0": net["wasi:sockets/types@0.3.0"],
+    "wasi:sockets/ip-name-lookup@0.3.0": net["wasi:sockets/ip-name-lookup@0.3.0"],
+    "wasmnet:sockets-ext/udp@0.1.0": net["wasmnet:sockets-ext/udp@0.1.0"],
+    ...
+};
+
+let pinger = new app:ping {
+    "wasi:sockets/types@0.3.0": net["wasi:sockets/types@0.3.0"],
+    "wasi:sockets/ip-name-lookup@0.3.0": net["wasi:sockets/ip-name-lookup@0.3.0"],
+    "wasmnet:sockets-ext/icmp@0.1.0": net["wasmnet:sockets-ext/icmp@0.1.0"],
+    ...
+};
+
+export net["wasmnet:link/device@0.1.0"];
+export net["wasmnet:link/lifecycle@0.1.0"];
+export net["wasmnet:link/counters@0.1.0"];
+export tracer["wasi:cli/run@0.3.0"] as "app-traceroute";
+export pinger["wasi:cli/run@0.3.0"] as "app-ping";

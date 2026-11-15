@@ -1,0 +1,32 @@
+[package]
+name = "wasmnet-traceroute"
+version = "0.0.0"
+description = "The classic UDP traceroute as a WASI 0.3 app."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# A wasmnet app (world `wasmnet:app/app`): a classic UDP traceroute and an ordinary
+# WASI 0.3 program. Probes go out with `udp-socket.set-unicast-hop-limit` (standard WASI); the
+# routers' ICMP time-exceeded and the target's port-unreachable come back through
+# `wasmnet:sockets-ext/udp` (`IP_RECVERR`). `src/lib.rs` is the pure logic (config, matching
+# errors to probes, the hop lines; guest-tested in wasmtime); `src/component.rs` is the glue.
+
+[lib]
+# The artifact is named after the component, not the package: `traceroute.wasm`.
+name = "traceroute"
+crate-type = ["cdylib"]
+
+[dependencies]
+# What the apps share: bindings, config keys, address conversions.
+wasmnet-app-kit = { path = "../../../crates/wasmnet-app-kit" }
+wasmnet-wire = { path = "../../../crates/wasmnet-wire" }
+thiserror.workspace = true
+# The `run` export is an async func; one task, so no spawn and no inter-task wakeup.
+wit-bindgen = { workspace = true, features = ["macros", "realloc", "async"] }
+# The standard WASI 0.3 bindings: sockets, name lookup and clocks, exactly as on any WASI host.
+wasip3 = { workspace = true, features = ["std"] }
+
+[lints]
+workspace = true

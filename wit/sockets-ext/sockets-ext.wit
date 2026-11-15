@@ -1,0 +1,365 @@
+/// Small socket extensions that WASI 0.3 lacks: `tcp`, `udp`, `multicast`, `interfaces` and
+/// `icmp` (see `docs/design/socket-extensions.md`).
+///
+/// Shape: **freestanding functions that take a `borrow` of a
+/// `wasi:sockets` resource**. WIT cannot add methods to a foreign resource and does not need to.
+/// The consequences:
+///
+/// - The component that exports `wasi:sockets/types` (the node's netstack) must export these
+///   interfaces too, at **exactly the same `wasi:sockets` version** (`@0.3.0` today): the `use`
+///   below names that version, and wac links an app's import to the netstack's export only when
+///   both name the same resource.
+/// - An app imports only the interfaces it calls, so a portable app can degrade gracefully
+///   when a provider lacks them (stock wasmtime has no `wasmnet:sockets-ext`).
+/// - Everything here is shaped so that it could be upstreamed to `wasi:sockets` or dropped
+///   later: plain POSIX equivalents, `wasi:sockets` error codes.
+///
+/// `icmp` is the one exception to this shape: WASI has no ICMP socket to borrow,
+/// so it brings its own resource, `icmp-socket`, shaped like `udp-socket`.
+package wasmnet:sockets-ext@0.1.0;
+
+/// TCP knobs: abortive close and Nagle.
+///
+/// Every function is synchronous and never blocks: it changes the provider's state and wakes
+/// its driver, which acts at the same virtual instant. The socket is only borrowed for the call.
+interface tcp {
+    use wasi:sockets/types@0.3.0.{tcp-socket, error-code};
+
+    /// Abort the connection now: send one RST (POSIX: `SO_LINGER {1, 0}` then `close`, or
+    /// nginx's `reset_timedout_connection`).
+    ///
+    /// Effects, all at the current virtual instant:
+    /// - any data still queued in either direction is discarded, and one RST goes to the peer;
+    /// - this socket's `receive` stream ends and its future resolves to `err(connection-reset)`;
+    /// - a running `send` stops reading the app's stream (the app's next write sees the stream
+    ///   dropped) and its future resolves to `err(connection-reset)`;
+    /// - the peer's futures resolve to `err(connection-reset)` once the RST arrives.
+    ///
+    /// On a socket that is not connected (unbound, bound, listening, already closed) this does
+    /// nothing. Calling it twice is harmless. The resource itself stays valid until dropped.
+    abort: func(socket: borrow<tcp-socket>);
+
+    /// Enable (`true`) or disable Nagle's algorithm. POSIX: `TCP_NODELAY`.
+    ///
+    /// The default is `false` (Nagle on), like POSIX. A listener's setting is inherited by the
+    /// sockets it accepts. It may be set at any time and applies to the next segment.
+    ///
+    /// # Typical errors
+    /// - `invalid-state`: the socket is closed.
+    set-no-delay: func(socket: borrow<tcp-socket>, value: bool) -> result<_, error-code>;
+
+    /// The current `TCP_NODELAY` setting.
+    get-no-delay: func(socket: borrow<tcp-socket>) -> result<bool, error-code>;
+}
+
+/// UDP: the ICMP errors about a socket's own datagrams. POSIX: `IP_RECVERR` /
+/// `IPV6_RECVERR` and `recvmsg(MSG_ERRQUEUE)`, which is how an unprivileged `traceroute` or
+/// `tracepath` learns which router dropped its probe. WASI 0.3 has no equivalent: a datagram to
+/// an unreachable or expired destination is simply lost, and the app's timeout decides.
+///
+/// Setting a probe's TTL needs nothing new: `udp-socket.set-unicast-hop-limit` is standard WASI.
+interface udp {
+    use wasi:sockets/types@0.3.0.{udp-socket, error-code, ip-address, ip-socket-address};
+
+    /// One ICMP error (ICMPv4 types 3, 11 and 12; ICMPv6 types 1 to 4) that quotes a datagram
+    /// this socket sent.
+    record icmp-error {
+        /// Who sent the ICMP message: the router that dropped the datagram, or the destination
+        /// itself (port unreachable). POSIX: `SO_EE_OFFENDER`.
+        reporter: ip-address,
+        /// The datagram's destination, from the quoted header. POSIX: `msg_name`.
+        destination: ip-socket-address,
+        /// The raw ICMP type and code, of the socket's family (ICMPv4 or ICMPv6). Time exceeded
+        /// is 11/0 (IPv4) or 3/0 (IPv6); port unreachable 3/3 or 1/4.
+        icmp-type: u8,
+        icmp-code: u8,
+    }
+
+    /// Start (`true`) or stop (`false`, which also discards what is queued) queueing ICMP errors
+    /// for this socket. POSIX: `setsockopt(IP_RECVERR)`. Off by default.
+    ///
+    /// Errors are matched to the socket by the quoted datagram's source port (and address, if
+    /// the socket is bound to a specific one), so the socket should be bound. The provider keeps
+    /// a small queue per socket (16 errors in wasmnet's netstack) and drops new errors while it
+    /// is full.
+    ///
+    /// # Typical errors
+    /// - `invalid-state`: the socket is closed.
+    set-recv-errors: func(socket: borrow<udp-socket>, value: bool) -> result<_, error-code>;
+
+    /// Whether ICMP errors are being queued.
+    get-recv-errors: func(socket: borrow<udp-socket>) -> result<bool, error-code>;
+
+    /// The oldest queued ICMP error; waits until one arrives. POSIX: `recvmsg(MSG_ERRQUEUE)`,
+    /// blocking. Cancelling the call (dropping its future, for example after a timeout) loses
+    /// nothing: an error stays queued until a call returns it.
+    ///
+    /// # Typical errors
+    /// - `invalid-state`: errors are not being queued (`set-recv-errors(true)` was not called).
+    receive-error: async func(socket: borrow<udp-socket>) -> result<icmp-error, error-code>;
+}
+
+/// The node's network interfaces. POSIX: `getifaddrs(3)` / `if_nameindex(3)`.
+///
+/// WASI 0.3 names no interfaces, yet multicast needs one (which link to join a group on, which
+/// link a datagram to a group leaves by), IPv6 link-local addresses need a scope, and a
+/// responder such as mDNS must know its own addresses to announce them. The index is the same
+/// number POSIX uses for `IPV6_MULTICAST_IF`, `ipv6mr_interface` and a `sin6_scope_id`.
+interface interfaces {
+    use wasi:sockets/types@0.3.0.{ip-address};
+
+    /// One address of an interface, with its prefix length.
+    record interface-address {
+        address: ip-address,
+        prefix-length: u8,
+    }
+
+    /// One network interface.
+    record network-interface {
+        /// 1, 2, ...: never 0 (0 means "the default interface" wherever an index is taken).
+        index: u32,
+        /// `eth0`, ...
+        name: string,
+        /// The hardware address, if the link has one (6 bytes on Ethernet).
+        hardware-address: option<list<u8>>,
+        /// Every unicast address, IPv4 and IPv6 (link-local included), as configured right now:
+        /// an address leased by DHCP appears once the lease is bound and leaves with it.
+        addresses: list<interface-address>,
+        /// The IP MTU.
+        mtu: u32,
+        /// The link has carrier.
+        up: bool,
+        /// The interface can send and receive multicast.
+        multicast: bool,
+    }
+
+    /// Every interface, in index order. Sync, never blocks; a snapshot of the current state.
+    list-interfaces: func() -> list<network-interface>;
+}
+
+/// IP multicast on UDP sockets: the any-source multicast part of POSIX that WASI
+/// 0.3 leaves out (`wasi-sockets` `Posix-compatibility.md` lists these options as unsupported).
+///
+/// | here | POSIX (IPv4) | POSIX (IPv6) |
+/// |---|---|---|
+/// | `join-multicast-group` | `IP_ADD_MEMBERSHIP` | `IPV6_JOIN_GROUP` |
+/// | `leave-multicast-group` | `IP_DROP_MEMBERSHIP` | `IPV6_LEAVE_GROUP` |
+/// | `multicast-hop-limit` | `IP_MULTICAST_TTL` | `IPV6_MULTICAST_HOPS` |
+/// | `multicast-loopback` | `IP_MULTICAST_LOOP` | `IPV6_MULTICAST_LOOP` |
+/// | `multicast-interface` | `IP_MULTICAST_IF` (by index, like `ip_mreqn`) | `IPV6_MULTICAST_IF` |
+///
+/// Semantics follow Linux:
+/// - A **membership** belongs to the socket and to an interface. The interface joins the group
+///   (it sends an IGMP or MLD report) when its first socket joins, and leaves it when its last
+///   member leaves or is dropped. A socket's family decides the group's family.
+/// - **Receiving**: a datagram to a group the interface has joined is delivered to the socket
+///   bound to its destination port (bound to the unspecified address or to the group), like
+///   unicast. Joining does not bind; bind first (mDNS binds `0.0.0.0:5353`).
+/// - **Sending** to a group needs no membership. Each datagram leaves with the hop limit in
+///   force when `send` was called: the multicast hop limit for a group destination, the unicast
+///   one otherwise (a datagram queued earlier keeps its own).
+/// - Interfaces are named by index ([`interfaces`]); 0 means the default interface.
+///
+/// Every function is synchronous and never blocks; the provider acts at the current virtual
+/// instant (a join's report leaves at once).
+interface multicast {
+    use wasi:sockets/types@0.3.0.{udp-socket, error-code, ip-address};
+
+    /// Join `group` on interface `interface` (0: the default). Any-source multicast only.
+    ///
+    /// # Typical errors
+    /// - `invalid-argument`: `group` is not a multicast address, or not of the socket's family;
+    ///   `interface` names no interface.
+    /// - `address-in-use`: the socket already joined this group on this interface (`EADDRINUSE`).
+    /// - `invalid-state`: the socket is closed.
+    join-multicast-group: func(socket: borrow<udp-socket>, group: ip-address, %interface: u32) -> result<_, error-code>;
+
+    /// Leave a group joined with `join-multicast-group`.
+    ///
+    /// # Typical errors
+    /// - `invalid-argument`: the socket is not a member of `group` on `interface`
+    ///   (`EADDRNOTAVAIL`).
+    leave-multicast-group: func(socket: borrow<udp-socket>, group: ip-address, %interface: u32) -> result<_, error-code>;
+
+    /// The hop limit (TTL) of datagrams this socket sends to a group: 1 to 255. The default is
+    /// the node's (1, like POSIX, unless the node is configured otherwise). mDNS uses 255.
+    ///
+    /// # Typical errors
+    /// - `invalid-argument`: 0.
+    set-multicast-hop-limit: func(socket: borrow<udp-socket>, value: u8) -> result<_, error-code>;
+    /// The hop limit set by `set-multicast-hop-limit`, or the default.
+    get-multicast-hop-limit: func(socket: borrow<udp-socket>) -> result<u8, error-code>;
+
+    /// Whether a datagram this socket sends to a group the node itself has joined is also
+    /// delivered locally (to the node's own sockets on that port). Default `true`, like POSIX. The
+    /// local copy never appears on the wire.
+    set-multicast-loopback: func(socket: borrow<udp-socket>, value: bool) -> result<_, error-code>;
+    /// Whether multicast loopback is on (`set-multicast-loopback`).
+    get-multicast-loopback: func(socket: borrow<udp-socket>) -> result<bool, error-code>;
+
+    /// The interface datagrams to a group leave by (0: the default, the interface the routing
+    /// table picks).
+    ///
+    /// # Typical errors
+    /// - `invalid-argument`: no such interface.
+    set-multicast-interface: func(socket: borrow<udp-socket>, %interface: u32) -> result<_, error-code>;
+    /// The outgoing multicast interface index (`set-multicast-interface`); 0 is the default.
+    get-multicast-interface: func(socket: borrow<udp-socket>) -> result<u32, error-code>;
+}
+
+/// ICMP echo sockets: Linux's unprivileged "ping sockets",
+/// `socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP)` and `socket(AF_INET6, SOCK_DGRAM, IPPROTO_ICMPV6)`.
+/// They carry echo requests out and their echo replies in, nothing else, so they need no more
+/// authority than a UDP socket: what `ping` needs without `CAP_NET_RAW`.
+///
+/// | here | Linux |
+/// |---|---|
+/// | `icmp-socket.create` | `socket(AF_INET[6], SOCK_DGRAM, IPPROTO_ICMP[V6])` |
+/// | `bind(addr, identifier)` | `bind` with `sin_port` / `sin6_port` = the identifier |
+/// | `get-identifier` | `getsockname`'s port |
+/// | `send` / `receive` | `sendto` / `recvfrom` of ICMP messages, header first |
+/// | `set-unicast-hop-limit` | `IP_TTL` / `IPV6_UNICAST_HOPS` |
+/// | `set-recv-errors`, `receive-error` | `IP_RECVERR` / `IPV6_RECVERR`, `recvmsg(MSG_ERRQUEUE)` |
+///
+/// Every sync method changes the provider's state and wakes its driver, which acts at the same
+/// virtual instant; async ones park on the driver's progress. Nothing calls back into the app.
+interface icmp {
+    use wasi:sockets/types@0.3.0.{error-code, ip-address, ip-address-family};
+
+    /// One ICMP error that quotes an echo request this socket sent (ICMPv4 types 3, 11 and 12;
+    /// ICMPv6 types 1 to 4).
+    record icmp-error {
+        /// Who sent the ICMP message: the router that dropped the request, or the destination
+        /// itself. POSIX: `SO_EE_OFFENDER`.
+        reporter: ip-address,
+        /// The request's destination, from the quoted header. POSIX: `msg_name`.
+        destination: ip-address,
+        /// The request's sequence number, from the quoted ICMP header.
+        sequence: u16,
+        /// The raw ICMP type and code, of the socket's family. Time exceeded is 11/0 (IPv4) or
+        /// 3/0 (IPv6); host unreachable 3/1 or 1/3.
+        icmp-type: u8,
+        icmp-code: u8,
+    }
+
+    /// One received echo reply and what its IP header said.
+    record icmp-datagram {
+        /// The ICMP message, header first (as `receive` returns it).
+        data: list<u8>,
+        /// Who sent it.
+        remote-address: ip-address,
+        /// The IPv4 TTL or IPv6 hop limit the reply arrived with; `none` if the provider does
+        /// not know it.
+        hop-limit: option<u8>,
+    }
+
+    /// An ICMP echo socket of one family. Dropping it closes it: requests still queued are
+    /// discarded, and its identifier is free again.
+    resource icmp-socket {
+        /// A new, unbound socket.
+        ///
+        /// # Typical errors
+        /// - `not-supported`: the provider has no ICMP sockets for this family.
+        create: static func(address-family: ip-address-family) -> result<icmp-socket, error-code>;
+
+        /// Bind to `local-address` (unspecified, or one of the node's addresses of the socket's
+        /// family) and to an echo `identifier`; 0 lets the provider pick a free one (Linux:
+        /// `sin_port = 0`). An unbound socket is bound to the unspecified address and a picked
+        /// identifier on its first `send` or `connect`. The provider picks identifiers
+        /// deterministically.
+        ///
+        /// # Typical errors
+        /// - `invalid-argument`: the address is of the other family.
+        /// - `invalid-state`: already bound.
+        /// - `address-not-bindable`: the address is not one of the node's.
+        /// - `address-in-use`: another ICMP socket of this family holds `identifier`.
+        bind: func(local-address: ip-address, identifier: u16) -> result<_, error-code>;
+
+        /// Set the default destination and receive echo replies from it only (binds first if
+        /// unbound). Linux: `connect`.
+        ///
+        /// # Typical errors
+        /// - `invalid-argument`: the address is of the other family, or unspecified.
+        connect: func(remote-address: ip-address) -> result<_, error-code>;
+
+        /// Forget the default destination. Linux: `connect(AF_UNSPEC)`.
+        ///
+        /// # Typical errors
+        /// - `invalid-state`: not connected.
+        disconnect: func() -> result<_, error-code>;
+
+        /// Queue one ICMP message for `remote-address` (or the connected one). `data` is the
+        /// whole ICMP message, header first, and must be an echo request of the socket's family
+        /// (type 8 or 128, code 0, at least 8 bytes). The provider overwrites its identifier with
+        /// the socket's and fills in the checksum; the sequence number and payload are the
+        /// app's. Returns once the message is queued (like `sendto`): it leaves at once, or after
+        /// neighbor resolution. A unicast destination gets the socket's unicast hop limit, a
+        /// multicast one the node's multicast hop limit (an IPv4 broadcast is unicast here, as
+        /// for UDP).
+        ///
+        /// # Typical errors
+        /// - `invalid-argument`: not an echo request of the socket's family; a destination of
+        ///   the other family; no destination; a bound IPv6 address the provider would not use
+        ///   as the source for this destination.
+        /// - `datagram-too-large`: the message does not fit in one frame.
+        /// - `remote-unreachable`: no route to the destination.
+        send: async func(data: list<u8>, remote-address: option<ip-address>) -> result<_, error-code>;
+
+        /// The next echo reply for this socket, header first, and who sent it; waits until one
+        /// arrives. Only echo replies of the socket's family, with its identifier, from the
+        /// connected peer if any, are delivered. Cancelling the call loses nothing.
+        ///
+        /// # Typical errors
+        /// - `invalid-state`: not bound.
+        receive: async func() -> result<tuple<list<u8>, ip-address>, error-code>;
+
+        /// `receive`, plus what the IP header said about the reply.
+        /// Linux: `recvmsg` with `IP_RECVTTL` / `IPV6_RECVHOPLIMIT`. Same filtering, waiting
+        /// and errors as `receive`; the two take from the same queue.
+        receive-datagram: async func() -> result<icmp-datagram, error-code>;
+
+        /// The bound address.
+        ///
+        /// # Typical errors
+        /// - `invalid-state`: not bound.
+        get-local-address: func() -> result<ip-address, error-code>;
+
+        /// The echo identifier.
+        ///
+        /// # Typical errors
+        /// - `invalid-state`: not bound.
+        get-identifier: func() -> result<u16, error-code>;
+
+        /// The connected address.
+        ///
+        /// # Typical errors
+        /// - `invalid-state`: not connected.
+        get-remote-address: func() -> result<ip-address, error-code>;
+
+        /// The socket's address family.
+        get-address-family: func() -> ip-address-family;
+
+        /// The hop limit (TTL) of requests to unicast destinations: 1 to 255. The default is the
+        /// node's. It applies to requests sent after the call.
+        ///
+        /// # Typical errors
+        /// - `invalid-argument`: 0.
+        get-unicast-hop-limit: func() -> result<u8, error-code>;
+        /// Sets the hop limit read by `get-unicast-hop-limit`.
+        set-unicast-hop-limit: func(value: u8) -> result<_, error-code>;
+
+        /// Start (`true`) or stop (`false`, which also discards what is queued) queueing the ICMP
+        /// errors that quote this socket's requests. Off by default. The provider keeps a small
+        /// queue (16 errors in wasmnet's netstack) and drops new errors while it is full.
+        set-recv-errors: func(value: bool) -> result<_, error-code>;
+        /// Whether ICMP errors are being queued (`set-recv-errors`).
+        get-recv-errors: func() -> result<bool, error-code>;
+
+        /// The oldest queued ICMP error; waits until one arrives. Cancelling the call loses
+        /// nothing.
+        ///
+        /// # Typical errors
+        /// - `invalid-state`: errors are not being queued.
+        receive-error: async func() -> result<icmp-error, error-code>;
+    }
+}

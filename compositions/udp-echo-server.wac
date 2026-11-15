@@ -1,0 +1,22 @@
+// node-udp-echo-server = the netstack + the udp-echo-server app.
+//
+// The netstack is instantiated once and its `wasi:sockets` exports satisfy the app's imports.
+// Every other import (std's p2 runtime, p3 clocks, wasi:config, wasmnet:link/log and wire)
+// is forwarded to the host with `...`. The node exports the netstack's device side and the
+// app's `wasi:cli/run`, renamed `app-<name>`; the host calls each `app-*` run after `start`.
+//
+// Built by `cargo xtask build`: `wasmnet:<component>` and `app:<app>` resolve to the release
+// builds of components/<component> and components/apps/<app>.
+package wasmnet:node-udp-echo-server;
+
+let net = new wasmnet:netstack { ... };
+
+let server = new app:udp-echo-server {
+    "wasi:sockets/types@0.3.0": net["wasi:sockets/types@0.3.0"],
+    ...
+};
+
+export net["wasmnet:link/device@0.1.0"];
+export net["wasmnet:link/lifecycle@0.1.0"];
+export net["wasmnet:link/counters@0.1.0"];
+export server["wasi:cli/run@0.3.0"] as "app-udp-echo-server";

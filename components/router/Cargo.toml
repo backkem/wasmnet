@@ -1,0 +1,33 @@
+[package]
+name = "wasmnet-router"
+version = "0.0.0"
+description = "A stepped device that routes IPv4 and IPv6 between its ports: ARP, NDP, ICMP errors, static routes, DHCP relay."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# A wasmnet stepped device (world `wasmnet:router/router`): an IPv4/IPv6 router.
+# Per-port addresses, ARP and NDP with request queueing, a static routing table with longest-prefix
+# match, TTL / hop-limit decrement, ICMP errors, ping, per-port MTU, structured events and
+# counters. Parsing uses etherparse. `src/lib.rs` and its modules are the pure logic, unit- and
+# property-tested inside wasmtime (`cargo test --target wasm32-wasip2 -p wasmnet-router`);
+# `src/component.rs` is the wit-bindgen glue, left out of test builds.
+
+[lib]
+# The artifact is named after the component, not the package: `router.wasm`.
+name = "router"
+crate-type = ["cdylib"]
+
+[dependencies]
+wasmnet-wire = { path = "../../crates/wasmnet-wire" }
+etherparse = { workspace = true }
+thiserror.workspace = true
+wit-bindgen = { workspace = true, features = ["macros", "realloc"] }
+
+[dev-dependencies]
+# Runs inside wasmtime too (wasm32-wasip2 has std and getrandom support).
+proptest = { workspace = true }
+
+[lints]
+workspace = true

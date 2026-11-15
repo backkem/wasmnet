@@ -1,0 +1,21 @@
+[package]
+name = "wasmnet-core"
+version = "0.0.0"
+description = "The runtime-agnostic simulation core: virtual clock and event queue, executor, patch panel, link model, pcap, journal and the network builder behind a Runtime trait. No wasmtime; builds for wasm32-unknown-unknown."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+wasmnet-wire = { path = "../wasmnet-wire" }
+# `SimRng` implements rand_core 0.10's `TryRng` (the same major as wasmtime-wasi's `rand`).
+rand_core = "0.10"
+# Causal digests of events and records; pure Rust, builds for wasm32.
+sha2.workspace = true
+# `wasmnet:infra` device specs: deterministic CBOR.
+wasmnet-det-cbor = { path = "../wasmnet-det-cbor" }
+
+[lints]
+workspace = true

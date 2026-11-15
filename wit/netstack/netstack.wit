@@ -1,0 +1,89 @@
+/// The netstack component's world.
+///
+/// The netstack is an async wasmnet node (`wasmnet:link/counted-async-device`;
+/// `docs/design/async-under-virtual-time.md`) that also *exports* the real
+/// `wasi:sockets@0.3.0` (`docs/design/socket-extensions.md`). A node is this component plus N
+/// apps, composed with `wac` so that one netstack instance satisfies every app's
+/// `wasi:sockets` imports. The composed node imports no `wasi:sockets` at all.
+///
+/// - `wasi:sockets/types`: UDP (`udp-socket`) and TCP (`tcp-socket`).
+/// - `wasi:sockets/ip-name-lookup`: IP literals and the static `hosts.<name>` table from the
+///   node's config (an `/etc/hosts`), then DNS and mDNS for `.local`.
+/// - `wasmnet:sockets-ext/tcp`: `abort` (RST now) and `set-no-delay`, at the same
+///   `wasi:sockets` version as the exported `types`.
+/// - `wasmnet:sockets-ext/udp`: the ICMP errors about a UDP socket's datagrams
+///   (`IP_RECVERR`), for traceroute.
+/// - `wasmnet:sockets-ext/{multicast,interfaces}`: IP multicast on UDP sockets
+///   (join/leave, hop limit, loopback, outgoing interface) and the interface list.
+/// - `wasmnet:sockets-ext/icmp`: ICMP echo sockets (Linux's ping sockets) for the `ping` app;
+///   `icmp-socket.receive-datagram` reports each echo reply's TTL / hop limit.
+/// - `state`: quiescent save and restore, for a composed node that saves itself; below.
+///
+/// The world exports no inspection interface. An embedder that wants one exports this world
+/// plus its own, over the crate's typed `netstack::debug` (reads of the interface, counters, app
+/// sockets and learned neighbors).
+///
+/// Every socket call runs inside the netstack instance. Sync socket functions only change the
+/// netstack's state and wake its driver task; the streams and futures they return are served by
+/// that driver task. Async ones (`udp-socket.send`/`receive`, `tcp-socket.connect`, `receive-error`,
+/// `resolve-addresses`) park on the driver's progress. None of them ever calls back into an app.
+package wasmnet:netstack@0.1.0;
+
+world netstack {
+    include wasmnet:link/counted-async-device@0.1.0;
+    export wasi:sockets/types@0.3.0;
+    export wasi:sockets/ip-name-lookup@0.3.0;
+    export wasmnet:sockets-ext/tcp@0.1.0;
+    export wasmnet:sockets-ext/udp@0.1.0;
+    export wasmnet:sockets-ext/multicast@0.1.0;
+    export wasmnet:sockets-ext/interfaces@0.1.0;
+    export wasmnet:sockets-ext/icmp@0.1.0;
+    export state;
+}
+
+/// Quiescent snapshots of the netstack, for a composed node that saves and restores itself.
+/// A component composed with the netstack imports this; the host never calls it.
+///
+/// A save is taken only at a quiescent point: no TCP connection (unbound, bound and listening
+/// sockets with nothing queued), no datagram or ICMP error waiting, no lookup, no DHCP client,
+/// no ping session. What a fresh netstack built from the same config cannot rebuild goes into
+/// the state: smoltcp's interface state, every app socket and the smoltcp slot it occupies, the
+/// tables, generators and counters, the driver's timers and counters, and the device instant.
+/// A restore puts it onto a paused netstack (config `snapshot.paused`), whose clock then reads
+/// the saved instant at the moment of the restore and runs on from there: the restored node
+/// sends the same frames at the same device instants as the saved one would have.
+///
+/// All functions are control calls: they never yield and never call another component.
+///
+/// Embedder surface, unstable: it may change between versions without notice.
+interface state {
+    use wasi:sockets/types@0.3.0.{tcp-socket, udp-socket};
+
+    /// The node was built paused (`snapshot.paused`): it sends and answers nothing, and its
+    /// apps should not start, until `restore`.
+    paused: func() -> bool;
+
+    /// The netstack's state now; an error says why it is not quiescent. Taking it changes
+    /// nothing.
+    save: func() -> result<list<u8>, string>;
+
+    /// Replaces a paused netstack's state with `state` (from `save` of a node with the same
+    /// config) and starts it. Refused, leaving the node paused, when the node is not paused or
+    /// the state is not one of its own.
+    restore: func(state: list<u8>) -> result<_, string>;
+
+    /// The netstack's id of an app socket: what a saved app refers to it by.
+    tcp-id: func(socket: borrow<tcp-socket>) -> u32;
+    /// The netstack's id of an app UDP socket (as `tcp-id`).
+    udp-id: func(socket: borrow<udp-socket>) -> u32;
+
+    /// After `restore`: the restored socket `id`, as a new resource owned by the caller. Each
+    /// is handed back once; a listener comes back with `reclaim-listener`.
+    reclaim-tcp: func(id: u32) -> result<tcp-socket, string>;
+    /// After `restore`: the restored UDP socket `id` (as `reclaim-tcp`).
+    reclaim-udp: func(id: u32) -> result<udp-socket, string>;
+
+    /// After `restore`: a restored listener and a new stream of the connections it accepts
+    /// (what `listen` returned when it was saved).
+    reclaim-listener: func(id: u32) -> result<tuple<tcp-socket, stream<tcp-socket>>, string>;
+}

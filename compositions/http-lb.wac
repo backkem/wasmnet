@@ -1,0 +1,19 @@
+// node-http-lb = the netstack + the http-lb app.
+//
+// Same shape as http-server.wac: the netstack's `wasi:sockets` exports satisfy the load
+// balancer's TCP imports (it listens on two ports and connects to its backends by address, so
+// it needs no name lookup); `wasi:random` (its random policy) and the rest go to the host with
+// `...`, where the node's seeded PRNG serves it.
+package wasmnet:node-http-lb;
+
+let net = new wasmnet:netstack { ... };
+
+let lb = new app:http-lb {
+    "wasi:sockets/types@0.3.0": net["wasi:sockets/types@0.3.0"],
+    ...
+};
+
+export net["wasmnet:link/device@0.1.0"];
+export net["wasmnet:link/lifecycle@0.1.0"];
+export net["wasmnet:link/counters@0.1.0"];
+export lb["wasi:cli/run@0.3.0"] as "app-http-lb";

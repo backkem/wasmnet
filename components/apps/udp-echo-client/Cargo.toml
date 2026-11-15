@@ -1,0 +1,31 @@
+[package]
+name = "wasmnet-udp-echo-client"
+version = "0.0.0"
+description = "A WASI 0.3 app that sends UDP datagrams to an echo server and checks the replies."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# A wasmnet app (world `wasmnet:app/app`): an ordinary WASI 0.3 program that sends N
+# UDP datagrams to an echo server, waits for each reply with a timeout on virtual
+# `wasi:clocks`, measures round-trip times and exits with a status. `src/lib.rs` is the pure
+# logic (config, payloads, statistics; guest-tested in wasmtime); `src/component.rs` is the glue.
+
+[lib]
+# The artifact is named after the component, not the package: `udp_echo_client.wasm`.
+name = "udp_echo_client"
+crate-type = ["cdylib"]
+
+[dependencies]
+# What the apps share: bindings, config keys, address conversions.
+wasmnet-app-kit = { path = "../../../crates/wasmnet-app-kit" }
+wasmnet-wire = { path = "../../../crates/wasmnet-wire" }
+thiserror.workspace = true
+# The `run` export is an async func; one task, so no spawn and no inter-task wakeup.
+wit-bindgen = { workspace = true, features = ["macros", "realloc", "async"] }
+# The standard WASI 0.3 bindings: sockets, name lookup and clocks, exactly as on any WASI host.
+wasip3 = { workspace = true, features = ["std"] }
+
+[lints]
+workspace = true

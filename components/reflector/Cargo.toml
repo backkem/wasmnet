@@ -1,0 +1,41 @@
+[package]
+name = "wasmnet-reflector"
+version = "0.0.0"
+description = "Test fixture: a stepped device that echoes frames back out of the port they came in on."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# A wasmnet:link device (world `stepped-device`). `src/lib.rs` is the pure logic, unit-tested
+# inside wasmtime with `cargo test --target wasm32-wasip2 -p wasmnet-reflector`; `src/component.rs` is the
+# wit-bindgen glue, left out of test builds.
+#
+# With `--features async-device` the same logic is exported as world `async-device` instead
+# (`src/component_async.rs`): `start()` spawns a task that echoes each frame after a virtual
+# `wasi:clocks` wait. The host's async-device test builds that variant into its own target dir.
+
+[lib]
+# The artifact is named after the component, not the package: `reflector.wasm`.
+name = "reflector"
+crate-type = ["cdylib"]
+
+[features]
+async-device = [
+    "dep:wasip3",
+    "wit-bindgen/async",
+    # `start` spawns the echo task, and `receive` (another component-model task) wakes it.
+    "wit-bindgen/async-spawn",
+    "wit-bindgen/inter-task-wakeup",
+]
+
+[dependencies]
+wasmnet-wire = { path = "../../crates/wasmnet-wire" }
+wit-bindgen = { workspace = true, features = ["macros", "realloc"] }
+# Only for `wasi:random/random`, the seeded source of the device's MAC address.
+wasip2.workspace = true
+# async-device only: virtual `wasi:clocks@0.3` waits.
+wasip3 = { workspace = true, optional = true, features = ["std"] }
+
+[lints]
+workspace = true

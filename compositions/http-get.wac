@@ -1,0 +1,20 @@
+// node-http-get = the netstack + the http-get app.
+//
+// Same shape as http-server.wac; the client also resolves names through the netstack's
+// `wasi:sockets/ip-name-lookup` (the node's `hosts.<name>` table) and aborts through
+// `wasmnet:sockets-ext/tcp`.
+package wasmnet:node-http-get;
+
+let net = new wasmnet:netstack { ... };
+
+let client = new app:http-get {
+    "wasi:sockets/types@0.3.0": net["wasi:sockets/types@0.3.0"],
+    "wasi:sockets/ip-name-lookup@0.3.0": net["wasi:sockets/ip-name-lookup@0.3.0"],
+    "wasmnet:sockets-ext/tcp@0.1.0": net["wasmnet:sockets-ext/tcp@0.1.0"],
+    ...
+};
+
+export net["wasmnet:link/device@0.1.0"];
+export net["wasmnet:link/lifecycle@0.1.0"];
+export net["wasmnet:link/counters@0.1.0"];
+export client["wasi:cli/run@0.3.0"] as "app-http-get";

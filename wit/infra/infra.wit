@@ -1,0 +1,196 @@
+/// The operational infrastructure API for **in-world controllers**: a device the embedder grants
+/// this interface (`DeviceOptions::infra`), such as the `replicas` controller app, creates,
+/// starts, stops, removes, lists, watches and reads the logs of sibling devices while the world
+/// runs.
+///
+/// **Every mutation is a derived operator event.** A call never changes the world inside the
+/// call: it validates, records what was asked (the resource shows it as its `target`), journals
+/// an `infra-<verb>` event on the caller, and queues the change in the simulation's one event
+/// queue at the caller's own position (the processing context of the call, like a frame
+/// transmitted with zero latency; a graceful stop at `now + grace`). The change applies when the
+/// world reaches that event, before anything it causes, so it is deterministic, recomputed on
+/// replay (never recorded as an operator input), and a debugger can stop the world between the
+/// request and its effect. Reads (`get`, `list`, `watch`, `logs`) are answered from the
+/// world as it is at the call.
+///
+/// **No new authority.** The host serves this interface only to devices whose
+/// `DeviceOptions::infra` is set, and refuses to instantiate any other component that imports
+/// it. It reaches no host resource. A controller may change only the devices it created (`owner`); it reads every
+/// device. A device spec it applies can grant nothing (no `infra`).
+///
+/// Specs are CBOR (deterministic encoding): a device as the embedder describes it, without its
+/// name, plus its cables:
+///
+/// ```text
+/// { "component": "node:http-server",          ; a catalog name
+///   "config":    { "mac": "02:..", "app.http-server.listen": "0.0.0.0:80", ... },
+///                                               ; text values; nested maps flatten with "."
+///   ? "stdio":   "journal",                     ; stdout/stderr lines into the journal
+///   ? "fuel_per_instant": uint,
+///   ? "wire":    [ { "port": uint, "to": "sw:3" / "sw", ? "latency": uint (ns), ? "mtu": uint } ] }
+///                                               ; "to" without a port: the first free port
+///                                               ; of that device when the change applies
+/// ```
+///
+/// No other system's types cross this interface: a controller translates whatever it speaks
+/// into these specs.
+package wasmnet:infra@0.1.0;
+
+interface types {
+    /// Virtual time in nanoseconds since the simulation started.
+    type instant = u64;
+
+    /// A resource version: the ordinal of the last change to the world's device table that
+    /// touched a device (1 for the first change; 0: nothing has changed yet). The list's `rv`
+    /// is the latest change. Monotonic within a run, the same on every replay.
+    type rv = u64;
+
+    /// Labels: `(key, value)` pairs, sorted by key, keys unique.
+    type labels = list<tuple<string, string>>;
+
+    /// What a device is doing.
+    enum phase {
+        /// Asked for (by `apply`) and not created yet.
+        pending,
+        running,
+        /// Stopped (by `stop` or an operator): no store, its links down, its name kept.
+        stopped,
+        /// It trapped: stopped by its own fault (its links down, `message` the trap). Only devices
+        /// a controller created crash alone; a trap anywhere else fails the whole run. `start`
+        /// runs it again.
+        crashed,
+        /// Removed: unwired, its name free. Only seen in a `deleted` change.
+        removed,
+        /// The last request could not be applied (`message` says why): apply again or remove.
+        failed,
+    }
+
+    /// One device, as the world has it.
+    record device {
+        name: string,
+        /// Stable for the device's life (an `apply` that recreated it keeps it): the digest of
+        /// the event that created it, so reruns and forks with the same history agree.
+        uid: string,
+        /// 1 at creation, +1 per spec change (an `apply` that recreated it).
+        generation: u64,
+        /// The change that last touched it.
+        rv: rv,
+        labels: labels,
+        /// The controller that created it; `none`: the network's description or an operator.
+        owner: option<string>,
+        /// Its spec (CBOR, see the package docs): as applied, or as asked while `pending`.
+        spec: list<u8>,
+        phase: phase,
+        /// Where the requests still queued for it lead (`running`, `stopped`, `removed`);
+        /// `none` when nothing is queued.
+        target: option<phase>,
+        /// When it entered its phase.
+        since: instant,
+        /// Its apps that returned, by name: `ok` or `error` (a composed node's `app-exit`).
+        apps: list<tuple<string, string>>,
+        /// Why the last request about it failed, if it did.
+        message: option<string>,
+    }
+
+    /// How a change touched a device.
+    enum change-kind {
+        added,
+        modified,
+        deleted,
+    }
+
+    /// One watch event: the device as of that change (`device.rv`).
+    record change {
+        kind: change-kind,
+        device: device,
+    }
+
+    /// One line a device wrote (the device needs `DeviceOptions::journal_stdio`).
+    record log-line {
+        at: instant,
+        /// `stdout` or `stderr`.
+        %stream: string,
+        line: string,
+    }
+
+    /// What `apply` did.
+    record applied {
+        device: device,
+        /// `false`: the device already had this spec and labels (nothing was queued).
+        changed: bool,
+    }
+
+    variant error {
+        /// The name is taken by a device with another owner, or a request id was reused with
+        /// other arguments.
+        conflict(string),
+        /// No such device.
+        not-found(string),
+        /// A malformed spec, name, selector or stream.
+        invalid(string),
+        /// Not this caller's to change (another owner, the caller itself), or a spec that
+        /// would grant authority (`infra`); also every call from a device that was not
+        /// granted this interface, and every mutation in a split (multi-site) network.
+        denied(string),
+    }
+}
+
+/// The devices of the caller's world. Every function is **sync and never yields**; the host
+/// stamps everything with virtual time. Arguments and results are owned by the caller (lists
+/// are copied across the boundary).
+///
+/// Mutations (`apply`, `start`, `stop`, `remove`) take an optional `request-id`: the host keeps
+/// the last 256 answers per caller, so a retry with the same id and arguments is answered from
+/// the record and never applied twice; the same id with other arguments is a `conflict`. Every
+/// mutation is idempotent by name besides: asking for what is already true (or already queued)
+/// queues nothing.
+interface devices {
+    use types.{instant, rv, labels, phase, device, change, log-line, applied, error};
+
+    /// Creates the device `name` from `spec` (CBOR) with `labels`, or updates it: a device with
+    /// another spec is recreated (removed and added again with its new cables, in one change:
+    /// same uid, generation + 1); one with other labels only gets the labels at once. A new
+    /// device starts running when the change applies (there is no separate start: a later
+    /// `start` is a no-op). Returns the device as asked for (`pending`, or with its `target`).
+    /// Fails with `conflict` if `name` belongs to another owner (or to the network's
+    /// description), `invalid` for a bad spec, `denied` for a spec that grants authority.
+    apply: func(request-id: option<string>, name: string, labels: labels, spec: list<u8>) -> result<applied, error>;
+
+    /// Starts a stopped or crashed device again (a fresh instance of its component and config; the links
+    /// its stop took down come back up). A running or pending device: a no-op.
+    start: func(request-id: option<string>, name: string) -> result<device, error>;
+
+    /// Stops a running device after `grace-ns` of virtual time (0: at once): it keeps running
+    /// for the grace period, then its store is dropped and its links go down (the far ends see
+    /// the carrier drop). Its name, spec and cables stay. A stopped device: a no-op.
+    stop: func(request-id: option<string>, name: string, grace-ns: u64) -> result<device, error>;
+
+    /// Removes a device (stopped if running, unwired, its name free), after any change still
+    /// queued for it (so `stop` with a grace period, then `remove`, removes it after the grace
+    /// period). `false`: there was no such device (a successful no-op).
+    remove: func(request-id: option<string>, name: string) -> result<bool, error>;
+
+    /// One device (including one still `pending`).
+    get: func(name: string) -> result<device, error>;
+
+    /// Every device whose labels include all of `selector`'s pairs (an empty selector: every
+    /// device), sorted by name, with the latest `rv` (pass it to `watch` to see what changes
+    /// next).
+    %list: func(selector: labels) -> tuple<rv, list<device>>;
+
+    /// The changes after `since` to devices matching `selector`, in world order, at most `max`
+    /// of them, and the `rv` to resume from (the last change returned, or the latest if fewer
+    /// than `max` matched). A pollable feed: a controller calls it on its period; nothing
+    /// blocks. Pending requests are not changes (they show in `list` and `get`).
+    watch: func(selector: labels, since: rv, max: u32) -> tuple<rv, list<change>>;
+
+    /// The last `tail` lines (0: all) the device wrote to `stream` (`stdout` or `stderr`) at or
+    /// after `since`, oldest first. Needs the device's `DeviceOptions::journal_stdio` (otherwise none).
+    logs: func(name: string, %stream: string, since: instant, tail: u32) -> result<list<log-line>, error>;
+}
+
+/// An in-world controller's capability: what the embedder grants a device it marks as a
+/// controller.
+world controller {
+    import devices;
+}

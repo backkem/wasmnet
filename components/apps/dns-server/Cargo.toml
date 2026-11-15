@@ -1,0 +1,31 @@
+[package]
+name = "wasmnet-dns-server"
+version = "0.0.0"
+description = "An authoritative DNS server (RFC 1035) for static zones, as a WASI 0.3 app."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# A wasmnet app (world `wasmnet:app/app`): an authoritative DNS server (RFC 1035)
+# for static zones (A, AAAA, CNAME, SOA), over plain `wasi:sockets@0.3.0` UDP. `src/lib.rs` is
+# the pure logic (config, zone lookup, the answers; guest-tested in wasmtime); `src/component.rs`
+# is the glue: one socket on port 53, a receive loop, a daemon.
+
+[lib]
+# The artifact is named after the component, not the package: `dns_server.wasm`.
+name = "dns_server"
+crate-type = ["cdylib"]
+
+[dependencies]
+# What the apps share: bindings, config keys, address conversions.
+wasmnet-app-kit = { path = "../../../crates/wasmnet-app-kit" }
+wasmnet-wire = { path = "../../../crates/wasmnet-wire" }
+thiserror.workspace = true
+# The `run` export is an async func; one task, so no spawn and no inter-task wakeup.
+wit-bindgen = { workspace = true, features = ["macros", "realloc", "async"] }
+# The standard WASI 0.3 bindings: sockets and clocks, exactly as on any WASI host.
+wasip3 = { workspace = true, features = ["std"] }
+
+[lints]
+workspace = true

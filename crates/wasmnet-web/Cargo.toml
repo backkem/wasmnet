@@ -1,0 +1,25 @@
+[package]
+name = "wasmnet-web"
+version = "0.0.0"
+description = "The browser backend of wasmnet-core: the simulator compiled to wasm32-unknown-unknown, with the devices supplied by JavaScript (transpiled components instantiated on the JS side), and a small network API across a hand-rolled boundary. Live and best-effort: not byte-identical to the native host."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+# cdylib: the wasm32 module a page loads; rlib: native tests against a fake JS host.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# The runtime-agnostic simulator: this crate is its JavaScript backend.
+wasmnet-core = { path = "../wasmnet-core" }
+# The boundary's decode errors.
+thiserror.workspace = true
+
+[dev-dependencies]
+# Reading pcap packet directions back in the tests.
+wasmnet-wire = { path = "../wasmnet-wire" }
+
+[lints]
+workspace = true

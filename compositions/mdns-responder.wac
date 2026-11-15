@@ -1,0 +1,17 @@
+// node-mdns-responder = the netstack + the mdns-responder app: a host that only
+// claims `<hostname>.local`.
+package wasmnet:node-mdns-responder;
+
+let net = new wasmnet:netstack { ... };
+
+let mdns = new app:mdns-responder {
+    "wasi:sockets/types@0.3.0": net["wasi:sockets/types@0.3.0"],
+    "wasmnet:sockets-ext/multicast@0.1.0": net["wasmnet:sockets-ext/multicast@0.1.0"],
+    "wasmnet:sockets-ext/interfaces@0.1.0": net["wasmnet:sockets-ext/interfaces@0.1.0"],
+    ...
+};
+
+export net["wasmnet:link/device@0.1.0"];
+export net["wasmnet:link/lifecycle@0.1.0"];
+export net["wasmnet:link/counters@0.1.0"];
+export mdns["wasi:cli/run@0.3.0"] as "app-mdns-responder";

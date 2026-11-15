@@ -1,0 +1,37 @@
+[package]
+name = "wasmnet-clock-probe"
+version = "0.0.0"
+description = "Test fixture: a std command that samples every source of time and entropy it can reach."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# `src/main.rs` is a plain std `wasm32-wasip2` command (exports wasi:cli/run@0.2).
+# `examples/async_probe.rs` is a p3 command (exports wasi:cli/run@0.3, async) built with
+# wit-bindgen's async ABI via the `wasip3` crate; it is our wasmtime x wit-bindgen check.
+
+# The artifact is named after the component, not the package: `clock-probe.wasm`.
+[[bin]]
+name = "clock-probe"
+path = "src/main.rs"
+
+[dependencies]
+wasip2.workspace = true
+
+[dev-dependencies]
+wasip3.workspace = true
+# `examples/ext_probe.rs`: imports a test-only host extension.
+wit-bindgen = { workspace = true, features = ["macros", "realloc"] }
+
+[[example]]
+name = "async-probe"
+path = "examples/async_probe.rs"
+crate-type = ["cdylib"]
+
+[[example]]
+name = "ext-probe"
+path = "examples/ext_probe.rs"
+
+[lints]
+workspace = true

@@ -1,0 +1,36 @@
+[package]
+name = "wasmnet-http-lb"
+version = "0.0.0"
+description = "An HTTP/1.1 load balancer as a WASI 0.3 app: health checks, round-robin or random, an admin API."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# A wasmnet app (world `wasmnet:app/app`): an HTTP/1.1 load balancer and
+# an ordinary WASI 0.3 program. It accepts client connections on `wasi:sockets@0.3.0` TCP and
+# proxies each request to one healthy backend (round-robin, or seeded-random from `wasi:random`),
+# checks its backends' health with real HTTP GETs, and serves a small admin API on its own port to
+# register and deregister backends. `src/lib.rs` is the pure logic (config, the backend pool and
+# its health state machine, the admin API, request rewriting; guest-tested in wasmtime);
+# `src/component.rs` is the glue.
+
+[lib]
+# The artifact is named after the component, not the package: `http_lb.wasm`.
+name = "http_lb"
+crate-type = ["cdylib"]
+
+[dependencies]
+# What the apps share: bindings, config keys, address conversions.
+wasmnet-app-kit = { path = "../../../crates/wasmnet-app-kit" }
+thiserror.workspace = true
+httparse.workspace = true
+wasmnet-wire = { path = "../../../crates/wasmnet-wire" }
+# The `run` export is an async func; connections and the health checker are futures polled by
+# `run` itself (no spawn).
+wit-bindgen = { workspace = true, features = ["macros", "realloc", "async"] }
+# The standard WASI 0.3 bindings: sockets, clocks and random, exactly as on any WASI host.
+wasip3 = { workspace = true, features = ["std"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,15 @@
+[package]
+name = "wasmnet-app-kit"
+version = "0.0.0"
+description = "What the apps under components/apps share: their bindings, config keys, socket address conversions, error names and the body hash."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The standard WASI 0.3 socket types the apps use (for the address conversions).
+wasip3 = { workspace = true, features = ["std"] }
+
+[lints]
+workspace = true

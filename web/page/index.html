@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>wasmnet in your browser</title>
+  <meta name="description" content="A deterministic virtual IP network made of WebAssembly components, running in this tab: two hosts, a switch and one HTTP GET.">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect x='1' y='1' width='14' height='14' rx='3' fill='%23226b5a'/%3E%3Cpath d='M4 8h8M4 8l2-2M12 8l-2 2' stroke='white' stroke-width='1.5' fill='none'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="style.css">
+  <script type="module" src="main.js"></script>
+</head>
+<body data-state="loading">
+  <header>
+    <h1>wasmnet <span>in your browser</span></h1>
+    <p class="tagline">
+      A whole IP network made of WebAssembly components: hosts, a switch, real Ethernet frames,
+      virtual time. This page runs one HTTP GET across it, in this tab.
+    </p>
+  </header>
+
+  <main>
+    <figure class="topology">
+      <pre aria-label="Two hosts linked through a switch">client (http-get) ──100 µs── switch ──150 µs── server (http-server)
+  10.0.0.2                                     10.0.0.1</pre>
+      <figcaption>
+        Each host is a <code>wasi:sockets@0.3</code> app composed with a TCP/IP stack; the switch
+        learns MAC addresses. The same network as
+        <a href="https://github.com/backkem/wasmnet/blob/main/crates/wasmnet-host/examples/http.rs"><code>examples/http.rs</code></a>.
+      </figcaption>
+    </figure>
+
+    <div id="loading" class="notice" role="status">
+      Downloading and compiling the components (<span id="size">a few MB</span>)…
+    </div>
+    <div id="nojspi" class="notice warn" hidden>
+      <strong>This example needs a Chromium-based browser</strong> (Chrome or Edge 137 or newer).
+      <span id="nojspi-detail"></span>
+    </div>
+
+    <form class="controls" onsubmit="return false">
+      <label for="seed">Seed</label>
+      <input id="seed" type="text" inputmode="numeric" value="42" autocomplete="off" spellcheck="false">
+      <button id="run" type="button" disabled>Run</button>
+      <p id="status" class="status" role="status">Loading…</p>
+    </form>
+
+    <section>
+      <h2>Journal <span class="hint">what every device reported, stamped with virtual time</span></h2>
+      <ol id="journal" class="journal" aria-live="off"></ol>
+    </section>
+
+    <section>
+      <h2>Outcome</h2>
+      <p id="outcome" class="outcome"></p>
+      <ul id="captures" class="captures"></ul>
+      <p class="hint">One pcap-ng file per link: open it in Wireshark to see ARP, the TCP handshake and <code>GET /</code>.</p>
+    </section>
+  </main>
+
+  <footer>
+    <p>
+      A browser run repeats itself (the same seed gives the same journal and captures), but the
+      order of work inside one instant follows the JavaScript component runtime, so its bytes are
+      not guaranteed to be the native run's; byte-identical runs are a property of the native host.
+    </p>
+    <p>
+      The simulator is Rust compiled to WebAssembly; the devices are components transpiled with
+      jco and hosted by <a href="https://github.com/backkem/codelib/tree/main/web">codelib-web</a>.
+      Chromium only. <a href="https://github.com/backkem/wasmnet">Source on GitHub</a>.
+      <a href="NOTICES.html">Third-party notices</a>.
+    </p>
+  </footer>
+</body>
+</html>

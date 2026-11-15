@@ -1,0 +1,30 @@
+[package]
+name = "wasmnet-replicas"
+version = "0.0.0"
+description = "A controller app that keeps N copies of a device running through wasmnet:infra."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# A wasmnet app and in-world controller: keeps `replicas` instances of a
+# device template running through `wasmnet:infra` (granted to its node by `infra = true`) and
+# registers them with a load balancer's admin API over TCP. `src/lib.rs` is the pure logic
+# (config, templates, specs, the reconcile plan; guest-tested in wasmtime); `src/component.rs`
+# is the glue.
+
+[lib]
+# The artifact is named after the component, not the package: `replicas.wasm`.
+name = "replicas"
+crate-type = ["cdylib"]
+
+[dependencies]
+wasmnet-wire = { path = "../../../crates/wasmnet-wire" }
+wasmnet-det-cbor = { path = "../../../crates/wasmnet-det-cbor" }
+thiserror.workspace = true
+# Two tasks: the reconcile loop and a stdin reader.
+wit-bindgen = { workspace = true, features = ["macros", "realloc", "async", "async-spawn", "inter-task-wakeup"] }
+wasip3 = { workspace = true, features = ["std"] }
+
+[lints]
+workspace = true

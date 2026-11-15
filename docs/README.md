@@ -1,0 +1,39 @@
+# Documentation
+
+How wasmnet works and how to extend it. The code is the reference; these notes explain it and
+point into it. The contracts themselves are in [wit/](../wit) ([wit/README.md](../wit/README.md)),
+and [the main README](../README.md) shows a network in ten lines.
+
+## Reading order
+
+1. [design/async-under-virtual-time.md](design/async-under-virtual-time.md): the executor, the
+   `wasmnet:link` contract, and why runs are deterministic.
+2. [design/event-order.md](design/event-order.md): the causal key that orders every event, event
+   boundaries, operator events and frame rules.
+3. [design/writing-a-device.md](design/writing-a-device.md): a stepped or async device, from the
+   call order to tests inside wasmtime.
+4. [design/writing-an-app.md](design/writing-an-app.md): a WASI 0.3 app, its config, and the `wac`
+   composition that makes it a node.
+5. [design/netstack.md](design/netstack.md): the smoltcp stack behind `wasi:sockets`, its driver
+   task, ICMP errors, DHCP and the resolver.
+6. [design/socket-extensions.md](design/socket-extensions.md): `wasmnet:sockets-ext`, what WASI
+   0.3 lacks.
+7. [design/configuration.md](design/configuration.md): every config key of every device and app.
+
+For embedders:
+
+- [design/runtime-and-extensions.md](design/runtime-and-extensions.md): the `Runtime` backend
+  contract, what `wasmnet-host` adds, and the extension points.
+- [design/topology-and-infra.md](design/topology-and-infra.md): changing a network while it runs,
+  and `wasmnet:infra` for in-world controllers.
+- [design/sites.md](design/sites.md): one network split over two simulators, and the site-sync
+  wire format.
+- [design/browser.md](design/browser.md): the same networks in a browser tab: the simulator on
+  `wasm32`, devices transpiled with jco, the stepping protocol, and why a browser run repeats
+  itself without matching the native run byte for byte.
+
+What is known to be wrong or unbounded today: [known-issues.md](known-issues.md).
+
+Elsewhere: [upstream/smoltcp.md](upstream/smoltcp.md) lists what we found in smoltcp and the
+patches we carry; the runnable example is
+[crates/wasmnet-host/examples/http.rs](../crates/wasmnet-host/examples/http.rs).

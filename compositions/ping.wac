@@ -1,0 +1,19 @@
+// node-ping = the netstack + the ping app.
+//
+// Same shape as udp-echo-server.wac (the one explained there); the app pings through the netstack's ICMP echo sockets
+// (`wasmnet:sockets-ext/icmp`, Linux's unprivileged ping sockets).
+package wasmnet:node-ping;
+
+let net = new wasmnet:netstack { ... };
+
+let pinger = new app:ping {
+    "wasi:sockets/types@0.3.0": net["wasi:sockets/types@0.3.0"],
+    "wasi:sockets/ip-name-lookup@0.3.0": net["wasi:sockets/ip-name-lookup@0.3.0"],
+    "wasmnet:sockets-ext/icmp@0.1.0": net["wasmnet:sockets-ext/icmp@0.1.0"],
+    ...
+};
+
+export net["wasmnet:link/device@0.1.0"];
+export net["wasmnet:link/lifecycle@0.1.0"];
+export net["wasmnet:link/counters@0.1.0"];
+export pinger["wasi:cli/run@0.3.0"] as "app-ping";

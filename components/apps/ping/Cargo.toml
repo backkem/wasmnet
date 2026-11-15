@@ -1,0 +1,33 @@
+[package]
+name = "wasmnet-ping"
+version = "0.0.0"
+description = "ICMP echo as a WASI 0.3 app, over the netstack's ICMP echo sockets."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# A wasmnet app (world `wasmnet:app/app`): ping, an ordinary WASI 0.3 program on
+# an ICMP echo socket (`wasmnet:sockets-ext/icmp`, Linux's unprivileged ping socket). The stack
+# picks the echo identifier; the app writes echo requests and reads replies and the ICMP errors
+# about its requests. `src/lib.rs` is the pure logic (config, messages, output lines; guest-tested
+# in wasmtime); `src/component.rs` is the glue.
+
+[lib]
+# The artifact is named after the component, not the package: `ping.wasm`.
+name = "ping"
+crate-type = ["cdylib"]
+
+[dependencies]
+# What the apps share: bindings, config keys, address conversions.
+wasmnet-app-kit = { path = "../../../crates/wasmnet-app-kit" }
+wasmnet-wire = { path = "../../../crates/wasmnet-wire" }
+thiserror.workspace = true
+# The `run` export is an async func; its sessions are futures polled by one task, so no spawn and
+# no inter-task wakeup.
+wit-bindgen = { workspace = true, features = ["macros", "realloc", "async"] }
+# The standard WASI 0.3 bindings: sockets, name lookup and clocks, exactly as on any WASI host.
+wasip3 = { workspace = true, features = ["std"] }
+
+[lints]
+workspace = true

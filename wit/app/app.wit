@@ -1,0 +1,37 @@
+/// The baseline contract of a wasmnet app: what a plain socket app imports and exports. An app
+/// may import more (for example `wasmnet:infra/devices`, for a controller the host grants it).
+///
+/// An app is an ordinary WASI 0.3 command: it exports `wasi:cli/run@0.3.0` and uses
+/// `wasi:sockets@0.3.0` and `wasi:clocks@0.3.0` exactly as it would on any WASI host. In a
+/// simulation it runs inside a node (`compositions/<node>.wac`): the node's netstack satisfies
+/// its sockets imports, and the host calls its `run` (exported by the node as `app-<name>`) once
+/// the netstack has started.
+///
+/// Two more imports come on top, both served deterministically by the host:
+/// - `wasi:config/store`: the node's config. An app reads only the keys under
+///   `app.<name>.` (the netstack ignores that prefix), so one node config holds everything.
+/// - `wasmnet:link/log`: time-stamped log lines and structured events in the simulation journal.
+///
+/// `run` may return (the host records an `app-exit` event with its status) or run forever as a
+/// daemon (a server). A daemon that is still running when the simulation goes quiescent is
+/// reported as parked, never as a deadlock.
+package wasmnet:app@0.1.0;
+
+world app {
+    import wasi:sockets/types@0.3.0;
+    import wasi:sockets/ip-name-lookup@0.3.0;
+    import wasi:clocks/monotonic-clock@0.3.0;
+    import wasi:config/store@0.2.0-rc.1;
+    import wasmnet:link/log@0.1.0;
+    /// Optional: `abort` and `set-no-delay`. A component imports only what it
+    /// calls, so an app that never uses them does not import this interface at all.
+    import wasmnet:sockets-ext/tcp@0.1.0;
+    /// Optional: the ICMP errors about a UDP socket's datagrams (traceroute).
+    import wasmnet:sockets-ext/udp@0.1.0;
+    /// Optional: IP multicast on UDP sockets, and the node's interfaces (mDNS).
+    import wasmnet:sockets-ext/multicast@0.1.0;
+    import wasmnet:sockets-ext/interfaces@0.1.0;
+    /// Optional: ICMP echo sockets, for ping.
+    import wasmnet:sockets-ext/icmp@0.1.0;
+    export wasi:cli/run@0.3.0;
+}

@@ -1,0 +1,19 @@
+[package]
+name = "wasmnet-wire"
+version = "0.0.0"
+description = "I/O-free, no_std helpers shared by host and components: MAC addresses, Ethernet frame views, pcap-ng encoding, DHCP and DNS messages."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Library errors use thiserror. thiserror 2 derives `core::error::Error`, so it works in no_std.
+thiserror.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+# Property tests of the DHCP and DNS codecs, run inside wasmtime like the rest.
+proptest = { workspace = true }

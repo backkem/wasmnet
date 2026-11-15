@@ -1,0 +1,26 @@
+[package]
+name = "wasmnet-wan-port"
+version = "0.0.0"
+description = "An L2 WAN port: one end of a bridged WAN link between two sites."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# A wasmnet:link device (world `stepped-device`): an L2 WAN port, one end of a bridged
+# WAN link (VXLAN-style encapsulation).
+# `src/lib.rs` is the pure logic, tested inside wasmtime with
+# `cargo test --target wasm32-wasip2 -p wasmnet-wan-port`; `src/component.rs` is the
+# wit-bindgen glue, left out of test builds.
+
+[lib]
+# The artifact is named after the component, not the package: `wan_port.wasm`.
+name = "wan_port"
+crate-type = ["cdylib"]
+
+[dependencies]
+wasmnet-wire = { path = "../../crates/wasmnet-wire" }
+wit-bindgen = { workspace = true, features = ["macros", "realloc"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,26 @@
+[package]
+name = "wasmnet-blaster"
+version = "0.0.0"
+description = "Test fixture: a stepped device that emits a train of raw Ethernet probe frames."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# A wasmnet:link device (world `stepped-device`). `src/lib.rs` is the pure logic, unit-tested
+# inside wasmtime with `cargo test --target wasm32-wasip2 -p wasmnet-blaster`; `src/component.rs` is the
+# wit-bindgen glue, left out of test builds.
+
+[lib]
+# The artifact is named after the component, not the package: `blaster.wasm`.
+name = "blaster"
+crate-type = ["cdylib"]
+
+[dependencies]
+wasmnet-wire = { path = "../../crates/wasmnet-wire" }
+wit-bindgen = { workspace = true, features = ["macros", "realloc"] }
+# Only for `wasi:random/random`, the seeded source of the device's MAC address.
+wasip2.workspace = true
+
+[lints]
+workspace = true

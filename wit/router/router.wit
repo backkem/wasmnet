@@ -1,0 +1,16 @@
+/// The router component's world.
+///
+/// A router is a stepped device (`wasmnet:link/stepped-device`: `ports`, `receive`, `poll`,
+/// `link-state`; config through `wasi:config/store`; events through `wasmnet:link/log`) that also
+/// exports `wasmnet:link/counters`, so tests can read its per-port and forwarding counters after a
+/// run. It needs no clock and no randomness: time arrives as `now` arguments, and its next
+/// deadline (an ARP/NDP retry) is `poll`'s answer.
+///
+/// This package exists only to name that combination; it adds no interface. (A world added to
+/// `wasmnet:link` would change that package for every device.)
+package wasmnet:router@0.1.0;
+
+world router {
+    include wasmnet:link/stepped-device@0.1.0;
+    export wasmnet:link/counters@0.1.0;
+}

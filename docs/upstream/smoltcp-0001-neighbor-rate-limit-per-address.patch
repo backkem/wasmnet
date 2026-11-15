@@ -1,0 +1,235 @@
+diff --git a/src/iface/neighbor.rs b/src/iface/neighbor.rs
+index 6b5c7d0..9f134df 100644
+--- a/src/iface/neighbor.rs
++++ b/src/iface/neighbor.rs
+@@ -42,14 +42,22 @@ impl Answer {
+ }
+ 
+ /// A neighbor cache backed by a map.
++///
++/// Discovery requests are rate-limited **per protocol address**: after a request for an
++/// address, the next request for that same address waits [`Cache::SILENT_TIME`], while
++/// requests for other addresses go out at once. At most `IFACE_NEIGHBOR_CACHE_COUNT`
++/// addresses can be silenced at a time; when all of them are, a lookup of any other missing
++/// address is rate-limited too, so the request rate never exceeds that many per
++/// [`Cache::SILENT_TIME`].
+ #[derive(Debug)]
+ pub struct Cache {
+     storage: LinearMap<IpAddress, Neighbor, IFACE_NEIGHBOR_CACHE_COUNT>,
+-    silent_until: Instant,
++    /// Addresses with a discovery request in flight, and when the next one may be sent.
++    silent_until: LinearMap<IpAddress, Instant, IFACE_NEIGHBOR_CACHE_COUNT>,
+ }
+ 
+ impl Cache {
+-    /// Minimum delay between discovery requests, in milliseconds.
++    /// Minimum delay between discovery requests for one address, in milliseconds.
+     pub(crate) const SILENT_TIME: Duration = Duration::from_millis(1_000);
+ 
+     /// Neighbor entry lifetime, in milliseconds.
+@@ -59,7 +67,7 @@ impl Cache {
+     pub fn new() -> Self {
+         Self {
+             storage: LinearMap::new(),
+-            silent_until: Instant::from_millis(0),
++            silent_until: LinearMap::new(),
+         }
+     }
+ 
+@@ -158,15 +166,39 @@ impl Cache {
+             return Answer::Found(hardware_addr);
+         }
+ 
+-        if timestamp < self.silent_until {
+-            Answer::RateLimited
+-        } else {
+-            Answer::NotFound
++        match self.silent_until.get(protocol_addr) {
++            Some(&until) if timestamp < until => Answer::RateLimited,
++            Some(_) => Answer::NotFound,
++            // Every slot is taken by an address that is still silent: no new request yet.
++            None if self.silent_until.is_full()
++                && self.silent_until.values().all(|&until| timestamp < until) =>
++            {
++                Answer::RateLimited
++            }
++            None => Answer::NotFound,
+         }
+     }
+ 
+-    pub(crate) fn limit_rate(&mut self, timestamp: Instant) {
+-        self.silent_until = timestamp + Self::SILENT_TIME;
++    /// A discovery request for `protocol_addr` was sent at `timestamp`: silence that address
++    /// for [`Cache::SILENT_TIME`].
++    pub(crate) fn limit_rate(&mut self, protocol_addr: IpAddress, timestamp: Instant) {
++        let until = timestamp + Self::SILENT_TIME;
++        if let Some(slot) = self.silent_until.get_mut(&protocol_addr) {
++            *slot = until;
++            return;
++        }
++        if self.silent_until.is_full() {
++            // Reuse the slot that went quiet first (`lookup` only lets a new address through
++            // when at least one slot has expired).
++            let oldest = *self
++                .silent_until
++                .iter()
++                .min_by_key(|(_, until)| **until)
++                .expect("full map is not empty")
++                .0;
++            self.silent_until.remove(&oldest);
++        }
++        let _ = self.silent_until.insert(protocol_addr, until);
+     }
+ 
+     pub(crate) fn flush(&mut self) {
+@@ -305,7 +337,7 @@ mod test {
+             Answer::NotFound
+         );
+ 
+-        cache.limit_rate(Instant::from_millis(0));
++        cache.limit_rate(MOCK_IP_ADDR_1.into(), Instant::from_millis(0));
+         assert_eq!(
+             cache.lookup(&MOCK_IP_ADDR_1.into(), Instant::from_millis(100)),
+             Answer::RateLimited
+@@ -316,6 +348,78 @@ mod test {
+         );
+     }
+ 
++    #[test]
++    fn test_hush_is_per_address() {
++        let mut cache = Cache::new();
++
++        cache.limit_rate(MOCK_IP_ADDR_1.into(), Instant::from_millis(0));
++        // Another address is not held back by the request for the first one.
++        assert_eq!(
++            cache.lookup(&MOCK_IP_ADDR_2.into(), Instant::from_millis(100)),
++            Answer::NotFound
++        );
++        cache.limit_rate(MOCK_IP_ADDR_2.into(), Instant::from_millis(100));
++        assert_eq!(
++            cache.lookup(&MOCK_IP_ADDR_1.into(), Instant::from_millis(999)),
++            Answer::RateLimited
++        );
++        assert_eq!(
++            cache.lookup(&MOCK_IP_ADDR_2.into(), Instant::from_millis(999)),
++            Answer::RateLimited
++        );
++        // Each address gets its own second.
++        assert_eq!(
++            cache.lookup(&MOCK_IP_ADDR_1.into(), Instant::from_millis(1000)),
++            Answer::NotFound
++        );
++        assert_eq!(
++            cache.lookup(&MOCK_IP_ADDR_2.into(), Instant::from_millis(1000)),
++            Answer::RateLimited
++        );
++        assert_eq!(
++            cache.lookup(&MOCK_IP_ADDR_2.into(), Instant::from_millis(1100)),
++            Answer::NotFound
++        );
++        // A repeated request restarts that address's silence.
++        cache.limit_rate(MOCK_IP_ADDR_1.into(), Instant::from_millis(1000));
++        assert_eq!(
++            cache.lookup(&MOCK_IP_ADDR_1.into(), Instant::from_millis(1500)),
++            Answer::RateLimited
++        );
++    }
++
++    #[test]
++    fn test_hush_is_bounded() {
++        let mut cache = Cache::new();
++        let addr = |i: usize| -> IpAddress {
++            #[cfg(feature = "proto-ipv6")]
++            return IpAddress::v6(0xfdaa, 0, 0, 0, 0, 0, 0, i as u16 + 1);
++            #[cfg(not(feature = "proto-ipv6"))]
++            return IpAddress::v4(10, 0, 0, i as u8 + 1);
++        };
++        let full = IFACE_NEIGHBOR_CACHE_COUNT;
++        // Requests for `full` different addresses within one silent period all go out ...
++        for i in 0..full {
++            let t = Instant::from_millis(i as i64);
++            assert_eq!(cache.lookup(&addr(i), t), Answer::NotFound);
++            cache.limit_rate(addr(i), t);
++        }
++        // ... but not one more: the request rate stays bounded.
++        let t = Instant::from_millis(full as i64);
++        assert_eq!(cache.lookup(&addr(full), t), Answer::RateLimited);
++        // Once the first silence ended, its slot is reused for a new address.
++        let t = Instant::from_millis(0) + Cache::SILENT_TIME;
++        assert_eq!(cache.lookup(&addr(full), t), Answer::NotFound);
++        cache.limit_rate(addr(full), t);
++        assert_eq!(cache.lookup(&addr(full), t), Answer::RateLimited);
++        // Every slot is silent again, so the evicted address waits for the next free one.
++        assert_eq!(cache.lookup(&addr(0), t), Answer::RateLimited);
++        let t = t + Duration::from_millis(1);
++        assert_eq!(cache.lookup(&addr(1), t), Answer::NotFound);
++        assert_eq!(cache.lookup(&addr(0), t), Answer::NotFound);
++        assert_eq!(cache.lookup(&addr(2), t), Answer::RateLimited);
++    }
++
+     #[test]
+     fn test_flush() {
+         let mut cache = Cache::new();
+diff --git a/src/iface/interface/mod.rs b/src/iface/interface/mod.rs
+index b17571e..62c5a8d 100644
+--- a/src/iface/interface/mod.rs
++++ b/src/iface/interface/mod.rs
+@@ -1201,8 +1201,8 @@ impl InterfaceInner {
+             _ => (),
+         }
+ 
+-        // The request got dispatched, limit the rate on the cache.
+-        self.neighbor_cache.limit_rate(self.now);
++        // The request got dispatched: limit the rate of requests for this address.
++        self.neighbor_cache.limit_rate(dst_addr, self.now);
+         Err(DispatchError::NeighborPending)
+     }
+ 
+diff --git a/src/iface/interface/tests/ipv4.rs b/src/iface/interface/tests/ipv4.rs
+index 75895ff..d2422ef 100644
+--- a/src/iface/interface/tests/ipv4.rs
++++ b/src/iface/interface/tests/ipv4.rs
+@@ -555,6 +555,43 @@ fn test_handle_other_arp_request(#[case] medium: Medium) {
+     );
+ }
+ 
++#[rstest]
++#[case(Medium::Ethernet)]
++#[cfg(feature = "medium-ethernet")]
++fn test_arp_requests_are_rate_limited_per_address(#[case] medium: Medium) {
++    let (mut iface, _sockets, _device) = setup(medium);
++    let a = IpAddress::Ipv4(Ipv4Address::new(192, 168, 1, 2));
++    let b = IpAddress::Ipv4(Ipv4Address::new(192, 168, 1, 3));
++
++    // A request for `a` goes out ...
++    assert_eq!(
++        iface
++            .inner
++            .lookup_hardware_addr(MockTxToken, &a, &mut iface.fragmenter),
++        Err(DispatchError::NeighborPending)
++    );
++    let now = iface.inner.now;
++    assert_eq!(
++        iface.inner.neighbor_cache.lookup(&a, now),
++        NeighborAnswer::RateLimited
++    );
++    // ... and does not hold back the request for `b` at the same instant.
++    assert_eq!(
++        iface.inner.neighbor_cache.lookup(&b, now),
++        NeighborAnswer::NotFound
++    );
++    assert_eq!(
++        iface
++            .inner
++            .lookup_hardware_addr(MockTxToken, &b, &mut iface.fragmenter),
++        Err(DispatchError::NeighborPending)
++    );
++    assert_eq!(
++        iface.inner.neighbor_cache.lookup(&b, now),
++        NeighborAnswer::RateLimited
++    );
++}
++
+ #[rstest]
+ #[case(Medium::Ethernet)]
+ #[cfg(feature = "medium-ethernet")]

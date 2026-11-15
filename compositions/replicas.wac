@@ -1,0 +1,18 @@
+// node-replicas = the netstack + the replicas controller app.
+//
+// The app's TCP (its load balancer's admin API) comes from the netstack. Its `wasmnet:infra`
+// import is forwarded to the host with `...`: the host serves it only to a device whose
+// `DeviceOptions::infra` is set, and refuses to instantiate any other importer.
+package wasmnet:node-replicas;
+
+let net = new wasmnet:netstack { ... };
+
+let ctl = new app:replicas {
+    "wasi:sockets/types@0.3.0": net["wasi:sockets/types@0.3.0"],
+    ...
+};
+
+export net["wasmnet:link/device@0.1.0"];
+export net["wasmnet:link/lifecycle@0.1.0"];
+export net["wasmnet:link/counters@0.1.0"];
+export ctl["wasi:cli/run@0.3.0"] as "app-replicas";

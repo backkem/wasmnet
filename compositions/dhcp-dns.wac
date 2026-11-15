@@ -1,0 +1,25 @@
+// node-dhcp-dns = the netstack + the dhcp-server and dns-server apps: a dnsmasq-style
+// infrastructure node.
+//
+// One netstack instance serves both apps' `wasi:sockets` imports: the DHCP server binds UDP 67,
+// the DNS server UDP 53. Each app's `wasi:cli/run` is exported as `app-<name>`; the host calls
+// both after `start`, and both are daemons.
+package wasmnet:node-dhcp-dns;
+
+let net = new wasmnet:netstack { ... };
+
+let dhcp = new app:dhcp-server {
+    "wasi:sockets/types@0.3.0": net["wasi:sockets/types@0.3.0"],
+    ...
+};
+
+let dns = new app:dns-server {
+    "wasi:sockets/types@0.3.0": net["wasi:sockets/types@0.3.0"],
+    ...
+};
+
+export net["wasmnet:link/device@0.1.0"];
+export net["wasmnet:link/lifecycle@0.1.0"];
+export net["wasmnet:link/counters@0.1.0"];
+export dhcp["wasi:cli/run@0.3.0"] as "app-dhcp-server";
+export dns["wasi:cli/run@0.3.0"] as "app-dns-server";

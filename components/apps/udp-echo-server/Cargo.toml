@@ -1,0 +1,30 @@
+[package]
+name = "wasmnet-udp-echo-server"
+version = "0.0.0"
+description = "A WASI 0.3 app that sends every UDP datagram it receives straight back."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# A wasmnet app (world `wasmnet:app/app`): an ordinary WASI 0.3 program that echoes
+# every UDP datagram back to its sender. It imports `wasi:sockets@0.3.0`, which the node's
+# netstack satisfies once `compositions/udp-echo-server.wac` composes them. `src/lib.rs` is the
+# pure logic (config, guest-tested in wasmtime); `src/component.rs` is the glue.
+
+[lib]
+# The artifact is named after the component, not the package: `udp_echo_server.wasm`.
+name = "udp_echo_server"
+crate-type = ["cdylib"]
+
+[dependencies]
+# What the apps share: bindings, config keys, address conversions.
+wasmnet-app-kit = { path = "../../../crates/wasmnet-app-kit" }
+thiserror.workspace = true
+# The `run` export is an async func; one task, so no spawn and no inter-task wakeup.
+wit-bindgen = { workspace = true, features = ["macros", "realloc", "async"] }
+# The standard WASI 0.3 bindings: sockets and clocks, exactly as on any WASI host.
+wasip3 = { workspace = true, features = ["std"] }
+
+[lints]
+workspace = true

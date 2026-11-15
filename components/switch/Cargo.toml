@@ -1,0 +1,29 @@
+[package]
+name = "wasmnet-switch"
+version = "0.0.0"
+description = "A stepped device that implements a transparent learning Ethernet bridge."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# A wasmnet:link device (world `stepped-device`): a learning switch. `src/lib.rs` is the
+# pure logic, unit- and property-tested inside wasmtime with
+# `cargo test --target wasm32-wasip2 -p wasmnet-switch`; `src/component.rs` is the wit-bindgen glue,
+# left out of test builds.
+
+[lib]
+# The artifact is named after the component, not the package: `switch.wasm`.
+name = "switch"
+crate-type = ["cdylib"]
+
+[dependencies]
+wasmnet-wire = { path = "../../crates/wasmnet-wire" }
+wit-bindgen = { workspace = true, features = ["macros", "realloc"] }
+
+[dev-dependencies]
+# Runs inside wasmtime too (wasm32-wasip2 has std and getrandom support).
+proptest = { workspace = true }
+
+[lints]
+workspace = true

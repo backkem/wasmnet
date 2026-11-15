@@ -1,0 +1,19 @@
+// node-traceroute = the netstack + the traceroute app.
+//
+// Same shape as udp-echo-server.wac (the one explained there); the app also reads its UDP socket's ICMP errors through the
+// netstack's `wasmnet:sockets-ext/udp` (the `IP_RECVERR` analogue).
+package wasmnet:node-traceroute;
+
+let net = new wasmnet:netstack { ... };
+
+let tracer = new app:traceroute {
+    "wasi:sockets/types@0.3.0": net["wasi:sockets/types@0.3.0"],
+    "wasi:sockets/ip-name-lookup@0.3.0": net["wasi:sockets/ip-name-lookup@0.3.0"],
+    "wasmnet:sockets-ext/udp@0.1.0": net["wasmnet:sockets-ext/udp@0.1.0"],
+    ...
+};
+
+export net["wasmnet:link/device@0.1.0"];
+export net["wasmnet:link/lifecycle@0.1.0"];
+export net["wasmnet:link/counters@0.1.0"];
+export tracer["wasi:cli/run@0.3.0"] as "app-traceroute";
