@@ -571,6 +571,7 @@ separates the field), and routes are served in name order.
 |---|---|---|---|
 | `route.<name>.path` | path starting with `/`, no spaces or `?` | **required** per route | The route's path. |
 | `route.<name>.body` | text | empty | The body. |
+| `route.<name>.body-base64` | standard base64 with `=` padding | none | A binary body (a component a store node serves): used instead of `body`, and never templated. |
 | `route.<name>.type` | non-empty text | `text/plain` | The `Content-Type`. |
 | `route.<name>.sse-events` | integer, 1..=100000 | none | Embedder surface, unstable. Makes the route an event stream (`text/event-stream`, `GET` only) of events `1..=N`. |
 | `route.<name>.sse-interval-ms` | integer, 0..=60000 | `1000` | Milliseconds of virtual time between two events. Requires `sse-events`. |
@@ -682,7 +683,10 @@ are errors.
 | `period` | duration | `500ms` | Time between two reconciles. `0` is taken as 1 ns. |
 | `start` | duration | `0` | Wait before the first reconcile. |
 | `grace` | duration | `0` | A removed instance keeps running this long (a stop with grace). |
-| `template.component` | catalog name | **required** | The component instances are made from (`node:http-server`). |
+| `template.component` | catalog name | **required**, unless `template.fetch` | The component instances are made from (`node:http-server`). |
+| `template.fetch` | `http://<ipv4>[:port]/<path>` | not set | Instead of `template.component`: fetch the instances' component from a store node (one `GET` at the first reconcile, again at each one until it works), supply it through `wasmnet:infra/components` (the node needs `DeviceOptions::infra_supply`) and make the instances from its digest. Journalled as `replicas-supplied {digest, size}`; a failure as `replicas-error {what: fetch}`. |
+| `template.digest` | `sha256:` and 64 lowercase hex digits | not set | With `template.fetch`: the digest the component must have; the host refuses other bytes. |
+| `template.fetch-max` | integer, bytes | `16777216` | With `template.fetch`: the largest component it reads. |
 | `template.stdio` | `journal` or `capture` | not set | The instances' `stdio` option: `journal` journals stdout and stderr lines, `capture` only captures them. Any other value is a config error. Not set means `capture`. |
 | `template.fuel_per_instant` | integer, optionally followed by `K`, `M` or `G` (×1000, ×10⁶, ×10⁹) | the network's | The instances' fuel per virtual instant (`50M`, `4G`). |
 | `template.config.<key>` | text (templated) | | The instances' config key `<key>`. |

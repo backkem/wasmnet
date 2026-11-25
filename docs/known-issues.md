@@ -24,7 +24,9 @@ here so that nobody has to find these the hard way. Each entry names where the c
   ([design/links.md](design/links.md)).
 - **A compile cache directory must be trusted.** `Host::with_cache_dir` loads what it finds
   there as native code, and wasmtime checks only a header. Never point it at a directory other
-  users can write.
+  users can write. Components controllers supply go through it too (named by their full
+  SHA-256, so code in a network cannot make its artifact stand for other bytes), which adds
+  nothing to trust beyond the directory itself.
 
 ## The embedder surface
 
@@ -51,6 +53,12 @@ here so that nobody has to find these the hard way. Each entry names where the c
   applies (`infra-failed`).
 - **Arguments and environment are native only.** The browser backend does not serve
   `DeviceOptions::args` and `env`: its devices see neither.
+- **Supplied components are native only, and kept in memory.** The browser backend compiles
+  nothing while a network runs (`Runtime::compile_supplied` keeps its default refusal), so a
+  creation from a digest fails there (`failed`). On wasmtime a controller's store and the
+  compiled components live in memory for the run, bounded per controller by its
+  `SupplyLimits`, not across controllers. A component compiled in another process is shared
+  only through a compile cache directory, which must be trusted as before.
 - **A controller has no limits.** Nothing bounds how many devices a controller creates (beyond
   its 2^20 device numbers per run) or what they allocate.
 - **Split networks keep changes on one site.** A controller changes only devices on its own

@@ -265,6 +265,100 @@ with the trap's first line as its `message`; one an operator or its controller s
 stopped device could still show the message of an earlier refused request), which is the one
 change to existing tables: `get`, `list` and `watch` show it, the journal does not change.
 
+### Components a controller supplies
+
+A controller creates devices from catalog names: the embedder declared every image in advance.
+A platform that lets authors ship apps needs more: a controller that fetches a component over
+the simulated network (from a store node, say) and runs it. With the grant below, a controller
+hands the host the component's bytes, gets back their SHA-256, and applies specs that name the
+component by that digest. Tested end to end in
+[crates/wasmnet-host/tests/supply.rs](../../crates/wasmnet-host/tests/supply.rs).
+
+**The grant.** `DeviceOptions::infra_supply` (`Some(SupplyLimits)`, beside `infra`, which it
+needs). Without it nothing changes: `components.supply`, `release` and `list` answer `denied`
+(an empty list), and a spec that names a digest is `denied` at `apply`. The catalog rule stays
+for names.
+
+**Bytes in, a digest out.** `wasmnet:infra/components.supply(digest, bytes)` is one sync call
+that never yields: the controller passes the whole component, and optionally the digest it
+expects. The host computes the bytes' SHA-256; a stated digest that differs is `invalid` and
+stores nothing. One call, not chunks: the host must hold the whole component before it can
+check its digest and before the embedder can judge it, and a component is bounded anyway (a
+chunked form can be added later without changing this one). The answer is the reference
+`sha256:<64 lowercase hex digits>`, which a spec's `component` may then be. The prefix
+`sha256:` is reserved: a component name that starts with it is always a digest reference.
+
+**Bounds** (`SupplyLimits`): the largest component (`max_bytes`, checked after the bytes crossed
+the call and before anything else), and how many components (`max_components`) and bytes
+(`max_total`) the controller's store may keep at once. A supply past a bound is `denied` and
+stores nothing. Supplying bytes the store already keeps costs nothing and is not judged again.
+
+**The embedder decides what may run.** Before bytes are kept, compiled or instantiated, the
+network calls the embedder's admission callback (`Network::set_supply_admission`) with the
+bytes, their digest and the calling controller. Its `Err(reason)` is the controller's
+`denied(reason)`, and nothing is stored. Without a callback every supply is refused: a grant
+alone runs nothing. This is where an embedder applies its import policy. The wasmtime host
+offers one ready-made: `wasmnet_host::ImportPolicy` lists a component's imports by parsing it
+(nothing is compiled) and refuses any import its patterns do not allow, and a component that is
+not a well-formed component. The host links the same imports for every device whatever the
+policy says, so a policy only narrows them: a supplied component that imports something the
+host does not serve (`wasi:sockets`, an unknown package) never instantiates. The host checks
+that when it compiles the component, so the creation fails cleanly (`failed`, the device's
+`message` and `infra-failed` on the controller name the import), never the network. A supplied
+component that imports `wasmnet:infra` is refused at instantiation like every component of a
+spec, which can grant nothing.
+
+**Compiled once per digest.** When a creation from a digest applies, the network asks the
+runtime to compile the controller's bytes (`Runtime::compile_supplied`; the default refuses,
+which is what the browser backend does) and keeps the result by digest for as long as any
+controller's store keeps those bytes, so a second device, a recreation and a start of a stopped
+one compile nothing (`Network::supplied_compiles` counts the compilations). On wasmtime, with a
+compile cache directory ([runtime-and-extensions.md](runtime-and-extensions.md)), the
+compilation goes through it: the artifact is named by the bytes' full SHA-256 and the engine's
+compatibility hash. A stale artifact cannot be picked up (another engine has another hash), and
+code inside the network cannot substitute other code: it chooses only bytes, the host names
+their artifact by the digest it computed itself, and making two different components share an
+artifact would take a SHA-256 collision. The admission callback runs before any lookup, so a
+cached artifact never skips it. What remains is the known rule that the directory itself must
+be trusted ([known-issues.md](../known-issues.md)): whoever can write files there can replace
+any artifact, supplied or not.
+
+**What the store keeps, and when it lets go.** Each controller has its own store; another
+controller can neither read nor name its components. A digest stays in the store while the
+controller holds it (from `supply` until `components.release`, or until the controller is
+removed; a stop or a crash keeps the hold, like a disk), while a device in the table names it
+(in any phase: a stopped or crashed device starts again from it, a failed one can be applied
+again), or while a request still queued names it. At the first point none is left (a `release`,
+a request applying, a device removed, the controller removed) the bytes and the compiled
+component are dropped, journalled as `component-dropped {digest, size}` on the controller.
+Devices already running keep their instances, and a device that was created from it keeps its
+component to start again, as every device does.
+
+**Records.** `infra-supply {digest, size}` on the controller when it takes the hold,
+`infra-release {digest}` when it gives it up, `component-dropped` as above; the bytes are never
+journalled. A device made from supplied bytes shows its digest reference as its `component`, in
+its spec and in `device-added`. It is otherwise like any other device the controller created:
+its fuel and memory limits, it crashes alone, `logs`, `control`, `stop`, `start` and
+recreation.
+
+**Deterministic and replayable.** The bytes come from inside the simulation (the controller
+received them over the network), so a rerun makes the same supply at the same position, and
+the admission callback is called again there; like an embedder action, the network stays a
+function of its inputs only while the callback's verdict depends only on what it is given.
+Nothing is read from outside. A compilation changes no record: whether it happens, and whether
+a cache served it, is wall time only.
+
+**Split networks.** A controller's store lives on its site, with the controller and the devices
+it creates there. The merge carries what the records carry: digests and sizes in the
+controller's journal and the digest references in the table; no bytes cross sites.
+
+**What a controller with the grant can do**: run code it chose, within the embedder's admission,
+its bounds and the device limits (fuel, memory, its device count), on its own site, with the
+imports the host links for every device and no grant of its own (no `infra`). **What it cannot
+do**: run anything the admission refused, read or use another controller's components, keep
+more bytes than its bounds, make a compiled artifact stand for other bytes, or reach anything
+outside the network.
+
 ### A change feed that wakes a controller
 
 `wasmnet:infra/changes.wait(selector, since, deadline)` (package 0.1.2) is an async function:

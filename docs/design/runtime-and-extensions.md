@@ -11,12 +11,16 @@ of the core's own flow, so an extension never reorders the queue or the journal.
 ## The `Runtime` contract
 
 `wasmnet_core::Runtime` ([crates/wasmnet-core/src/network.rs](../../crates/wasmnet-core/src/network.rs))
-has one associated type and two methods:
+has one associated type and four methods (three with defaults; `summarize` is the one not listed here):
 
 - `type Component: ?Sized`: what a device is made from (wasmtime: a compiled `Component`).
 - `instantiate(DeviceContext, &Component) -> Result<DeviceInstance>`.
 - `install(&mut Network)`: called once when a network is created on this runtime; the place to
   register network extensions and cable kinds. The default does nothing.
+- `compile_supplied(digest, bytes)`: turns a component a controller supplied as bytes into a
+  component, once per digest (`docs/design/topology-and-infra.md`); its refusal fails the
+  creation, never the network. The default refuses (a backend that compiles nothing at run
+  time, as the browser's).
 
 `DeviceContext` carries everything one device needs: its index and unique name, the network
 seed, the shared `VirtualClock`, its `Wire` (`wire.transmit`), its `JournalEnd` (`log`), its
@@ -80,6 +84,11 @@ core itself is built for `wasm32-unknown-unknown` and a browser's engine runs th
   so only `Host::load`'s wall time changes. `default_cache_dir()` is the platform's per-user
   cache directory (`%LOCALAPPDATA%`, `~/Library/Caches`, `$XDG_CACHE_HOME` or `~/.cache`, then
   `wasmnet/compile-cache`); the embedder may pass any other.
+  Components controllers supply go through it with `CompileCache::load_bytes`, named by their
+  full SHA-256 ([topology-and-infra.md](topology-and-infra.md#components-a-controller-supplies)).
+- **`ImportPolicy`** ([src/admit.rs](../../crates/wasmnet-host/src/admit.rs)): a ready-made
+  admission for supplied components, an allow list of import patterns checked by parsing the
+  component (`component_imports`), before anything is compiled.
 - **`Sim`**: runs one `wasi:cli/run` command under its own virtual clock, outside any network.
 
 A limit of the wasmtime backend: it drives instantiation and `ports()` with `block_on` on the

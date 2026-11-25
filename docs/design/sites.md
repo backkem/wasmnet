@@ -61,6 +61,11 @@ site). What makes it work:
   device another controller created is refused by the rule of cables in both runs alike
   (`infra-failed`): its owner is known on the site that has it, and the name's `infra_prefix`
   tells the other site whose it is ([topology-and-infra.md](topology-and-infra.md)).
+- **Supplied components stay with their controller.** A controller's store of supplied
+  components and their compiled code live on its site, where it creates devices from them; the
+  merge carries only what the records carry (`infra-supply {digest, size}`, digest references
+  in specs and `device-added`), never the bytes. Each site's network needs the same admission
+  callback (`crates/wasmnet-host/tests/infra_sites.rs` fetches a component across the WAN link).
 
 What does not cross sites:
 
