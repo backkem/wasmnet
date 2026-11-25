@@ -120,3 +120,70 @@ only through operator events (`Op::Stdin`, `Op::StdinNamed`), at their instant
 4. Test it end to end under the host, as
    [crates/wasmnet-host/tests/nodes.rs](../../crates/wasmnet-host/tests/nodes.rs) does with
    `http-get` and `http-server`.
+
+## An app in another repository
+
+An app does not have to live in this tree. A crate anywhere needs one dependency and no WIT
+files; [crates/wasmnet-host/tests/fixtures/external-app](../../crates/wasmnet-host/tests/fixtures/external-app)
+is a complete one, which
+[tests/external_app.rs](../../crates/wasmnet-host/tests/external_app.rs) copies to a temporary
+directory, builds there, composes and runs.
+
+**The dependency.** `wasmnet-app-kit`, by git at a fixed revision (or by path, next to a
+checkout), in a crate whose library is a `cdylib`:
+
+```toml
+[lib]
+name = "hello"
+crate-type = ["cdylib"]
+
+[dependencies]
+wasmnet-app-kit = { git = "https://github.com/backkem/wasmnet", rev = "<commit>" }
+```
+
+The kit re-exports the two crates the bindings are made with, `wasmnet_app_kit::wasip3` (the
+standard sockets and clocks) and `wasmnet_app_kit::wit_bindgen` (streams, futures,
+`spawn_local`), so the app names neither. One that lists them itself must pin the versions the
+kit pins, or the socket types stop matching. The toolchain needs the `wasm32-wasip2` target and
+Rust 1.98 or later.
+
+**The bindings.** One line, as for an app in this tree: `wasmnet_app_kit::app_bindings!();`.
+The bindings were generated inside the kit from the WIT in its own checkout (cargo checks out
+the whole repository for a git dependency), so nothing is copied. Implement
+`exports::wasi::cli::run::Guest` for a type and hand it to `export!`. Then build and check:
+
+```sh
+cargo build --release --target wasm32-wasip2
+wasm-tools validate target/wasm32-wasip2/release/hello.wasm
+```
+
+An app that imports more than `wasmnet:app/app` offers (as `replicas` adds `wasmnet:infra`)
+still writes its own `wit_bindgen::generate!`, whose paths are literals relative to the app's
+crate: it needs the WIT at a place it can name, such as a submodule. `wasmnet_app_kit::WIT_DIR`
+is the directory in the kit's checkout, for a build script or a tool that wants to read or copy
+it.
+
+**A netstack.** The app runs on the netstack built from the same revision, so that the
+interfaces it imports are the ones the netstack exports. In a checkout of this repository at
+that revision ([components/README.md](../../components/README.md) names everything `--only`
+takes):
+
+```sh
+cargo xtask build --only netstack,switch --out-dir ../my-app/parts
+```
+
+**The node.** A composition of the app's own, shaped like the one above, and `wac` with each
+part given by path:
+
+```sh
+wac compose node.wac -o node-hello.wasm \
+    --dep wasmnet:netstack=parts/netstack.wasm \
+    --dep app:hello=target/wasm32-wasip2/release/hello.wasm
+wasm-tools validate node-hello.wasm
+```
+
+**Running it.** A native crate that depends on `wasmnet-host` (the same repository, the same
+revision) loads the node with `Host::load("node-hello.wasm")` and gives the device the
+netstack's keys plus `app.hello.*`, as in [How the host runs a node](#how-the-host-runs-a-node).
+`wasmnet_host::wasmtime` is the wasmtime the host is built on, so that crate pins none of its
+own. The tool versions to install are in [tools.toml](../../tools.toml).

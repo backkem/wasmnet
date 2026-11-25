@@ -61,7 +61,10 @@ core itself is built for `wasm32-unknown-unknown` and a browser's engine runs th
   plus virtual time), `wasi:random` from per-device seeded PRNGs, `wasi:cli` with captured
   stdout and stderr and stdin from operator events, `wasi:config/store`, `wasmnet:link` and
   `wasmnet:infra`. `wasi:sockets` and `wasi:filesystem` are not linked: a component that imports
-  them fails to instantiate.
+  them fails to instantiate. `wasi:random/random` is served from the seed on purpose,
+  `get-random-bytes` included: a deliberate departure from WASI 0.3's note that a deterministic
+  environment must omit that function, made so that ordinary programs run unmodified and repeat
+  exactly (so no byte a guest draws here is a secret).
 - **Guards**: each store's fuel is set to its per-instant budget (`Guard::fuel_per_instant`, or
   `DeviceOptions::fuel_per_instant`) the first time its actor runs at a new instant.
 - **The compile cache** ([src/cache.rs](../../crates/wasmnet-host/src/cache.rs)), off unless
@@ -127,7 +130,11 @@ extensions were added: `configure_engine` and `engine_built` (only for extension
 `init_store`), `store_created`, `instance_ready` (may report an optional export and its
 `ControlHandler`) and `install` (from `Runtime::install`). Whatever a guest can observe through
 an extension must be a function of its inputs, virtual time (`HostState::now`) and seeds
-(`HostState::seed`).
+(`HostState::seed`). A store's extension state is keyed by its type, not by the extension that
+put it there (`HostState::insert_extension`, one value per type), so two extensions may share
+one device's state by naming the same type, where a second `insert_extension` replaces the
+first value instead of merging with it; an extension that wants state of its own keeps its
+type private.
 
 **What is implemented here.** `Runtime` has two implementations, `Host` (wasmtime) and
 `wasmnet-web`'s `JsRuntime` (a browser). `HostExtension` has one,
