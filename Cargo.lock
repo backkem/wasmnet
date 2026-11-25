@@ -1521,6 +1521,7 @@ name = "wasmnet-app-kit"
 version = "0.0.0"
 dependencies = [
  "wasip3",
+ "wasmnet-wire",
  "wit-bindgen 0.61.1",
 ]
 

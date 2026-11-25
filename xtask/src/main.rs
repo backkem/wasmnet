@@ -185,8 +185,15 @@ fn nodes(root: &Path) -> Result<Vec<Node>> {
 fn test_guest() -> Result<()> {
     let root = root();
     let mut cmd = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
-    cmd.current_dir(&root)
-        .args(["test", "--target", TARGET, "-p", "wasmnet-wire"]);
+    cmd.current_dir(&root).args([
+        "test",
+        "--target",
+        TARGET,
+        "-p",
+        "wasmnet-wire",
+        "-p",
+        "wasmnet-app-kit",
+    ]);
     for c in components(&root)?.iter().filter(|c| c.lib) {
         cmd.args(["-p", &c.package]);
     }

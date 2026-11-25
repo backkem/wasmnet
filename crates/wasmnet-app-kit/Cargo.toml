@@ -12,6 +12,8 @@ publish.workspace = true
 wasip3 = { workspace = true, features = ["std"] }
 # The apps' bindings (world `wasmnet:app/app`) are generated here; `run` is an async export.
 wit-bindgen = { workspace = true, features = ["macros", "realloc", "async"] }
+# The DNS codec the mDNS service browser (`mdns`) speaks.
+wasmnet-wire = { path = "../wasmnet-wire" }
 
 [lints]
 workspace = true

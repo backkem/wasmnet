@@ -14,11 +14,15 @@
 //! * [`to_std`] and [`to_wit`]: socket addresses between `std::net` and `wasi:sockets`.
 //! * [`error_name`]: a `wasi:sockets` error code in kebab case, as the apps log it.
 //! * [`Fnv`]: the FNV-1a body hash the HTTP apps log.
+//! * [`mdns`]: a DNS-SD service browser over Multicast DNS (continuous querying, a cache,
+//!   resolving instances) that an app drives over its own UDP sockets.
 //!
 //! Everything but [`bindings`] and [`event`] is pure (no imports are called). The crate
 //! compiles natively too, where a call to an import panics.
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+
+pub mod mdns;
 
 use wasip3::sockets::types::{IpSocketAddress, Ipv4SocketAddress, Ipv6SocketAddress};
 
