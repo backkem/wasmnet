@@ -6,7 +6,8 @@
 //! name.
 
 use wasmnet_core::infra::{
-    Calls, Change, ChangeKind, ChangeWait, CommandAnswer, DeviceView, InfraError, LogLine, Phase,
+    Calls, Change, ChangeKind, ChangeWait, CommandAnswer, DeviceView, EventPage, Follow,
+    InfraError, LogLine, Phase, Ready, TableSince,
 };
 use wasmnet_core::supply::StoredComponent;
 
@@ -41,6 +42,8 @@ pub const FUNCTIONS: &[&str] = &[
     "components.supply",
     "components.release",
     "components.list",
+    "events.read",
+    "events.arm",
 ];
 
 /// Serves `function` (`devices.apply`, ... as in [`FUNCTIONS`]) with `args` from `calls`.
@@ -181,6 +184,22 @@ fn call(calls: Calls<'_>, function: &str, a: &Args<'_>) -> Result<Reply, String>
                 calls.supplied().into_iter().map(supplied).collect(),
             ))
         }
+        "events.read" => {
+            a.arity(4)?;
+            result(
+                calls
+                    .read_events(&a.str(0)?, &a.strs(1)?, a.u64(2)?, a.u32(3)?)
+                    .map(page),
+            )
+        }
+        "events.arm" => {
+            a.arity(2)?;
+            result(
+                calls
+                    .arm(a.table(0)?, a.follows(1)?)
+                    .map(|r| Value::option(r.map(ready))),
+            )
+        }
         other => return Err(format!("no function `{other}`")),
     })
 }
@@ -258,6 +277,64 @@ impl Args<'_> {
             Value::Bytes(b) => Ok(b.clone()),
             other => Err(Self::wrong(i, "bytes", other)),
         }
+    }
+
+    /// `list<string>`.
+    fn strs(&self, i: usize) -> Result<Vec<String>, String> {
+        let Value::List(items) = self.get(i)? else {
+            return Err(Self::wrong(i, "a list of strings", self.get(i)?));
+        };
+        items
+            .iter()
+            .map(|item| match item {
+                Value::Str(s) => Ok(s.clone()),
+                other => Err(Self::wrong(i, "a string", other)),
+            })
+            .collect()
+    }
+
+    /// A record's fields as arguments of their own, by name: `names` in that order.
+    fn fields(i: usize, v: &Value, names: &[&str]) -> Result<Vec<Value>, String> {
+        let Value::Record(fields) = v else {
+            return Err(Self::wrong(i, "a record", v));
+        };
+        names
+            .iter()
+            .map(|n| {
+                fields
+                    .iter()
+                    .find(|(k, _)| k == n)
+                    .map(|(_, v)| v.clone())
+                    .ok_or_else(|| format!("argument {i}: no field `{n}`"))
+            })
+            .collect()
+    }
+
+    /// `option<table-since>`: none, the record itself (as jco passes it), or `some`.
+    fn table(&self, i: usize) -> Result<Option<TableSince>, String> {
+        let v = match self.get(i)? {
+            Value::None => return Ok(None),
+            Value::Some(v) => &**v,
+            v => v,
+        };
+        let f = Self::fields(i, v, &["selector", "since"])?;
+        let f = Args(&f);
+        Ok(Some(TableSince::new(f.pairs(0)?, f.u64(1)?)))
+    }
+
+    /// `list<follow>`.
+    fn follows(&self, i: usize) -> Result<Vec<Follow>, String> {
+        let Value::List(items) = self.get(i)? else {
+            return Err(Self::wrong(i, "a list of follows", self.get(i)?));
+        };
+        items
+            .iter()
+            .map(|item| {
+                let f = Self::fields(i, item, &["name", "kinds", "since"])?;
+                let f = Args(&f);
+                Ok(Follow::new(f.str(0)?, f.strs(1)?, f.u64(2)?))
+            })
+            .collect()
     }
 
     /// `list<tuple<string, string>>`.
@@ -362,6 +439,37 @@ fn supplied(c: StoredComponent) -> Value {
     ])
 }
 
+fn page(p: EventPage) -> Value {
+    let events = p
+        .events
+        .into_iter()
+        .map(|e| {
+            Value::record(vec![
+                ("seq", Value::U64(e.seq)),
+                ("at", Value::U64(e.at)),
+                ("kind", Value::Str(e.kind)),
+                ("fields", pairs(e.fields)),
+            ])
+        })
+        .collect();
+    Value::record(vec![
+        ("events", Value::List(events)),
+        ("next", Value::U64(p.next)),
+        ("missed", Value::U64(p.missed)),
+    ])
+}
+
+fn ready(r: Ready) -> Value {
+    Value::record(vec![
+        ("rv", Value::U64(r.rv)),
+        ("changed", Value::Bool(r.changed)),
+        (
+            "devices",
+            Value::List(r.devices.into_iter().map(Value::Str).collect()),
+        ),
+    ])
+}
+
 /// `wasmnet:infra/types.error`.
 fn error(e: InfraError) -> Value {
     let (tag, m) = match e {
@@ -392,6 +500,25 @@ mod tests {
         assert!(matches!(
             start_wait(calls, &[Value::List(vec![]), Value::U64(0), Value::None]),
             Err(Reply::Error(_))
+        ));
+        let read = [
+            Value::str("r1"),
+            Value::List(vec![]),
+            Value::U64(0),
+            Value::U32(1),
+        ];
+        assert!(matches!(
+            serve(calls, "events.read", &read),
+            Reply::Error(Value::Variant(tag, _)) if tag == "denied"
+        ));
+        let follow = Value::record(vec![
+            ("name", Value::str("r1")),
+            ("kinds", Value::List(vec![Value::str("tunnel-*")])),
+            ("since", Value::U64(0)),
+        ]);
+        assert!(matches!(
+            serve(calls, "events.arm", &[Value::None, Value::List(vec![follow])]),
+            Reply::Error(Value::Variant(tag, _)) if tag == "denied"
         ));
     }
 

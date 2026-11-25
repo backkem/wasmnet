@@ -58,8 +58,9 @@
 /// into these specs.
 ///
 /// Versions: 0.1.1 added `devices.control`; 0.1.2 added `changes.wait`, `devices.control-answer`,
-/// `devices.wire`, `devices.unwire`, `components`, the spec keys `args`, `env` and `memory`, digest
-/// references as a spec's `component` and the cable key `impair`. A component built against
+/// `devices.wire`, `devices.unwire`, `components`, `events`, the spec keys `args`, `env` and
+/// `memory`, digest references as a spec's `component` and the cable key `impair`. A component
+/// built against
 /// 0.1.0 or 0.1.1 still links, since an addition keeps the `0.1` line compatible.
 package wasmnet:infra@0.1.2;
 
@@ -293,10 +294,12 @@ interface devices {
 }
 
 /// A change feed that wakes its caller (0.1.2), for a controller that should react to a crash
-/// or an exit at once instead of polling `watch` on a timer. A controller without async tasks
-/// (a stepped device) keeps polling `watch` from its `poll`.
+/// or an exit at once instead of polling `watch` on a timer, and (`wait-any`) to an event of a
+/// device it created. A controller without async tasks (a stepped device) arms the same wait with
+/// `events.arm` instead, or polls `watch` from its `poll`.
 interface changes {
     use types.{instant, rv, labels, error};
+    use events.{follow, table-since, ready};
 
     /// Waits until the caller's view of the device table (see `devices`) has a change after
     /// `since` to a device whose labels include all of `selector`'s pairs, or until virtual
@@ -312,6 +315,135 @@ interface changes {
     /// - Cancelling the call (dropping it) stops waiting and cancels its deadline.
     /// - Fails with `denied` from a device that was not granted this interface.
     wait: async func(selector: labels, since: rv, deadline: option<instant>) -> result<rv, error>;
+
+    /// Waits until something in `table` (none: the table does not end the wait) or `follows`
+    /// (at most 64 devices this caller created, see `events`) is ready, or until virtual time
+    /// reaches `deadline` (none: no deadline), and says what is ready (nothing, at the
+    /// deadline). A controller with one loop waits here for both its table and its devices'
+    /// events (0.1.2).
+    ///
+    /// - Returns at once if something is ready already, or if `deadline` is not after now.
+    /// - Otherwise the caller's task waits; nothing else of the caller is blocked. What ends the
+    ///   wait (a device journalling an event, a change being made, a followed device being
+    ///   removed) wakes it in that processing context, so the caller runs in that event's next
+    ///   round: at the same position on every replay, and the same in a world split over sites.
+    /// - Cancelling the call (dropping it) stops waiting and cancels its deadline.
+    /// - Fails at once, without waiting, with `not-found`, `denied` or `invalid` as
+    ///   `events.read` does for any follow, `invalid` for more than 64, `denied` from a device
+    ///   that was not granted this interface.
+    wait-any: async func(table: option<table-since>, follows: list<follow>, deadline: option<instant>) -> result<ready, error>;
+}
+
+/// The events of the devices a controller created (0.1.2): what each journalled through
+/// `wasmnet:link/log.event` (a router's `tunnel-up {tunnel, peer}`, a switch's `mac-learned`, an
+/// app's own events), so a controller can follow a device's state without sending it a command on
+/// a period. Kinds and fields are the device's own text. The records the network makes about a
+/// device (`device-added`, `app-exit`, ...) are not among them: the device table shows those.
+///
+/// **Whose events.** Only the devices the caller created: a device another controller created
+/// is not in its view (`not-found`), and the network's own devices and the caller itself are
+/// `denied`, as for `devices.logs`: in a world split over sites, a device of the network's own
+/// may journal on another site, while the devices a controller created are on its site.
+///
+/// **What is kept.** The events of every device a controller created, from its creation (an
+/// event it journals while it is instantiated included), in a ring per device: the last 256, at
+/// most 256 KiB together (each event counting its kind, its field names and values and 32 bytes),
+/// the newest always kept. Each field is at most 16 KiB, as in the journal. The ring goes with
+/// the device when it is removed; a stop, a crash, a start and a recreation (`apply` with a new
+/// spec) keep it.
+///
+/// **The cursor.** Every event has a number, `seq`: 1 for the first event of a device name, one
+/// more for each next, never reused while the world runs (a device removed and created again
+/// under its name goes on from the last number). A reader passes the last number it has seen as
+/// `since` and gets what came after it: several events at one instant have numbers of their own,
+/// so none is read twice or skipped. Events the ring dropped before a reader got them are
+/// reported as `missed` (a gap, never skipped silently); a reader that missed events should read
+/// the device's state another way (a router's `tunnels` command) and go on from `next`.
+///
+/// **Filters.** A list of kind patterns: a kind (`tunnel-up`), or a prefix and `*` (`tunnel-*`);
+/// at most 16, each 1 to 128 bytes without spaces; an empty list is every kind.
+///
+/// **Waiting.** `changes.wait-any` (an async controller) and `arm` (a stepped controller, which
+/// cannot await) end on one condition: a change of the device table the caller waits for, an
+/// event a follow waits for, a gap after a follow's cursor, or a followed device leaving the
+/// table. One call covers both the table and events, because a controller has one loop; the
+/// async one lives in `changes`, so that this interface is all sync and a stepped device can
+/// import it without async support. A wake comes in the
+/// processing context of what caused it (the device journalling the event, the change being
+/// made), so the controller runs at the same position on every replay and in a world split over
+/// sites.
+///
+/// Served only to devices granted `wasmnet:infra`; every call of any other device is `denied`.
+interface events {
+    use types.{instant, rv, labels, error};
+
+    /// One event a device journalled.
+    record event {
+        /// Its number among the events of the device's name (the cursor).
+        seq: u64,
+        /// When it was journalled.
+        at: instant,
+        kind: string,
+        /// In the order the device gave them.
+        fields: list<tuple<string, string>>,
+    }
+
+    /// What `read` found.
+    record page {
+        /// The events after `since` matching the filter, oldest first.
+        events: list<event>,
+        /// The cursor to pass as `since` next: every event up to it was looked at (those the
+        /// filter left out included).
+        next: u64,
+        /// How many events after `since` the ring dropped before they were read, of any kind
+        /// (the ring keeps every kind). Not 0: a gap.
+        missed: u64,
+    }
+
+    /// One device a wait follows: events of `kinds` (empty: every kind) after `since`.
+    record follow {
+        name: string,
+        kinds: list<string>,
+        since: u64,
+    }
+
+    /// The table part of a wait: a change of the caller's view after `since` to a device whose
+    /// labels include all of `selector`'s pairs, as `changes.wait` takes them.
+    record table-since {
+        selector: labels,
+        since: rv,
+    }
+
+    /// What ended a wait.
+    record ready {
+        /// The latest resource version of the caller's view.
+        rv: rv,
+        /// The table has a change the wait was for.
+        changed: bool,
+        /// The followed devices with an event the wait was for, a gap, or gone from the table,
+        /// in the order given. Read each with `read` (a gone one answers `not-found`).
+        devices: list<string>,
+    }
+
+    /// The events device `name` journalled after `since` whose kind matches `kinds`, oldest
+    /// first, at most `max` (0 counts as 1), with the cursor to read from next and the gap, if
+    /// any. Sync, never yields; answered from the ring as it is at the call. A device still
+    /// `pending` has none yet. Fails with `not-found` for no such device in the caller's view,
+    /// `denied` for one the caller did not create, `invalid` for a malformed filter.
+    read: func(name: string, kinds: list<string>, since: u64, max: u32) -> result<page, error>;
+
+    /// `changes.wait-any` for a controller without async tasks (a stepped device), as a
+    /// one-shot wake of its `wasmnet:link/device.poll`. Sync, never yields.
+    ///
+    /// - If something is ready already, returns it (`some`) and arms nothing: read and arm again.
+    /// - Otherwise (`none`) it arms: the first event, change or departure that would end the wait
+    ///   queues one more `poll` of the caller at that instant, in that processing context, after
+    ///   what is already queued there. Its own poll deadlines are unaffected (the wake is a poll
+    ///   of its own, beside them). It fires once; arm again after reading.
+    /// - One armed wait per caller: a new `arm` replaces it, and one with no `table` and no
+    ///   `follows` only disarms. The caller's stop, crash or restart disarms it too.
+    /// - Fails like `changes.wait-any`, and then leaves nothing armed.
+    arm: func(table: option<table-since>, follows: list<follow>) -> result<option<ready>, error>;
 }
 
 /// Components a controller supplies as bytes (0.1.2), for a controller that fetches a component
@@ -383,5 +515,6 @@ interface components {
 world controller {
     import devices;
     import changes;
+    import events;
     import components;
 }

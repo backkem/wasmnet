@@ -342,6 +342,14 @@ fn to_value(v: &Val, t: &Type) -> Value {
                 .map(|(i, t)| to_value(i, &t))
                 .collect(),
         ),
+        // A record: an object, its fields by name (kebab-case, as `codec.ts` writes them).
+        (Val::Record(fields), Type::Record(r)) => Value::Record(
+            fields
+                .iter()
+                .zip(r.fields())
+                .map(|((name, v), f)| (name.clone(), to_value(v, &f.ty)))
+                .collect(),
+        ),
         other => panic!("an argument the page never sends: {other:?}"),
     }
 }
@@ -974,6 +982,101 @@ fn a_controller_commands_and_reconfigures_alike() {
                 .iter()
                 .any(|e| e.2 == "device-reconfigured" && e.1 == "s1"),
             "the switch took its new config in place: {s:#?}"
+        );
+        s
+    });
+}
+
+/// A controller follows the events of a router it created (`wasmnet:infra/events`): three
+/// routes added at one instant, each of which sets off its rule once (the rule reads the
+/// router's `route-added` events after it), a read with a filter and a cursor, and a read of
+/// a device it did not create, which is refused.
+fn device_events(net: &mut dyn Backend) -> Seen {
+    let r1 = spec(
+        "router",
+        &[
+            ("mac", "02:00:00:00:fe:10"),
+            ("port0.ipv4", "10.0.1.1/24"),
+            ("port1.ipv4", "10.0.2.1/24"),
+        ],
+    );
+    net.add(
+        "sw",
+        "switch",
+        config(&[("ports", "3")]),
+        DeviceOptions::default(),
+    );
+    let steps = [
+        format!("0ms apply r1 {}", hex(&r1)),
+        "1ms control r1 route-add 10.0.3.0/24 via 10.0.2.2".to_owned(),
+        "1ms control r1 route-add 10.0.4.0/24 via 10.0.2.2".to_owned(),
+        "1ms control r1 route-add 10.0.5.0/24 via 10.0.2.2".to_owned(),
+        "2ms events r1 route-* 1".to_owned(),
+        "2ms events sw".to_owned(),
+    ];
+    let mut script: Vec<(String, String)> = steps
+        .iter()
+        .enumerate()
+        .map(|(n, s)| (format!("step.{n}"), s.clone()))
+        .collect();
+    script.push((
+        "on.0".to_owned(),
+        "r1 route-added : events r1 route-added".to_owned(),
+    ));
+    let mut options = DeviceOptions::default();
+    options.infra = true;
+    net.add("ctl", "infra_script", script.into_iter().collect(), options);
+    net.run_to(5 * MS);
+    seen(
+        net,
+        Vec::new(),
+        &["infra-script", "route-added", "infra-script-missed"],
+    )
+}
+
+#[test]
+fn a_controller_follows_device_events_alike() {
+    on_both(|net| {
+        let s = device_events(net);
+        let rules: Vec<&Event> = s
+            .events
+            .iter()
+            .filter(|e| e.2 == "infra-script")
+            .filter(|e| e.3.iter().any(|(k, v)| k == "step" && v == "on.0"))
+            .collect();
+        let seqs: Vec<&str> = rules
+            .iter()
+            .flat_map(|e| {
+                e.3.iter()
+                    .filter(|(k, _)| k == "seq")
+                    .map(|(_, v)| v.as_str())
+            })
+            .collect();
+        assert_eq!(seqs, ["1", "2", "3"], "each event once: {s:#?}");
+        assert!(
+            rules.iter().all(|e| e.0 == MS),
+            "at the events' instant: {s:#?}"
+        );
+        let read = s
+            .events
+            .iter()
+            .find(|e| e.3.iter().any(|(k, v)| k == "step" && v == "4"))
+            .expect("the read step");
+        assert!(
+            read.3.contains(&("seqs".to_owned(), "2,3".to_owned())),
+            "{read:?}"
+        );
+        let refused = s
+            .events
+            .iter()
+            .find(|e| e.3.iter().any(|(k, v)| k == "step" && v == "5"))
+            .expect("the refused step");
+        assert!(
+            refused
+                .3
+                .iter()
+                .any(|(k, v)| k == "result" && v.starts_with("Denied")),
+            "{refused:?}"
         );
         s
     });

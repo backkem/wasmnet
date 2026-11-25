@@ -1,5 +1,5 @@
 //! `wasmnet:infra` as every backend serves it: one method per function of the interfaces
-//! (`devices`, `components`, `changes`), answered from the calling device's [`InfraEnd`].
+//! (`devices`, `components`, `changes`, `events`), answered from the calling device's [`InfraEnd`].
 //!
 //! A backend links the imports for every device and turns each guest call into one call here,
 //! then the answer back into its own types; it decides nothing itself. What a device without
@@ -10,7 +10,10 @@
 use crate::clock::Nanos;
 use crate::supply::StoredComponent;
 
-use super::{Change, ChangeWait, CommandAnswer, DeviceView, InfraEnd, InfraError, LogLine};
+use super::{
+    Change, ChangeWait, CommandAnswer, DeviceView, EventPage, EventWait, Follow, InfraEnd,
+    InfraError, LogLine, Ready, TableSince,
+};
 
 /// The error of every call from a device the network did not grant `wasmnet:infra`.
 pub fn ungranted() -> InfraError {
@@ -183,6 +186,37 @@ impl<'a> Calls<'a> {
     ) -> Result<ChangeWait, InfraError> {
         Ok(self.end()?.wait(selector, since, deadline))
     }
+
+    /// `changes.wait-any`: the future the backend awaits on the device's behalf (refused at
+    /// once, before any waiting, for a follow the caller may not read).
+    pub fn wait_any(
+        &self,
+        table: Option<TableSince>,
+        follows: Vec<Follow>,
+        deadline: Option<Nanos>,
+    ) -> Result<EventWait, InfraError> {
+        self.end()?.wait_any(table, follows, deadline)
+    }
+
+    /// `events.read`.
+    pub fn read_events(
+        &self,
+        name: &str,
+        kinds: &[String],
+        since: u64,
+        max: u32,
+    ) -> Result<EventPage, InfraError> {
+        self.end()?.events(name, kinds, since, max)
+    }
+
+    /// `events.arm`.
+    pub fn arm(
+        &self,
+        table: Option<TableSince>,
+        follows: Vec<Follow>,
+    ) -> Result<Option<Ready>, InfraError> {
+        self.end()?.arm(table, follows)
+    }
 }
 
 #[cfg(test)]
@@ -204,6 +238,9 @@ mod tests {
             calls.logs("x", "stdout", 0, 0),
             Err(InfraError::Denied(_))
         ));
+        assert_eq!(calls.read_events("x", &[], 0, 1), Err(ungranted()));
+        assert_eq!(calls.arm(None, Vec::new()), Err(ungranted()));
+        assert!(calls.wait_any(None, Vec::new(), None).is_err());
     }
 
     #[test]

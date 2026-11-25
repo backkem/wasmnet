@@ -136,6 +136,7 @@ interface Root {
 const INFRA: Record<string, string[]> = {
   devices: ['apply', 'start', 'stop', 'remove', 'control', 'wire', 'unwire', 'controlAnswer', 'get', 'list', 'watch', 'logs'],
   components: ['supply', 'release', 'list'],
+  events: ['read', 'arm'],
 };
 
 const kebab = (s: string) => s.replace(/[A-Z]/g, (c) => `-${c.toLowerCase()}`);

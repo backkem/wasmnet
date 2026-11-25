@@ -18,7 +18,8 @@ mod bindings {
     });
 }
 
-use bindings::wasmnet::infra::{changes, components, devices, types};
+use bindings::wasmnet::infra::{changes, components, devices, events, types};
+use wasmnet_core::infra::{EventPage, Follow, Ready, TableSince};
 
 /// [`HasData`] marker: the state is the store's [`HostState`].
 struct Infra;
@@ -246,6 +247,68 @@ impl components::Host for HostState {
     }
 }
 
+fn follows(f: Vec<events::Follow>) -> Vec<Follow> {
+    f.into_iter()
+        .map(|f| Follow::new(f.name, f.kinds, f.since))
+        .collect()
+}
+
+fn table(t: Option<events::TableSince>) -> Option<TableSince> {
+    t.map(|t| TableSince::new(t.selector, t.since))
+}
+
+fn ready(r: Ready) -> events::Ready {
+    events::Ready {
+        rv: r.rv,
+        changed: r.changed,
+        devices: r.devices,
+    }
+}
+
+fn page(p: EventPage) -> events::Page {
+    events::Page {
+        events: p
+            .events
+            .into_iter()
+            .map(|e| events::Event {
+                seq: e.seq,
+                at: e.at,
+                kind: e.kind,
+                fields: e.fields,
+            })
+            .collect(),
+        next: p.next,
+        missed: p.missed,
+    }
+}
+
+impl events::Host for HostState {
+    fn read(
+        &mut self,
+        name: String,
+        kinds: Vec<String>,
+        since: u64,
+        max: u32,
+    ) -> Result<events::Page, types::Error> {
+        self.calls()
+            .read_events(&name, &kinds, since, max)
+            .map(page)
+            .map_err(error)
+    }
+
+    fn arm(
+        &mut self,
+        t: Option<events::TableSince>,
+        f: Vec<events::Follow>,
+    ) -> Result<Option<events::Ready>, types::Error> {
+        Ok(self
+            .calls()
+            .arm(table(t), follows(f))
+            .map_err(error)?
+            .map(ready))
+    }
+}
+
 impl changes::Host for HostState {}
 
 impl<U> changes::HostWithStore<U> for Infra {
@@ -262,10 +325,25 @@ impl<U> changes::HostWithStore<U> for Infra {
             .map_err(error)?;
         Ok(wait.await)
     }
+
+    /// Waits on virtual time for a change or an event ([`wasmnet_core::InfraEnd::wait_any`]).
+    async fn wait_any(
+        store: &Accessor<U, Self>,
+        t: Option<events::TableSince>,
+        f: Vec<events::Follow>,
+        deadline: Option<u64>,
+    ) -> Result<events::Ready, types::Error> {
+        let end = store.with(|mut view| view.get().infra.clone());
+        let wait = Calls::new(end.as_ref())
+            .wait_any(table(t), follows(f), deadline)
+            .map_err(error)?;
+        Ok(ready(wait.await))
+    }
 }
 
 pub(crate) fn add_to_linker(l: &mut Linker<HostState>) -> wasmtime::Result<()> {
     devices::add_to_linker::<_, Infra>(l, |s| s)?;
+    events::add_to_linker::<_, Infra>(l, |s| s)?;
     components::add_to_linker::<_, Infra>(l, |s| s)?;
     changes::add_to_linker::<_, Infra>(l, |s| s)
 }
