@@ -716,6 +716,7 @@ impl Reader<'_> {
                 kind: LinkKind::from_code(self.u8()?),
                 impairments: [Impairments::default(); 2],
                 capture: CaptureOptions::default(),
+                capture_notes: Vec::new(),
             };
             for imp in &mut info.impairments {
                 *imp = Impairments {
@@ -752,7 +753,12 @@ impl Reader<'_> {
                 dropped_queue,
                 lost_random,
             };
-            links.push((info, stats, self.bytes()?.to_vec()));
+            let pcap = self.bytes()?.to_vec();
+            // The notes travel in the capture itself, as its section comments.
+            info.capture_notes = crate::pcap::parse_header(&pcap)
+                .map(|c| c.comments)
+                .unwrap_or_default();
+            links.push((info, stats, pcap));
         }
         Ok(SiteRecords {
             outcome,
@@ -1425,13 +1431,14 @@ pub fn merge(
                     .flat_map(|s| s.taps.iter().filter(|t| t.link.index() == j))
                     .collect();
                 taps.sort_by(|x, y| x.tag.cmp(&y.tag));
-                // The header both sites wrote for the link (names, snap length, descriptions;
-                // without a readable one, the ends' names), then both halves' records, each
-                // with its original length.
-                let header = crate::pcap::parse_header(&sites[0].links[j].2)
-                    .map(|c| c.interfaces)
+                // The header the first site wrote for the link (names, snap length,
+                // descriptions, notes; without a readable one, the ends' names and no notes),
+                // then both halves' records, each with its original length.
+                let (header, notes) = crate::pcap::parse_header(&sites[0].links[j].2)
+                    .map(|c| (c.interfaces, c.comments))
                     .unwrap_or_default();
-                let mut pcap = PcapNgEncoder::new("wasmnet")?;
+                let notes: Vec<&str> = notes.iter().map(String::as_str).collect();
+                let mut pcap = PcapNgEncoder::with_comments("wasmnet", &notes)?;
                 let mut ifaces = Vec::new();
                 for (end, port) in [ea, eb].into_iter().enumerate() {
                     let (name, snaplen, description) = match header.get(end) {
@@ -1716,6 +1723,7 @@ mod tests {
                         Impairments::default(),
                     ],
                     capture: CaptureOptions::default().snap_len(96).name_ends(true),
+                    capture_notes: Vec::new(),
                 },
                 LinkStats {
                     frames: [1, 2],
@@ -1767,6 +1775,7 @@ mod tests {
                     kind: LinkKind::Ethernet,
                     impairments: [Impairments::default(); 2],
                     capture: CaptureOptions::default(),
+                    capture_notes: Vec::new(),
                 },
                 LinkStats::default(),
                 Vec::new(),

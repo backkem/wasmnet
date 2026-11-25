@@ -292,6 +292,25 @@ impl LinkMut<'_> {
         self
     }
 
+    /// Sets the notes its capture carries, for a person who opens it (`docs/design/links.md`,
+    /// "Notes in a capture"): each note becomes one `opt_comment` of the capture's Section
+    /// Header Block, in order, such as `UDP 6081: Geneve tunnel data with STUN checks`. They
+    /// replace the notes set before; none (the default) leaves the capture's bytes as they were.
+    /// Unlike the capture options they may change at any time: a capture read later carries the
+    /// notes in force then.
+    ///
+    /// Panics if the notes break [`pcap::check_notes`](crate::pcap::check_notes) (more than 16,
+    /// an empty one, or one over 1024 bytes); [`Network::set_capture_notes`] refuses them
+    /// instead.
+    pub fn capture_notes<S: Into<String>>(self, notes: impl IntoIterator<Item = S>) -> Self {
+        let notes: Vec<String> = notes.into_iter().map(Into::into).collect();
+        if let Err(e) = crate::pcap::check_notes(&notes) {
+            panic!("{e}");
+        }
+        self.panel.set_notes(self.id.0, notes);
+        self
+    }
+
     /// Counts its traffic per interval of virtual time as well (`docs/design/links.md`):
     /// buckets of `series.width` ns, the last `series.keep` kept
     /// ([`Network::link_series`]). It starts empty, from now on.
@@ -2331,6 +2350,25 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
     /// it keeps of each frame follows the link's [`CaptureOptions`].
     pub fn pcap(&self, link: LinkId) -> Vec<u8> {
         self.panel.pcap(link.0)
+    }
+
+    /// Sets the notes `link`'s capture carries ([`LinkMut::capture_notes`]), at any time:
+    /// before, during or after a run, for links the builder wired and links created while the
+    /// network ran alike. A capture read later ([`pcap`](Self::pcap)) carries them; an empty
+    /// list removes them. Refused ([`Error::Refused`]) for a link the network does not have and
+    /// for notes that break [`pcap::check_notes`](crate::pcap::check_notes).
+    pub fn set_capture_notes<S: Into<String>>(
+        &mut self,
+        link: LinkId,
+        notes: impl IntoIterator<Item = S>,
+    ) -> Result<()> {
+        if link.0 >= self.panel.link_count() {
+            return Err(Error::Refused(format!("no link {}", link.0)));
+        }
+        let notes: Vec<String> = notes.into_iter().map(Into::into).collect();
+        crate::pcap::check_notes(&notes).map_err(Error::Refused)?;
+        self.panel.set_notes(link.0, notes);
+        Ok(())
     }
 
     /// Every transmission on a wired port so far, in transmit order, with its fate (its bytes

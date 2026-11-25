@@ -212,6 +212,9 @@ pub struct LinkSetup {
     /// By sending end: `[a -> b, b -> a]`.
     pub impairments: [Impairments; 2],
     pub capture: Option<CaptureOptions>,
+    /// The notes its capture carries (`Network::set_capture_notes` in the core); the
+    /// `capture` object's `notes`.
+    pub capture_notes: Vec<String>,
 }
 
 fn impairments(what: &str, v: &Value) -> Result<Impairments, String> {
@@ -226,7 +229,7 @@ fn impairments(what: &str, v: &Value) -> Result<Impairments, String> {
 
 /// A link's setup from a value: `latency` (ns), `mtu`, `impair` (both directions) or
 /// `impair-ab` and `impair-ba` (each `{ rate, queue, loss-ppm, jitter }`), `capture`
-/// (`{ record, snap-len, name-ends }`).
+/// (`{ record, snap-len, name-ends, notes }`, `notes` a list of strings: the capture's notes).
 pub fn link(v: &Value) -> Result<LinkSetup, String> {
     let f = Fields::new(
         "link options",
@@ -255,13 +258,15 @@ pub fn link(v: &Value) -> Result<LinkSetup, String> {
         }
     }
     if let Some(c) = f.get("capture") {
-        let c = Fields::new("capture", c, &["record", "snap-len", "name-ends"])?;
+        let c = Fields::new("capture", c, &["record", "snap-len", "name-ends", "notes"])?;
         let mut o = CaptureOptions::default();
         if c.get("record").is_some() {
             o.record = c.bool("record")?;
         }
         o.snap_len = c.opt_u32("snap-len")?.unwrap_or(o.snap_len);
         o.name_ends = c.bool("name-ends")?;
+        s.capture_notes = c.strs("notes")?;
+        wasmnet_core::pcap::check_notes(&s.capture_notes)?;
         s.capture = Some(o);
     }
     Ok(s)
@@ -539,5 +544,21 @@ mod tests {
         assert_eq!(s.impairments[0], Impairments::default());
         assert_eq!(s.impairments[1].loss_ppm, 10);
         assert_eq!(s.capture.expect("capture").snap_len, 64);
+        assert!(s.capture_notes.is_empty());
+        let notes = |v: Vec<Value>| {
+            link(&rec(vec![(
+                "capture",
+                rec(vec![("notes", Value::List(v))]),
+            )]))
+        };
+        let s = notes(vec![
+            Value::str("UDP 6081: Geneve"),
+            Value::str("TCP 80: HTTP"),
+        ])
+        .expect("link");
+        assert_eq!(s.capture_notes, ["UDP 6081: Geneve", "TCP 80: HTTP"]);
+        assert_eq!(s.capture, Some(CaptureOptions::default()));
+        assert!(notes(vec![Value::str("")]).unwrap_err().contains("empty"));
+        assert!(notes(vec![Value::U32(1)]).is_err());
     }
 }

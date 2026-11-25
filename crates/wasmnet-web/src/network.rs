@@ -152,6 +152,7 @@ impl<H: JsHost + Clone + Unpin + 'static> Network<H> {
         if let Some(end) = [a, b].into_iter().find(|p| p.device.index() >= count) {
             return Err(format!("no device {}", end.device.index()));
         }
+        wasmnet_core::pcap::check_notes(&setup.capture_notes)?;
         let mut link = self.sim_mut().link(a, b).map_err(|e| e.to_string())?;
         link = link.latency(setup.latency);
         if let Some(mtu) = setup.mtu {
@@ -164,6 +165,9 @@ impl<H: JsHost + Clone + Unpin + 'static> Network<H> {
         }
         if let Some(capture) = setup.capture {
             link = link.capture(capture);
+        }
+        if !setup.capture_notes.is_empty() {
+            link = link.capture_notes(setup.capture_notes.iter().cloned());
         }
         Ok(link.id())
     }

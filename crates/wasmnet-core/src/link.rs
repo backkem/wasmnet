@@ -357,6 +357,9 @@ pub struct LinkInfo {
     pub impairments: [Impairments; 2],
     /// What its capture and frame log keep.
     pub capture: CaptureOptions,
+    /// The notes its capture carries as section comments
+    /// ([`Network::set_capture_notes`](crate::Network::set_capture_notes)).
+    pub capture_notes: Vec<String>,
 }
 
 /// What a link carries. A cable kind is a registered [`CableModel`] that names its
@@ -616,6 +619,8 @@ struct Link {
     lanes: [Lane; 2],
     /// What its capture and frame log keep (the snap length is the capture header's).
     capture: CaptureOptions,
+    /// The notes its capture carries: section comments, added when the capture is read.
+    notes: Vec<String>,
     /// A packet was written to its capture (its header is fixed from then on).
     recorded: bool,
     /// The instant it was created.
@@ -655,6 +660,26 @@ impl Link {
     fn kept(&self, frame: &[u8]) -> Vec<u8> {
         frame[..self.capture.kept(frame.len())].to_vec()
     }
+}
+
+/// `capture` (a link's, whose Section Header Block is the encoder's for [`PCAP_USER_APPL`])
+/// with that block written again to carry `notes` as `opt_comment`s, and the rest unchanged;
+/// `capture` itself without notes. Notes are checked when set ([`crate::pcap::check_notes`]),
+/// so they always fit a pcap-ng option.
+fn with_notes(capture: &[u8], notes: &[String]) -> Vec<u8> {
+    let notes: Vec<&str> = notes.iter().map(String::as_str).collect();
+    let header = match PcapNgEncoder::with_comments(PCAP_USER_APPL, &notes) {
+        Ok(header) if !notes.is_empty() => header.into_bytes(),
+        _ => return capture.to_vec(),
+    };
+    let section = capture
+        .get(4..8)
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
+        .filter(|&len| len <= capture.len())
+        .unwrap_or(capture.len());
+    let mut out = header;
+    out.extend_from_slice(&capture[section..]);
+    out
 }
 
 /// A link's capture header: one interface per end, `<device>:<port>`, with the snap length
@@ -877,6 +902,7 @@ impl Panel {
             lanes: Default::default(),
             capture,
             recorded: false,
+            notes: Vec::new(),
             created_at: at,
             series,
         });
@@ -1119,6 +1145,7 @@ impl Panel {
             kind: l.kind,
             impairments: [l.lanes[0].imp, l.lanes[1].imp],
             capture: l.capture,
+            capture_notes: l.notes.clone(),
         }
     }
 
@@ -1164,9 +1191,17 @@ impl Panel {
         self.state().links[link].stats
     }
 
-    /// The link's capture so far (a complete, valid pcap-ng file).
+    /// The link's capture so far (a complete, valid pcap-ng file), with its notes as section
+    /// comments: without notes, exactly the encoder's bytes.
     pub(crate) fn pcap(&self, link: usize) -> Vec<u8> {
-        self.state().links[link].pcap.bytes().to_vec()
+        let s = self.state();
+        let l = &s.links[link];
+        with_notes(l.pcap.bytes(), &l.notes)
+    }
+
+    /// Sets the notes `link`'s capture carries (checked by [`crate::pcap::check_notes`]).
+    pub(crate) fn set_notes(&self, link: usize, notes: Vec<String>) {
+        self.state().links[link].notes = notes;
     }
 
     pub(crate) fn frames(&self) -> Vec<FrameRecord> {
@@ -1968,6 +2003,40 @@ mod tests {
         let cap = crate::pcap::parse(&panel.pcap(link)).unwrap();
         assert_eq!(cap.packets.len(), 1);
         assert_eq!(cap.interfaces[0].snaplen, 16);
+    }
+
+    #[test]
+    fn notes_are_section_comments_at_any_time_and_none_change_nothing() {
+        let (clock, panel, link) = panel();
+        let plain = || {
+            let mut enc = PcapNgEncoder::new(PCAP_USER_APPL).unwrap();
+            let a = enc.add_ethernet_interface("a:0", 0).unwrap();
+            enc.add_ethernet_interface("b:1", 0).unwrap();
+            (enc, a)
+        };
+        panel.set_notes(link, vec!["UDP 6081: Geneve".into(), "TCP 80: HTTP".into()]);
+        let cap = crate::pcap::parse(&panel.pcap(link)).unwrap();
+        assert_eq!(cap.comments, ["UDP 6081: Geneve", "TCP 80: HTTP"]);
+        assert_eq!(cap.user_appl.as_deref(), Some(PCAP_USER_APPL));
+        assert_eq!(cap.interfaces.len(), 2);
+        // After packets: the same packets, with the notes in force when it is read.
+        panel.transmit(&clock, 0, 0, frame(10));
+        panel.set_notes(link, vec!["changed".into()]);
+        let noted = panel.pcap(link);
+        let cap = crate::pcap::parse(&noted).unwrap();
+        assert_eq!(cap.comments, ["changed"]);
+        assert_eq!(cap.packets.len(), 1);
+        assert_eq!(panel.link_info(link).capture_notes, ["changed"]);
+        // Without notes, exactly the capture the encoder wrote.
+        panel.set_notes(link, Vec::new());
+        let (mut enc, a) = plain();
+        enc.write_packet_directed(a, 0, &frame(10), Direction::Outbound)
+            .unwrap();
+        assert_eq!(panel.pcap(link), enc.bytes());
+        assert_eq!(
+            crate::pcap::parse(&panel.pcap(link)).unwrap().packets,
+            cap.packets
+        );
     }
 
     #[test]

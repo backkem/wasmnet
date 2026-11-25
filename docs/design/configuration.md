@@ -257,6 +257,13 @@ optional DHCP relay per port, and optional address translation and a packet filt
 ([nat.md](nat.md)) and tunnel ports ([tunnels.md](tunnels.md)). Ports are named `p0` to
 `p<N-1>`.
 
+What a router's port carries besides what it forwards, for notes on a capture
+([links.md](links.md#notes-in-a-capture)): ARP and IPv6 neighbor discovery, the ICMP and ICMPv6
+errors, echo replies and TCP resets it originates, Router Advertisements where `port<N>.ra` is on, DHCP
+relayed between UDP 67 and 68 where `port<N>.dhcp-relay` is set, STUN Binding on UDP
+`stun-server`, and each tunnel's Geneve or ESP in UDP with STUN checks on its
+`tunnel.<name>.udp` port (6081, or 4500 with a key; [tunnels.md](tunnels.md#notes-for-a-capture)).
+
 Source of truth: `Config::from_pairs` and `parse_route` in
 [components/router/src/config.rs](../../components/router/src/config.rs). It reads the whole
 config with `get-all`. Unknown keys are errors. At least one port must exist.

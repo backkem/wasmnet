@@ -154,3 +154,32 @@ journal, the outcome and every device's costs are the same under every option
 (`crates/wasmnet-host/tests/measure.rs`). Set the options before a link's first frame: its
 header is written again then; once it holds a packet, only `record` still changes. Cables have
 neither a capture nor a frame log, so the options do not concern them.
+
+### Notes in a capture
+
+A person who opens a capture in Wireshark sees bytes, not intent: that UDP 6081 between two
+routers is a tunnel, or that TCP 8080 is an embedder's own HTTP. An embedder can say so in the
+capture itself: `LinkMut::capture_notes` when it builds the link, or
+`Network::set_capture_notes(link, notes)` at any time, before, during or after a run (a
+capture read later holds the notes in force then). Each note is one `opt_comment` of the
+capture's Section Header Block, in order: Wireshark shows them under Statistics → Capture File
+Properties ("Capture file comments"), and `capinfos` prints them. The section header rather
+than an interface description, because a capture is one link and a note says what the link
+carries, not what one end sees. At most `pcap::MAX_NOTES` (16) notes of at most
+`pcap::MAX_NOTE_BYTES` (1024) bytes of UTF-8 each, none empty: `LinkMut::capture_notes` panics
+past that, `Network::set_capture_notes` refuses it. `pcap::parse` returns them as
+`Capture::comments`, and `LinkInfo::capture_notes` holds them. A capture without notes has
+exactly the bytes it had before notes existed.
+
+The library notes nothing by itself. What a port carries is a device's configuration (a
+router's tunnel port, an app's listen address), which the embedder wrote, and the host may not
+read frames to guess protocols; a device declaring its ports' protocols would need a new import
+in `wasmnet:link` for what the embedder already knows. [tunnels.md](tunnels.md#notes-for-a-capture)
+lists the notes for tunnels, and [netstack.md](netstack.md#what-a-node-carries) what a node's
+port carries.
+
+A split network carries the notes in the captures themselves: each site writes them into the
+captures of its own links, and a link between two sites gets the notes of the first site's
+half, so a split run's captures are byte for byte the unsplit run's when both sites set the
+same notes (`crates/wasmnet-host/tests/measure.rs`). In a browser the link options' `capture`
+object takes `notes`, a list of strings.

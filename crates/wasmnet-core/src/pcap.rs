@@ -56,6 +56,9 @@ pub struct Packet {
 pub struct Capture {
     /// `shb_userappl`, if present.
     pub user_appl: Option<String>,
+    /// The section's `opt_comment`s, in order: a link's capture notes
+    /// (`Network::set_capture_notes`).
+    pub comments: Vec<String>,
     pub interfaces: Vec<Interface>,
     pub packets: Vec<Packet>,
 }
@@ -115,6 +118,41 @@ pub struct LinkEnd {
 
 /// The first token of a [`LinkEnd`] description: its format and version.
 pub const LINK_END_FORMAT: &str = "wasmnet-link-end/1";
+
+/// The most notes a link's capture holds ([`crate::Network::set_capture_notes`]).
+pub const MAX_NOTES: usize = 16;
+/// The longest note, in bytes of UTF-8.
+pub const MAX_NOTE_BYTES: usize = 1024;
+
+/// Checks a link's capture notes: at most [`MAX_NOTES`], none empty, none longer than
+/// [`MAX_NOTE_BYTES`]. The error says which rule a note breaks.
+///
+/// ```
+/// # use wasmnet_core::pcap::check_notes;
+/// assert!(check_notes(&["UDP 6081: Geneve with STUN checks"]).is_ok());
+/// assert!(check_notes(&[""]).is_err());
+/// assert!(check_notes(&["x".repeat(1025)]).is_err());
+/// ```
+pub fn check_notes<S: AsRef<str>>(notes: &[S]) -> Result<(), String> {
+    if notes.len() > MAX_NOTES {
+        return Err(format!(
+            "{} capture notes, at most {MAX_NOTES} allowed",
+            notes.len()
+        ));
+    }
+    for (i, note) in notes.iter().enumerate() {
+        let len = note.as_ref().len();
+        if len == 0 {
+            return Err(format!("capture note {i} is empty"));
+        }
+        if len > MAX_NOTE_BYTES {
+            return Err(format!(
+                "capture note {i} has {len} bytes, at most {MAX_NOTE_BYTES} allowed"
+            ));
+        }
+    }
+    Ok(())
+}
 
 impl std::fmt::Display for LinkEnd {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -239,7 +277,9 @@ fn parse_blocks(bytes: &[u8], header_only: bool) -> Result<Capture, PcapError> {
             return Err(err(0, "file does not start with a Section Header Block"));
         }
         match block_type {
-            SHB if at == 0 => cap.user_appl = parse_shb(body).map_err(|r| err(at, &r))?,
+            SHB if at == 0 => {
+                (cap.user_appl, cap.comments) = parse_shb(body).map_err(|r| err(at, &r))?;
+            }
             SHB => return Err(err(at, "multiple sections are not supported")),
             IDB => cap
                 .interfaces
@@ -298,7 +338,8 @@ fn utf8(v: &[u8]) -> Result<String, String> {
     String::from_utf8(v.to_vec()).map_err(|_| "option string is not UTF-8".to_owned())
 }
 
-fn parse_shb(body: &[u8]) -> Result<Option<String>, String> {
+/// The section's `shb_userappl` and its `opt_comment`s, in order.
+fn parse_shb(body: &[u8]) -> Result<(Option<String>, Vec<String>), String> {
     if le32(body, 0) != Some(BYTE_ORDER_MAGIC) {
         return Err("bad byte-order magic (only little-endian is supported)".into());
     }
@@ -306,10 +347,17 @@ fn parse_shb(body: &[u8]) -> Result<Option<String>, String> {
         return Err("unsupported version (want 1.0)".into());
     }
     let opts = options(body.get(16..).ok_or("truncated SHB")?)?;
-    opts.iter()
+    let user_appl = opts
+        .iter()
         .find(|(c, _)| *c == 4)
         .map(|(_, v)| utf8(v))
-        .transpose()
+        .transpose()?;
+    let comments = opts
+        .iter()
+        .filter(|(c, _)| *c == 1)
+        .map(|(_, v)| utf8(v))
+        .collect::<Result<_, _>>()?;
+    Ok((user_appl, comments))
 }
 
 fn parse_idb(body: &[u8]) -> Result<Interface, String> {

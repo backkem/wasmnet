@@ -411,6 +411,25 @@ and its controller replaces the route to the other's prefix with one over that t
 relay forwards at layer 3, so the inner hop limit drops once more, and it sees the inner
 packets in the clear.
 
+## Notes for a capture
+
+A capture of a link that carries a tunnel shows Geneve, ESP and STUN only where Wireshark
+guesses them (above). An embedder can say what the ports carry in the capture itself, as notes
+on the link (`LinkMut::capture_notes` or `Network::set_capture_notes`,
+[links.md](links.md#notes-in-a-capture)), one note per port and protocol, with the ports that
+the tunnels' `tunnel.<name>.udp` keys name. For example, on the links of two routers' outside ports:
+
+```text
+UDP 6081: Geneve (RFC 8926) tunnel data, with STUN (RFC 8489) Binding checks on the same port
+UDP 4500: ESP in UDP (RFC 3948, ChaCha20-Poly1305 per RFC 7634) keyed tunnel data, with signed STUN Binding checks on the same port; Decode As STUN for the checks
+```
+
+A note on the inside links helps too, when a tunnel's inner traffic is what a reader looks
+for there, for example `TCP 8080: the embedder's HTTP API`. Notes follow a link's port, not
+a NAT's mapping: when a translating router moves a tunnel to another outside port, the note
+on the link beyond it names the port as seen there, which the embedder learns from the
+reflexive endpoint in the router's `tunnels` answer.
+
 ## Determinism
 
 The router draws no random numbers: transaction ids are the tunnel's id and a counter, a keyed

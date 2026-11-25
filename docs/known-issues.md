@@ -87,6 +87,12 @@ here so that nobody has to find these the hard way. Each entry names where the c
   only the devices of its own site ([design/sites.md](design/sites.md)).
 - **`Network` is large.** About ninety methods on one type; the core and the embedder surface
   are told apart only by their doc comments.
+- **Capture notes come only from the embedder.** No operator event or `wasmnet:infra` call
+  sets them, so a link a controller wires gets notes only when the embedder calls
+  `Network::set_capture_notes` for it, and nothing notes what a device's ports carry by itself
+  ([design/links.md](design/links.md#notes-in-a-capture)). In a split network a link between
+  two sites takes the first site's notes; both sites must set the same notes for its capture to
+  match an unsplit run's.
 - **The browser binding reports errors as strings** (`wasmnet_web::Network::link`, the
   `JsHost` methods), where the native API has one typed error. Its TypeScript `Network` reaches
   operator events, device options and link options as plain objects that the simulator reads

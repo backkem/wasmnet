@@ -327,6 +327,21 @@ end with real nodes ([crates/wasmnet-host/tests/multihomed.rs](../../crates/wasm
 a host on a LAN, by DHCP, and on a static second segment serves both and fetches through
 either router by its routes).
 
+## What a node carries
+
+For notes on a capture ([links.md](links.md#notes-in-a-capture)), what a node's port puts on
+the wire. The stack itself: Ethernet II; ARP and IPv6 neighbor discovery; replies to ICMP and
+ICMPv6 echo requests; IGMP and MLD reports for the groups its apps join; with
+`ipv4 = "dhcp"`, a DHCP client on UDP 68 talking to port 67; for a name not in its `hosts`
+table, DNS queries from an ephemeral UDP port to port 53 of its DNS servers, and for a `.local`
+name, mDNS queries to UDP 5353 of 224.0.0.251 or ff02::fb. Then what its apps open: the ports
+they serve (by default `http-server` and `http-lb` TCP 80, `dns-server` UDP 53,
+`dhcp-server` UDP 67, `mdns-responder` UDP 5353, `udp-echo-server` UDP 7;
+[configuration.md](configuration.md#apps)), and ephemeral ports from 49152 up for connects and
+unbound sends, TCP and UDP counted apart. These are the netstack's well-known protocols on
+their well-known ports, which Wireshark decodes without help; a note is worth its line for an
+app's own protocol on a port of its choosing.
+
 ## smoltcp, patched
 
 smoltcp is vendored in [third_party/smoltcp](../../third_party/smoltcp) with seven patches,

@@ -17,6 +17,7 @@ const BYTE_ORDER_MAGIC: u32 = 0x1A2B_3C4D;
 const LINKTYPE_ETHERNET: u16 = 1;
 
 const OPT_ENDOFOPT: u16 = 0;
+const OPT_COMMENT: u16 = 1;
 const OPT_SHB_USERAPPL: u16 = 4;
 const OPT_IF_NAME: u16 = 2;
 const OPT_IF_DESCRIPTION: u16 = 3;
@@ -75,7 +76,16 @@ pub struct PcapNgEncoder {
 
 impl PcapNgEncoder {
     /// Starts a new section. `user_appl` is recorded as `shb_userappl` and is omitted when empty.
+    /// The same as [`with_comments`](Self::with_comments) without comments.
     pub fn new(user_appl: &str) -> Result<Self, PcapNgError> {
+        Self::with_comments(user_appl, &[])
+    }
+
+    /// Starts a new section whose Section Header Block also carries one `opt_comment` per entry
+    /// of `comments`, in order, after `shb_userappl` (UTF-8, at most 65535 bytes each; an empty
+    /// comment is omitted). Without comments it writes exactly the bytes [`new`](Self::new)
+    /// does. Wireshark shows section comments as the capture file's comments.
+    pub fn with_comments(user_appl: &str, comments: &[&str]) -> Result<Self, PcapNgError> {
         let mut enc = Self {
             buf: Vec::new(),
             snaplens: Vec::new(),
@@ -87,6 +97,9 @@ impl PcapNgEncoder {
             b.extend_from_slice(&(-1i64).to_le_bytes()); // section length: unspecified
             let mut opts = Options::new(b);
             opts.add_str(OPT_SHB_USERAPPL, user_appl)?;
+            for comment in comments {
+                opts.add_str(OPT_COMMENT, comment)?;
+            }
             opts.finish();
             Ok(())
         })?;
@@ -364,6 +377,35 @@ mod tests {
     #[test]
     fn reference_bytes() {
         assert_eq!(reference_capture().bytes(), EXPECTED);
+    }
+
+    #[test]
+    fn section_comments_follow_the_user_application() {
+        // No comments (or only empty ones): exactly `new`'s header.
+        for comments in [&[][..], &[""][..]] {
+            let enc = PcapNgEncoder::with_comments("wasmnet", comments).unwrap();
+            assert_eq!(enc.bytes(), &EXPECTED[..44]);
+        }
+        let enc = PcapNgEncoder::with_comments("wasmnet", &["UDP 6081: Geneve", "ü"]).unwrap();
+        #[rustfmt::skip]
+        let shb: &[u8] = &[
+            0x0a, 0x0d, 0x0d, 0x0a,  72, 0, 0, 0,
+            0x4d, 0x3c, 0x2b, 0x1a,  1, 0,  0, 0,
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            4, 0, 7, 0,  b'w', b'a', b's', b'm', b'n', b'e', b't', 0,
+            1, 0, 16, 0,
+            b'U', b'D', b'P', b' ', b'6', b'0', b'8', b'1',
+            b':', b' ', b'G', b'e', b'n', b'e', b'v', b'e',
+            1, 0, 2, 0,  0xc3, 0xbc, 0, 0,
+            0, 0, 0, 0,
+            72, 0, 0, 0,
+        ];
+        assert_eq!(enc.bytes(), shb);
+        let long = "x".repeat(65_536);
+        assert_eq!(
+            PcapNgEncoder::with_comments("wasmnet", &[&long]).unwrap_err(),
+            PcapNgError::OptionTooLong(65_536)
+        );
     }
 
     #[test]

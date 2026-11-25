@@ -495,6 +495,8 @@ fn a_recreated_device_is_followed_by_its_capture_headers() {
 /// site.
 const NAMES: [&str; 3] = ["sw", "server", "client"];
 const L: Nanos = 200 * US;
+/// What both links carry, as notes on their captures.
+const NOTES: [&str; 2] = ["TCP 80: HTTP (http-server)", "ARP: 10.0.0.0/24"];
 
 /// The network on one site: `local` names the devices it runs, the others are placeholders;
 /// every link records with `capture`.
@@ -537,8 +539,24 @@ fn site(local: &[&str], capture: CaptureOptions) -> Network<'static> {
 
 fn wire(network: &mut Network<'static>) {
     let [sw, server, client] = [0, 1, 2].map(wasmnet_host::DeviceId::from_index);
-    network.link(client.port(0), sw.port(0)).unwrap().latency(L);
-    network.link(sw.port(1), server.port(0)).unwrap().latency(L);
+    network
+        .link(client.port(0), sw.port(0))
+        .unwrap()
+        .latency(L)
+        .capture_notes(NOTES);
+    let server_side = network
+        .link(sw.port(1), server.port(0))
+        .unwrap()
+        .latency(L)
+        .id();
+    network.set_capture_notes(server_side, NOTES).unwrap();
+    // Refused, and nothing changes: an empty note, a long one, too many.
+    let long = "x".repeat(pcap::MAX_NOTE_BYTES + 1);
+    let many = vec!["n"; pcap::MAX_NOTES + 1];
+    assert!(network.set_capture_notes(server_side, [""]).is_err());
+    assert!(network.set_capture_notes(server_side, [long]).is_err());
+    assert!(network.set_capture_notes(server_side, many).is_err());
+    assert_eq!(network.link_info(server_side).capture_notes, NOTES);
 }
 
 /// Through the wire format, as a carrier would move it.
@@ -631,6 +649,8 @@ fn split_over_two_sites_keeps_what_the_captures_keep() {
             for (l, (s, pcap)) in whole.links().into_iter().zip(&merged.links) {
                 assert_eq!(*s, whole.link_stats(l), "{what}: link {l:?} counters");
                 assert!(*pcap == whole.pcap(l), "{what}: link {l:?} capture");
+                let comments = pcap::parse(pcap).unwrap().comments;
+                assert_eq!(comments, NOTES, "{what}: link {l:?} notes");
             }
         }
     }
