@@ -1,0 +1,97 @@
+diff --git a/src/socket/tcp.rs b/src/socket/tcp.rs
+index e841367..9b3a907 100644
+--- a/src/socket/tcp.rs
++++ b/src/socket/tcp.rs
+@@ -1880,6 +1880,21 @@ impl<'a> Socket<'a> {
+             control = TcpControl::None;
+         }
+ 
++        // If the segment was cut at the right edge of the receive window, its FIN lies beyond
++        // the window too (RFC 9293 3.10.7.4): disregard it, or the stream would end without the
++        // octets that were cut. The peer sends them again, with the FIN, once the window opens.
++        if control == TcpControl::Fin
++            && !matches!(self.state, State::Listen | State::SynSent)
++            && window_start + payload_offset + payload.len() < segment_end
++        {
++            tcp_trace!(
++                "ignoring FIN because the segment was cut at the window's right edge. accepted_end={} segment_end={}",
++                window_start + payload_offset + payload.len(),
++                segment_end
++            );
++            control = TcpControl::None;
++        }
++
+         // Validate and update the state.
+         match (self.state, control) {
+             // RSTs are not accepted in the LISTEN state.
+@@ -5024,6 +5039,70 @@ mod test {
+         assert_eq!(s.state, State::CloseWait);
+     }
+ 
++    #[test]
++    fn test_established_receive_fin_past_right_window_edge() {
++        let mut s = socket_established_with_buffer_sizes(64, 6);
++
++        // Eight octets and a FIN against a window of six: the segment is cut at the window's
++        // right edge, so its FIN lies beyond the window too and must not be accepted
++        // (RFC 9293 3.10.7.4). Accepting it would end the stream without "gh".
++        send!(
++            s,
++            TcpRepr {
++                seq_number: REMOTE_SEQ + 1,
++                ack_number: Some(LOCAL_SEQ + 1),
++                control: TcpControl::Fin,
++                payload: &b"abcdefgh"[..],
++                ..SEND_TEMPL
++            }
++        );
++        assert_eq!(s.state, State::Established);
++        recv!(
++            s,
++            [TcpRepr {
++                seq_number: LOCAL_SEQ + 1,
++                ack_number: Some(REMOTE_SEQ + 1 + 6),
++                window_len: 0,
++                ..RECV_TEMPL
++            }]
++        );
++
++        s.recv(|data| {
++            assert_eq!(data, b"abcdef");
++            (6, ())
++        })
++        .unwrap();
++
++        // The app read: the window opens again.
++        recv!(
++            s,
++            [TcpRepr {
++                seq_number: LOCAL_SEQ + 1,
++                ack_number: Some(REMOTE_SEQ + 1 + 6),
++                window_len: 6,
++                ..RECV_TEMPL
++            }]
++        );
++
++        // The peer sends the rest again, with its FIN: now it fits.
++        send!(
++            s,
++            TcpRepr {
++                seq_number: REMOTE_SEQ + 1 + 6,
++                ack_number: Some(LOCAL_SEQ + 1),
++                control: TcpControl::Fin,
++                payload: &b"gh"[..],
++                ..SEND_TEMPL
++            }
++        );
++        assert_eq!(s.state, State::CloseWait);
++        s.recv(|data| {
++            assert_eq!(data, b"gh");
++            (2, ())
++        })
++        .unwrap();
++    }
++
+     #[test]
+     fn test_established_send_wrap() {
+         let mut s = socket_established();
