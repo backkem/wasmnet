@@ -31,6 +31,12 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Build and validate every component and node
         run: cargo xtask build
+      - name: The published set and its manifest (no build path in the bytes)
+        run: cargo xtask artifacts --out target/artifacts
+      - uses: actions/upload-artifact@v4
+        with:
+          name: manifest-${{ matrix.os }}
+          path: target/artifacts/manifest.toml
       - name: Native tests (wire, simulator, host, end to end)
         run: cargo test --workspace
       - name: Component tests, inside wasmtime
@@ -39,3 +45,47 @@ jobs:
         run: cargo doc --no-deps --workspace
         env:
           RUSTDOCFLAGS: -D warnings
+
+  platforms:
+    # Whether a Linux and a Windows build give the same component bytes. Not guaranteed
+    # (docs/design/artifacts.md): this job reports the files that differ and does not fail the
+    # workflow until the two builds agree.
+    needs: test
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: manifest-*
+          path: manifests
+      - name: Compare the two platforms' manifests
+        run: >
+          cargo xtask artifacts --compare
+          manifests/manifest-ubuntu-latest/manifest.toml
+          manifests/manifest-windows-latest/manifest.toml
+
+  tree:
+    # Nothing local in the tree, nor in the commits a push or pull request brings: no absolute
+    # path into a home or projects directory, no AI coding tool session link or trailer, no
+    # merge conflict marker. Only the new commits are read, never the history before them.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - name: Check the tree and the new commits
+        shell: bash
+        env:
+          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          HEAD: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+        run: |
+          if [ -z "$BASE" ] || [ "$BASE" = 0000000000000000000000000000000000000000 ]; then
+            cargo xtask check-tree
+          else
+            cargo xtask check-tree --commits "$BASE..$HEAD"
+          fi
