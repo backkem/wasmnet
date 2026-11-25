@@ -5,7 +5,7 @@
 //! other tunnels keep their port when one is removed. Commands, events and counters name the
 //! tunnel, never its port number.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use wasmnet_wire::MacAddr;
 
@@ -388,21 +388,26 @@ impl Router {
                 Action::Event(e) => out.event(e),
             }
         }
+        // The port's MTU follows the tunnel's (its default follows the peer's outer family).
+        if let Some(t) = self.tunnels.slots[slot].as_ref() {
+            self.ports[port].cfg.mtu = t.mtu();
+        }
     }
 
-    /// Sends one UDP datagram from the router's own address toward `dst`: from `src` if given
-    /// (an answer leaves from the address its request was sent to), else from the egress port's
-    /// IPv4 address. Returns whether it left (it may still wait for ARP).
+    /// Sends one UDP datagram from the router's own address toward `dst`, over IPv4 or IPv6 as
+    /// `dst` is: from `src` if given (an answer leaves from the address its request was sent
+    /// to), else from the egress port's address of that family (for IPv6 its configured one,
+    /// never the link-local one). Returns whether it left (it may still wait for ARP or NDP).
     fn outer_send(
         &mut self,
         now: u64,
-        src: Option<Ipv4Addr>,
+        src: Option<IpAddr>,
         sport: u16,
-        dst: SocketAddrV4,
+        dst: SocketAddr,
         payload: &[u8],
         out: &mut impl Sink,
     ) -> bool {
-        let to = IpAddr::V4(*dst.ip());
+        let to = dst.ip();
         let Some(route) = self.lookup(to, out) else {
             self.counters.no_route += 1;
             return false;
@@ -411,15 +416,39 @@ impl Router {
         if self.is_tunnel(route.port) || !self.is_up(route.port) {
             return false;
         }
-        let Some(src) = src.or(self.ports[route.port as usize].cfg.ipv4.map(|(a, _)| a)) else {
-            return false;
+        let cfg = &self.ports[route.port as usize].cfg;
+        let mtu = usize::from(cfg.mtu);
+        let p = match to {
+            IpAddr::V4(to4) => {
+                let src = match src {
+                    Some(IpAddr::V4(a)) => Some(a),
+                    _ => cfg.ipv4.map(|(a, _)| a),
+                };
+                let Some(src) = src else {
+                    return false;
+                };
+                let datagram = wire::udp_v4(src, to4, sport, dst.port(), payload);
+                if 20 + datagram.len() > mtu {
+                    return false;
+                }
+                let id = self.next_id();
+                wire::ipv4(src, to4, PROTO_UDP, self.cfg.ttl, id, &datagram)
+            }
+            IpAddr::V6(to6) => {
+                let src = match src {
+                    Some(IpAddr::V6(a)) => Some(a),
+                    _ => cfg.ipv6.map(|(a, _)| a),
+                };
+                let Some(src) = src else {
+                    return false;
+                };
+                let datagram = wire::udp_v6(src, to6, sport, dst.port(), payload);
+                if 40 + datagram.len() > mtu {
+                    return false;
+                }
+                wire::ipv6(src, to6, PROTO_UDP, self.cfg.ttl, &datagram)
+            }
         };
-        let datagram = wire::udp_v4(src, *dst.ip(), sport, dst.port(), payload);
-        if 20 + datagram.len() > usize::from(self.ports[route.port as usize].cfg.mtu) {
-            return false;
-        }
-        let id = self.next_id();
-        let p = wire::ipv4(src, *dst.ip(), PROTO_UDP, self.cfg.ttl, id, &datagram);
         self.send_ip(now, route.port, route.next_hop(to), p, None, out);
         true
     }
@@ -441,7 +470,7 @@ impl Router {
             t.c.down_drops += 1;
             return;
         };
-        if t.spec.mss_clamp && mss::clamp(&mut packet, t.spec.mtu) {
+        if t.spec.mss_clamp && mss::clamp(&mut packet, t.mtu()) {
             t.c.mss_clamped += 1;
         }
         let datagram = if t.keyed() {
@@ -506,21 +535,76 @@ impl Router {
             return true;
         }
         let payload = &udp[8..len];
-        let from = SocketAddrV4::new(src, sport);
+        let from = SocketAddr::new(IpAddr::V4(src), sport);
+        self.datagram_in(now, IpAddr::V4(dst), dport, from, payload, out);
+        true
+    }
+
+    /// An IPv6 packet addressed to the router (`upper` its UDP datagram, the packet having no
+    /// extension headers or fragments): if it is to a tunnel port (or the STUN server port), it
+    /// is handled here and `true` is returned. IPv6 requires the UDP checksum (RFC 8200 §8.1): a
+    /// zero one is malformed. Link-local addresses are not tunnel endpoints.
+    pub(super) fn tunnel_in_v6(
+        &mut self,
+        now: u64,
+        (src, dst): (Ipv6Addr, Ipv6Addr),
+        udp: &[u8],
+        out: &mut impl Sink,
+    ) -> bool {
+        if !self.tunnels.used || udp.len() < 8 {
+            return false;
+        }
+        let (sport, dport) = (
+            u16::from_be_bytes([udp[0], udp[1]]),
+            u16::from_be_bytes([udp[2], udp[3]]),
+        );
+        if !self.tunnels.listens(dport)
+            || !tunnel::unicast_endpoint(IpAddr::V6(src))
+            || !tunnel::unicast_endpoint(IpAddr::V6(dst))
+        {
+            return false;
+        }
+        let len = usize::from(u16::from_be_bytes([udp[4], udp[5]]));
+        let checksum = u16::from_be_bytes([udp[6], udp[7]]);
+        let valid = len >= 8
+            && len <= udp.len()
+            && checksum != 0
+            && wire::finish(wire::sum16(
+                &udp[..len],
+                wire::pseudo_v6(src, dst, PROTO_UDP, len),
+            )) == 0;
+        if !valid {
+            self.tunnels.c.malformed += 1;
+            return true;
+        }
+        let from = SocketAddr::new(IpAddr::V6(src), sport);
+        self.datagram_in(now, IpAddr::V6(dst), dport, from, &udp[8..len], out);
+        true
+    }
+
+    /// A datagram to tunnel port `dport` on the router's address `dst`, either family.
+    fn datagram_in(
+        &mut self,
+        now: u64,
+        dst: IpAddr,
+        dport: u16,
+        from: SocketAddr,
+        payload: &[u8],
+        out: &mut impl Sink,
+    ) {
         if stun::is_stun(payload) {
             self.stun_in(now, dst, dport, from, payload, out);
         } else {
             self.data_in(now, dport, from, payload, out);
         }
-        true
     }
 
     fn stun_in(
         &mut self,
         now: u64,
-        dst: Ipv4Addr,
+        dst: IpAddr,
         dport: u16,
-        from: SocketAddrV4,
+        from: SocketAddr,
         payload: &[u8],
         out: &mut impl Sink,
     ) {
@@ -537,7 +621,7 @@ impl Router {
                 username: None,
             } => {
                 self.tunnels.c.bindings_answered += 1;
-                let answer = stun::success(&txid, SocketAddr::V4(from));
+                let answer = stun::success(&txid, from);
                 self.outer_send(now, Some(dst), dport, from, &answer, out);
             }
             stun::Message::Request {
@@ -586,7 +670,7 @@ impl Router {
         &mut self,
         now: u64,
         dport: u16,
-        from: SocketAddrV4,
+        from: SocketAddr,
         payload: &[u8],
         out: &mut impl Sink,
     ) {
@@ -619,7 +703,7 @@ impl Router {
         let mut inner = g.inner.to_vec();
         if let Some(t) = self.tunnels.slots[slot].as_mut() {
             t.on_data(now, from, inner.len(), &mut actions);
-            if t.spec.mss_clamp && mss::clamp(&mut inner, t.spec.mtu) {
+            if t.spec.mss_clamp && mss::clamp(&mut inner, t.mtu()) {
                 t.c.mss_clamped += 1;
             }
         }
@@ -632,7 +716,7 @@ impl Router {
         &mut self,
         now: u64,
         dport: u16,
-        from: SocketAddrV4,
+        from: SocketAddr,
         payload: &[u8],
         out: &mut impl Sink,
     ) {
@@ -648,7 +732,7 @@ impl Router {
             inner = t.on_esp(now, from, payload, &mut actions);
             if let Some(i) = inner.as_mut()
                 && t.spec.mss_clamp
-                && mss::clamp(i, t.spec.mtu)
+                && mss::clamp(i, t.mtu())
             {
                 t.c.mss_clamped += 1;
             }
@@ -763,11 +847,11 @@ impl Router {
     }
 }
 
-/// An IPv4 endpoint for `tunnel-peer`, checked as the `peer` key is.
-fn tunnel_endpoint(text: &str) -> Result<SocketAddrV4, String> {
+/// An endpoint (IPv4 or IPv6) for `tunnel-peer`, checked as the `peer` key is.
+fn tunnel_endpoint(text: &str) -> Result<SocketAddr, String> {
     let spec = Spec::from_pairs([("id", "1"), ("local", "fd00::1/128"), ("peer", text)])?;
     spec.peers
         .first()
         .copied()
-        .ok_or_else(|| format!("`{text}` is not an IPv4 endpoint"))
+        .ok_or_else(|| format!("`{text}` is not an endpoint"))
 }

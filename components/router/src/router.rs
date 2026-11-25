@@ -1483,7 +1483,11 @@ impl Router {
         let unicast = !dst.is_multicast();
         match upper.ip_number.0 {
             PROTO_ICMPV6 => self.icmpv6_in(now, port, eth_src, (src, dst, hops), body, out),
-            PROTO_UDP if unicast => self.icmp_error_v6(now, port, packet, 1, 4, [0; 4], out),
+            PROTO_UDP if unicast => {
+                if !self.tunnel_in_v6(now, (src, dst), body, out) {
+                    self.icmp_error_v6(now, port, packet, 1, 4, [0; 4], out);
+                }
+            }
             PROTO_TCP if unicast => {
                 if let Some((seq, ack, flags)) = wire::rst_for(body)
                     && let Some((sport, dport)) = ports_of(PROTO_TCP, body)

@@ -11,7 +11,7 @@ const S: u64 = 1_000_000_000;
 const K1: &str = "1111111111111111111111111111111111111111111111111111111111111111";
 const K2: &str = "2222222222222222222222222222222222222222222222222222222222222222";
 
-fn e(s: &str) -> SocketAddrV4 {
+fn e(s: &str) -> SocketAddr {
     s.parse().unwrap()
 }
 
@@ -63,7 +63,7 @@ fn reasons(out: &[Action]) -> Vec<String> {
 fn deliver(
     now: u64,
     t: &mut Tunnel,
-    from: SocketAddrV4,
+    from: SocketAddr,
     d: &[u8],
     out: &mut Vec<Action>,
 ) -> Option<Vec<u8>> {
@@ -405,5 +405,4 @@ fn keyed_listings_name_the_key_by_its_id_only() {
     assert!(!line.contains("1111"), "{line}");
     let plain = end("p", "fd00:ff::c/128", None, None);
     assert!(!plain.listing().contains(" key "));
-    let _ = SocketAddr::V4(e(A));
 }

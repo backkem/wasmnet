@@ -7,7 +7,7 @@ use super::*;
 const MS: u64 = 1_000_000;
 const S: u64 = 1_000_000_000;
 
-fn e(s: &str) -> SocketAddrV4 {
+fn e(s: &str) -> SocketAddr {
     s.parse().unwrap()
 }
 
@@ -27,7 +27,7 @@ fn kinds(out: &[Action]) -> Vec<&str> {
 }
 
 /// The decoded messages sent, with their destination.
-fn sent(out: &[Action]) -> Vec<(SocketAddrV4, stun::Message)> {
+fn sent(out: &[Action]) -> Vec<(SocketAddr, stun::Message)> {
     out.iter()
         .filter_map(|a| match a {
             Action::Send { to, datagram } => Some((*to, stun::parse(datagram).unwrap())),
@@ -296,7 +296,7 @@ fn candidates_are_bounded() {
     for n in 0..20u16 {
         t.on_request(
             MS,
-            SocketAddrV4::new([203, 0, 113, 2].into(), 2000 + n),
+            SocketAddr::new([203, 0, 113, 2].into(), 2000 + n),
             &[0; 12],
             &mut out,
         );
@@ -312,7 +312,7 @@ fn the_peer_is_always_a_candidate_so_a_tunnel_that_goes_down_probes_it_again() {
     for n in 0..MAX_CANDIDATES as u16 {
         t.on_request(
             MS,
-            SocketAddrV4::new([203, 0, 113, 2].into(), 2000 + n),
+            SocketAddr::new([203, 0, 113, 2].into(), 2000 + n),
             &[0; 12],
             &mut out,
         );

@@ -125,6 +125,24 @@ pub fn udp_v4(src: Ipv4Addr, dst: Ipv4Addr, sport: u16, dport: u16, payload: &[u
     d
 }
 
+/// A UDP datagram (header and payload) with its checksum over the IPv6 pseudo-header, which
+/// IPv6 requires (RFC 8200 §8.1).
+pub fn udp_v6(src: Ipv6Addr, dst: Ipv6Addr, sport: u16, dport: u16, payload: &[u8]) -> Vec<u8> {
+    let len = 8 + payload.len();
+    let mut d = Vec::with_capacity(len);
+    d.extend_from_slice(&sport.to_be_bytes());
+    d.extend_from_slice(&dport.to_be_bytes());
+    d.extend_from_slice(&(len as u16).to_be_bytes());
+    d.extend_from_slice(&[0, 0]);
+    d.extend_from_slice(payload);
+    let c = match finish(sum16(&d, pseudo_v6(src, dst, PROTO_UDP, len))) {
+        0 => 0xffff,
+        c => c,
+    };
+    d[6..8].copy_from_slice(&c.to_be_bytes());
+    d
+}
+
 /// An IPv6 packet (no extension headers).
 pub fn ipv6(src: Ipv6Addr, dst: Ipv6Addr, next: u8, hop_limit: u8, payload: &[u8]) -> Vec<u8> {
     let mut p = Vec::with_capacity(40 + payload.len());

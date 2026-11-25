@@ -35,7 +35,7 @@ pub mod stun;
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
-use std::net::{IpAddr, SocketAddr, SocketAddrV4};
+use std::net::{IpAddr, SocketAddr};
 
 use wasmnet_wire::parse_duration;
 
@@ -56,6 +56,25 @@ pub const KEYED_OVERHEAD: u16 = 20 + 8 + esp::OVERHEAD as u16;
 /// A keyed tunnel's default MTU: a 1500-byte path minus [`KEYED_OVERHEAD`] (1438, so a
 /// full-size packet needs no padding).
 pub const KEYED_MTU: u16 = 1500 - KEYED_OVERHEAD;
+/// What a tunnel adds to an inner packet: the outer IPv4 (20) or IPv6 (40) header, UDP (8), and
+/// Geneve (8) or ESP ([`esp::OVERHEAD`]: an inner packet whose length plus 2 is a multiple of 4;
+/// up to 3 more bytes of padding for others).
+pub const fn overhead(keyed: bool, outer_v6: bool) -> u16 {
+    let ip = if outer_v6 { 40 } else { 20 };
+    let encap = if keyed {
+        esp::OVERHEAD as u16
+    } else {
+        geneve::HEADER as u16
+    };
+    ip + 8 + encap
+}
+
+/// The default tunnel MTU: a 1500-byte outer path minus [`overhead`]. Without a key 1464 over
+/// IPv4 and 1444 over IPv6; with one 1438 and 1418 (lengths that need no ESP padding).
+pub const fn default_mtu(keyed: bool, outer_v6: bool) -> u16 {
+    1500 - overhead(keyed, outer_v6)
+}
+
 /// Checks a keyed tunnel remembers while it waits for their answers.
 const PENDING: usize = 16;
 
@@ -74,11 +93,14 @@ pub struct Spec {
     /// The local UDP port.
     pub udp: u16,
     /// Candidate endpoints of the peer.
-    pub peers: Vec<SocketAddrV4>,
+    pub peers: Vec<SocketAddr>,
     /// Endpoints to ask for this tunnel's reflexive endpoint.
-    pub reflectors: Vec<SocketAddrV4>,
-    /// The tunnel port's IP MTU.
+    pub reflectors: Vec<SocketAddr>,
+    /// The tunnel port's IP MTU: as given, or the default for an outer IPv4 path
+    /// ([`Tunnel::mtu`] follows the peer's family when it was not given).
     pub mtu: u16,
+    /// `mtu` was given (not a default).
+    pub mtu_given: bool,
     pub probe_ns: u64,
     pub rounds: u32,
     pub keepalive_ns: u64,
@@ -113,19 +135,32 @@ pub fn valid_name(n: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
-fn endpoints(key: &str, v: &str) -> Result<Vec<SocketAddrV4>, String> {
-    let mut out: Vec<SocketAddrV4> = Vec::new();
+/// Whether `ip` can be an outer endpoint: unicast, not loopback, and for IPv6 not link-local
+/// (an outer path is routed) and not an IPv4-mapped address (write the IPv4 form).
+pub fn unicast_endpoint(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(a) => {
+            !(a.is_unspecified() || a.is_multicast() || a.is_broadcast() || a.is_loopback())
+        }
+        IpAddr::V6(a) => {
+            !(a.is_unspecified()
+                || a.is_multicast()
+                || a.is_loopback()
+                || (a.segments()[0] & 0xffc0) == 0xfe80
+                || a.to_ipv4_mapped().is_some())
+        }
+    }
+}
+
+fn endpoints(key: &str, v: &str) -> Result<Vec<SocketAddr>, String> {
+    let mut out: Vec<SocketAddr> = Vec::new();
     for item in v.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-        let e: SocketAddrV4 = item.parse().map_err(|_| {
-            format!("{key}: `{item}` is not an IPv4 endpoint like 203.0.113.2:6081")
+        let e: SocketAddr = item.parse().map_err(|_| {
+            format!(
+                "{key}: `{item}` is not an endpoint like 203.0.113.2:6081 or [2001:db8::2]:6081"
+            )
         })?;
-        let ip = *e.ip();
-        if e.port() == 0
-            || ip.is_unspecified()
-            || ip.is_multicast()
-            || ip.is_broadcast()
-            || ip.is_loopback()
-        {
+        if e.port() == 0 || !unicast_endpoint(e.ip()) {
             return Err(format!("{key}: `{item}` is not a unicast endpoint"));
         }
         if !out.contains(&e) {
@@ -186,9 +221,9 @@ impl Spec {
                 .filter(|&p| p != 0)
                 .ok_or_else(|| format!("udp: `{v}` is not a port 1..=65535"))?,
         };
+        let mtu_given = seen.contains_key("mtu");
         let mtu = match seen.get("mtu") {
-            None if key.is_some() => KEYED_MTU,
-            None => DEFAULT_MTU,
+            None => default_mtu(key.is_some(), false),
             Some(v) => v
                 .parse::<u16>()
                 .ok()
@@ -215,6 +250,7 @@ impl Spec {
             peers: endpoints("peer", seen.get("peer").copied().unwrap_or(""))?,
             reflectors: endpoints("reflector", seen.get("reflector").copied().unwrap_or(""))?,
             mtu,
+            mtu_given,
             probe_ns: dur("probe", 100_000_000)?,
             rounds,
             keepalive_ns: dur("keepalive", 25_000_000_000)?,
@@ -315,7 +351,7 @@ pub struct Counters {
 pub enum Action {
     /// Send `datagram` from the tunnel's UDP port to `to`.
     Send {
-        to: SocketAddrV4,
+        to: SocketAddr,
         datagram: Vec<u8>,
     },
     /// The tunnel port's carrier: up when the tunnel is.
@@ -329,9 +365,9 @@ pub struct Tunnel {
     pub name: String,
     pub spec: Spec,
     state: State,
-    candidates: Vec<SocketAddrV4>,
-    peer: Option<SocketAddrV4>,
-    reflexive: Option<SocketAddrV4>,
+    candidates: Vec<SocketAddr>,
+    peer: Option<SocketAddr>,
+    reflexive: Option<SocketAddr>,
     /// A reflector answered: stop asking.
     reflected: bool,
     seq: u64,
@@ -449,7 +485,7 @@ fn ev(kind: &'static str, fields: Vec<(&str, String)>) -> Action {
     ))
 }
 
-fn ep(e: Option<SocketAddrV4>) -> String {
+fn ep(e: Option<SocketAddr>) -> String {
     e.map_or_else(|| "-".to_owned(), |e| e.to_string())
 }
 
@@ -509,15 +545,25 @@ impl Tunnel {
         self.state
     }
 
-    pub fn peer(&self) -> Option<SocketAddrV4> {
+    pub fn peer(&self) -> Option<SocketAddr> {
         self.peer.filter(|_| self.state == State::Up)
     }
 
-    pub fn reflexive(&self) -> Option<SocketAddrV4> {
+    pub fn reflexive(&self) -> Option<SocketAddr> {
         self.reflexive
     }
 
-    pub fn candidates(&self) -> &[SocketAddrV4] {
+    /// The tunnel port's MTU now: `mtu` if it was given, otherwise the default for the outer
+    /// family of the peer it is up with (IPv4 while it is not up).
+    pub fn mtu(&self) -> u16 {
+        if self.spec.mtu_given {
+            return self.spec.mtu;
+        }
+        let v6 = self.peer().is_some_and(|p| p.is_ipv6());
+        default_mtu(self.keyed(), v6)
+    }
+
+    pub fn candidates(&self) -> &[SocketAddr] {
         &self.candidates
     }
 
@@ -546,7 +592,7 @@ impl Tunnel {
         }
     }
 
-    fn check(&mut self, to: SocketAddrV4, out: &mut Vec<Action>) {
+    fn check(&mut self, to: SocketAddr, out: &mut Vec<Action>) {
         self.seq += 1;
         self.c.checks_sent += 1;
         let t = txid(TX_CHECK, self.spec.id, self.seq);
@@ -647,7 +693,7 @@ impl Tunnel {
     pub fn add_candidate(
         &mut self,
         now: u64,
-        e: SocketAddrV4,
+        e: SocketAddr,
         source: &str,
         out: &mut Vec<Action>,
     ) -> bool {
@@ -679,7 +725,7 @@ impl Tunnel {
 
     /// Forgets a candidate. A tunnel that is up keeps its peer even so, but does not probe it
     /// again after going down unless it is heard from or given again.
-    pub fn remove_candidate(&mut self, e: SocketAddrV4) -> bool {
+    pub fn remove_candidate(&mut self, e: SocketAddr) -> bool {
         let before = self.candidates.len();
         self.candidates.retain(|c| *c != e);
         before != self.candidates.len()
@@ -687,7 +733,7 @@ impl Tunnel {
 
     /// A packet with this tunnel's id came from `from`: the peer is alive, or has moved, or
     /// the tunnel comes up.
-    fn heard(&mut self, now: u64, from: SocketAddrV4, out: &mut Vec<Action>) {
+    fn heard(&mut self, now: u64, from: SocketAddr, out: &mut Vec<Action>) {
         // The endpoint heard from is always a candidate, so a tunnel that goes down probes its
         // last peer again; at the bound it takes the oldest candidate's place.
         if !self.candidates.contains(&from) {
@@ -730,14 +776,14 @@ impl Tunnel {
     pub fn on_request(
         &mut self,
         now: u64,
-        from: SocketAddrV4,
+        from: SocketAddr,
         t: &stun::TransactionId,
         out: &mut Vec<Action>,
     ) {
         self.c.requests_received += 1;
         out.push(Action::Send {
             to: from,
-            datagram: stun::success(t, SocketAddr::V4(from)),
+            datagram: stun::success(t, from),
         });
         if self.state == State::Up {
             self.heard(now, from, out);
@@ -751,7 +797,7 @@ impl Tunnel {
     pub fn on_response(
         &mut self,
         now: u64,
-        from: SocketAddrV4,
+        from: SocketAddr,
         t: &stun::TransactionId,
         mapped: Option<SocketAddr>,
         out: &mut Vec<Action>,
@@ -761,10 +807,6 @@ impl Tunnel {
             return;
         }
         self.c.responses_received += 1;
-        let mapped = match mapped {
-            Some(SocketAddr::V4(m)) => Some(m),
-            _ => None,
-        };
         if let Some(m) = mapped
             && self.reflexive != Some(m)
         {
@@ -780,13 +822,17 @@ impl Tunnel {
         }
         if kind == TX_QUERY {
             self.reflected = true;
+        } else if self.state == State::Up && self.peer != Some(from) {
+            // A late answer from another candidate (of either family) probed in the same round:
+            // the tunnel stays with the peer it came up with. Only the peer's own checks and data
+            // move it.
         } else {
             self.heard(now, from, out);
         }
     }
 
     /// A data packet for this tunnel from `from`, of `len` inner bytes.
-    pub fn on_data(&mut self, now: u64, from: SocketAddrV4, len: usize, out: &mut Vec<Action>) {
+    pub fn on_data(&mut self, now: u64, from: SocketAddr, len: usize, out: &mut Vec<Action>) {
         self.c.rx_packets += 1;
         self.c.rx_bytes += len as u64;
         self.heard(now, from, out);
@@ -815,7 +861,7 @@ impl Tunnel {
 
     /// A message refused for `reason`: counted, and journalled as `tunnel-auth-failed` the
     /// first time this reason comes since the tunnel came up or changed its key.
-    pub fn refuse(&mut self, reason: &'static str, from: SocketAddrV4, out: &mut Vec<Action>) {
+    pub fn refuse(&mut self, reason: &'static str, from: SocketAddr, out: &mut Vec<Action>) {
         self.c.auth_failed += 1;
         if reason == "replayed" {
             self.c.replayed += 1;
@@ -896,7 +942,7 @@ impl Tunnel {
     pub fn on_request_signed(
         &mut self,
         now: u64,
-        from: SocketAddrV4,
+        from: SocketAddr,
         t: &stun::TransactionId,
         d: &[u8],
         signed: &stun::Signed,
@@ -919,7 +965,7 @@ impl Tunnel {
         if let Err(r) = k.learn(sa, Some(counter)) {
             return self.refuse(r, from, out);
         }
-        let datagram = stun::success_signed(t, SocketAddr::V4(from), k.sa(), &k.password);
+        let datagram = stun::success_signed(t, from, k.sa(), &k.password);
         self.c.requests_received += 1;
         out.push(Action::Send { to: from, datagram });
         self.confirmed(which, out);
@@ -940,7 +986,7 @@ impl Tunnel {
     pub fn on_response_signed(
         &mut self,
         now: u64,
-        from: SocketAddrV4,
+        from: SocketAddr,
         t: &stun::TransactionId,
         mapped: Option<SocketAddr>,
         d: &[u8],
@@ -979,7 +1025,7 @@ impl Tunnel {
     pub fn on_esp(
         &mut self,
         now: u64,
-        from: SocketAddrV4,
+        from: SocketAddr,
         d: &[u8],
         out: &mut Vec<Action>,
     ) -> Option<Vec<u8>> {

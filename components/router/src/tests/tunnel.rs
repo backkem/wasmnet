@@ -697,3 +697,500 @@ fn allow_rules_for_a_tunnel_from_the_config() {
     bad.push(("tunnel.to-b.allow", "tcp dport"));
     assert!(Config::from_pairs(bad).is_err());
 }
+
+// ---- outer IPv6 -------------------------------------------------------------------------------
+
+const PEER6: &str = "fd00:1::20";
+
+/// A UDP datagram over IPv6 with its checksum, from `src:sport` (host `from`) to the router.
+fn udp6_in(from: u8, src: &str, sport: u16, dst: &str, dport: u16, payload: &[u8]) -> Vec<u8> {
+    let d = wire::udp_v6(v6(src), v6(dst), sport, dport, payload);
+    let p = wire::ipv6(v6(src), v6(dst), PROTO_UDP, 64, &d);
+    wire::eth_frame(RTR0, mac(from), ETHERTYPE_IPV6, &p)
+}
+
+/// The reference decoding of an outer IPv6 frame: UDP (checksum checked, and never zero),
+/// `(src, dst, hop limit, sport, dport, payload)`.
+fn outer6(frame: &[u8]) -> (Ipv6Addr, Ipv6Addr, u8, u16, u16, Vec<u8>) {
+    assert_eq!(frame[12..14], [0x86, 0xdd], "an IPv6 frame");
+    let ip = &frame[14..];
+    let h = Ipv6HeaderSlice::from_slice(ip).unwrap();
+    assert_eq!(h.next_header().0, PROTO_UDP);
+    let u = &ip[40..40 + usize::from(h.payload_length())];
+    let len = usize::from(u16::from_be_bytes([u[4], u[5]]));
+    assert_eq!(len, u.len());
+    assert_ne!(u[6..8], [0, 0], "IPv6 needs the UDP checksum");
+    let ps = wire::pseudo_v6(h.source_addr(), h.destination_addr(), PROTO_UDP, len);
+    assert_eq!(wire::finish(wire::sum16(u, ps)), 0, "UDP checksum");
+    (
+        h.source_addr(),
+        h.destination_addr(),
+        h.hop_limit(),
+        u16::from_be_bytes([u[0], u[1]]),
+        u16::from_be_bytes([u[2], u[3]]),
+        u[8..].to_vec(),
+    )
+}
+
+/// A router whose tunnel `to-b` has its peer at `[fd00:1::20]:6081` over IPv6 (with `more`
+/// settings), P known by NDP; its first check, decoded.
+fn tunnel6(more: &str) -> (Router, Out, stun::TransactionId) {
+    let (mut r, mut out) = router(&[]);
+    r.receive(0, 0, &ns_frame(P_MAC, PEER6, "fd00:1::1"), &mut out);
+    // B too, so that an ICMPv6 error to it leaves at once.
+    r.receive(0, 1, &ns_frame(B_MAC, "fd00:2::10", "fd00:2::1"), &mut out);
+    out.take();
+    let spec = format!("to-b id 7 local fd00:ff::a/128 peer [{PEER6}]:6081{more}");
+    assert_eq!(
+        r.command(MS, "tunnel-add", &spec, &mut out).as_deref(),
+        Ok("added")
+    );
+    for route in ["fd00:b::/64 tunnel to-b", "10.9.0.0/16 tunnel to-b"] {
+        assert_eq!(
+            r.command(MS, "route-add", route, &mut out).as_deref(),
+            Ok("added")
+        );
+    }
+    r.poll(MS, &mut out);
+    let tx = out.take();
+    cabled_only(&tx);
+    assert_eq!(tx.len(), 1, "one check");
+    let (src, dst, hops, sport, dport, payload) = outer6(&tx[0].1);
+    assert_eq!(
+        (src, dst, hops, dport),
+        (v6("fd00:1::1"), v6(PEER6), 64, 6081)
+    );
+    assert!(sport == 6081 || sport == 4500);
+    let (stun::Message::Request { txid, .. }, _) = stun::parse_signed(&payload).unwrap() else {
+        panic!("a Binding request")
+    };
+    (r, out, txid)
+}
+
+#[test]
+fn an_ipv6_outer_path_carries_both_inner_families() {
+    let (mut r, mut out, txid) = tunnel6("");
+    // Before it is up the port has the IPv4 default MTU; P's answer brings it up over IPv6.
+    let me: SocketAddr = "[fd00:1::1]:6081".parse().unwrap();
+    let answer = stun::success(&txid, me);
+    r.receive(
+        2 * MS,
+        0,
+        &udp6_in(P_MAC, PEER6, 6081, "fd00:1::1", 6081, &answer),
+        &mut out,
+    );
+    assert_eq!(
+        out.event("tunnel-up").get("peer"),
+        Some("[fd00:1::20]:6081")
+    );
+    assert_eq!(
+        out.event("tunnel-reflexive").get("endpoint"),
+        Some("[fd00:1::1]:6081")
+    );
+    out.take();
+    let listing = r.command(2 * MS, "tunnels", "", &mut out).unwrap();
+    assert!(
+        listing.contains("state up peer [fd00:1::20]:6081 reflexive [fd00:1::1]:6081"),
+        "{listing}"
+    );
+    // Inner IPv6 and IPv4, in Geneve, in UDP over IPv6.
+    let inner6 = wire::ipv6(
+        v6("fd00:2::10"),
+        v6("fd00:b::10"),
+        PROTO_UDP,
+        64,
+        &udp(1, 2, b"six"),
+    );
+    r.receive(
+        3 * MS,
+        1,
+        &wire::eth_frame(RTR1, mac(B_MAC), ETHERTYPE_IPV6, &inner6),
+        &mut out,
+    );
+    let tx = out.take();
+    let (.., payload) = outer6(&tx[0].1);
+    assert_eq!(payload[..8], [0, 0, 0x86, 0xdd, 0, 0, 7, 0]);
+    r.receive(
+        4 * MS,
+        1,
+        &frame_v4(
+            B_MAC,
+            RTR1,
+            "10.0.2.10",
+            "10.9.1.1",
+            PROTO_UDP,
+            64,
+            false,
+            &udp(1, 2, b"four"),
+        ),
+        &mut out,
+    );
+    let tx = out.take();
+    let (.., payload) = outer6(&tx[0].1);
+    assert_eq!(payload[..4], [0, 0, 0x08, 0x00]);
+    // And back: Geneve from P over IPv6 enters as if from the tunnel port.
+    let back = wire::ipv6(
+        v6("fd00:b::10"),
+        v6("fd00:1::99"),
+        PROTO_UDP,
+        64,
+        &udp(2, 1, b"back"),
+    );
+    r.receive(
+        5 * MS,
+        0,
+        &udp6_in(
+            P_MAC,
+            PEER6,
+            6081,
+            "fd00:1::1",
+            6081,
+            &geneve::encap(7, &back),
+        ),
+        &mut out,
+    );
+    assert_eq!(counter(&r, "tunnel-to-b-rx-packets"), Some(1));
+    // A datagram with a zero UDP checksum is malformed over IPv6 (allowed over IPv4).
+    let mut zero = udp6_in(
+        P_MAC,
+        PEER6,
+        6081,
+        "fd00:1::1",
+        6081,
+        &geneve::encap(7, &back),
+    );
+    zero[14 + 40 + 6..14 + 40 + 8].copy_from_slice(&[0, 0]);
+    r.receive(6 * MS, 0, &zero, &mut out);
+    assert_eq!(counter(&r, "tunnel-malformed"), Some(1));
+    assert_eq!(counter(&r, "tunnel-to-b-rx-packets"), Some(1));
+}
+
+#[test]
+fn over_ipv6_the_mtu_and_the_clamp_are_20_bytes_smaller() {
+    let (mut r, mut out, txid) = tunnel6("");
+    let me: SocketAddr = "[fd00:1::1]:6081".parse().unwrap();
+    r.receive(
+        2 * MS,
+        0,
+        &udp6_in(
+            P_MAC,
+            PEER6,
+            6081,
+            "fd00:1::1",
+            6081,
+            &stun::success(&txid, me),
+        ),
+        &mut out,
+    );
+    out.take();
+    assert_eq!(crate::tunnel::default_mtu(false, true), 1444);
+    // A SYN's MSS is clamped to 1444 - 60.
+    let mut seg = vec![
+        0x30, 0x39, 0, 80, 0, 0, 0, 1, 0, 0, 0, 0, 0x60, 0x02, 0xff, 0xff, 0, 0, 0, 0,
+    ];
+    seg.extend_from_slice(&[2, 4, 0x05, 0xa0]);
+    let ps = wire::pseudo_v6(v6("fd00:2::10"), v6("fd00:b::10"), PROTO_TCP, seg.len());
+    let c = wire::finish(wire::sum16(&seg, ps));
+    seg[16..18].copy_from_slice(&c.to_be_bytes());
+    let syn = wire::ipv6(v6("fd00:2::10"), v6("fd00:b::10"), PROTO_TCP, 64, &seg);
+    r.receive(
+        3 * MS,
+        1,
+        &wire::eth_frame(RTR1, mac(B_MAC), ETHERTYPE_IPV6, &syn),
+        &mut out,
+    );
+    let tx = out.take();
+    let (.., payload) = outer6(&tx[0].1);
+    assert_eq!(
+        &payload[8 + 40 + 20..8 + 40 + 24],
+        &[2, 4, 0x05, 0x68],
+        "MSS 1384"
+    );
+    // 1444 bytes leave in an outer packet of exactly 1500; 1445 bounce with Packet Too Big.
+    let fits = wire::ipv6(
+        v6("fd00:2::10"),
+        v6("fd00:b::10"),
+        PROTO_UDP,
+        64,
+        &udp(1, 2, &[0; 1444 - 48]),
+    );
+    r.receive(
+        4 * MS,
+        1,
+        &wire::eth_frame(RTR1, mac(B_MAC), ETHERTYPE_IPV6, &fits),
+        &mut out,
+    );
+    let tx = out.take();
+    assert_eq!(tx[0].1.len() - 14, 1500);
+    let big = wire::ipv6(
+        v6("fd00:2::10"),
+        v6("fd00:b::10"),
+        PROTO_UDP,
+        64,
+        &udp(1, 2, &[0; 1444 - 47]),
+    );
+    r.receive(
+        5 * MS,
+        1,
+        &wire::eth_frame(RTR1, mac(B_MAC), ETHERTYPE_IPV6, &big),
+        &mut out,
+    );
+    assert_eq!(
+        out.event("forward-drop").get("reason"),
+        Some("packet-too-big")
+    );
+    let ptb = out
+        .take()
+        .into_iter()
+        .find(|(p, _)| *p == 1)
+        .expect("the error, to B")
+        .1;
+    // ICMPv6 type 2 (Packet Too Big), MTU 1444.
+    assert_eq!(ptb[14 + 40], 2);
+    assert_eq!(ptb[14 + 44..14 + 48], 1444u32.to_be_bytes());
+}
+
+#[test]
+fn a_keyed_tunnel_over_ipv6_has_a_mtu_of_1418() {
+    let key = "77".repeat(32);
+    let (mut r, mut out, txid) = tunnel6(&format!(" key {key}"));
+    // P answers as a keyed peer would: signed, with its SA.
+    let password = crate::tunnel::key::Key::parse(&key)
+        .unwrap()
+        .stun_password();
+    let me: SocketAddr = "[fd00:1::1]:4500".parse().unwrap();
+    let answer = stun::success_signed(&txid, me, (0x8000_0099, 1), &password);
+    r.receive(
+        2 * MS,
+        0,
+        &udp6_in(P_MAC, PEER6, 4500, "fd00:1::1", 4500, &answer),
+        &mut out,
+    );
+    assert_eq!(
+        out.event("tunnel-up").get("peer"),
+        Some("[fd00:1::20]:4500")
+    );
+    out.take();
+    assert_eq!(crate::tunnel::default_mtu(true, true), 1418);
+    let fits = wire::ipv6(
+        v6("fd00:2::10"),
+        v6("fd00:b::10"),
+        PROTO_UDP,
+        64,
+        &udp(1, 2, &[0; 1418 - 48]),
+    );
+    r.receive(
+        3 * MS,
+        1,
+        &wire::eth_frame(RTR1, mac(B_MAC), ETHERTYPE_IPV6, &fits),
+        &mut out,
+    );
+    let tx = out.take();
+    assert_eq!(tx[0].1.len() - 14, 1500, "no padding, exactly the path");
+    let (.., payload) = outer6(&tx[0].1);
+    assert_eq!(payload[..4], 0x8000_0099u32.to_be_bytes(), "ESP to P's SPI");
+    let big = wire::ipv6(
+        v6("fd00:2::10"),
+        v6("fd00:b::10"),
+        PROTO_UDP,
+        64,
+        &udp(1, 2, &[0; 1418 - 47]),
+    );
+    r.receive(
+        4 * MS,
+        1,
+        &wire::eth_frame(RTR1, mac(B_MAC), ETHERTYPE_IPV6, &big),
+        &mut out,
+    );
+    assert_eq!(
+        out.event("forward-drop").get("reason"),
+        Some("packet-too-big")
+    );
+}
+
+#[test]
+fn mixed_candidates_come_up_over_the_first_answer_and_stay() {
+    let (mut r, mut out) = router(&[]);
+    r.receive(0, 0, &ns_frame(P_MAC, PEER6, "fd00:1::1"), &mut out);
+    r.receive(
+        0,
+        0,
+        &arp_frame(1, P_MAC, PEER, MacAddr::ZERO, "10.0.1.1"),
+        &mut out,
+    );
+    out.take();
+    let spec = format!("to-b id 7 local fd00:ff::a/128 peer {PEER}:6081,[{PEER6}]:6081");
+    r.command(MS, "tunnel-add", &spec, &mut out).unwrap();
+    r.command(MS, "route-add", "fd00:b::/64 tunnel to-b", &mut out)
+        .unwrap();
+    r.poll(MS, &mut out);
+    let tx = out.take();
+    assert_eq!(tx.len(), 2, "a check to each candidate, in order");
+    assert_eq!(tx[0].1[12..14], [0x08, 0x00]);
+    let (.., v6_check) = outer6(&tx[1].1);
+    let (_, v4_check) = {
+        let (.., p) = outer(&tx[0].1);
+        ((), p)
+    };
+    let txid_of = |p: &[u8]| match stun::parse(p).unwrap() {
+        stun::Message::Request { txid, .. } => txid,
+        _ => panic!(),
+    };
+    // The IPv6 answer comes first: up over IPv6, the IPv6 default MTU.
+    let me6: SocketAddr = "[fd00:1::1]:6081".parse().unwrap();
+    r.receive(
+        2 * MS,
+        0,
+        &udp6_in(
+            P_MAC,
+            PEER6,
+            6081,
+            "fd00:1::1",
+            6081,
+            &stun::success(&txid_of(&v6_check), me6),
+        ),
+        &mut out,
+    );
+    assert_eq!(
+        out.event("tunnel-up").get("peer"),
+        Some("[fd00:1::20]:6081")
+    );
+    // The IPv4 answer, later: the tunnel stays where it is.
+    let me4: SocketAddr = "10.0.1.1:6081".parse().unwrap();
+    r.receive(
+        3 * MS,
+        0,
+        &udp_in(
+            P_MAC,
+            PEER,
+            6081,
+            "10.0.1.1",
+            6081,
+            &stun::success(&txid_of(&v4_check), me4),
+        ),
+        &mut out,
+    );
+    assert!(out.events.iter().all(|e| e.kind != "tunnel-roamed"));
+    let listing = r.command(3 * MS, "tunnels", "", &mut out).unwrap();
+    assert!(listing.contains("peer [fd00:1::20]:6081"), "{listing}");
+    // The peer's own check from its IPv4 endpoint moves it there, and the MTU follows.
+    let check = stun::request(&[1, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 9], Some("7"));
+    r.receive(
+        4 * MS,
+        0,
+        &udp_in(P_MAC, PEER, 6081, "10.0.1.1", 6081, &check),
+        &mut out,
+    );
+    assert_eq!(out.event("tunnel-roamed").get("to"), Some("10.0.1.20:6081"));
+    out.take();
+    let fits = wire::ipv6(
+        v6("fd00:2::10"),
+        v6("fd00:b::10"),
+        PROTO_UDP,
+        64,
+        &udp(1, 2, &[0; 1464 - 48]),
+    );
+    r.receive(
+        5 * MS,
+        1,
+        &wire::eth_frame(RTR1, mac(B_MAC), ETHERTYPE_IPV6, &fits),
+        &mut out,
+    );
+    let tx = out.take();
+
+    assert_eq!(tx[0].1[12..14], [0x08, 0x00], "over IPv4 now");
+    assert_eq!(tx[0].1.len() - 14, 1500);
+}
+
+#[test]
+fn the_stun_server_and_tunnel_ports_answer_over_ipv6() {
+    let (mut r, mut out) = router(&[("stun-server", "3478")]);
+    r.receive(0, 0, &ns_frame(P_MAC, PEER6, "fd00:1::1"), &mut out);
+    out.take();
+    let tx_id = [9; 12];
+    r.receive(
+        MS,
+        0,
+        &udp6_in(
+            P_MAC,
+            PEER6,
+            5555,
+            "fd00:1::1",
+            3478,
+            &stun::request(&tx_id, None),
+        ),
+        &mut out,
+    );
+    let tx = out.take();
+    let (src, dst, _, sport, dport, payload) = outer6(&tx[0].1);
+    assert_eq!(
+        (src, dst, sport, dport),
+        (v6("fd00:1::1"), v6(PEER6), 3478, 5555)
+    );
+    assert_eq!(
+        stun::parse(&payload),
+        Ok(stun::Message::Success {
+            txid: tx_id,
+            mapped: Some("[fd00:1::20]:5555".parse().unwrap())
+        })
+    );
+    // A datagram to a port nobody listens on still gets port unreachable.
+    r.receive(
+        2 * MS,
+        0,
+        &udp6_in(P_MAC, PEER6, 5555, "fd00:1::1", 9999, b"x"),
+        &mut out,
+    );
+    let tx = out.take();
+    assert_eq!(tx[0].1[14 + 40], 1, "ICMPv6 destination unreachable");
+    assert_eq!(tx[0].1[14 + 41], 4, "port unreachable");
+}
+
+#[test]
+fn ipv6_endpoints_parse_and_odd_ones_are_refused() {
+    let (mut r, mut out) = router(&[]);
+    r.command(MS, "tunnel-add", "to-b id 7 local fd00:ff::a/128", &mut out)
+        .unwrap();
+    assert_eq!(
+        r.command(MS, "tunnel-peer", "to-b [2001:db8::2]:6081", &mut out)
+            .as_deref(),
+        Ok("added")
+    );
+    for bad in [
+        "to-b [fe80::2]:6081",
+        "to-b [::ffff:203.0.113.2]:6081",
+        "to-b [ff02::1]:6081",
+        "to-b [::1]:6081",
+        "to-b [2001:db8::2]:0",
+        "to-b 2001:db8::2:6081",
+    ] {
+        assert!(
+            r.command(MS, "tunnel-peer", bad, &mut out).is_err(),
+            "{bad}"
+        );
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 256,
+        rng_seed: proptest::test_runner::RngSeed::Fixed(8200),
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    })]
+
+    #[test]
+    fn arbitrary_datagrams_on_an_ipv6_tunnel_port_never_trap(
+        body in proptest::collection::vec(any::<u8>(), 0..80),
+        stunlike in any::<bool>(),
+    ) {
+        let (mut r, mut out, _) = tunnel6("");
+        let mut payload = body;
+        if stunlike && payload.len() >= 20 {
+            payload[0] &= 0x3f;
+            payload[4..8].copy_from_slice(&stun::MAGIC.to_be_bytes());
+        }
+        r.receive(2 * MS, 0, &udp6_in(P_MAC, PEER6, 6081, "fd00:1::1", 6081, &payload), &mut out);
+        let _ = r.poll(3 * MS, &mut out);
+    }
+}
