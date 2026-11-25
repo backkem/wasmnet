@@ -62,10 +62,11 @@ sha2 = "0.10"
 # HTTP/1.1 head parsing in the http-server and http-get apps (guests; no_std core).
 httparse = { version = "1.10", default-features = false }
 
-# smoltcp 0.14.0 with four patches: neighbor discovery is rate-limited per address, not per
+# smoltcp 0.14.0 with five patches: neighbor discovery is rate-limited per address, not per
 # interface; the interface and socket state can be read and restored for snapshots; TCP fast
-# recovery retransmits on partial ACKs (NewReno); and TCP ignores the FIN of a segment cut at the
-# receive window (docs/upstream/smoltcp.md). The pristine crate plus the patches lives in
+# recovery retransmits on partial ACKs (NewReno); TCP ignores the FIN of a segment cut at the
+# receive window; and a fast retransmit with only the FIN outstanding resends the FIN
+# (docs/upstream/smoltcp.md). The pristine crate plus the patches lives in
 # third_party/smoltcp; the version stays =0.14.0 so dropping a patch is one line once upstream
 # has the fix.
 [patch.crates-io]

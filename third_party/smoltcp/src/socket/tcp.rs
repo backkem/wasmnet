@@ -2341,8 +2341,16 @@ impl<'a> Socket<'a> {
     }
 
     fn seq_to_transmit(&self, cx: &mut Context) -> bool {
-        // Fast retransmits should always send, even if later congestion checks would disallow
-        if self.pending_fast_retransmit && !self.tx_buffer.is_empty() {
+        // Fast retransmits should always send, even if later congestion checks would disallow.
+        // With every data octet acknowledged, the segment to retransmit is the FIN alone:
+        // `dispatch` sends it, as it follows an empty payload with the FIN in these states.
+        let lone_fin_unacked = self.tx_buffer.is_empty()
+            && matches!(
+                self.state,
+                State::FinWait1 | State::Closing | State::LastAck
+            )
+            && self.remote_last_seq > self.local_seq_no;
+        if self.pending_fast_retransmit && (!self.tx_buffer.is_empty() || lone_fin_unacked) {
             return true;
         }
 
@@ -7740,6 +7748,45 @@ mod test {
         recv!(s, time 1000, Ok(TcpRepr {
             control: TcpControl::Fin,
             seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            ..RECV_TEMPL
+        }));
+    }
+
+    #[test]
+    fn test_fast_retransmit_of_a_lone_fin() {
+        let mut s = socket_established();
+        s.send_slice(b"abc").unwrap();
+        s.close();
+        recv!(s, time 0, Ok(TcpRepr {
+            control: TcpControl::Fin,
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload: &b"abc"[..],
+            ..RECV_TEMPL
+        }));
+
+        // The peer acknowledges the data but not the FIN (it dropped it), four times: the
+        // last three are duplicate ACKs, and the only thing left to retransmit is the FIN.
+        for _ in 0..4 {
+            send!(s, time 10, TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1 + 3),
+                ..SEND_TEMPL
+            });
+        }
+        recv!(s, time 10, Ok(TcpRepr {
+            control: TcpControl::Fin,
+            seq_number: LOCAL_SEQ + 1 + 3,
+            ack_number: Some(REMOTE_SEQ + 1),
+            ..RECV_TEMPL
+        }));
+
+        // Lost again: the retransmission timer is running, and sends it once more.
+        recv_nothing!(s, time 500);
+        recv!(s, time 5000, Ok(TcpRepr {
+            control: TcpControl::Fin,
+            seq_number: LOCAL_SEQ + 1 + 3,
             ack_number: Some(REMOTE_SEQ + 1),
             ..RECV_TEMPL
         }));

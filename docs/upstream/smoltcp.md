@@ -1,6 +1,6 @@
 # smoltcp: issues found while building wasmnet
 
-Pinned version: **smoltcp =0.14.0** (`Medium::Ethernet`, features as in `components/netstack/Cargo.toml`), **vendored with four patches** (`third_party/smoltcp`, `[patch.crates-io]`; #2, #28, #31 and #32 below). This is a running list of upstream bugs, spec deviations and API gaps that we hit, with the part of wasmnet where each was found and how we work around it today. Keep it current. When something gets filed upstream, add the link. When a fix lands, note the version and remove our workaround.
+Pinned version: **smoltcp =0.14.0** (`Medium::Ethernet`, features as in `components/netstack/Cargo.toml`), **vendored with five patches** (`third_party/smoltcp`, `[patch.crates-io]`; #2, #28, #31, #32 and #34 below). This is a running list of upstream bugs, spec deviations and API gaps that we hit, with the part of wasmnet where each was found and how we work around it today. Keep it current. When something gets filed upstream, add the link. When a fix lands, note the version and remove our workaround.
 
 These are our own notes from building one stack on smoltcp. Unless the last column says so, an
 entry has not been reported upstream yet, and some may turn out to be our misreading: check
@@ -43,14 +43,15 @@ Legend: **bug**: violates an RFC or is clearly wrong. **gap**: missing behaviour
 | 31 | gap | **Fast recovery has no partial-ACK handling (NewReno, RFC 6582).** Reno leaves fast recovery on the first ACK of new data, so a second loss in the same window waits for three more duplicate ACKs, which seldom come, and then for a retransmission timeout (at least 1 s). A queue overflow drops several frames at once, so this is the common case. | TCP congestion control over a small transmit queue | **Fixed in our vendored smoltcp** (`smoltcp-0003-newreno-partial-acks.patch`, [below](#upstream-ready-patch-newreno-partial-acks-31)). | patch ready, not filed |
 | 32 | bug | **A FIN is accepted on a segment cut at the receive window's right edge.** `process` trims a segment to the window but took its FIN whenever the segment starts at or before `RCV.NXT` (`control == Fin && window_start < segment_start` was the only check), so the FIN took the sequence number of the first byte that was cut: the stream ended early with `CLOSE-WAIT`, and the ACK of the FIN acknowledged the first cut byte to the sender as if it had arrived. RFC 9293 §3.10.7.4 drops a FIN that lies beyond the window. A sender reaches past the window with a fast retransmission, which sends a full segment from `SND.UNA` without looking at the window, or with a segment sent against an older window that the receiver has since moved back by a few bytes (a scaled window counts in steps of `2^shift`). | TCP congestion-control tests: an app that stops reading while a stream ends, a loss: 1 to 3 bytes missing before EOF | **Fixed in our vendored smoltcp** (`smoltcp-0004-fin-past-the-receive-window.patch`, [below](#upstream-ready-patch-a-fin-past-the-receive-window-32)): the FIN of a segment cut at the right edge is ignored; the sender sends the cut bytes and the FIN again once the window opens. Fast retransmissions still ignore the window (harmless now). | patch ready, not filed |
 | 33 | gap | **No SACK-based recovery, Limited Transmit (RFC 3042), early retransmit (RFC 5827) or tail-loss probe, and a minimum RTO of 1 s** (`RTTE_MIN_RTO`, RFC 6298's SHOULD; Linux uses 200 ms). A loss that three duplicate ACKs do not reveal costs at least 1 s. smoltcp sends SACK blocks as a receiver but ignores the peer's. | TCP congestion control, lossy links | None; the costs are in `docs/design/netstack.md`. | not filed |
-| 34 | bug | **A connection can hang with only its FIN unacknowledged.** When every data byte is acknowledged but the FIN is not (here: the receiver's window was zero, and it dropped a retransmitted segment whose data it already had together with its FIN, while it accepts a bare FIN at a zero window), the receiver's repeated ACKs count as duplicate ACKs (`ack_number < remote_last_seq`). The third starts a fast retransmit: `dispatch` sets `pending_fast_retransmit` and idles the retransmission timer, but there is no data to retransmit (`seq_to_transmit` wants a non-empty transmit buffer) and the FIN cannot go either (`can_fin` needs `remote_last_seq == local_seq_no + tx_buffer.len()`). Nothing is sent and no timer is armed, so the FIN never goes again. | the netstack's simulation: `tcp.congestion = "none"`, the receiving app not reading, 1 MB with data segment 134 lost: every byte arrives, the end of the stream never does | None yet. A fix would not count ACKs as duplicates once all data is acknowledged, or keep the timer when a fast retransmit has nothing to send. | not filed |
+| 34 | bug | **A connection could hang with only its FIN unacknowledged.** When every data byte is acknowledged but the FIN is not (here: the receiver's window was zero, and it dropped a retransmitted segment whose data it already had together with its FIN, while it accepts a bare FIN at a zero window), the receiver's repeated ACKs count as duplicate ACKs (`ack_number < remote_last_seq`). The third started a fast retransmit: `dispatch` set `pending_fast_retransmit` and idled the retransmission timer, but `seq_to_transmit` wanted a non-empty transmit buffer for a fast retransmit and `can_fin` needs `remote_last_seq == local_seq_no + tx_buffer.len()`, so nothing was sent and no timer was armed: the FIN never went again. | the netstack's simulation: `tcp.congestion = "none"`, the receiving app not reading, 1 MB with data segment 134 lost: every byte arrived, the end of the stream never did | **Fixed in our vendored smoltcp** (`smoltcp-0005-fast-retransmit-of-a-lone-fin.patch`, [below](#upstream-ready-patch-fast-retransmit-of-a-lone-fin-34)): with every data octet acknowledged, a fast retransmit sends the FIN alone. | patch ready, not filed |
 
 
 ## Plan
 - ~~Fix #2~~: done (vendored patch). Open the upstream PR below, and drop `third_party/smoltcp` once a release has it.
 - ~~Fix #31~~: done (vendored patch, NewReno). Open the upstream PR below.
 - ~~Fix #32~~: done (vendored patch). Open the upstream PR below.
-- Fix #34 (a hang with only the FIN unacknowledged), and file the other half of #32: fast retransmissions that ignore the window.
+- ~~Fix #34~~: done (vendored patch). Open the upstream PR below.
+- File the other half of #32: fast retransmissions ignore the receive window (harmless with the #32 fix: the receiver drops what is past the edge, and the sender sends it again once the window opens).
 - ~~Fix #7~~: done in the netstack (family demultiplexing). An upstream family filter would let us delete `UdpSockets::demux` and the TCP stray hand-off.
 - File upstream issues for #1, #3, #4, #5, #7, #8, #9, #18, #20, #21, #24, #26 and #27, with minimal repros. Our deterministic simulations make good reproducers.
 
@@ -185,3 +186,41 @@ the receive buffer, the reader stopped, a fast retransmission with the FIN past 
 before, 19 998 of 20 000 bytes and end-of-stream, under Reno and without congestion control)
 and `reno_loses_no_byte_to_a_loss_while_the_reader_has_stopped` (1 MB against a scaled window
 with the reader stopped: before, 30 of 142 loss positions ended the stream 1 to 3 bytes short).
+
+## Upstream-ready patch: fast retransmit of a lone FIN (#34)
+
+Ready to send as a PR against smoltcp `main` (written and tested against 0.14.0; not opened
+yet). The diff is [`smoltcp-0005-fast-retransmit-of-a-lone-fin.patch`](smoltcp-0005-fast-retransmit-of-a-lone-fin.patch)
+(1 file, +49 / -2; applies with `git apply` to the 0.14.0 crate, after the four patches before
+it): exactly the change in `third_party/smoltcp`.
+
+**Title:** tcp: a fast retransmit with only the FIN outstanding retransmits the FIN
+
+**Description:**
+
+> Once every data octet is acknowledged and only the FIN is outstanding, further ACKs of the
+> data still count as duplicate ACKs (`ack_number < remote_last_seq`, the FIN occupying the
+> last sequence number). The third one starts a fast retransmit: `dispatch` sets
+> `pending_fast_retransmit` and idles the retransmission timer. But `seq_to_transmit` only
+> honours a pending fast retransmit with data in the transmit buffer, and `can_fin` needs the
+> FIN not to have been sent yet, so nothing is sent; with the timer idle nothing is ever sent
+> again, and the connection hangs in FIN-WAIT-1, CLOSING or LAST-ACK. A peer gets there by
+> dropping the FIN, for example with a zero window it dropped a retransmitted segment whose data
+> it already had, FIN included.
+>
+> This change lets a pending fast retransmit go when the transmit buffer is empty and the FIN is
+> outstanding: `dispatch` already follows an empty payload with the FIN in those states, so the
+> retransmission is the FIN alone, at `SND.UNA`, and it arms the retransmission timer again as
+> any segment does. Nothing else changes.
+>
+> Test: `test_fast_retransmit_of_a_lone_fin` (data and FIN, the data acknowledged four times:
+> the FIN goes again at once, and once more on the retransmission timer). `cargo test --lib`
+> passes with the default features (679 tests), with
+> `--features socket-tcp-reno,socket-tcp-cubic` (705), and with
+> `std,alloc,medium-ethernet,proto-ipv4,proto-ipv6,multicast,socket-tcp,socket-tcp-reno,socket-tcp-cubic,socket-udp,socket-icmp,socket-dhcpv4,auto-icmp-echo-reply` (318).
+
+**Found and verified in wasmnet:** the netstack's
+`no_loss_ends_a_stream_short_or_hangs_it_while_the_reader_has_stopped` (1 MB with the reader
+stopped, each of the 142 data segments lost in turn, under Reno and without congestion
+control): before, losing segment 134 without congestion control delivered every byte and never
+the end of the stream.
