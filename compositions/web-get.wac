@@ -1,0 +1,27 @@
+// node-web-get = the netstack + the http-server and http-get apps: a web server that also
+// fetches. With several ports (`port<N>.*`) it is a multi-homed host that serves every link it
+// is on and fetches by its routes (crates/wasmnet-host/tests/multihomed.rs).
+//
+// One netstack serves both apps' `wasi:sockets` imports.
+package wasmnet:node-web-get;
+
+let net = new wasmnet:netstack { ... };
+
+let server = new app:http-server {
+    "wasi:sockets/types@0.3.0": net["wasi:sockets/types@0.3.0"],
+    "wasmnet:sockets-ext/tcp@0.1.0": net["wasmnet:sockets-ext/tcp@0.1.0"],
+    ...
+};
+
+let client = new app:http-get {
+    "wasi:sockets/types@0.3.0": net["wasi:sockets/types@0.3.0"],
+    "wasi:sockets/ip-name-lookup@0.3.0": net["wasi:sockets/ip-name-lookup@0.3.0"],
+    "wasmnet:sockets-ext/tcp@0.1.0": net["wasmnet:sockets-ext/tcp@0.1.0"],
+    ...
+};
+
+export net["wasmnet:link/device@0.1.0"];
+export net["wasmnet:link/lifecycle@0.1.0"];
+export net["wasmnet:link/counters@0.1.0"];
+export server["wasi:cli/run@0.3.0"] as "app-http-server";
+export client["wasi:cli/run@0.3.0"] as "app-http-get";
