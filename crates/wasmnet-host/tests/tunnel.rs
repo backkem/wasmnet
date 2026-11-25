@@ -76,6 +76,8 @@ struct Setup {
     keys: Option<[&'static str; 2]>,
     /// Frames an attacker on the Internet switch sends (from the relay's cable), at instants.
     inject: Vec<(u64, Vec<u8>)>,
+    /// The homes are IPv4 inside (10.1.0.0/24, 10.2.0.0/24) instead of IPv6.
+    inner_v4: bool,
 }
 
 /// Tunnel keys: the direct tunnel's, another, and the relay's two pairs.
@@ -100,6 +102,7 @@ impl Setup {
             end: 4 * S,
             keys: None,
             inject: Vec::new(),
+            inner_v4: false,
         }
     }
 
@@ -225,26 +228,42 @@ fn run(seed: u64, s: &Setup) -> Run {
         let natd = network
             .device_with_config(&format!("nat-{name}"), &router, pairs(&cfg))
             .unwrap();
-        let subnet = format!("fd00:{name}::1/64");
-        let boxr = network
-            .device_with_config(
-                &format!("box-{name}"),
-                &router,
-                pairs(&[
-                    ("mac", &format!("02:00:00:00:b{n}:00")),
-                    ("port0.ipv4", "192.168.1.2/24"),
-                    ("port1.ipv6", &subnet),
-                    ("port1.ipv6-link-local", "fe80::1"),
-                    ("routes", "default via 192.168.1.1"),
-                ]),
+        let box_mac = format!("02:00:00:00:b{n}:00");
+        let (inner, gw) = if s.inner_v4 {
+            (
+                vec![("port1.ipv4".to_owned(), format!("10.{}.0.1/24", n + 1))],
+                format!("10.{}.0.1", n + 1),
             )
+        } else {
+            (
+                vec![
+                    ("port1.ipv6".to_owned(), format!("fd00:{name}::1/64")),
+                    ("port1.ipv6-link-local".to_owned(), "fe80::1".to_owned()),
+                ],
+                "fe80::1".to_owned(),
+            )
+        };
+        let mut box_cfg = vec![("mac", box_mac.as_str()), ("port0.ipv4", "192.168.1.2/24")];
+        box_cfg.extend(inner.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        box_cfg.push(("routes", "default via 192.168.1.1"));
+        let boxr = network
+            .device_with_config(&format!("box-{name}"), &router, pairs(&box_cfg))
             .unwrap();
         let mac = format!("02:00:00:00:0{n}:10");
-        let addr = format!("fd00:{name}::10/64");
+        let addr = if s.inner_v4 {
+            format!("10.{}.0.10/24", n + 1)
+        } else {
+            format!("fd00:{name}::10/64")
+        };
+        let (family, gw_key) = if s.inner_v4 {
+            ("ipv4", "ipv4-gateway")
+        } else {
+            ("ipv6", "ipv6-gateway")
+        };
         let mut node = vec![
             ("mac", mac.as_str()),
-            ("ipv6", addr.as_str()),
-            ("ipv6-gateway", "fe80::1"),
+            (family, addr.as_str()),
+            (gw_key, gw.as_str()),
         ];
         let node = if name == "a" {
             node.push(("app.http-get.urls", s.urls));
@@ -285,7 +304,11 @@ fn run(seed: u64, s: &Setup) -> Run {
             command(&mut network, boxes[i], "tunnel-add", &spec),
             "added"
         );
-        let route = format!("fd00:{other}::/64 tunnel to-{other}");
+        let route = if s.inner_v4 {
+            format!("10.{}.0.0/24 tunnel to-{other}", 2 - i)
+        } else {
+            format!("fd00:{other}::/64 tunnel to-{other}")
+        };
         assert_eq!(
             command(&mut network, boxes[i], "route-add", &route),
             "added"
@@ -406,6 +429,8 @@ struct Wan {
     geneve: usize,
     /// ESP packets (RFC 4303 in UDP, RFC 3948): a keyed tunnel's data.
     esp: usize,
+    /// Geneve packets with an inner IPv4 packet.
+    inner_v4: usize,
     /// STUN messages that carry MESSAGE-INTEGRITY-SHA256 (0x001C).
     signed: usize,
     /// Distinct outer UDP endpoints seen (address and port).
@@ -468,14 +493,23 @@ fn decode_wan(run: &Run) -> Wan {
         } else {
             assert_eq!(d[0], 0, "Geneve version 0, no options");
             assert_eq!(d[1], 0, "no O or C bit");
-            assert_eq!(d[2..4], [0x86, 0xdd], "inner IPv6");
             assert_eq!(d[7], 0);
-            let inner = Ipv6Slice::from_slice(&d[8..]).expect("an inner IPv6 packet");
-            let src = inner.header().source_addr().segments();
-            assert!(
-                src[0] == 0xfd00 && [0xa, 0xb, 0xff].contains(&src[1]),
-                "{src:x?}"
-            );
+            if d[2..4] == [0x08, 0x00] {
+                // Inner IPv4, from a home's 10.1.0.0/24 or 10.2.0.0/24.
+                let inner =
+                    etherparse::Ipv4Slice::from_slice(&d[8..]).expect("an inner IPv4 packet");
+                let src = inner.header().source_addr().octets();
+                assert!(src[0] == 10 && [1, 2].contains(&src[1]), "{src:?}");
+                w.inner_v4 += 1;
+            } else {
+                assert_eq!(d[2..4], [0x86, 0xdd], "inner IPv6");
+                let inner = Ipv6Slice::from_slice(&d[8..]).expect("an inner IPv6 packet");
+                let src = inner.header().source_addr().segments();
+                assert!(
+                    src[0] == 0xfd00 && [0xa, 0xb, 0xff].contains(&src[1]),
+                    "{src:x?}"
+                );
+            }
             w.geneve += 1;
         }
     }
@@ -1698,4 +1732,33 @@ fn what_the_cryptography_costs() {
     println!("{}", rows.join("\n"));
     assert!(f1 > f0, "encryption costs something");
     assert!(per_check[1] > per_check[0], "signing costs something");
+}
+
+#[test]
+fn ipv4_inside_over_an_ipv4_tunnel_keyless_and_keyed() {
+    // The fourth combination of families (outer IPv6 is `tests/tunnel6.rs`).
+    for keyed in [false, true] {
+        let mut s = Setup::new(nat(EI, APD), nat(EI, APD));
+        if keyed {
+            s = s.keyed();
+        }
+        s.inner_v4 = true;
+        s.urls = "http://10.2.0.10/big?n=20000";
+        s.listen = "0.0.0.0:80";
+        each_seed(&s, |r, label| {
+            let log = transcript(&r.journal);
+            assert!(r.fetched(), "{label}\n{log}");
+            let w = decode_wan(r);
+            if keyed {
+                assert!(w.esp > 10 && w.geneve == 0, "{label}: {w:?}");
+            } else {
+                assert!(w.inner_v4 > 10, "{label}: {w:?}");
+                assert_eq!(w.geneve, w.inner_v4, "{label}: only IPv4 inside");
+            }
+            assert!(
+                r.counter("box-a", "tunnel-to-b-mss-clamped") >= 1,
+                "{label}"
+            );
+        });
+    }
 }
