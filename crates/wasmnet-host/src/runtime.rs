@@ -175,17 +175,11 @@ impl Runtime for Host {
             None => Component::from_binary(&self.engine, bytes).map_err(crate::runtime_error),
         };
         let component = compiled.map_err(|e| {
-            format!(
-                "`{digest}` is not a component this host compiles: {}",
-                self.summarize(&e.to_string())
-            )
+            wasmnet_core::supply::not_compiled(digest, &self.summarize(&e.to_string()))
         })?;
         self.linker.instantiate_pre(&component).map_err(|e| {
-            format!(
-                "`{digest}` does not link on this host: {}",
-                // The outermost message names the import (its causes name only the part).
-                wasmnet_core::infra::one_line(&e.to_string())
-            )
+            // The outermost message names the import (its causes name only the part).
+            wasmnet_core::supply::not_linked(digest, &wasmnet_core::infra::one_line(&e.to_string()))
         })?;
         Ok(component)
     }

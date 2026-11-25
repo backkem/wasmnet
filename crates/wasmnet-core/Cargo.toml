@@ -16,6 +16,9 @@ rand_core = "0.10"
 sha2.workspace = true
 # `wasmnet:infra` device specs: deterministic CBOR.
 wasmnet-det-cbor = { path = "../wasmnet-det-cbor" }
+# Lists a supplied component's imports without compiling it (`ImportPolicy`), on every
+# backend: the version wasmtime itself parses with. Pure Rust, builds for wasm32.
+wasmparser = { version = "=0.261.0", default-features = false, features = ["component-model", "std"] }
 
 [lints]
 workspace = true

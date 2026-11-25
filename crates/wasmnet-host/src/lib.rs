@@ -97,7 +97,7 @@
 //! `wasi:config/store` imports), `command` ([`Sim`], the command runner), `wasi` (the
 //! deterministic WASI linker, [`HostState`]), `stdio` (captured, optionally journalled
 //! stdout/stderr, and stdin), `infra` (`wasmnet:infra`), `extension` ([`HostExtension`],
-//! [`ControlHandler`]), `cache` ([`CompileCache`]), `admit` ([`ImportPolicy`]). Virtual time, the event queue, the
+//! [`ControlHandler`]), `cache` ([`CompileCache`]). [`ImportPolicy`] is the sim core's. Virtual time, the event queue, the
 //! executors, the patch panel, the journal, the seeded PRNG and pcap live in the sim core
 //! ([`sim`]).
 //!
@@ -109,7 +109,6 @@
 #![deny(unsafe_code)]
 
 mod actor;
-mod admit;
 mod cache;
 mod command;
 mod control;
@@ -136,8 +135,8 @@ use std::path::Path;
 use wasmtime::component::{Component, Linker};
 use wasmtime::{Config, Engine};
 
-pub use admit::{ImportPolicy, component_imports};
 pub use cache::{CacheStats, CompileCache, default_cache_dir};
+pub use wasmnet_core::admit::{ImportPolicy, component_imports};
 /// The compile cache's default budget, default place and pruning.
 pub mod compile_cache {
     pub use crate::cache::{MAX_CACHE_BYTES, default_cache_dir, prune_dir};

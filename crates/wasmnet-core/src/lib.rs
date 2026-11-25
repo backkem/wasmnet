@@ -74,6 +74,7 @@
 
 #![deny(unsafe_code)]
 
+pub mod admit;
 mod clock;
 pub mod commands;
 mod config;
@@ -98,6 +99,7 @@ use std::any::Any;
 use std::fmt;
 use std::time::Duration;
 
+pub use admit::{ImportPolicy, component_imports};
 pub use clock::{
     Ctx, EventKey, HOST_DEVICE, KEY_DEPTH, KeyLevel, Nanos, Origin, Sleep, Tag, VirtualClock,
 };

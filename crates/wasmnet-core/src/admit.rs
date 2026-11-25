@@ -1,4 +1,4 @@
-//! A ready-made admission for components controllers supply ([`ImportPolicy`]): which imports
+//! Admission of components controllers supply ([`ImportPolicy`]): which imports
 //! a supplied component may have (`docs/design/topology-and-infra.md`).
 //!
 //! The host links the same imports for every device, so a policy only narrows what a supplied
@@ -57,7 +57,7 @@ pub fn component_imports(bytes: &[u8]) -> Result<Vec<String>, String> {
 /// component, with the import named.
 ///
 /// ```
-/// use wasmnet_host::ImportPolicy;
+/// use wasmnet_core::ImportPolicy;
 /// let policy = ImportPolicy::new(["wasi:*", "wasmnet:link/*"]);
 /// assert!(policy.allows("wasi:clocks/monotonic-clock@0.3.0"));
 /// assert!(!policy.allows("wasmnet:infra/devices@0.1.2"));
@@ -119,10 +119,10 @@ impl ImportPolicy {
     }
 
     /// The policy as a network's admission callback
-    /// ([`Network::set_supply_admission`](crate::sim::Network::set_supply_admission)).
+    /// ([`Network::set_supply_admission`](crate::Network::set_supply_admission)).
     pub fn admission(
         self,
-    ) -> impl Fn(&wasmnet_core::Supplied<'_>) -> Result<(), String> + Send + Sync + 'static {
+    ) -> impl Fn(&crate::Supplied<'_>) -> Result<(), String> + Send + Sync + 'static {
         move |supplied| self.check(supplied.bytes)
     }
 }

@@ -92,6 +92,19 @@ pub struct StoredComponent {
     pub users: u32,
 }
 
+/// A backend's refusal of supplied bytes it cannot compile ([`crate::Runtime::compile_supplied`]):
+/// not a component, or not one it compiles; `why` is the backend's own reason. Every backend
+/// words it this way.
+pub fn not_compiled(digest: &str, why: &str) -> String {
+    format!("`{digest}` is not a component this host compiles: {why}")
+}
+
+/// A backend's refusal of a supplied component that imports something it does not serve;
+/// `why` names the import. Every backend words it this way.
+pub fn not_linked(digest: &str, why: &str) -> String {
+    format!("`{digest}` does not link on this host: {why}")
+}
+
 /// The digest reference of `bytes`: `sha256:` and the SHA-256 in 64 lowercase hex digits.
 pub fn reference_of(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(DIGEST_PREFIX.len() + 64);
