@@ -88,6 +88,7 @@ mod link;
 mod network;
 mod output;
 pub mod pcap;
+pub mod reconfigure;
 mod rng;
 pub mod sites;
 
@@ -118,6 +119,7 @@ pub use network::{
     Placement, PortRef, Records, Runtime,
 };
 pub use output::{CAPTURE_LIMIT, OutputCapture};
+pub use reconfigure::{RECONFIGURE_EXPORT, ReconfigureCall, Refusal};
 pub use rng::{SimRng, derive_seed};
 
 /// Default wall-clock reading at virtual time 0: 2026-01-01T00:00:00Z.

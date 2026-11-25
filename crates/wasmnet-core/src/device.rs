@@ -65,6 +65,12 @@ pub struct DeviceCost {
     /// Wall time inside the actor's polls, when the runtime gave the executor a wall clock.
     /// Not deterministic: reports only.
     pub wall_ns: u64,
+    /// The device's linear memory now, in bytes, all its instances together (the netstack and
+    /// the apps of a composed node alike), as the backend saw it grow (0 with a backend that
+    /// does not measure it, and once the device stopped). Deterministic.
+    pub memory: u64,
+    /// The most it had at once since it was instantiated. Deterministic.
+    pub peak_memory: u64,
 }
 
 /// A device's cost, shared by the executor (calls, polls, wall) and the backend (fuel).
@@ -105,6 +111,14 @@ impl CostMeter {
             m.cost.peak_fuel = sum;
             m.cost.peak_fuel_at = at;
         }
+    }
+
+    /// The device's linear memory is now `bytes` (the backend measures it as it grows, and
+    /// reports 0 when the instance is dropped).
+    pub fn set_memory(&self, bytes: u64) {
+        let mut m = lock(&self.inner);
+        m.cost.memory = bytes;
+        m.cost.peak_memory = m.cost.peak_memory.max(bytes);
     }
 
     pub(crate) fn add_call(&self) {

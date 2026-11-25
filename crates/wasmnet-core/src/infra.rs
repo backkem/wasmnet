@@ -149,6 +149,8 @@ pub(crate) struct CableReq {
     pub far: Option<u32>,
     pub latency: Nanos,
     pub mtu: Option<u32>,
+    /// Its impairments by sending end: from this device's port, then from the far end.
+    pub impair: Option<[crate::Impairments; 2]>,
 }
 
 /// A validated device spec of a derived creation.
@@ -171,16 +173,33 @@ pub(crate) enum Verb {
     Remove,
     /// A command into the device's `wasmnet:control/commands` export.
     Control(DeviceCommand),
+    /// A cable from one of the device's ports.
+    Wire(CableReq),
+    /// Unplugs the cable at one of the device's ports.
+    Unwire(u32),
+    /// A new config for a running device that may take it in place
+    /// ([`crate::reconfigure`]); `old` is the spec it runs with.
+    Reconfigure {
+        spec: DerivedSpec,
+        old: Vec<u8>,
+    },
+    /// The device took `.0`'s config in place: the network records it.
+    Configured(DerivedSpec),
 }
 
 impl Verb {
     fn name(&self) -> &'static str {
         match self {
-            Verb::Create(_) | Verb::Recreate(_) => "apply",
+            Verb::Create(_)
+            | Verb::Recreate(_)
+            | Verb::Reconfigure { .. }
+            | Verb::Configured(_) => "apply",
             Verb::Start => "start",
             Verb::Stop => "stop",
             Verb::Remove => "remove",
             Verb::Control(_) => "control",
+            Verb::Wire(_) => "wire",
+            Verb::Unwire(_) => "unwire",
         }
     }
 }
@@ -397,6 +416,11 @@ impl Infra {
         Self::change(s, ChangeKind::Modified, &e.device);
     }
 
+    /// Who created device `name` (`None`: the network or an operator, or not in the table).
+    pub(crate) fn owner_of(&self, name: &str) -> Option<String> {
+        self.state().items.get(name).and_then(|i| i.owner.clone())
+    }
+
     /// The names of the devices `owner` created that are in the table, by name.
     pub(crate) fn owned_by(&self, owner: &str) -> Vec<String> {
         self.state()
@@ -444,12 +468,18 @@ impl Infra {
     /// The `wasmnet:infra` end of controller `device`, which may create only names starting
     /// with `prefix` (if given). Its view of the table starts here: the network's own devices
     /// and the devices it created, with resource versions counting the changes it sees.
-    pub(crate) fn end(&self, device: &str, prefix: Option<String>) -> InfraEnd {
+    pub(crate) fn end(
+        &self,
+        device: &str,
+        prefix: Option<String>,
+        max_devices: Option<u32>,
+    ) -> InfraEnd {
         self.add_view(device);
         InfraEnd {
             infra: self.clone(),
             device: device.to_owned(),
             prefix,
+            max_devices,
         }
     }
 
@@ -547,8 +577,22 @@ impl Infra {
         item.since = at;
         if phase == Phase::Running {
             item.apps.clear();
-            item.message = None;
         }
+        // A stop says why only when it was its owner's ([`Self::stopped_with`]); a crash
+        // is `crashed`, with the trap ([`Self::crashed`]).
+        item.message = None;
+        Self::change(&mut s, ChangeKind::Modified, name);
+    }
+
+    /// Device `name` stopped because its controller `owner` stopped (a cascade).
+    pub(crate) fn stopped_with(&self, name: &str, owner: &str, at: Nanos) {
+        let mut s = self.state();
+        let Some(item) = s.items.get_mut(name) else {
+            return;
+        };
+        item.phase = Phase::Stopped;
+        item.since = at;
+        item.message = Some(format!("stopped with its owner `{owner}`"));
         Self::change(&mut s, ChangeKind::Modified, name);
     }
 
@@ -608,6 +652,63 @@ impl Infra {
         if let Err(message) = answer {
             self.journal_failed(&req, message.clone(), at);
         }
+    }
+
+    /// The device answered the reconfiguration of derived request `index`, at the current
+    /// instant and in its own processing context. `ok`: a follow-up request records the new
+    /// config (the network applies it right after, at this instant); `restart`: a follow-up
+    /// request recreates the device with it; `invalid`: the request fails, the device keeps
+    /// its config and the table its old spec.
+    pub(crate) fn reconfigured(&self, index: usize, answer: &Result<(), crate::Refusal>) {
+        let at = self.clock.now();
+        let mut s = self.state();
+        let Some(req) = s.requests.get(index).cloned() else {
+            return;
+        };
+        let Verb::Reconfigure { spec, old } = &req.verb else {
+            return;
+        };
+        let current = s.items.get(&req.name).is_some_and(|i| i.uid == req.uid);
+        match answer {
+            Ok(()) | Err(crate::Refusal::Restart(_)) if current => {
+                let verb = match answer {
+                    Ok(()) => Verb::Configured(spec.clone()),
+                    _ => Verb::Recreate(spec.clone()),
+                };
+                let follow = Request {
+                    verb,
+                    ..req.clone()
+                };
+                let item = s.items.get_mut(&req.name).expect("current");
+                item.queued += 1;
+                item.target = Some(Phase::Running);
+                let next = s.requests.len();
+                s.requests.push(follow);
+                self.clock.schedule_derived(at, next);
+            }
+            Err(crate::Refusal::Invalid(message)) => {
+                if current {
+                    let item = s.items.get_mut(&req.name).expect("current");
+                    item.spec = old.clone();
+                    item.message = Some(message.clone());
+                    Self::change(&mut s, ChangeKind::Modified, &req.name);
+                }
+                drop(s);
+                self.journal_failed(&req, message.clone(), at);
+            }
+            _ => {}
+        }
+    }
+
+    /// Device `name` took a new config in place (generation + 1).
+    pub(crate) fn configured(&self, name: &str) {
+        let mut s = self.state();
+        let Some(item) = s.items.get_mut(name) else {
+            return;
+        };
+        item.generation += 1;
+        item.message = None;
+        Self::change(&mut s, ChangeKind::Modified, name);
     }
 
     /// Keeps the answer to command request `index` and records it as a change of the device
@@ -863,6 +964,8 @@ pub struct InfraEnd {
     pub(crate) device: String,
     /// The names it may create, if limited ([`crate::DeviceOptions::infra_prefix`]).
     pub(crate) prefix: Option<String>,
+    /// The most devices it may have ([`crate::DeviceOptions::infra_max_devices`]).
+    pub(crate) max_devices: Option<u32>,
 }
 
 impl InfraEnd {
@@ -1059,7 +1162,21 @@ impl InfraEnd {
                     }
                     return Ok((self.view(&s, name), true));
                 }
-                let verb = Verb::Recreate(parsed);
+                // Only the config changed: the device may take it in place (the network
+                // decides when it applies: a device without the export is recreated).
+                let in_place = parse_spec(&item.spec).is_ok_and(|(old, _)| {
+                    old.component == parsed.component
+                        && old.options == parsed.options
+                        && old.wire == parsed.wire
+                });
+                let verb = if in_place {
+                    Verb::Reconfigure {
+                        spec: parsed,
+                        old: item.spec.clone(),
+                    }
+                } else {
+                    Verb::Recreate(parsed)
+                };
                 let req = Request {
                     caller: self.device.clone(),
                     name: name.to_owned(),
@@ -1070,6 +1187,20 @@ impl InfraEnd {
                 Ok((self.view(&s, name), true))
             }
             None => {
+                if let Some(max) = self.max_devices {
+                    let has = s
+                        .items
+                        .values()
+                        .filter(|i| i.owner.as_deref() == Some(self.device.as_str()))
+                        .count();
+                    if has >= max as usize {
+                        return Err(InfraError::Denied(format!(
+                            "`{}` may have at most {max} devices, and has {has}: remove one \
+                             first",
+                            self.device
+                        )));
+                    }
+                }
                 // The uid: the digest of the derived event that will create it.
                 let key = self.infra.clock.peek_key(now);
                 let uid = crate::digest::event(&key).short();
@@ -1246,6 +1377,110 @@ impl InfraEnd {
         };
         self.queue(&mut s, req, now, Phase::Removed);
         Ok((true, true))
+    }
+
+    /// `devices.wire`: queues a cable from port `cable.port` of `name`, a device this caller
+    /// created, to `cable.to` (a device this caller created, or one of the network's own:
+    /// the rule of creation-time cables). Not idempotent by name: a second cable from the same
+    /// port is refused when it applies (the port is taken); a retry by request id is answered
+    /// from the record.
+    pub fn wire(
+        &self,
+        request_id: Option<String>,
+        name: &str,
+        cable: &[u8],
+    ) -> Result<DeviceView, InfraError> {
+        let args = format!("wire {name} {cable:?}");
+        self.link_verb(request_id, args, name, || {
+            let v =
+                det_cbor::decode(cable).map_err(|e| invalid(format!("cable: not CBOR: {e:?}")))?;
+            let c = parse_cable(&v)?;
+            let far = self
+                .infra
+                .state()
+                .items
+                .get(&c.device)
+                .map(|i| i.owner.clone());
+            if let Some(Some(owner)) = far
+                && owner != self.device
+            {
+                return Err(InfraError::Denied(format!(
+                    "`{}` belongs to `{owner}`: a controller's cables go to its own devices \
+                     and the network's",
+                    c.device
+                )));
+            }
+            let fields = vec![("port", c.port.to_string()), ("to", c.device.clone())];
+            Ok((Verb::Wire(c), fields))
+        })
+    }
+
+    /// `devices.unwire`: queues unplugging the cable at `port` of `name`, a device this caller
+    /// created. Refused when it applies if no cable is there.
+    pub fn unwire(
+        &self,
+        request_id: Option<String>,
+        name: &str,
+        port: u32,
+    ) -> Result<DeviceView, InfraError> {
+        let args = format!("unwire {name} {port}");
+        self.link_verb(request_id, args, name, || {
+            Ok((Verb::Unwire(port), vec![("port", port.to_string())]))
+        })
+    }
+
+    /// `wire` and `unwire`: on a device this caller created that exists or is about to, queued
+    /// after what is already queued for it; journalled as `infra-<verb>` with `fields`.
+    fn link_verb(
+        &self,
+        request_id: Option<String>,
+        args: String,
+        name: &str,
+        verb: impl FnOnce() -> Result<(Verb, Vec<(&'static str, String)>), InfraError>,
+    ) -> Result<DeviceView, InfraError> {
+        if let Some(r) = self.recorded(&request_id, &args) {
+            return match r? {
+                Answer::Device(a) => a,
+                _ => Err(InfraError::Conflict(
+                    "request id reused by another verb".into(),
+                )),
+            };
+        }
+        let mut journal = None;
+        let answer = (|| {
+            self.mutable(name)?;
+            let (verb, fields) = verb()?;
+            let what = verb.name();
+            let now = self.infra.clock.now();
+            let mut s = self.infra.state();
+            let item = self
+                .own(&s, name)?
+                .cloned()
+                .ok_or_else(|| InfraError::NotFound(format!("no device `{name}`")))?;
+            let heading = item.target.unwrap_or(item.phase);
+            if matches!(heading, Phase::Failed | Phase::Removed) {
+                return Err(InfraError::Invalid(format!("`{name}` does not exist")));
+            }
+            let req = Request {
+                caller: self.device.clone(),
+                name: name.to_owned(),
+                verb,
+                uid: item.uid.clone(),
+            };
+            self.queue(&mut s, req, now, heading);
+            journal = Some((what, fields));
+            Ok(self.view(&s, name))
+        })();
+        self.record(&request_id, args, Answer::Device(answer.clone()));
+        if let Some((what, fields)) = journal {
+            let mut f = vec![("name", name.to_owned())];
+            f.extend(fields);
+            if let Some(id) = request_id {
+                f.push(("request", id));
+            }
+            self.journal(&format!("infra-{what}"), f);
+        }
+        answer
     }
 
     /// `devices.control`: queues `command` with `argument` for the device's
@@ -1581,6 +1816,13 @@ pub(crate) fn parse_spec(bytes: &[u8]) -> Result<(DerivedSpec, Vec<u8>), InfraEr
                 );
             }
             "args" => options.args = parse_args(val)?,
+            "memory" => {
+                options.memory = Some(
+                    val.as_uint()
+                        .filter(|&m| m > 0)
+                        .ok_or_else(|| invalid("memory: uint bytes, > 0"))?,
+                );
+            }
             "env" => options.env = parse_env(val)?,
             "wire" => {
                 let Value::Array(cables) = val else {
@@ -1590,7 +1832,7 @@ pub(crate) fn parse_spec(bytes: &[u8]) -> Result<(DerivedSpec, Vec<u8>), InfraEr
                     wire.push(parse_cable(c)?);
                 }
             }
-            "infra" | "infra_prefix" | "infra_cascade" => {
+            "infra" | "infra_prefix" | "infra_cascade" | "infra_max_devices" => {
                 return Err(InfraError::Denied(format!(
                     "a controller cannot grant `{k}` (only the embedder can)"
                 )));
@@ -1710,11 +1952,19 @@ fn parse_cable(c: &Value) -> Result<CableReq, InfraError> {
                 .ok_or_else(|| invalid("a cable's mtu: uint"))?,
         ),
     };
+    let impair = match c.get("impair") {
+        None => None,
+        Some(v) => Some(parse_impair(v)?),
+    };
     if let Value::Map(e) = c {
         for (k, _) in e {
             match k.as_text() {
-                Some("port" | "to" | "latency" | "mtu") => {}
-                _ => return Err(invalid("a cable has port, to, latency and mtu only")),
+                Some("port" | "to" | "latency" | "mtu" | "impair") => {}
+                _ => {
+                    return Err(invalid(
+                        "a cable has port, to, latency, mtu and impair only",
+                    ));
+                }
             }
         }
     }
@@ -1724,7 +1974,89 @@ fn parse_cable(c: &Value) -> Result<CableReq, InfraError> {
         far,
         latency,
         mtu,
+        impair,
     })
+}
+
+/// A cable's `impair`: one map (both directions) or two (from this device's port, then from
+/// the far end), each `{rate, queue, loss_ppm, jitter}` (all optional; the defaults are a
+/// link's: unimpaired).
+fn parse_impair(v: &Value) -> Result<[crate::Impairments; 2], InfraError> {
+    let one = |m: &Value| -> Result<crate::Impairments, InfraError> {
+        let Value::Map(entries) = m else {
+            return Err(invalid("impair: maps of rate, queue, loss_ppm and jitter"));
+        };
+        let mut imp = crate::Impairments::default();
+        for (k, v) in entries {
+            let n = v
+                .as_uint()
+                .ok_or_else(|| invalid("impair: rate, queue, loss_ppm and jitter are uints"))?;
+            let small = || u32::try_from(n).map_err(|_| invalid("impair: a value too large"));
+            match k.as_text() {
+                Some("rate") => imp.rate = n,
+                Some("queue") => imp.queue = small()?,
+                Some("loss_ppm") => imp.loss_ppm = small()?,
+                Some("jitter") => imp.jitter = n,
+                _ => return Err(invalid("impair: rate, queue, loss_ppm and jitter only")),
+            }
+        }
+        Ok(imp)
+    };
+    match v {
+        Value::Map(_) => {
+            let i = one(v)?;
+            Ok([i, i])
+        }
+        Value::Array(items) if items.len() == 2 => Ok([one(&items[0])?, one(&items[1])?]),
+        _ => Err(invalid("impair: a map, or an array of two maps")),
+    }
+}
+
+/// An impairment in its canonical CBOR form (only what differs from the default).
+fn impair_value(imp: &crate::Impairments) -> Value {
+    let d = crate::Impairments::default();
+    let mut m = Vec::new();
+    if imp.rate != d.rate {
+        m.push((Value::text("rate"), Value::Uint(imp.rate)));
+    }
+    if imp.queue != d.queue {
+        m.push((Value::text("queue"), Value::Uint(u64::from(imp.queue))));
+    }
+    if imp.loss_ppm != d.loss_ppm {
+        m.push((
+            Value::text("loss_ppm"),
+            Value::Uint(u64::from(imp.loss_ppm)),
+        ));
+    }
+    if imp.jitter != d.jitter {
+        m.push((Value::text("jitter"), Value::Uint(imp.jitter)));
+    }
+    Value::Map(m)
+}
+
+/// A cable in its canonical CBOR form.
+fn cable_value(c: &CableReq) -> Value {
+    let to = match c.far {
+        Some(p) => format!("{}:{p}", c.device),
+        None => c.device.clone(),
+    };
+    let mut e = vec![
+        (Value::text("port"), Value::Uint(u64::from(c.port))),
+        (Value::text("to"), Value::text(to)),
+    ];
+    if c.latency > 0 {
+        e.push((Value::text("latency"), Value::Uint(c.latency)));
+    }
+    if let Some(mtu) = c.mtu {
+        e.push((Value::text("mtu"), Value::Uint(u64::from(mtu))));
+    }
+    if let Some([a, b]) = &c.impair {
+        e.push((
+            Value::text("impair"),
+            Value::Array(vec![impair_value(a), impair_value(b)]),
+        ));
+    }
+    Value::Map(e)
 }
 
 /// A device's spec in its canonical CBOR form (the devices a network is built with: `wire`
@@ -1759,6 +2091,15 @@ pub(crate) fn spec_value(
     if let Some(prefix) = &options.infra_prefix {
         m.push((Value::text("infra_prefix"), Value::text(prefix.as_str())));
     }
+    if let Some(max) = options.infra_max_devices {
+        m.push((
+            Value::text("infra_max_devices"),
+            Value::Uint(u64::from(max)),
+        ));
+    }
+    if let Some(bytes) = options.memory {
+        m.push((Value::text("memory"), Value::Uint(bytes)));
+    }
     match options.infra_cascade {
         crate::Cascade::Keep => {}
         crate::Cascade::Stop => m.push((Value::text("infra_cascade"), Value::text("stop"))),
@@ -1781,26 +2122,7 @@ pub(crate) fn spec_value(
         m.push((Value::text("env"), Value::Map(env)));
     }
     if let Some(wire) = wire.filter(|w| !w.is_empty()) {
-        let cables = wire
-            .iter()
-            .map(|c| {
-                let to = match c.far {
-                    Some(p) => format!("{}:{p}", c.device),
-                    None => c.device.clone(),
-                };
-                let mut e = vec![
-                    (Value::text("port"), Value::Uint(u64::from(c.port))),
-                    (Value::text("to"), Value::text(to)),
-                ];
-                if c.latency > 0 {
-                    e.push((Value::text("latency"), Value::Uint(c.latency)));
-                }
-                if let Some(mtu) = c.mtu {
-                    e.push((Value::text("mtu"), Value::Uint(u64::from(mtu))));
-                }
-                Value::Map(e)
-            })
-            .collect();
+        let cables = wire.iter().map(cable_value).collect();
         m.push((Value::text("wire"), Value::Array(cables)));
     }
     Value::Map(m).encode()
@@ -1913,8 +2235,8 @@ mod tests {
     fn calls_queue_requests_and_the_table_follows_the_network() {
         let clock = VirtualClock::new(std::time::Duration::ZERO);
         let infra = Infra::new(clock.clone(), Journal::new(clock.clone()));
-        let ctl = infra.end("ctl", None);
-        let other = infra.end("other", None);
+        let ctl = infra.end("ctl", None, None);
+        let other = infra.end("other", None, None);
         infra.added(
             "ctl",
             spec_value(
@@ -2017,7 +2339,7 @@ mod tests {
     fn commands_queue_for_the_callers_running_devices() {
         let clock = VirtualClock::new(std::time::Duration::ZERO);
         let infra = Infra::new(clock.clone(), Journal::new(clock.clone()));
-        let end = |device: &str| infra.end(device, None);
+        let end = |device: &str| infra.end(device, None, None);
         let (ctl, other) = (end("ctl"), end("other"));
         let spec_of = |c: &str| spec_value(c, &DeviceConfig::new(), DeviceOptions::default(), None);
         infra.added("ctl", spec_of("node:ctl"), 0, None);
@@ -2121,6 +2443,77 @@ mod tests {
         assert_eq!(controls, 2, "the retry was not journalled again");
     }
 
+    /// `wire` and `unwire` on the caller's own devices, toward its own or the network's, and a
+    /// limit on how many devices a controller may have; a cable's `impair` in its forms.
+    #[test]
+    fn cables_and_limits_at_the_call() {
+        let clock = VirtualClock::new(std::time::Duration::ZERO);
+        let infra = Infra::new(clock.clone(), Journal::new(clock.clone()));
+        let spec_of = |c: &str| spec_value(c, &DeviceConfig::new(), DeviceOptions::default(), None);
+        infra.added("sw", spec_of("switch"), 0, None);
+        let ctl = infra.end("ctl", None, Some(2));
+        let other = infra.end("other", None, None);
+        ctl.apply(None, "web", vec![], &spec("node:web")).unwrap();
+        other
+            .apply(None, "theirs", vec![], &spec("node:web"))
+            .unwrap();
+        let to = |device: &str| {
+            Value::Map(vec![
+                (Value::text("port"), Value::Uint(1)),
+                (Value::text("to"), Value::text(device)),
+            ])
+            .encode()
+        };
+        let queued = clock.pending_events();
+        ctl.wire(None, "web", &to("sw"))
+            .expect("to the network's own");
+        ctl.unwire(None, "web", 0).expect("its own port");
+        assert_eq!(clock.pending_events(), queued + 2);
+        for (who, name, cable) in [
+            (&ctl, "web", to("theirs")),
+            (&ctl, "sw", to("web")),
+            (&other, "web", to("sw")),
+        ] {
+            assert!(
+                matches!(who.wire(None, name, &cable), Err(InfraError::Denied(_))),
+                "{name}"
+            );
+        }
+        assert!(matches!(
+            ctl.wire(None, "nope", &to("sw")),
+            Err(InfraError::NotFound(_))
+        ));
+        assert!(matches!(
+            ctl.wire(None, "web", &[0xff]),
+            Err(InfraError::Invalid(_))
+        ));
+        // Two devices at most: the third is refused and nothing is queued for it.
+        ctl.apply(None, "web-2", vec![], &spec("node:web")).unwrap();
+        let queued = clock.pending_events();
+        assert!(matches!(
+            ctl.apply(None, "web-3", vec![], &spec("node:web")),
+            Err(InfraError::Denied(m)) if m.contains("at most 2")
+        ));
+        assert_eq!(clock.pending_events(), queued);
+        assert!(ctl.get("web-3").is_err());
+        // `impair`: one map for both directions, or two by sending end.
+        let imp = |v: Value| {
+            parse_cable(&Value::Map(vec![
+                (Value::text("port"), Value::Uint(0)),
+                (Value::text("to"), Value::text("sw")),
+                (Value::text("impair"), v),
+            ]))
+        };
+        let rate = |r: u64| Value::Map(vec![(Value::text("rate"), Value::Uint(r))]);
+        let both = imp(rate(5)).unwrap().impair.unwrap();
+        assert_eq!((both[0].rate, both[1].rate), (5, 5));
+        let two = imp(Value::Array(vec![rate(5), rate(7)])).unwrap();
+        assert_eq!(two.impair.map(|i| (i[0].rate, i[1].rate)), Some((5, 7)));
+        assert_eq!(parse_cable(&cable_value(&two)).unwrap(), two, "canonical");
+        assert!(imp(Value::Array(vec![rate(5)])).is_err());
+        assert!(imp(Value::Map(vec![(Value::text("speed"), Value::Uint(1))])).is_err());
+    }
+
     /// A command sent with a request id has its answer kept for its caller: `None` until the
     /// device answers, then the text (cut at `MAX_ANSWER`), as a `modified` change of the
     /// device; a command that never reaches its device is answered with why.
@@ -2128,7 +2521,7 @@ mod tests {
     fn a_controller_reads_its_commands_answers() {
         let clock = VirtualClock::new(std::time::Duration::ZERO);
         let infra = Infra::new(clock.clone(), Journal::new(clock.clone()));
-        let ctl = infra.end("ctl", None);
+        let ctl = infra.end("ctl", None, None);
         infra.added(
             "ctl",
             spec_value("ctl", &DeviceConfig::new(), DeviceOptions::default(), None),
@@ -2146,7 +2539,7 @@ mod tests {
             Err(InfraError::NotFound(_))
         ));
         assert!(matches!(
-            infra.end("other", None).control_answer("q"),
+            infra.end("other", None, None).control_answer("q"),
             Err(InfraError::NotFound(_))
         ));
         infra.added("r1", vec![], 0, Some(0));
@@ -2183,8 +2576,8 @@ mod tests {
         infra.added("sw", spec_of("switch"), 0, None);
         infra.added("ctl-a", spec_of("node:ctl"), 0, None);
         infra.added("ctl-b", spec_of("node:ctl"), 0, None);
-        let a = infra.end("ctl-a", Some("a-".to_owned()));
-        let b = infra.end("ctl-b", None);
+        let a = infra.end("ctl-a", Some("a-".to_owned()), None);
+        let b = infra.end("ctl-b", None, None);
         b.apply(None, "b-1", vec![], &spec("node:web")).unwrap();
         a.apply(None, "a-1", vec![], &spec("node:web")).unwrap();
         infra.added("b-1", vec![], 0, Some(0));

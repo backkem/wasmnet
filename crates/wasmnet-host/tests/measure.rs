@@ -447,6 +447,7 @@ fn a_recreated_device_is_followed_by_its_capture_headers() {
                         to_port: 1,
                         latency: 100 * US,
                         mtu: None,
+                        impairments: None,
                     }],
                 },
                 Placement::StartOf(150 * MS),

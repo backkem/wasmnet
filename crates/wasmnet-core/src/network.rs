@@ -92,6 +92,8 @@ pub struct DeviceContext {
     /// ([`DeviceOptions::args`], [`DeviceOptions::env`]), for `wasi:cli/environment`.
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
+    /// [`DeviceOptions::memory`], for a backend that enforces it.
+    pub memory: Option<u64>,
     /// Where the guest's stdout and stderr go (journalled per [`DeviceOptions::journal_stdio`]).
     pub stdout: OutputCapture,
     pub stderr: OutputCapture,
@@ -280,6 +282,16 @@ pub struct DeviceOptions {
     /// With `infra`: what becomes of the devices this controller created when it stops or is
     /// removed ([`Cascade`]; by default they keep running).
     pub infra_cascade: Cascade,
+    /// With `infra`: the most devices this controller may have at once (every device it
+    /// created that is in the table, whatever its phase); an `apply` of a new name beyond it
+    /// is refused (`denied`) and changes nothing. `None`: no limit.
+    pub infra_max_devices: Option<u32>,
+    /// The most linear memory the device may use, in bytes, all its instances together. A
+    /// device that grows past it traps, deterministically, at the growing instruction: a
+    /// device a controller created crashes alone (`crashed`), any other fails the network,
+    /// as when it runs out of fuel. `None`: no limit (the backend's own). Backends that cannot
+    /// enforce it (the browser) ignore it.
+    pub memory: Option<u64>,
     /// The device's arguments after `argv[0]` (its name), served by `wasi:cli/environment`.
     pub args: Vec<String>,
     /// Its environment variables, in this order, served by `wasi:cli/environment`.
@@ -848,6 +860,7 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
             config,
             args: options.args.clone(),
             env: options.env.clone(),
+            memory: options.memory,
             stdout: stdout.clone(),
             stderr: stderr.clone(),
             inbox: inbox.clone(),
@@ -855,9 +868,13 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
             fuel_per_instant: options
                 .fuel_per_instant
                 .unwrap_or(self.guard.fuel_per_instant),
-            infra: options
-                .infra
-                .then(|| self.infra.end(name, options.infra_prefix.clone())),
+            infra: options.infra.then(|| {
+                self.infra.end(
+                    name,
+                    options.infra_prefix.clone(),
+                    options.infra_max_devices,
+                )
+            }),
             ext,
         };
         let handles = Handles {
@@ -1161,11 +1178,14 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
     /// or a name only a controller on another site may create (its `infra_prefix`).
     fn cable_to_another_site(&self, req: &crate::infra::Request) -> Option<String> {
         use crate::infra::Verb;
-        let (Verb::Create(spec) | Verb::Recreate(spec)) = &req.verb else {
-            return None;
+        let wire = match &req.verb {
+            Verb::Create(spec) | Verb::Recreate(spec) | Verb::Reconfigure { spec, .. } => {
+                spec.wire.as_slice()
+            }
+            Verb::Wire(c) => std::slice::from_ref(c),
+            _ => return None,
         };
-        spec.wire
-            .iter()
+        wire.iter()
             .find(|c| match self.live_device(&c.device) {
                 Some(d) => self.devices[d.0].remote,
                 None => self.devices.iter().any(|d| {
@@ -1190,9 +1210,34 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
         use crate::infra::Verb;
         let name = req.name.clone();
         let phase = self.live_device(&name).map(|d| self.devices[d.0].phase);
+        let reconfigurable = self.live_device(&name).is_some_and(|d| {
+            phase == Some(DevicePhase::Running)
+                && self.devices[d.0]
+                    .exports
+                    .iter()
+                    .any(|e| e == crate::RECONFIGURE_EXPORT)
+        });
         match &req.verb {
-            Verb::Create(spec) | Verb::Recreate(spec) => {
-                if matches!(req.verb, Verb::Recreate(_)) && phase.is_some() {
+            // Only the config changed, and the device takes configs in place: ask it. Its
+            // answer decides (`Infra::reconfigured`): a follow-up request records the config or
+            // recreates the device.
+            Verb::Reconfigure { spec, .. } if reconfigurable => {
+                let id = self.live_device(&name).expect("running");
+                let call =
+                    crate::ReconfigureCall::derived(spec.config.clone(), self.infra.clone(), n);
+                OpTarget::control(self, None, id, Box::new(call));
+                Ok(())
+            }
+            Verb::Configured(spec) => {
+                if let Some(id) = self.live_device(&name) {
+                    self.devices[id.0].config = spec.config.clone();
+                }
+                self.infra.configured(&name);
+                self.journal_event(&name, at, "device-reconfigured", Vec::new());
+                Ok(())
+            }
+            Verb::Create(spec) | Verb::Recreate(spec) | Verb::Reconfigure { spec, .. } => {
+                if !matches!(req.verb, Verb::Create(_)) && phase.is_some() {
                     self.infra.set_recreating(&name, true);
                     let removed = self.apply_change(
                         None,
@@ -1206,7 +1251,7 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
                         return Err(e);
                     }
                 }
-                let wire = self.cables(&spec.wire)?;
+                let wire = self.cables(&req.caller, &spec.wire)?;
                 self.applying = Some(n);
                 let added = self.apply_change(
                     None,
@@ -1245,19 +1290,82 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
                 OpTarget::control(self, None, id, Box::new(call));
                 Ok(())
             }
+            Verb::Wire(c) => {
+                let id = self
+                    .live_device(&name)
+                    .ok_or_else(|| format!("no device `{name}`"))?;
+                let cable = self.cables(&req.caller, std::slice::from_ref(c))?.remove(0);
+                let far = self
+                    .live_device(&cable.to_device)
+                    .ok_or_else(|| format!("wire: no device `{}`", cable.to_device))?;
+                let tag = self.clock.peek_tag();
+                let link = self
+                    .connect(id.port(cable.port), far.port(cable.to_port))
+                    .map_err(|e| e.to_string())?;
+                self.created_links.push((link.0, tag));
+                self.link_options(link.0, cable.latency, cable.mtu, cable.impairments);
+                let l = self.panel.link_info(link.0).name;
+                self.journal_event(&name, at, "link-added", vec![("link", l)]);
+                Ok(())
+            }
+            Verb::Unwire(port) => {
+                let id = self
+                    .live_device(&name)
+                    .ok_or_else(|| format!("no device `{name}`"))?;
+                let link = self
+                    .panel
+                    .links_of(id.0)
+                    .into_iter()
+                    .find(|&l| {
+                        self.panel
+                            .link_info(l)
+                            .ends
+                            .iter()
+                            .any(|e| e.device == id && e.port == *port)
+                    })
+                    .ok_or_else(|| format!("unwire: no cable at `{name}:{port}`"))?;
+                let info = self.panel.link_info(link);
+                let far = info.ends.iter().find(|e| e.device != id || e.port != *port);
+                if let Some(owner) =
+                    far.and_then(|e| self.infra.owner_of(&self.devices[e.device.0].name))
+                    && owner != req.caller
+                {
+                    return Err(format!(
+                        "unwire: the cable at `{name}:{port}` leads to a device of `{owner}`"
+                    ));
+                }
+                self.unwire(link, at);
+                self.journal_event(&name, at, "link-removed", vec![("link", info.name)]);
+                Ok(())
+            }
             _ => Ok(()),
         }
     }
 
-    /// A derived creation's cables, far ports resolved: a cable to a device without a port
-    /// takes its first free declared port (in order; none twice in one request).
-    fn cables(&self, wire: &[crate::infra::CableReq]) -> std::result::Result<Vec<Cable>, String> {
+    /// A controller's cables (of a creation, or `wire`), far ports resolved: a cable to a
+    /// device without a port takes its first free declared port (in order; none twice in one
+    /// request). The one rule for a controller's cables: the far end is a device `caller`
+    /// created or one of the network's own, never another controller's.
+    fn cables(
+        &self,
+        caller: &str,
+        wire: &[crate::infra::CableReq],
+    ) -> std::result::Result<Vec<Cable>, String> {
         let mut taken: Vec<(usize, u32)> = Vec::new();
         let mut out = Vec::new();
         for c in wire {
             let d = self
                 .live_device(&c.device)
                 .ok_or_else(|| format!("wire: no device `{}`", c.device))?;
+            if let Some(owner) = self.infra.owner_of(&c.device)
+                && owner != caller
+            {
+                return Err(format!(
+                    "wire: `{}` belongs to `{owner}`: a controller's cables go to its own \
+                     devices and the network's",
+                    c.device
+                ));
+            }
             let far = match c.far {
                 Some(p) => p,
                 None => {
@@ -1284,9 +1392,30 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
                 to_port: far,
                 latency: c.latency,
                 mtu: c.mtu,
+                impairments: c.impair,
             });
         }
         Ok(out)
+    }
+
+    /// A new link's latency, MTU (if given) and impairments by sending end (if given), before
+    /// any frame crosses it.
+    fn link_options(
+        &mut self,
+        link: usize,
+        latency: Nanos,
+        mtu: Option<u32>,
+        impairments: Option<[Impairments; 2]>,
+    ) {
+        self.panel.set_latency(link, latency);
+        if let Some(mtu) = mtu {
+            self.panel.set_mtu(link, mtu);
+        }
+        if let Some(imp) = impairments {
+            for (end, i) in imp.into_iter().enumerate() {
+                self.panel.set_impairments(link, Some(end), i);
+            }
+        }
     }
 
     /// Applies a topology change or name-resolved write (the [`Op`] of operator event `op`, or
@@ -1326,7 +1455,7 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
                     let d = self
                         .live_device(&c.to_device)
                         .ok_or_else(|| format!("wire: no device `{}`", c.to_device))?;
-                    ends.push((c.port, d.port(c.to_port), c.latency, c.mtu));
+                    ends.push((c.port, d.port(c.to_port), c.latency, c.mtu, c.impairments));
                 }
                 // Its creator: the controller whose request this is, or the embedder.
                 let creator = self
@@ -1360,16 +1489,13 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
                 }
                 self.journal_event(&name, at, "device-added", vec![("component", component)]);
                 // Its cables, before it first runs (this op's rounds come after).
-                for (port, far, latency, mtu) in ends {
+                for (port, far, latency, mtu, impairments) in ends {
                     let tag = self.clock.peek_tag();
                     let link = self
                         .connect(DeviceId(idx).port(port), far)
                         .map_err(|e| format!("`{name}` was added, but: {e}"))?;
                     self.created_links.push((link.0, tag));
-                    self.panel.set_latency(link.0, latency);
-                    if let Some(mtu) = mtu {
-                        self.panel.set_mtu(link.0, mtu);
-                    }
+                    self.link_options(link.0, latency, mtu, impairments);
                     let l = self.panel.link_info(link.0).name;
                     self.journal_event(&name, at, "link-added", vec![("link", l)]);
                 }
@@ -1442,6 +1568,7 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
                 mtu,
                 kind,
                 cable,
+                impairments,
             } => {
                 let end = |l: &Self, (name, port): &(String, u32)| {
                     l.live_device(name)
@@ -1452,10 +1579,7 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
                 let tag = self.clock.peek_tag();
                 let link = self.connect(pa, pb).map_err(|e| e.to_string())?;
                 self.created_links.push((link.0, tag));
-                self.panel.set_latency(link.0, latency);
-                if let Some(mtu) = mtu {
-                    self.panel.set_mtu(link.0, mtu);
-                }
+                self.link_options(link.0, latency, mtu, impairments);
                 if kind != LinkKind::Ethernet {
                     self.panel.set_kind(link.0, kind);
                 }
@@ -1616,7 +1740,7 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
             match cascade {
                 Cascade::Stop if self.devices[i].phase == DevicePhase::Running => {
                     self.stop_device(i, at);
-                    self.infra.set_phase(&name, Phase::Stopped, at);
+                    self.infra.stopped_with(&name, &owner, at);
                     self.journal_event(&name, at, "device-stopped", fields);
                 }
                 Cascade::Remove => self.remove_device(i, at, fields),
@@ -2387,6 +2511,9 @@ pub struct Cable {
     pub latency: Nanos,
     /// The link's MTU, if not the default.
     pub mtu: Option<u32>,
+    /// Its impairments by sending end (from the new device's port, then from the far end),
+    /// set before any frame crosses it; `None`: unimpaired.
+    pub impairments: Option<[Impairments; 2]>,
 }
 
 /// An operator event the sim core applies (`docs/design/event-order.md`).
@@ -2445,6 +2572,9 @@ pub enum Op {
         kind: LinkKind,
         /// A cable's setup value ([`LinkMut::cable_setup`]).
         cable: Option<ExtValue>,
+        /// Its impairments by sending end (from `a`, then from `b`), set before any frame
+        /// crosses it; `None`: unimpaired.
+        impairments: Option<[Impairments; 2]>,
     },
     /// Unwires a link by name: it goes down and its ports are free again.
     Unwire { link: String },
