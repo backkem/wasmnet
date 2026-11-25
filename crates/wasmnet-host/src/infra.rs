@@ -126,6 +126,22 @@ impl devices::Host for HostState {
             .map_err(error)
     }
 
+    fn control_answer(
+        &mut self,
+        request_id: String,
+    ) -> Result<Option<types::CommandAnswer>, types::Error> {
+        let end = self.infra.as_ref().ok_or_else(ungranted)?;
+        Ok(end
+            .control_answer(&request_id)
+            .map_err(error)?
+            .map(|a| types::CommandAnswer {
+                name: a.name,
+                command: a.command,
+                at: a.at,
+                answer: a.answer,
+            }))
+    }
+
     fn get(&mut self, name: String) -> Result<types::Device, types::Error> {
         let end = self.infra.as_ref().ok_or_else(ungranted)?;
         end.get(&name).map(device).map_err(error)

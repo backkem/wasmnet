@@ -53,7 +53,32 @@ fn with<R>(f: impl FnOnce(&mut Script) -> R) -> R {
 fn run(step: &Step) -> (String, Vec<(String, String)>) {
     let id = Some(step.request_id.as_str());
     let name = step.name.as_str();
+    if let Some(when) = &step.when {
+        let answer = devices::control_answer(&when.request_id).ok().flatten();
+        let text = answer.as_ref().and_then(|a| a.answer.as_ref().ok());
+        if !when.holds(text.map(String::as_str)) {
+            return ("skipped".to_owned(), Vec::new());
+        }
+    }
     let answer = match &step.verb {
+        Verb::Answer => {
+            return match devices::control_answer(name) {
+                Ok(None) => ("pending".to_owned(), Vec::new()),
+                Ok(Some(a)) => {
+                    let (result, text) = match a.answer {
+                        Ok(t) => ("ok", t),
+                        Err(t) => ("err", t),
+                    };
+                    let text = text.lines().collect::<Vec<_>>().join(" | ");
+                    let fields = vec![
+                        ("at".to_owned(), a.at.to_string()),
+                        ("text".to_owned(), text),
+                    ];
+                    (result.to_owned(), fields)
+                }
+                Err(e) => (format!("{e:?}"), Vec::new()),
+            };
+        }
         Verb::Apply { spec } => {
             devices::apply(id, name, &[], spec).map(|a| if a.changed { "ok" } else { "unchanged" })
         }

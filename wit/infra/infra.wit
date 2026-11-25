@@ -42,8 +42,8 @@
 /// No other system's types cross this interface: a controller translates whatever it speaks
 /// into these specs.
 ///
-/// Versions: 0.1.1 added `devices.control`; 0.1.2 added `changes.wait` and the spec keys `args`
-/// and `env`. A component built against 0.1.0 or 0.1.1 still links, since an addition keeps
+/// Versions: 0.1.1 added `devices.control`; 0.1.2 added `changes.wait`,
+/// `devices.control-answer` and the spec keys `args` and `env`. A component built against 0.1.0 or 0.1.1 still links, since an addition keeps
 /// the `0.1` line compatible.
 package wasmnet:infra@0.1.2;
 
@@ -126,6 +126,17 @@ interface types {
         line: string,
     }
 
+    /// The answer to a command (`devices.control-answer`, 0.1.2).
+    record command-answer {
+        /// The device it went to, and the command.
+        name: string,
+        command: string,
+        /// When it came: the instant the command ran in the device (or was refused).
+        at: instant,
+        /// The device's `ok` text or its refusal (or why the command never reached it).
+        answer: result<string, string>,
+    }
+
     /// What `apply` did.
     record applied {
         device: device,
@@ -159,7 +170,7 @@ interface types {
 /// `conflict`. Every mutation but `control` is idempotent by name besides: asking for what is
 /// already true (or already queued) queues nothing.
 interface devices {
-    use types.{instant, rv, labels, phase, device, change, log-line, applied, error};
+    use types.{instant, rv, labels, phase, device, change, log-line, applied, command-answer, error};
 
     /// Creates the device `name` from `spec` (CBOR) with `labels`, or updates it: a device with
     /// another spec is recreated (removed and added again with its new cables, in one change:
@@ -193,10 +204,13 @@ interface devices {
     ///   derived event applies, at `now` and after any request still queued for the device (so an
     ///   `apply` followed by a `control` reaches the new device), and the device is polled at that
     ///   instant after it. Returns the device as asked for (`target`: `running`).
-    /// - The device's answer is not returned. A refusal (the device's `err`, or a device that
-    ///   stopped meanwhile or takes no commands) is journalled on the caller as
-    ///   `infra-failed {verb: control, name, message}` at the instant it is known, and shown as
-    ///   the device's `message`; what a command did is in the device's own journal.
+    /// - The device's answer is not returned by this call: it comes later, when the command
+    ///   runs. With a request id, `control-answer` reads it from then on. Either way the answer
+    ///   is a `modified` change of the device (which wakes `changes.wait`); a refusal (the
+    ///   device's `err`, or a device that stopped meanwhile or takes no commands) is also
+    ///   journalled on the caller as `infra-failed {verb: control, name, message}` at the
+    ///   instant it is known, and shown as the device's `message`; what a command did is in the
+    ///   device's own journal.
     /// - Idempotent by request id only: without one, every call sends the command again, so a
     ///   device's commands should be idempotent themselves (the router's are).
     /// - Fails with `not-found` for no such device; `denied` for a device another owner or the
@@ -204,6 +218,15 @@ interface devices {
     ///   1 to 63 lowercase letters, digits and `-` starting with a letter, an argument over
     ///   64 KiB, or a device that is not running or about to run.
     control: func(request-id: option<string>, name: string, command: string, argument: string) -> result<device, error>;
+
+    /// The answer to the command this caller sent with `request-id` (0.1.2): `none` while it has
+    /// not run yet, then the device's `ok` text or its refusal (or why the command never reached
+    /// the device), at most 64 KiB (longer answers are cut). Answers are the caller's own; the
+    /// host keeps the last 256 commands each caller sent with a request id. It is answered from
+    /// the instant the command runs (the derived event's own instant), the same on every replay
+    /// and in a world split over sites. Fails with `not-found` for a request id the caller sent
+    /// no command with, or one more than 256 commands ago.
+    control-answer: func(request-id: string) -> result<option<command-answer>, error>;
 
     /// One device of the caller's view (including one still `pending`).
     get: func(name: string) -> result<device, error>;

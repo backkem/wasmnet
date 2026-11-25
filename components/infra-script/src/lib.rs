@@ -16,11 +16,18 @@
 //!   `control <name> <command> [<argument>]` (the argument is the rest of the line, trimmed),
 //!   `start <name>`, `stop <name>` (no grace period), `remove <name>`, or
 //!   `logs <name> [stdout|stderr] [<tail>]` (the device's journalled output lines, default
-//!   `stderr` and every line).
+//!   `stderr` and every line), or `answer <request-id>` (the answer to the command sent with
+//!   that request id: `devices.control-answer`).
+//! * `when=<request-id>~<text>` or `when=<request-id>!<text>` (after `id=`, if any): the step
+//!   runs only if the answer to the command sent with that request id has come, is `ok`, and
+//!   contains (`~`) or does not contain (`!`) `<text>` (no spaces); otherwise its result is
+//!   `skipped`. That is a controller acting on what a device answered.
 //!
 //! Every step's result is journalled as `infra-script {step, verb, name, result}`: `result` is
 //! `ok`, `unchanged` (an `apply` that changed nothing, a `remove` of nothing) or the error. A
-//! `logs` step adds `lines` (how many) and `text` (the lines, joined with ` | `).
+//! `logs` step adds `lines` (how many) and `text` (the lines, joined with ` | `); an `answer`
+//! step adds `at` and `text` (the answer's lines, joined with ` | `), and its `result` is `ok`,
+//! `err` (the device refused), `pending` or the error.
 //! Unknown keys and malformed steps are configuration errors (the glue logs and traps).
 //!
 //! This file is pure logic with no bindings, unit-tested inside wasmtime. The wit-bindgen glue
@@ -51,6 +58,8 @@ pub enum Verb {
         stream: String,
         tail: u32,
     },
+    /// `devices.control-answer` for the step's name, a request id.
+    Answer,
 }
 
 impl Verb {
@@ -62,6 +71,7 @@ impl Verb {
             Verb::Stop => "stop",
             Verb::Remove => "remove",
             Verb::Logs { .. } => "logs",
+            Verb::Answer => "answer",
         }
     }
 }
@@ -73,8 +83,28 @@ pub struct Step {
     pub at: u64,
     pub request_id: String,
     pub verb: Verb,
-    /// The device it is about.
+    /// The device it is about (for `answer`, the request id).
     pub name: String,
+    /// It runs only if this holds.
+    pub when: Option<When>,
+}
+
+/// A step's condition on the answer to an earlier command (`when=`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct When {
+    /// The request id the command was sent with.
+    pub request_id: String,
+    /// `true`: the answer contains `text`; `false`: it does not.
+    pub contains: bool,
+    pub text: String,
+}
+
+impl When {
+    /// Whether the condition holds for `answer`: the answer's `ok` text, if it came and was
+    /// `ok`. No answer (yet), or a refusal, never satisfies it.
+    pub fn holds(&self, answer: Option<&str>) -> bool {
+        answer.is_some_and(|a| a.contains(self.text.as_str()) == self.contains)
+    }
 }
 
 /// A step that could not be parsed.
@@ -102,7 +132,8 @@ fn hex(text: &str) -> Option<Vec<u8>> {
 
 /// Parses one step's value.
 pub fn parse_step(n: u32, text: &str) -> Result<Step, String> {
-    let syntax = "`<at> [id=<id>] apply|control|start|stop|remove|logs <name> [<rest>]`";
+    let syntax = "`<at> [id=<id>] [when=<id>~|!<text>] \
+                  apply|control|start|stop|remove|logs|answer <name> [<rest>]`";
     let text = text.trim();
     let (at, rest) = text.split_once(char::is_whitespace).ok_or(syntax)?;
     let at = parse_duration(at).ok_or_else(|| format!("`{at}` is not a duration"))?;
@@ -111,6 +142,22 @@ pub fn parse_step(n: u32, text: &str) -> Result<Step, String> {
     if let Some(id) = rest.strip_prefix("id=") {
         let (id, after) = id.split_once(char::is_whitespace).ok_or(syntax)?;
         request_id = id.to_owned();
+        rest = after.trim_start();
+    }
+    let mut when = None;
+    if let Some(cond) = rest.strip_prefix("when=") {
+        let shape = "when: `<request-id>~<text>` or `<request-id>!<text>`";
+        let (cond, after) = cond.split_once(char::is_whitespace).ok_or(syntax)?;
+        let at = cond.find(['~', '!']).ok_or(shape)?;
+        let (id, text) = (&cond[..at], &cond[at + 1..]);
+        if id.is_empty() || text.is_empty() {
+            return Err(shape.to_owned());
+        }
+        when = Some(When {
+            request_id: id.to_owned(),
+            contains: cond.as_bytes()[at] == b'~',
+            text: text.to_owned(),
+        });
         rest = after.trim_start();
     }
     let (verb, rest) = rest.split_once(char::is_whitespace).ok_or(syntax)?;
@@ -140,6 +187,10 @@ pub fn parse_step(n: u32, text: &str) -> Result<Step, String> {
         "start" => Verb::Start,
         "stop" => Verb::Stop,
         "remove" => Verb::Remove,
+        "answer" if !rest.is_empty() => {
+            return Err("answer: takes only a request id".to_owned());
+        }
+        "answer" => Verb::Answer,
         "logs" => {
             let mut words = rest.split_whitespace();
             let stream = match words.next() {
@@ -169,6 +220,7 @@ pub fn parse_step(n: u32, text: &str) -> Result<Step, String> {
         request_id,
         verb,
         name: name.to_owned(),
+        when,
     })
 }
 
@@ -291,6 +343,39 @@ mod tests {
             }
         );
         assert_eq!(again.next_deadline(), None);
+    }
+
+    #[test]
+    fn answers_and_conditions_on_them() {
+        let s = parse_step(0, "5ms answer q").unwrap();
+        assert_eq!((s.verb, s.name.as_str(), s.when), (Verb::Answer, "q", None));
+        let s = parse_step(1, "5ms id=x when=q!10.0.3.0/24 control r1 route-add y").unwrap();
+        let when = s.when.expect("a condition");
+        assert_eq!(
+            when,
+            When {
+                request_id: "q".into(),
+                contains: false,
+                text: "10.0.3.0/24".into()
+            }
+        );
+        assert_eq!(s.request_id, "x");
+        assert!(when.holds(Some("10.0.1.0/24 port 1")));
+        assert!(!when.holds(Some("10.0.3.0/24 via 10.0.2.2")));
+        assert!(!when.holds(None), "no answer yet: never");
+        let has = parse_step(2, "5ms when=q~port answer q")
+            .unwrap()
+            .when
+            .unwrap();
+        assert!(has.contains && has.holds(Some("a port")));
+        for bad in [
+            "5ms answer q extra",
+            "5ms when=q answer q",
+            "5ms when=~x answer q",
+            "5ms when=q~ answer q",
+        ] {
+            assert!(parse_step(0, bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]
