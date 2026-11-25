@@ -976,3 +976,48 @@ fn a_waking_controller_matches_the_unsplit_run() {
         );
     }
 }
+
+/// `devices.wire` follows the rule of a creation's cables: a far end on another site fails the
+/// split run at that event, the same every time, where the unsplit network wires it. The
+/// `unwire` before it stays on the controller's site and is fine.
+#[test]
+fn a_wire_to_another_site_fails_the_split_run_deterministically() {
+    let mut plan = one_controller("r1:1");
+    let to_b = Value::Map(vec![
+        (Value::text("port"), Value::Uint(1)),
+        (Value::text("to"), Value::text("sw-b")),
+        (Value::text("latency"), Value::Uint(50 * US)),
+    ])
+    .encode();
+    let ctl = &mut plan.devices[1].config;
+    ctl.insert("step.20".to_owned(), "150ms unwire r1 1".to_owned());
+    ctl.insert(
+        "step.21".to_owned(),
+        format!("200ms wire r1 {}", hex(&to_b)),
+    );
+    let whole = run_whole(&plan, 42);
+    assert_eq!(
+        events(&whole.journal, "r1", "link-removed").len(),
+        1,
+        "{}",
+        transcript(&whole.journal)
+    );
+    assert!(
+        events(&whole.journal, "r1", "link-added")
+            .iter()
+            .any(|f| field(f, "link") == "r1.1-sw-b.2"),
+        "the unsplit network wires it:\n{}",
+        transcript(&whole.journal)
+    );
+    let failure = || match run_split(&plan, 42) {
+        Ok(_) => panic!("the split run should fail"),
+        Err(e) => e,
+    };
+    let (site, at, message) = failure();
+    assert_eq!((site, at), (0, 200 * MS), "{message}");
+    assert!(
+        message.contains("asked for a cable from `r1` to `sw-b`"),
+        "{message}"
+    );
+    assert_eq!(failure(), (site, at, message));
+}
