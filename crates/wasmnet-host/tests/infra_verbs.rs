@@ -593,3 +593,145 @@ fn a_device_built_directly_starts_again_without_a_resolver() {
         );
     });
 }
+
+// ---- a command's answer, for its controller ----
+
+/// `ctl` creates the router `r1` between the client's network (10.0.1.0/24, on `lan`) and the
+/// transit network (10.0.2.0/24, on `wan`), behind which `gw` leads to the server's network
+/// (10.0.3.0/24). It sends `r1` the command `routes` with a request id, reads the answer, and
+/// adds the route to 10.0.3.0/24 only if the answer lacks it; then reads `routes` again. When
+/// `r1` was created with that route already, the conditional step is skipped. Either way the
+/// client's fetch from the server succeeds.
+fn answering_network(seed: u64, with_route: bool) -> Network<'static> {
+    let b = built();
+    let mut network = network(seed);
+    let router = b.load("router");
+    let lan = network
+        .device_with_config("lan", &b.load("switch"), config(&[("ports", "3")]))
+        .unwrap();
+    let wan = network
+        .device_with_config("wan", &b.load("switch"), config(&[("ports", "3")]))
+        .unwrap();
+    let gw = network
+        .device_with_config(
+            "gw",
+            &router,
+            config(&[
+                ("mac", "02:00:00:00:fe:20"),
+                ("port0.ipv4", "10.0.2.2/24"),
+                ("port1.ipv4", "10.0.3.1/24"),
+                ("routes", "10.0.1.0/24 via 10.0.2.1"),
+            ]),
+        )
+        .unwrap();
+    let server = network
+        .device_with_config(
+            "server",
+            &b.load("node-http-server"),
+            config(&[
+                ("mac", "02:00:00:00:03:10"),
+                ("ipv4", "10.0.3.10/24"),
+                ("ipv4-gateway", "10.0.3.1"),
+            ]),
+        )
+        .unwrap();
+    let client = network
+        .device_with_config(
+            "client",
+            &b.load("node-http-get"),
+            config(&[
+                ("mac", "02:00:00:00:01:20"),
+                ("ipv4", "10.0.1.20/24"),
+                ("ipv4-gateway", "10.0.1.1"),
+                ("app.http-get.url", "http://10.0.3.10/"),
+                ("app.http-get.start", "50ms"),
+            ]),
+        )
+        .unwrap();
+    let mut r1 = vec![
+        ("mac", "02:00:00:00:fe:10"),
+        ("port0.ipv4", "10.0.1.1/24"),
+        ("port1.ipv4", "10.0.2.1/24"),
+    ];
+    if with_route {
+        r1.push(("routes", "10.0.3.0/24 via 10.0.2.2"));
+    }
+    let r1 = spec("router", &r1, &["lan", "wan"], Vec::new());
+    network
+        .device_with_options(
+            "ctl",
+            &b.load("infra_script"),
+            script(&[
+                format!("0ms apply r1 {}", hex(&r1)),
+                "1ms id=q control r1 routes".to_owned(),
+                "1ms answer q".to_owned(),
+                "2ms answer q".to_owned(),
+                "2ms id=add when=q!10.0.3.0/24 control r1 route-add 10.0.3.0/24 via 10.0.2.2"
+                    .to_owned(),
+                "3ms id=q2 control r1 routes".to_owned(),
+                "4ms answer q2".to_owned(),
+                "4ms answer nope".to_owned(),
+            ]),
+            controller(Cascade::Keep),
+        )
+        .unwrap();
+    for (a, b) in [
+        (client.port(0), lan.port(0)),
+        (gw.port(0), wan.port(0)),
+        (server.port(0), gw.port(1)),
+    ] {
+        network.link(a, b).unwrap().latency(100 * US);
+    }
+    network
+}
+
+#[test]
+fn a_controller_reads_a_commands_answer_and_acts_on_it() {
+    for with_route in [false, true] {
+        at_two_seeds(
+            1_000 * MS,
+            |seed| answering_network(seed, with_route),
+            |network, seed| {
+                let journal = network.journal();
+                let log = transcript(&journal);
+                let steps = events(&journal, "ctl", "infra-script");
+                let step = |n: u32| {
+                    steps
+                        .iter()
+                        .find(|f| field(f, "step") == n.to_string())
+                        .unwrap_or_else(|| panic!("step {n}:\n{log}"))
+                };
+                // Asked in the same poll the command was sent in: not answered yet.
+                assert_eq!(field(step(2), "result"), "pending", "{log}");
+                // A millisecond later: `r1`'s table, as the router wrote it, at 1 ms.
+                let first = step(3);
+                assert_eq!(field(first, "result"), "ok", "{log}");
+                assert_eq!(field(first, "at"), MS.to_string());
+                assert!(field(first, "text").contains("10.0.1.0/24"), "{first:?}");
+                assert_eq!(
+                    field(first, "text").contains("10.0.3.0/24"),
+                    with_route,
+                    "{first:?}"
+                );
+                // The route is added only when the answer lacked it.
+                let added = field(step(4), "result");
+                assert_eq!(added, if with_route { "skipped" } else { "ok" }, "{log}");
+                assert_eq!(
+                    events(&journal, "r1", "route-added").len(),
+                    usize::from(!with_route),
+                    "{log}"
+                );
+                assert!(field(step(6), "text").contains("10.0.3.0/24 via 10.0.2.2"));
+                assert!(field(step(7), "result").contains("NotFound"), "{log}");
+                // Either way the client reaches the server through it.
+                let done = events(&journal, "client", "http-get-done");
+                assert_eq!(
+                    done.len(),
+                    1,
+                    "with_route={with_route}, seed {seed}:\n{log}"
+                );
+                assert_eq!(field(&done[0], "status"), "200");
+            },
+        );
+    }
+}

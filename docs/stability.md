@@ -16,7 +16,8 @@ address translation and packet filter with their keys and commands (`tests/nat.r
 operator events (`Op::Control` with a `DeviceCommand`) is embedder surface like every
 operator event, though that test exercises it too. So are a device's arguments and
 environment (`DeviceOptions::args` and `env`, the spec keys `args` and `env`), a controller's
-`logs` of its own devices, `DeviceOptions::infra_cascade` and `wasmnet:infra/changes.wait`
+`logs` of its own devices, `devices.control-answer`, `DeviceOptions::infra_cascade` and
+`wasmnet:infra/changes.wait`
 (`crates/wasmnet-host/tests/infra_verbs.rs`). `Runtime::Component` must be `ToOwned`, so a
 network keeps each device's component to start it again.
 

@@ -202,7 +202,7 @@ the device is running or about to be (`invalid` otherwise). It follows the rules
 mutation: it validates and records (`infra-control {name, command}` on the caller), and queues
 a derived event at the caller's position, after anything still queued for that device (so an
 `apply` and a `control` in one poll reach the new device). When the event applies the command
-runs in the device. The answer is not returned to the caller: a refusal (the device's error, a
+runs in the device. The answer is not returned by the call: a refusal (the device's error, a
 device that stopped meanwhile or takes no commands) is journalled on the caller as
 `infra-failed {verb: control, name, message}`, at the instant and in the processing context
 the device gave it, and shown as the device's `message`; what the command did is in the
@@ -211,9 +211,30 @@ answered from the record and not sent again; without a request id, every call se
 command, so commands should be idempotent (the router's are). In a split network it reaches
 the controller's own devices, which are on its site.
 
+**Reading the answer: `devices.control-answer(request-id)`** (0.1.2). A controller that sent a
+command with a request id reads its answer by that id: `none` until the command has run, then
+the device's `ok` text or its refusal (or why it never reached the device), with the instant
+it came. A read by request id, rather than the answer on the device's record, because the
+`device` record cannot grow a field without breaking the package, because several commands to
+one device can be in flight at once, and because a router's `tunnels` or `routes` listing is
+an answer to one question, not a property of the device. Bounds: the host keeps the answers to
+the last 256 commands each caller sent with a request id (an older id is `not-found`), each at
+most 64 KiB (cut at a character boundary). An answer is a controller's own: no other caller
+reads it. It is available from the instant the command runs, which is the derived event's own
+instant (so not within the poll that sent it), the same on every replay and, since the device
+is on the caller's site, in a split network. Every answer, `ok` or not, is also a `modified`
+change of the device (its `message` the refusal, or none), so a controller waiting on
+`changes.wait` wakes when it comes. This is new for `ok` answers: before 0.1.2 an answer that
+was not a refusal left the table as it was, so a controller that sends commands now sees one
+more change, and one more resource version, per command. The `infra-script` fixture reads
+answers (`answer <request-id>`) and makes a step depend on one (`when=<id>~<text>`, `!<text>`):
+[crates/wasmnet-host/tests/infra_verbs.rs](../../crates/wasmnet-host/tests/infra_verbs.rs) adds a
+route to a router only when its `routes` answer lacks it.
+
 The package went from `wasmnet:infra@0.1.0` to `0.1.1` (`devices.control`) and to `0.1.2`
-(`changes.wait`, the spec keys `args` and `env`): additions, so a component built against an
-earlier `0.1` still links (wasmtime matches `0.1.x` imports semver-compatibly).
+(`changes.wait`, `devices.control-answer`, the spec keys `args` and `env`): additions, so a
+component built against an earlier `0.1` still links (wasmtime matches `0.1.x` imports
+semver-compatibly).
 
 The `infra-script` test fixture ([components/infra-script](../../components/infra-script)) is
 a controller with a script: a stepped device with no ports that makes `apply`, `control`,
