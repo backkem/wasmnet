@@ -5,8 +5,9 @@
 //!
 //! Everything a device is served comes from the sim core, as on the wasmtime backend: its
 //! entropy ([`DeviceEntropy`]), its `argv` ([`wasmnet_core::argv`]), its `wasmnet:infra` calls
-//! ([`Calls`]), the answers of its control calls ([`CommandCall`], [`ReconfigureCall`]) and its
-//! `app-exit` records ([`JournalEnd::app_exit`]). This module only routes.
+//! ([`Calls`]), the answers of its control calls ([`wasmnet_core::CommandCall`],
+//! [`wasmnet_core::ReconfigureCall`], every one an export call by name) and its `app-exit`
+//! records ([`JournalEnd::app_exit`]). This module only routes.
 //!
 //! **Re-entrancy.** An actor calls into JavaScript (`receive`), the guest calls an import, and the
 //! import calls back into this crate (`transmit`) while the actor is still being polled. So
