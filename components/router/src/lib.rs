@@ -54,6 +54,7 @@ pub mod neighbor;
 pub mod route;
 pub mod router;
 pub mod track;
+pub mod tunnel;
 pub mod wire;
 
 #[cfg(test)]
