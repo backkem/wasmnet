@@ -211,6 +211,32 @@ impl CompileCache {
             self.remember(path, s, &content);
         }
         let artifact = self.artifact(engine, &content);
+        self.through(engine, &artifact, &bytes, start)
+    }
+
+    /// Loads the component `bytes` from the cache when possible, else compiles and stores it:
+    /// for bytes that come from no file (a component a controller supplied). The artifact is
+    /// named by the bytes' full SHA-256 (64 hex digits, unlike a file's 32), computed here, and
+    /// the engine's key: whoever chooses the bytes chooses only the artifact of those bytes.
+    pub fn load_bytes(&self, engine: &Engine, bytes: &[u8]) -> Result<Component> {
+        let start = Instant::now();
+        let content: String = Sha256::digest(bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let artifact = self.artifact(engine, &content);
+        self.through(engine, &artifact, bytes, start)
+    }
+
+    /// `artifact` if it loads, else `bytes` compiled (once across processes) and stored there.
+    fn through(
+        &self,
+        engine: &Engine,
+        artifact: &Path,
+        bytes: &[u8],
+        start: Instant,
+    ) -> Result<Component> {
+        let artifact = artifact.to_path_buf();
         let component = match deserialize(engine, &artifact) {
             Some(c) => {
                 self.hits.fetch_add(1, Ordering::Relaxed);
@@ -232,7 +258,7 @@ impl CompileCache {
                     }
                     None => {
                         let c =
-                            Component::from_binary(engine, &bytes).map_err(crate::runtime_error)?;
+                            Component::from_binary(engine, bytes).map_err(crate::runtime_error)?;
                         self.misses.fetch_add(1, Ordering::Relaxed);
                         if let Ok(serialized) = c.serialize()
                             && store(&artifact, &serialized).is_ok()
@@ -622,6 +648,35 @@ mod tests {
             name.ends_with(".cwasm") && name.len() == 32 + 1 + 16 + 6,
             "{name}"
         );
+    }
+
+    /// Bytes without a file (a supplied component) are compiled once and then loaded, under
+    /// their full SHA-256: other bytes never get their artifact.
+    #[test]
+    fn bytes_are_cached_by_their_full_digest() {
+        let dir = std::env::temp_dir().join(format!("wasmnet-bytes-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut config = wasmtime::Config::new();
+        config.wasm_component_model(true);
+        let engine = Engine::new(&config).unwrap();
+        let cache = CompileCache::new(&dir);
+        // The smallest component: its header, no sections.
+        let empty = b"\0asm\x0d\0\x01\0";
+        cache.load_bytes(&engine, empty).expect("compiles");
+        cache.load_bytes(&engine, empty).expect("loads");
+        let stats = cache.stats();
+        assert_eq!((stats.misses, stats.hits), (1, 1));
+        let names: Vec<String> = artifacts(&dir)
+            .into_iter()
+            .map(|(_, _, p)| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        let full: String = Sha256::digest(empty)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(names, [format!("{full}-{}.cwasm", engine_key(&engine))]);
+        assert!(cache.load_bytes(&engine, b"not a component").is_err());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// A component's content key is remembered by path and stamp, in this process and in the

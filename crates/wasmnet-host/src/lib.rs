@@ -84,6 +84,8 @@
 //! * [`Sim`]: runs one `wasi:cli/run` command (p2 or p3) under a virtual clock.
 //! * [`DeviceOptions`]: a device's own fuel budget per instant, its stdout/stderr lines in the
 //!   journal ([`Record::Output`], [`Network::stdout`]), and its `wasmnet:infra` grant.
+//! * [`ImportPolicy`]: a ready-made admission for components controllers supply
+//!   ([`sim::Network::set_supply_admission`]): an allow list of imports, checked by parsing.
 //! * [`HostExtension`]: extra host capabilities linked into every store
 //!   (`Host::with_extension`), with per-store state in [`HostState`]; its rules and hook order
 //!   are in `docs/design/runtime-and-extensions.md`.
@@ -95,7 +97,7 @@
 //! `wasi:config/store` imports), `command` ([`Sim`], the command runner), `wasi` (the
 //! deterministic WASI linker, [`HostState`]), `stdio` (captured, optionally journalled
 //! stdout/stderr, and stdin), `infra` (`wasmnet:infra`), `extension` ([`HostExtension`],
-//! [`ControlHandler`]), `cache` ([`CompileCache`]). Virtual time, the event queue, the
+//! [`ControlHandler`]), `cache` ([`CompileCache`]), `admit` ([`ImportPolicy`]). Virtual time, the event queue, the
 //! executors, the patch panel, the journal, the seeded PRNG and pcap live in the sim core
 //! ([`sim`]).
 //!
@@ -107,6 +109,7 @@
 #![deny(unsafe_code)]
 
 mod actor;
+mod admit;
 mod cache;
 mod command;
 mod control;
@@ -133,6 +136,7 @@ use std::path::Path;
 use wasmtime::component::{Component, Linker};
 use wasmtime::{Config, Engine};
 
+pub use admit::{ImportPolicy, component_imports};
 pub use cache::{CacheStats, CompileCache, default_cache_dir};
 /// The compile cache's default budget, default place and pruning.
 pub mod compile_cache {

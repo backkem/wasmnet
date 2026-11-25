@@ -1593,6 +1593,7 @@ dependencies = [
  "wasmnet-core",
  "wasmnet-det-cbor",
  "wasmnet-wire",
+ "wasmparser 0.261.0",
  "wasmtime",
  "wasmtime-wasi",
 ]

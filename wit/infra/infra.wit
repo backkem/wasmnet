@@ -24,7 +24,9 @@
 /// name, plus its cables:
 ///
 /// ```text
-/// { "component": "node:http-server",          ; a catalog name
+/// { "component": "node:http-server",          ; a catalog name, or a digest reference
+///                                               ; "sha256:<64 hex>" of a component the
+///                                               ; caller supplied (`components.supply`)
 ///   "config":    { "mac": "02:..", "app.http-server.listen": "0.0.0.0:80", ... },
 ///                                               ; text values; nested maps flatten with "."
 ///   ? "stdio":   "journal",                     ; stdout/stderr lines into the journal
@@ -56,9 +58,9 @@
 /// into these specs.
 ///
 /// Versions: 0.1.1 added `devices.control`; 0.1.2 added `changes.wait`, `devices.control-answer`,
-/// `devices.wire`, `devices.unwire`, the spec keys `args`, `env` and `memory` and the cable key
-/// `impair`. A component built against 0.1.0 or 0.1.1 still links, since an addition keeps the
-/// `0.1` line compatible.
+/// `devices.wire`, `devices.unwire`, `components`, the spec keys `args`, `env` and `memory`, digest
+/// references as a spec's `component` and the cable key `impair`. A component built against
+/// 0.1.0 or 0.1.1 still links, since an addition keeps the `0.1` line compatible.
 package wasmnet:infra@0.1.2;
 
 interface types {
@@ -162,7 +164,7 @@ interface types {
         /// The name is taken by a device with another owner, or a request id was reused with
         /// other arguments.
         conflict(string),
-        /// No such device.
+        /// No such device, or no such component in the caller's store.
         not-found(string),
         /// A malformed spec, name, selector, stream or command, or a command for a device that
         /// is not running.
@@ -192,7 +194,9 @@ interface devices {
     /// device starts running when the change applies (there is no separate start: a later
     /// `start` is a no-op). Returns the device as asked for (`pending`, or with its `target`).
     /// Fails with `conflict` if `name` belongs to another owner (or to the network's
-    /// description), `invalid` for a bad spec, `denied` for a spec that grants authority.
+    /// description), `invalid` for a bad spec, `denied` for a spec that grants authority or
+    /// names a digest reference from a caller not granted `components`, `not-found` for a
+    /// digest reference the caller's store does not keep.
     apply: func(request-id: option<string>, name: string, labels: labels, spec: list<u8>) -> result<applied, error>;
 
     /// Starts a stopped or crashed device again (a fresh instance of its component and config; the links
@@ -310,9 +314,74 @@ interface changes {
     wait: async func(selector: labels, since: rv, deadline: option<instant>) -> result<rv, error>;
 }
 
+/// Components a controller supplies as bytes (0.1.2), for a controller that fetches a component
+/// over the network (from a store node) and runs it. Served only to a controller the embedder
+/// grants it (`DeviceOptions::infra_supply`, which needs `DeviceOptions::infra`); every call of
+/// any other device is `denied` (`list`: empty).
+///
+/// A component is named by its **digest reference**, `sha256:` and the SHA-256 of its bytes in
+/// 64 lowercase hex digits, which a spec's `component` may be (`devices.apply`): the device is
+/// made from the caller's own bytes, never another controller's. The embedder decides what may
+/// run: it judges every supplied component before anything keeps, compiles or instantiates it,
+/// and a component that imports what the host does not serve fails its creation (`failed`, the
+/// device's `message` names the import). A component is compiled once per digest, however many
+/// devices are made from it.
+///
+/// **The store.** Each controller has its own: a component stays in it while the caller holds
+/// it (from `supply` until `release`, or until the caller is removed), while a device of the
+/// caller in the table names it (in any phase), or while a request still queued names it, and
+/// goes (journalled as `component-dropped`) at the first point none is left. The embedder
+/// bounds the largest component and the store's count and total bytes.
+///
+/// Every function is **sync and never yields**. Bytes are copied across the boundary; the host
+/// never journals them, only their digest and size.
+interface components {
+    use types.{error};
+
+    /// One component the caller's store keeps.
+    record supplied {
+        /// Its digest reference, `sha256:<64 hex>`.
+        digest: string,
+        /// Its size in bytes.
+        size: u64,
+        /// The caller holds it (`supply` until `release`).
+        held: bool,
+        /// How many of the caller's devices in the table and queued requests name it.
+        users: u32,
+    }
+
+    /// Keeps `bytes`, a whole component, in the caller's store, and returns its digest
+    /// reference; the caller holds it from now on.
+    ///
+    /// - `digest`: the reference the caller expects (it fetched it with the bytes); `none`: any.
+    ///   The host computes the bytes' SHA-256 itself; a stated digest that differs is `invalid`
+    ///   and nothing is kept.
+    /// - Bytes the store keeps already: the caller holds them (again); they are not judged
+    ///   again and cost no room.
+    /// - Otherwise the embedder judges them, at this call: its refusal is `denied` with its
+    ///   reason, and nothing is kept. Journalled as `infra-supply {digest, size}` on the caller
+    ///   when it takes the hold.
+    /// - Fails with `denied` from a caller without the grant, for a component larger than the
+    ///   grant allows, or for a store already at its count or byte bound (release one, or remove
+    ///   the devices that name one, first); `invalid` for a malformed `digest`.
+    supply: func(digest: option<string>, bytes: list<u8>) -> result<string, error>;
+
+    /// The caller no longer holds the component `digest` (journalled as `infra-release
+    /// {digest}`): it goes once no device and no queued request of the caller names it either
+    /// (at once if none does). `false`: the caller did not hold it (a successful no-op). Devices
+    /// made from it keep running, and a stopped one keeps what it needs to start again. Fails
+    /// with `denied` from a caller without the grant, `invalid` for a malformed `digest`.
+    release: func(digest: string) -> result<bool, error>;
+
+    /// The components the caller's store keeps, by digest (empty from a caller without the
+    /// grant).
+    %list: func() -> list<supplied>;
+}
+
 /// An in-world controller's capability: what the embedder grants a device it marks as a
 /// controller.
 world controller {
     import devices;
     import changes;
+    import components;
 }

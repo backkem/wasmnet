@@ -16,6 +16,9 @@ wasmnet-wire = { path = "../wasmnet-wire" }
 wasmnet-core = { path = "../wasmnet-core" }
 # Content keys of the precompiled-component cache.
 sha2.workspace = true
+# Lists a supplied component's imports without compiling it (`ImportPolicy`): the version
+# wasmtime itself parses with.
+wasmparser = { version = "=0.261.0", default-features = false, features = ["component-model", "std"] }
 # wasmtime-wasi's p2 `Pollable` trait is declared with `#[async_trait]`.
 async-trait = "0.1"
 # Captured stdio: the byte type of wasmtime-wasi's p2 streams, and the AsyncWrite trait

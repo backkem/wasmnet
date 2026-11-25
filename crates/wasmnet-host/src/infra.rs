@@ -17,7 +17,7 @@ mod bindings {
     });
 }
 
-use bindings::wasmnet::infra::{changes, devices, types};
+use bindings::wasmnet::infra::{changes, components, devices, types};
 
 /// [`HasData`] marker: the state is the store's [`HostState`].
 struct Infra;
@@ -229,6 +229,34 @@ impl devices::Host for HostState {
     }
 }
 
+impl components::Host for HostState {
+    fn supply(&mut self, digest: Option<String>, bytes: Vec<u8>) -> Result<String, types::Error> {
+        let end = self.infra.as_ref().ok_or_else(ungranted)?;
+        end.supply(digest.as_deref(), &bytes).map_err(error)
+    }
+
+    fn release(&mut self, digest: String) -> Result<bool, types::Error> {
+        let end = self.infra.as_ref().ok_or_else(ungranted)?;
+        end.release(&digest).map_err(error)
+    }
+
+    fn list(&mut self) -> Vec<components::Supplied> {
+        let Some(end) = &self.infra else {
+            return Vec::new();
+        };
+        end.supplied()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|c| components::Supplied {
+                digest: c.digest,
+                size: c.size,
+                held: c.held,
+                users: c.users,
+            })
+            .collect()
+    }
+}
+
 impl changes::Host for HostState {}
 
 impl<U> changes::HostWithStore<U> for Infra {
@@ -248,6 +276,7 @@ impl<U> changes::HostWithStore<U> for Infra {
 
 pub(crate) fn add_to_linker(l: &mut Linker<HostState>) -> wasmtime::Result<()> {
     devices::add_to_linker::<_, Infra>(l, |s| s)?;
+    components::add_to_linker::<_, Infra>(l, |s| s)?;
     changes::add_to_linker::<_, Infra>(l, |s| s)
 }
 

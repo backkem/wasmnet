@@ -167,6 +167,31 @@ impl Runtime for Host {
             .and_then(|(_, rest)| rest.lines().map(str::trim).rfind(|l| !l.is_empty()));
         wasmnet_core::infra::one_line(cause.unwrap_or(message))
     }
+
+    /// Compiles supplied bytes on the main (metered) engine, through the compile cache when
+    /// the host has one ([`crate::CompileCache::load_bytes`]), and refuses a component that
+    /// imports anything this host's linker does not serve, so that its creation fails with the
+    /// import named, before anything is instantiated.
+    fn compile_supplied(&self, digest: &str, bytes: &[u8]) -> Result<Component, String> {
+        let compiled = match &self.cache {
+            Some(cache) => cache.load_bytes(&self.engine, bytes),
+            None => Component::from_binary(&self.engine, bytes).map_err(crate::runtime_error),
+        };
+        let component = compiled.map_err(|e| {
+            format!(
+                "`{digest}` is not a component this host compiles: {}",
+                self.summarize(&e.to_string())
+            )
+        })?;
+        self.linker.instantiate_pre(&component).map_err(|e| {
+            format!(
+                "`{digest}` does not link on this host: {}",
+                // The outermost message names the import (its causes name only the part).
+                wasmnet_core::infra::one_line(&e.to_string())
+            )
+        })?;
+        Ok(component)
+    }
 }
 /// The apps of a composed node: every export named `app-<name>` must be an instance with a
 /// `run: async func() -> result` (an app's renamed `wasi:cli/run@0.3.x`). Sorted by
