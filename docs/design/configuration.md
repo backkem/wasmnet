@@ -198,6 +198,7 @@ through the DNS servers (if the node has any).
 | Key | Value | Default | Meaning |
 |---|---|---|---|
 | `tcp.congestion` | `reno` or `none` | `reno` | The congestion controller of every TCP connection the node opens or accepts: Reno with NewReno's fast recovery, or none (only the peer's receive window limits a sender, which puts it all on the wire at once). See [netstack.md](netstack.md#tcp-congestion-control). |
+| `tcp.rto-min` | duration of whole milliseconds, `1ms` to `60s` | `200ms` | The least retransmission timeout of every TCP connection once it has measured its round trip, as Linux's `TCP_RTO_MIN`: the timeout is at least the smoothed round-trip time plus this. Before the first measurement it is 1 s. `1s` is close to the netstack's timing before this key. See [netstack.md](netstack.md#tcp-congestion-control). |
 
 ### Test and embedding keys
 

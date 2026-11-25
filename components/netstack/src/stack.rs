@@ -437,7 +437,7 @@ impl Stack {
             sockets,
             routes: config.routes.clone(),
             udp: UdpSockets::new(count),
-            tcp: TcpSockets::new(config.tcp_congestion),
+            tcp: TcpSockets::new(config.tcp_congestion, config.tcp_rto_min_ns),
             hosts: config.hosts.clone(),
             hop_limit: config.hop_limit,
             resolver: {

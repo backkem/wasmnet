@@ -45,6 +45,7 @@
 //! | key | value | default |
 //! |---|---|---|
 //! | `tcp.congestion` | the congestion controller of every TCP connection: `reno`, or `none` (the whole send window at once) | `reno` |
+//! | `tcp.rto-min` | the least retransmission timeout once a connection has measured its round trip, as Linux's `TCP_RTO_MIN`: at least the smoothed round-trip time plus this; whole milliseconds, 1ms..=60s ([`crate::tcp::parse_rto_min`]) | `200ms` |
 //!
 //! Several ports and static routes:
 //!
@@ -153,6 +154,8 @@ pub struct Config {
     pub mdns_attempts: u32,
     /// `tcp.congestion`: the congestion controller of every TCP connection.
     pub tcp_congestion: crate::tcp::Congestion,
+    /// `tcp.rto-min` in nanoseconds: the least retransmission timeout of every TCP connection.
+    pub tcp_rto_min_ns: u64,
     /// `snapshot.paused`: the node waits for a `wasmnet:netstack/state`
     /// restore before it does anything (set by an embedder that restores the stack before it
     /// starts).
@@ -204,6 +207,7 @@ impl Default for Config {
             mdns_timeout_ns: crate::resolver::DEFAULT_MDNS_TIMEOUT_NS,
             mdns_attempts: crate::resolver::DEFAULT_MDNS_ATTEMPTS,
             tcp_congestion: crate::tcp::Congestion::default(),
+            tcp_rto_min_ns: crate::tcp::DEFAULT_RTO_MIN_NS,
             paused: false,
             more_ports: Vec::new(),
             routes: Vec::new(),
@@ -242,6 +246,7 @@ const TOP_KEYS: &[&str] = &[
     "resolver.mdns-timeout",
     "resolver.mdns-attempts",
     "tcp.congestion",
+    "tcp.rto-min",
 ];
 /// Keys under this prefix belong to the node's apps (`app.<app>.<key>`).
 pub const APP_PREFIX: &str = "app.";
@@ -682,6 +687,13 @@ impl Config {
                     crate::tcp::Congestion::parse,
                 )?
                 .unwrap_or(d.tcp_congestion),
+            tcp_rto_min_ns: r
+                .get(
+                    "tcp.rto-min",
+                    "a whole number of milliseconds from 1ms to 60s like 200ms",
+                    crate::tcp::parse_rto_min,
+                )?
+                .unwrap_or(d.tcp_rto_min_ns),
             paused: r
                 .get("snapshot.paused", "true or false", |v| {
                     v.parse::<bool>().ok()
@@ -746,6 +758,28 @@ mod tests {
             parse(&[("tcp.congestion", "cubic")]),
             Err(ConfigError::Invalid { .. })
         ));
+    }
+
+    #[test]
+    fn tcp_rto_min_is_whole_milliseconds_from_1ms_to_60s() {
+        assert_eq!(parse(&[]).unwrap().tcp_rto_min_ns, 200_000_000);
+        for (v, want) in [
+            ("1s", 1_000_000_000),
+            ("200ms", 200_000_000),
+            ("1ms", 1_000_000),
+            ("60s", 60_000_000_000),
+        ] {
+            assert_eq!(parse(&[("tcp.rto-min", v)]).unwrap().tcp_rto_min_ns, want);
+        }
+        for bad in ["0", "0ms", "500us", "1500us", "61s", "fast", ""] {
+            assert!(
+                matches!(
+                    parse(&[("tcp.rto-min", bad)]),
+                    Err(ConfigError::Invalid { .. })
+                ),
+                "{bad:?}"
+            );
+        }
     }
 
     #[test]

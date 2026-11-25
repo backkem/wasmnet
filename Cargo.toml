@@ -69,11 +69,12 @@ hkdf = { version = "=0.12.4", default-features = false }
 hmac = { version = "=0.12.1", default-features = false }
 sha1 = { version = "=0.10.7", default-features = false }
 
-# smoltcp 0.14.0 with six patches: neighbor discovery is rate-limited per address, not per
+# smoltcp 0.14.0 with seven patches: neighbor discovery is rate-limited per address, not per
 # interface; the interface and socket state can be read and restored for snapshots; TCP fast
 # recovery retransmits on partial ACKs (NewReno); TCP ignores the FIN of a segment cut at the
-# receive window; a fast retransmit with only the FIN outstanding resends the FIN; and a TCP
-# socket's send MSS can be lowered by path MTU discovery (docs/upstream/smoltcp.md). The
+# receive window; a fast retransmit with only the FIN outstanding resends the FIN; a TCP
+# socket's send MSS can be lowered by path MTU discovery; and the retransmission timeout's
+# minimum and margin are settable (docs/upstream/smoltcp.md). The
 # pristine crate plus the patches lives in third_party/smoltcp; the version stays =0.14.0 so
 # dropping a patch is one line once upstream has the fix.
 [patch.crates-io]

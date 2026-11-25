@@ -1,6 +1,6 @@
 # smoltcp: issues found while building wasmnet
 
-Pinned version: **smoltcp =0.14.0** (`Medium::Ethernet`, features as in `components/netstack/Cargo.toml`), **vendored with six patches** (`third_party/smoltcp`, `[patch.crates-io]`; #2, #28, #31, #32, #34 and #35 below). This is a running list of upstream bugs, spec deviations and API gaps that we hit, with the part of wasmnet where each was found and how we work around it today. Keep it current. When something gets filed upstream, add the link. When a fix lands, note the version and remove our workaround.
+Pinned version: **smoltcp =0.14.0** (`Medium::Ethernet`, features as in `components/netstack/Cargo.toml`), **vendored with seven patches** (`third_party/smoltcp`, `[patch.crates-io]`; #2, #28, #31, #32, #34, #35 and #36 below). This is a running list of upstream bugs, spec deviations and API gaps that we hit, with the part of wasmnet where each was found and how we work around it today. Keep it current. When something gets filed upstream, add the link. When a fix lands, note the version and remove our workaround.
 
 These are our own notes from building one stack on smoltcp. Unless the last column says so, an
 entry has not been reported upstream yet, and some may turn out to be our misreading: check
@@ -42,9 +42,10 @@ Legend: **bug**: violates an RFC or is clearly wrong. **gap**: missing behaviour
 | 30 | quirk | **The initial congestion window is 2048 bytes whatever the MSS** (`2 * DEFAULT_MSS` with a default MSS of 1024; `set_mss` changes the increments, not the window). At a 1500-byte MTU that is one full segment and 588 bytes, below RFC 5681's two full segments and far below RFC 6928's ten, and the receiver holds its ACK for its delayed-ACK time (10 ms) because less than two full segments arrived. | TCP congestion control, bulk transfers | None: it costs one delayed ACK at the start of a transfer. | not filed |
 | 31 | gap | **Fast recovery has no partial-ACK handling (NewReno, RFC 6582).** Reno leaves fast recovery on the first ACK of new data, so a second loss in the same window waits for three more duplicate ACKs, which seldom come, and then for a retransmission timeout (at least 1 s). A queue overflow drops several frames at once, so this is the common case. | TCP congestion control over a small transmit queue | **Fixed in our vendored smoltcp** (`smoltcp-0003-newreno-partial-acks.patch`, [below](#upstream-ready-patch-newreno-partial-acks-31)). | patch ready, not filed |
 | 32 | bug | **A FIN is accepted on a segment cut at the receive window's right edge.** `process` trims a segment to the window but took its FIN whenever the segment starts at or before `RCV.NXT` (`control == Fin && window_start < segment_start` was the only check), so the FIN took the sequence number of the first byte that was cut: the stream ended early with `CLOSE-WAIT`, and the ACK of the FIN acknowledged the first cut byte to the sender as if it had arrived. RFC 9293 §3.10.7.4 drops a FIN that lies beyond the window. A sender reaches past the window with a fast retransmission, which sends a full segment from `SND.UNA` without looking at the window, or with a segment sent against an older window that the receiver has since moved back by a few bytes (a scaled window counts in steps of `2^shift`). | TCP congestion-control tests: an app that stops reading while a stream ends, a loss: 1 to 3 bytes missing before EOF | **Fixed in our vendored smoltcp** (`smoltcp-0004-fin-past-the-receive-window.patch`, [below](#upstream-ready-patch-a-fin-past-the-receive-window-32)): the FIN of a segment cut at the right edge is ignored; the sender sends the cut bytes and the FIN again once the window opens. Fast retransmissions still ignore the window (harmless now). | patch ready, not filed |
-| 33 | gap | **No SACK-based recovery, Limited Transmit (RFC 3042), early retransmit (RFC 5827) or tail-loss probe, and a minimum RTO of 1 s** (`RTTE_MIN_RTO`, RFC 6298's SHOULD; Linux uses 200 ms). A loss that three duplicate ACKs do not reveal costs at least 1 s. smoltcp sends SACK blocks as a receiver but ignores the peer's. | TCP congestion control, lossy links | None; the costs are in `docs/design/netstack.md`. | not filed |
+| 33 | gap | **No SACK-based recovery, Limited Transmit (RFC 3042), early retransmit (RFC 5827) or tail-loss probe.** A loss that three duplicate ACKs do not reveal costs a retransmission timeout (at least 1 s by default; see #36). smoltcp sends SACK blocks as a receiver but ignores the peer's. | TCP congestion control, lossy links | The netstack's least timeout is 200 ms (#36); the costs are in `docs/design/netstack.md`. | not filed |
 | 34 | bug | **A connection could hang with only its FIN unacknowledged.** When every data byte is acknowledged but the FIN is not (here: the receiver's window was zero, and it dropped a retransmitted segment whose data it already had together with its FIN, while it accepts a bare FIN at a zero window), the receiver's repeated ACKs count as duplicate ACKs (`ack_number < remote_last_seq`). The third started a fast retransmit: `dispatch` set `pending_fast_retransmit` and idled the retransmission timer, but `seq_to_transmit` wanted a non-empty transmit buffer for a fast retransmit and `can_fin` needs `remote_last_seq == local_seq_no + tx_buffer.len()`, so nothing was sent and no timer was armed: the FIN never went again. | the netstack's simulation: `tcp.congestion = "none"`, the receiving app not reading, 1 MB with data segment 134 lost: every byte arrived, the end of the stream never did | **Fixed in our vendored smoltcp** (`smoltcp-0005-fast-retransmit-of-a-lone-fin.patch`, [below](#upstream-ready-patch-fast-retransmit-of-a-lone-fin-34)): with every data octet acknowledged, a fast retransmit sends the FIN alone. | patch ready, not filed |
 | 35 | gap | **No path MTU discovery, and no way to lower a connection's send MSS after the handshake.** smoltcp ignores ICMP "fragmentation needed" and "packet too big" (#4), and a socket's segment size is fixed by the interface MTU and the peer's MSS option. Over a path with a smaller MTU than both ends, every full-size segment is dropped by the router before the narrow link and resent unchanged on every timeout: the transfer stalls after the handshake. | the netstack between two routers joined by a 1280-byte link (`crates/wasmnet-host/tests/path_mtu.rs`) | **Our sixth vendored patch** (`smoltcp-0006-path-mtu-lowered.patch`, [below](#upstream-ready-patch-path-mtu-lowered-35)): `Socket::path_mtu_lowered(seq, mss)` lowers the send MSS when `seq` lies in the send window and resends the data in flight at once in the new size; the netstack validates the ICMP error and calls it (`TcpSockets::path_mtu`). | patch ready, not filed |
+| 36 | gap | **The retransmission timeout's bounds are fixed.** The minimum (`RTTE_MIN_RTO`, 1 s: RFC 6298's SHOULD) and the least margin over the smoothed RTT (`RTTE_MIN_MARGIN`, 5 ms: RFC 6298's clock granularity G) are constants. Linux uses 200 ms for both (`TCP_RTO_MIN`, which bounds the variation term: its timeout is at least `SRTT + 200 ms`). With the 1 s floor a loss that duplicate ACKs cannot reveal costs at least 1 s even on a LAN; lowering only the floor leaves a 5 ms margin, and on a steady path where `RTTVAR` decays to its rounding floor of 3 ms the timeout sits 12 ms above the round trip, so a slightly later ACK (a peer's delayed ACK of up to 200 ms on Linux) causes a spurious retransmission. | TCP over lossy links and small queues (`crates/wasmnet-host/tests/congestion.rs`) | **Our seventh vendored patch** (`smoltcp-0007-settable-rto-bounds.patch`, [below](#upstream-ready-patch-settable-rto-bounds-36)): `Socket::set_rto_min` and `Socket::set_rto_min_margin` (defaults unchanged, 1 s and 5 ms); the netstack sets both to `tcp.rto-min`, 200 ms by default. | patch ready, not filed |
 
 
 ## Plan
@@ -53,6 +54,7 @@ Legend: **bug**: violates an RFC or is clearly wrong. **gap**: missing behaviour
 - ~~Fix #32~~: done (vendored patch). Open the upstream PR below.
 - ~~Fix #34~~: done (vendored patch). Open the upstream PR below.
 - ~~Fix #35~~: done (vendored patch, path MTU discovery). Open the upstream PR below.
+- ~~Fix #36~~: done (vendored patch, settable RTO bounds). Open the upstream PR below.
 - File the other half of #32: fast retransmissions ignore the receive window (harmless with the #32 fix: the receiver drops what is past the edge, and the sender sends it again once the window opens).
 - ~~Fix #7~~: done in the netstack (family demultiplexing). An upstream family filter would let us delete `UdpSockets::demux` and the TCP stray hand-off.
 - File upstream issues for #1, #3, #4, #5, #7, #8, #9, #18, #20, #21, #24, #26 and #27, with minimal repros. Our deterministic simulations make good reproducers.
@@ -271,3 +273,54 @@ stalled after the handshake; after, it takes 24 ms to 25 ms of virtual time) and
 netstack's simulations `a_packet_too_big_lowers_the_segment_size_and_resends_at_once`,
 `a_packet_too_big_is_trusted_only_when_it_quotes_data_in_flight` and
 `an_ipv6_packet_too_big_under_1280_counts_as_1280`.
+
+## Upstream-ready patch: settable RTO bounds (#36)
+
+Ready to send as a PR against smoltcp `main` (written and tested against 0.14.0; not opened
+yet). The diff is [`smoltcp-0007-settable-rto-bounds.patch`](smoltcp-0007-settable-rto-bounds.patch)
+(1 file, +208 / -3; applies with `git apply` to the 0.14.0 crate, after the six patches before it):
+exactly the change in `third_party/smoltcp`.
+
+**Title:** tcp: let the owner set the retransmission timeout's minimum and its margin over SRTT
+
+**Description:**
+
+> The RTT estimator computes `RTO = SRTT + max(G, K * RTTVAR)` (RFC 6298 (2.2), (2.3)) and
+> clamps it to at least 1 s (2.4). Both bounds are constants: `RTTE_MIN_MARGIN` (`G`, 5 ms)
+> and `RTTE_MIN_RTO` (1 s). A stack that wants Linux's behaviour cannot have it: Linux's
+> `TCP_RTO_MIN` is 200 ms, and it bounds the variation term, so its timeout is at least
+> `SRTT + 200 ms`. On a LAN the 1 s floor makes every loss that duplicate ACKs cannot reveal
+> (the last segments of a transfer, a lost retransmission, a window under four segments) cost
+> a full second. Lowering the floor alone is not enough: on a steady path `RTTVAR` decays to
+> its rounding floor of 3 ms, the timeout settles 12 ms above the round trip, and an ACK that
+> comes a little later than usual (the peer's delayed ACK, up to 200 ms on Linux, or one more
+> segment queued on the way) triggers a spurious retransmission.
+>
+> This change keeps both bounds in the estimator and adds `Socket::set_rto_min` and
+> `Socket::set_rto_min_margin` (with `rto_min` and `rto_min_margin` to read them). The
+> defaults are the constants, so nothing changes unless an owner sets them. Setting both to
+> 200 ms gives Linux's rule. The timeout before the first RTT sample stays RFC 6298's 1 s
+> (2.1), as on Linux; backing off still doubles the timeout in force, up to 60 s; values above
+> 60 s count as 60 s, and the bounds count in whole milliseconds like the estimator. A reset
+> socket keeps its bounds. A new bound applies from the next RTT sample on.
+>
+> Tests: `test_rtt_estimator_bounds` (the defaults; a 200 ms minimum raises a 30 ms timeout
+> and lets a steady 300 ms path settle at 312 ms; with a 200 ms margin as well it settles at
+> 500 ms; a reset keeps the bounds and drops the measurement), `test_set_rto_min_and_margin`
+> (setters, getters, the 60 s cap, kept across a reset), `test_rto_min_keeps_the_initial_timeout`
+> (1 s before any sample), `test_rto_min_bounds_the_measured_timeout` (after a 10 ms sample the
+> retransmission goes 200 ms after the segment, 1 s with the default) and
+> `test_rto_min_margin_adds_to_the_smoothed_rtt` (210 ms with both bounds at 200 ms), all in
+> `socket/tcp.rs`. `cargo test --lib` passes with the default features (685 tests), with
+> `--features socket-tcp-reno,socket-tcp-cubic` (711), and with
+> `std,alloc,medium-ethernet,proto-ipv4,proto-ipv6,multicast,socket-tcp,socket-tcp-reno,socket-tcp-cubic,socket-udp,socket-icmp,socket-dhcpv4,auto-icmp-echo-reply` (318: the TCP socket tests need the default features).
+
+**Found and verified in wasmnet:** the netstack's simulations
+`a_lone_lost_segment_goes_again_after_the_least_timeout` (200 ms after the loss, 1 s with
+`tcp.rto-min = 1s`), `on_a_long_steady_path_the_timeout_stays_the_minimum_above_the_round_trip`
+(after twenty 600 ms round trips a lost segment goes again after 800 ms; with the minimum
+alone, 612 ms) and `a_delayed_ack_after_steady_round_trips_is_no_reason_to_retransmit`, and
+`crates/wasmnet-host/tests/congestion.rs` (1 MB at 10 Mbit/s, seeds 1 to 8): through a 4-frame
+transmit queue 1.85 s with a least timeout of 1 s, 1.05 s with 200 ms; with 1 % loss each way
+0.85 s to 5.83 s with 1 s, 0.85 s to 2.07 s with 200 ms, no seed slower; over a path of 300 ms
+each way, no retransmission with 200 ms.

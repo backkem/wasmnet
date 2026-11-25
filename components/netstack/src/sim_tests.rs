@@ -3081,3 +3081,131 @@ fn a_udp_socket_that_asks_for_errors_gets_the_fragmentation_needed() {
     );
     assert!(sim.events(0, "path-mtu-lowered").is_empty());
 }
+
+// ---- The retransmission timeout (`tcp.rto-min`) ----
+
+#[test]
+fn the_least_retransmission_timeout_is_200ms_unless_configured() {
+    for (extra, want) in [
+        (&[][..], 200 * MS),
+        (&[("tcp.rto-min", "1s")][..], 1_000 * MS),
+    ] {
+        let mut sim = two(extra, 1);
+        assert_eq!(sim.tcp(0).0.rto_min_ns(), want);
+    }
+}
+
+/// Node 0's retransmissions as `(time, delay since the segment first left)`.
+fn retransmission_delays(sim: &Sim) -> Vec<(u64, u64)> {
+    let mut first: BTreeMap<u32, u64> = BTreeMap::new();
+    let mut out = Vec::new();
+    for s in sim.tcp_segs().iter().filter(|s| s.from == 0 && s.len > 0) {
+        match first.get(&s.seq) {
+            Some(&at) => out.push((s.at, s.at - at)),
+            None => {
+                first.insert(s.seq, s.at);
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn a_lone_lost_segment_goes_again_after_the_least_timeout() {
+    // One segment, lost: no duplicate ACK can reveal it, so it waits for the retransmission
+    // timeout. The handshake measured the round trip (200 us, under smoltcp's millisecond
+    // resolution), so the timeout is the minimum: 200 ms by default, 1 s as before.
+    for (extra, want) in [
+        (&[][..], 200 * MS),
+        (&[("tcp.rto-min", "1s")][..], 1_000 * MS),
+    ] {
+        let sim = bulk_send(extra, 1_000, lose_data_segment(1));
+        assert_eq!(
+            retransmission_delays(&sim),
+            [(MS + want, want)],
+            "{extra:?}"
+        );
+    }
+}
+
+/// One way of a long path.
+const LONG: u64 = 300 * MS;
+
+/// Node 0 (with `extra`) and node 1 on a hub of [`LONG`] one way; node 1 connects to node 0's
+/// port 80. Then node 0 writes 100 bytes every second: for `answered` rounds node 1 answers
+/// each at once (its ACK rides on the answer, so node 0 measures exactly 600 ms), then for
+/// `unanswered` rounds it only reads (its ACK waits for smoltcp's delayed-ACK timer, 10 ms).
+/// `lose` picks what the hub loses.
+fn long_path(
+    extra: &[(&'static str, &'static str)],
+    answered: u64,
+    unanswered: u64,
+    lose: Lose,
+) -> Sim {
+    let mut sim = Sim::new(vec![node(&a(extra), 3), node(&b(), 4)], LONG);
+    sim.lose = lose;
+    let l = listen(&mut sim, 0, 1);
+    let cl = connect(&mut sim, 1, "10.0.0.1:80");
+    sim.run(5_000 * MS);
+    sim.now = 5_000 * MS;
+    established(&mut sim, 1, cl);
+    let sv = accept(&mut sim, 0, l);
+    sim.tcp(0).0.start_send(sv).unwrap();
+    sim.tcp(0).0.start_recv(sv).unwrap();
+    sim.tcp(1).0.start_send(cl).unwrap();
+    sim.tcp(1).0.start_recv(cl).unwrap();
+    for round in 0..answered + unanswered {
+        let at = 10_000 * MS + round * 1_000 * MS;
+        sim.run(at);
+        sim.now = at;
+        drain(&mut sim, 0, sv);
+        write(&mut sim, 0, sv, &[7; 100], false);
+        sim.run(at + LONG);
+        sim.now = at + LONG;
+        let (got, _) = drain(&mut sim, 1, cl);
+        if round < answered && !got.is_empty() {
+            write(&mut sim, 1, cl, &[8; 100], false);
+        }
+    }
+    sim.run(10_000 * MS + (answered + unanswered + 5) * 1_000 * MS);
+    sim
+}
+
+#[test]
+fn on_a_long_steady_path_the_timeout_stays_the_minimum_above_the_round_trip() {
+    // Twenty round trips of exactly 600 ms: RFC 6298's variation term decays to a few
+    // milliseconds, and with smoltcp's own margin (5 ms) and a bare 200 ms floor the timeout
+    // would fall to about 612 ms, 12 ms above the round trip. As on Linux, the minimum is a
+    // margin over the smoothed round trip: a segment lost in the next round goes again
+    // 600 + 200 ms after it left (600 ms + 1 s with `tcp.rto-min = 1s`).
+    for (extra, want) in [
+        (&[][..], 800 * MS),
+        (&[("tcp.rto-min", "1s")][..], 1_600 * MS),
+    ] {
+        let sim = long_path(extra, 20, 1, lose_data_segment(21));
+        let delays = retransmission_delays(&sim);
+        assert_eq!(delays.len(), 1, "{extra:?}: {delays:?}");
+        assert_eq!(delays[0].1, want, "{extra:?}: {delays:?}");
+    }
+}
+
+#[test]
+fn a_delayed_ack_after_steady_round_trips_is_no_reason_to_retransmit() {
+    // Twenty answered rounds (600 ms each), then ten whose ACK is delayed: nothing is sent
+    // twice, and the delayed ACKs did arrive 10 ms later than the answers before them.
+    let sim = long_path(&[], 20, 10, None);
+    assert_eq!(retransmission_delays(&sim), [], "spurious retransmissions");
+    let segs = sim.tcp_segs();
+    let data: Vec<&TcpSeg> = segs.iter().filter(|s| s.from == 0 && s.len > 0).collect();
+    assert_eq!(data.len(), 30);
+    for (round, d) in data.iter().enumerate() {
+        let end = d.seq.wrapping_add(d.len);
+        let acked_at = segs
+            .iter()
+            .find(|s| s.from == 1 && s.flags & ACK != 0 && s.ack == end)
+            .map(|s| s.at + LONG)
+            .expect("acknowledged");
+        let rtt = if round < 20 { 600 * MS } else { 610 * MS };
+        assert_eq!(acked_at - d.at, rtt, "round {round}");
+    }
+}

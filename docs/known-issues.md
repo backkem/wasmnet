@@ -111,10 +111,10 @@ here so that nobody has to find these the hard way. Each entry names where the c
 - **TCP loss recovery still ends in a timeout where duplicate ACKs cannot help** (a loss
   among a transfer's last segments, while the window is under four segments, or of a
   retransmission): smoltcp has no SACK-based recovery, Limited Transmit or tail-loss probe,
-  and its smallest retransmission timeout is 1 s
+  so such a loss costs a timeout, the round trip plus `tcp.rto-min` (200 ms by default)
   ([design/netstack.md](design/netstack.md#tcp-congestion-control)).
   In `crates/wasmnet-host/tests/congestion.rs`, 1 MB at 10 Mbit/s through a 4-frame queue
-  takes 1.85 s (0.83 s of it serialisation), and with 1 % loss 0.85 s to 5.8 s.
+  takes 1.05 s (0.83 s of it serialisation), and with 1 % loss 0.85 s to 2.07 s.
 - **Colliding query ids in the resolver** (an A and an AAAA query drawing the same id) cost one
   timeout before the retry.
 

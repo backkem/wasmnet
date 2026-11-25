@@ -1,0 +1,264 @@
+diff --git a/src/socket/tcp.rs b/src/socket/tcp.rs
+index fccd25e..7bbe25e 100644
+--- a/src/socket/tcp.rs
++++ b/src/socket/tcp.rs
+@@ -161,6 +161,10 @@ const RTTE_MAX_RTO: u32 = 60_000;
+ #[derive(Debug, Clone, Copy)]
+ #[cfg_attr(feature = "defmt", derive(defmt::Format))]
+ struct RttEstimator {
++    /// The least RTO once the RTT is measured, in milliseconds (RFC 6298 (2.4)).
++    min_rto: u32,
++    /// The least margin of the RTO over the smoothed RTT, in milliseconds (RFC 6298's G).
++    min_margin: u32,
+     /// true if we have made at least one rtt measurement.
+     have_measurement: bool,
+     // Using u32 instead of Duration to save space (Duration is i64)
+@@ -178,6 +182,8 @@ struct RttEstimator {
+ impl Default for RttEstimator {
+     fn default() -> Self {
+         Self {
++            min_rto: RTTE_MIN_RTO,
++            min_margin: RTTE_MIN_MARGIN,
+             have_measurement: false,
+             srtt: 0,   // ignored, will be overwritten on first measurement.
+             rttvar: 0, // ignored, will be overwritten on first measurement.
+@@ -190,6 +196,15 @@ impl Default for RttEstimator {
+ }
+ 
+ impl RttEstimator {
++    /// A fresh estimator with the same bounds, for a socket that is reset.
++    fn reset(&self) -> Self {
++        Self {
++            min_rto: self.min_rto,
++            min_margin: self.min_margin,
++            ..Self::default()
++        }
++    }
++
+     fn retransmission_timeout(&self) -> Duration {
+         Duration::from_millis(self.rto as _)
+     }
+@@ -213,8 +228,8 @@ impl RttEstimator {
+         }
+ 
+         // RFC 6298 (2.2), (2.3)
+-        let margin = RTTE_MIN_MARGIN.max(self.rttvar * RTTE_K);
+-        self.rto = (self.srtt + margin).clamp(RTTE_MIN_RTO, RTTE_MAX_RTO);
++        let margin = self.min_margin.max(self.rttvar * RTTE_K);
++        self.rto = (self.srtt + margin).clamp(self.min_rto, RTTE_MAX_RTO);
+ 
+         self.rto_count = 0;
+ 
+@@ -729,6 +744,52 @@ impl<'a> Socket<'a> {
+         (self.path_mss != usize::MAX).then_some(self.path_mss)
+     }
+ 
++    /// Set the least retransmission timeout once the round-trip time is measured.
++    ///
++    /// By default it is RFC 6298's 1 second (2.4); Linux uses 200 ms (`TCP_RTO_MIN`). The
++    /// timeout before the first measurement is 1 second whatever this is (RFC 6298 (2.1)),
++    /// and backing off doubles the timeout in force, up to 60 seconds. A value above 60
++    /// seconds counts as 60 seconds; the timeout counts in whole milliseconds.
++    ///
++    /// The new bound applies from the next round-trip sample on. A minimum below the default
++    /// usually wants a larger [minimum margin](#method.set_rto_min_margin) as well, so that
++    /// a peer's delayed acknowledgement does not trip the timeout on a long, steady path.
++    pub fn set_rto_min(&mut self, duration: Duration) {
++        self.rtte.min_rto = Self::rto_millis(duration);
++    }
++
++    /// Return the least retransmission timeout once the round-trip time is measured (see
++    /// [`set_rto_min`](#method.set_rto_min)).
++    pub fn rto_min(&self) -> Duration {
++        Duration::from_millis(self.rtte.min_rto as _)
++    }
++
++    /// Set the least margin of the retransmission timeout over the smoothed round-trip time.
++    ///
++    /// The timeout is `SRTT + max(G, K * RTTVAR)` (RFC 6298 (2.2), (2.3)), and at least the
++    /// [minimum timeout](#method.set_rto_min); this sets `G`, 5 ms by default. On a steady
++    /// path `RTTVAR` decays towards zero and the timeout falls towards `SRTT + G`, so that a
++    /// segment acknowledged a little later than the ones before it (by a delayed
++    /// acknowledgement, say) is retransmitted although it arrived. Linux keeps this margin
++    /// at its minimum timeout, 200 ms, the longest it delays an acknowledgement: its timeout
++    /// is at least `SRTT + 200 ms`. A value above 60 seconds counts as 60 seconds; the margin
++    /// counts in whole milliseconds.
++    ///
++    /// The new margin applies from the next round-trip sample on.
++    pub fn set_rto_min_margin(&mut self, duration: Duration) {
++        self.rtte.min_margin = Self::rto_millis(duration);
++    }
++
++    /// Return the least margin of the retransmission timeout over the smoothed round-trip
++    /// time (see [`set_rto_min_margin`](#method.set_rto_min_margin)).
++    pub fn rto_min_margin(&self) -> Duration {
++        Duration::from_millis(self.rtte.min_margin as _)
++    }
++
++    fn rto_millis(duration: Duration) -> u32 {
++        duration.total_millis().min(RTTE_MAX_RTO as u64) as u32
++    }
++
+     /// Return the current congestion control algorithm.
+     pub fn congestion_control(&self) -> CongestionControl {
+         use congestion::*;
+@@ -960,7 +1021,7 @@ impl<'a> Socket<'a> {
+ 
+         self.state = State::Closed;
+         self.timer = Timer::new();
+-        self.rtte = RttEstimator::default();
++        self.rtte = self.rtte.reset();
+         self.assembler = Assembler::new();
+         self.tx_buffer.clear();
+         self.rx_buffer.clear();
+@@ -10028,6 +10089,150 @@ mod test {
+         }
+     }
+ 
++    #[test]
++    fn test_rtt_estimator_bounds() {
++        // The defaults: RFC 6298's 1 s minimum.
++        let mut r = RttEstimator::default();
++        r.sample(10);
++        assert_eq!(r.retransmission_timeout(), Duration::from_millis(1000));
++
++        // A lower minimum: 10 + max(5, 4 * 5) = 30, raised to 200.
++        let mut r = RttEstimator {
++            min_rto: 200,
++            ..RttEstimator::default()
++        };
++        r.sample(10);
++        assert_eq!(r.retransmission_timeout(), Duration::from_millis(200));
++        // A steady 300 ms path: RTTVAR decays to 3 ms (where rounding up holds it) and the
++        // timeout falls to SRTT + 12 ms.
++        for _ in 0..100 {
++            r.sample(300);
++        }
++        assert_eq!(r.retransmission_timeout(), Duration::from_millis(312));
++
++        // With Linux's margin the timeout stays at least SRTT + 200 ms.
++        let mut r = RttEstimator {
++            min_rto: 200,
++            min_margin: 200,
++            ..RttEstimator::default()
++        };
++        r.sample(10);
++        assert_eq!(r.retransmission_timeout(), Duration::from_millis(210));
++        for _ in 0..100 {
++            r.sample(300);
++        }
++        assert_eq!(r.retransmission_timeout(), Duration::from_millis(500));
++
++        // The bounds survive a reset, the measurement does not.
++        let r = r.reset();
++        assert_eq!((r.min_rto, r.min_margin), (200, 200));
++        assert!(!r.have_measurement);
++        assert_eq!(r.retransmission_timeout(), Duration::from_millis(1000));
++    }
++
++    #[test]
++    fn test_set_rto_min_and_margin() {
++        let mut s = socket_established();
++        assert_eq!(s.rto_min(), Duration::from_millis(1000));
++        assert_eq!(s.rto_min_margin(), Duration::from_millis(5));
++        s.set_rto_min(Duration::from_millis(200));
++        s.set_rto_min_margin(Duration::from_secs(120));
++        assert_eq!(s.rto_min(), Duration::from_millis(200));
++        // Above the largest timeout: 60 s.
++        assert_eq!(s.rto_min_margin(), Duration::from_secs(60));
++        s.set_rto_min_margin(Duration::from_millis(200));
++        s.reset();
++        assert_eq!(s.rto_min(), Duration::from_millis(200));
++        assert_eq!(s.rto_min_margin(), Duration::from_millis(200));
++    }
++
++    #[test]
++    fn test_rto_min_keeps_the_initial_timeout() {
++        // Before any round trip is measured the timeout is 1 s, whatever the minimum.
++        let mut s = socket_established();
++        s.set_rto_min(Duration::from_millis(200));
++        s.send_slice(b"abcdef").unwrap();
++        recv!(s, time 0, Ok(TcpRepr {
++            seq_number: LOCAL_SEQ + 1,
++            ack_number: Some(REMOTE_SEQ + 1),
++            payload:    &b"abcdef"[..],
++            ..RECV_TEMPL
++        }));
++        recv_nothing!(s, time 999);
++        recv!(s, time 1000, Ok(TcpRepr {
++            seq_number: LOCAL_SEQ + 1,
++            ack_number: Some(REMOTE_SEQ + 1),
++            payload:    &b"abcdef"[..],
++            ..RECV_TEMPL
++        }));
++    }
++
++    /// Sends `abc`, acknowledged 10 ms later (one round-trip sample of 10 ms), then `def` at
++    /// 20 ms, and returns the socket with `def` in flight.
++    fn socket_after_a_10ms_sample(min_rto: u64, min_margin: Option<u64>) -> TestSocket {
++        let mut s = socket_established();
++        s.set_rto_min(Duration::from_millis(min_rto));
++        if let Some(margin) = min_margin {
++            s.set_rto_min_margin(Duration::from_millis(margin));
++        }
++        s.send_slice(b"abc").unwrap();
++        recv!(s, time 0, Ok(TcpRepr {
++            seq_number: LOCAL_SEQ + 1,
++            ack_number: Some(REMOTE_SEQ + 1),
++            payload:    &b"abc"[..],
++            ..RECV_TEMPL
++        }));
++        send!(s, time 10, TcpRepr {
++            seq_number: REMOTE_SEQ + 1,
++            ack_number: Some(LOCAL_SEQ + 1 + 3),
++            ..SEND_TEMPL
++        });
++        s.send_slice(b"def").unwrap();
++        recv!(s, time 20, Ok(TcpRepr {
++            seq_number: LOCAL_SEQ + 1 + 3,
++            ack_number: Some(REMOTE_SEQ + 1),
++            payload:    &b"def"[..],
++            ..RECV_TEMPL
++        }));
++        s
++    }
++
++    #[test]
++    fn test_rto_min_bounds_the_measured_timeout() {
++        // 10 + max(5, 4 * 5) = 30 ms, raised to the minimum of 200 ms.
++        let mut s = socket_after_a_10ms_sample(200, None);
++        recv_nothing!(s, time 219);
++        recv!(s, time 220, Ok(TcpRepr {
++            seq_number: LOCAL_SEQ + 1 + 3,
++            ack_number: Some(REMOTE_SEQ + 1),
++            payload:    &b"def"[..],
++            ..RECV_TEMPL
++        }));
++
++        // The default minimum: 1 s.
++        let mut s = socket_after_a_10ms_sample(1000, None);
++        recv_nothing!(s, time 1019);
++        recv!(s, time 1020, Ok(TcpRepr {
++            seq_number: LOCAL_SEQ + 1 + 3,
++            ack_number: Some(REMOTE_SEQ + 1),
++            payload:    &b"def"[..],
++            ..RECV_TEMPL
++        }));
++    }
++
++    #[test]
++    fn test_rto_min_margin_adds_to_the_smoothed_rtt() {
++        // 10 + max(200, 4 * 5) = 210 ms.
++        let mut s = socket_after_a_10ms_sample(200, Some(200));
++        recv_nothing!(s, time 229);
++        recv!(s, time 230, Ok(TcpRepr {
++            seq_number: LOCAL_SEQ + 1 + 3,
++            ack_number: Some(REMOTE_SEQ + 1),
++            payload:    &b"def"[..],
++            ..RECV_TEMPL
++        }));
++    }
++
+     #[test]
+     fn test_set_get_congestion_control() {
+         let mut s = socket_established();

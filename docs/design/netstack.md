@@ -120,19 +120,32 @@ Every TCP connection gets the congestion controller the node's `tcp.congestion` 
   everything ends it with the window at `ssthresh`. A retransmission timeout drops the window
   to one segment and resends everything from the last ACK (go-back-N) in slow start.
 - **`none`**: no congestion window, only the peer's receive window: a sender puts the whole
-  window on the wire at once, and each loss waits for three duplicate ACKs of its own. This is
-  the netstack's timing from before it had congestion control, byte for byte.
+  window on the wire at once, and each loss waits for three duplicate ACKs of its own. With
+  `tcp.rto-min = "1s"` this is close to the netstack's timing from before it had congestion
+  control: the same but for timeouts the smoothed round trip longer (below).
 
 Why Reno: its arithmetic is integer only, so its decisions are the same on every target, and it
 is the controller that builds here: smoltcp 0.14's Cubic calls `f64::powi` and `f64::mul_add`,
 which only std has, and the netstack builds smoltcp without std. On the short round trips of a
 simulated LAN, Cubic would mostly run in its Reno-friendly region anyway (RFC 9438 §4.3).
 
-What recovery depends on besides the controller, all smoltcp's and unchanged:
+What recovery depends on besides the controller:
 
-- **The retransmission timer** (RFC 6298): 1 s before the first RTT sample, at least 1 s and at
-  most 60 s, doubled on every timeout; after three timeouts in a row the RTT estimate is
-  discarded. RTT is sampled once per window, in whole milliseconds of virtual time.
+- **The retransmission timer** (RFC 6298, with Linux's floor): 1 s before the first RTT sample,
+  as RFC 6298 and Linux have it. Once the round trip is measured the timeout is
+  `SRTT + max(4 * RTTVAR, tcp.rto-min)`, at most 60 s, doubled on every timeout; after three
+  timeouts in a row the RTT estimate is discarded. `tcp.rto-min` is 200 ms by default, Linux's
+  `TCP_RTO_MIN` ([configuration.md](configuration.md)). Like Linux, the minimum is a margin
+  over the smoothed round trip, not only a floor under the timeout: on a steady path RTTVAR
+  decays to a few milliseconds, and with smoltcp's own margin (5 ms) the timeout would fall to
+  about 12 ms above the round trip, so that an ACK a little later than the ones before it (a
+  delayed ACK, another segment queued on the way) would be retransmitted although it arrived.
+  Our seventh smoltcp patch makes both bounds settable (`Socket::set_rto_min`,
+  `Socket::set_rto_min_margin`); the netstack sets both to `tcp.rto-min`. With
+  `tcp.rto-min = "1s"` the timeout is at least the round trip plus 1 s, close to the netstack
+  before the key (at least 1 s, plus a margin of 5 ms over the round trip), and the same on a
+  LAN whose round trip rounds to 0 ms. RTT is sampled once per window, in whole milliseconds
+  of virtual time.
 - **Fast retransmit** on the third duplicate ACK, with every controller.
 - **Delayed ACKs**: an ACK waits up to 10 ms, except for every second full segment, an
   out-of-order segment or one that fills a hole, which are acknowledged at once.
@@ -140,13 +153,15 @@ What recovery depends on besides the controller, all smoltcp's and unchanged:
 - **No SACK-based recovery, Limited Transmit, early retransmit or tail-loss probe**: smoltcp
   sends SACK blocks as a receiver but never uses the peer's. A loss that no three duplicate
   ACKs reveal (among the last segments of a transfer, while the window is under four segments,
-  or of a retransmission) costs a timeout, at least 1 s.
+  or of a retransmission) costs a timeout: the round trip plus 200 ms by default.
 
-Measured with real nodes (`crates/wasmnet-host/tests/congestion.rs`): 1 MB over 10 Mbit/s
-through a 4-frame transmit queue takes 1.85 s with Reno (the serialisation alone is 0.83 s; one
-timeout at the end of the transfer), against 54 virtual minutes with `none`; with 1 % loss each
-way it takes 0.85 s to 5.8 s over eight seeds, one timeout or more where duplicate ACKs could not
-help. A snapshot never holds a controller's state: it is only taken with no connection open.
+Measured with real nodes (`crates/wasmnet-host/tests/congestion.rs`, seeds 1 to 8): 1 MB over
+10 Mbit/s through a 4-frame transmit queue takes 1.05 s with Reno (the serialisation alone is
+0.83 s; one timeout at the end of the transfer; 1.85 s with `tcp.rto-min = "1s"`), against 54
+virtual minutes with `none`; with 1 % loss each way it takes 0.85 s to 2.07 s, one timeout or
+more where duplicate ACKs could not help (0.85 s to 5.83 s with `1s`, no seed faster). Over a
+path of 300 ms each way nothing is retransmitted. A snapshot never holds a controller's state:
+it is only taken with no connection open.
 
 ## ICMP errors
 
@@ -308,7 +323,7 @@ either router by its routes).
 
 ## smoltcp, patched
 
-smoltcp is vendored in [third_party/smoltcp](../../third_party/smoltcp) with six patches,
+smoltcp is vendored in [third_party/smoltcp](../../third_party/smoltcp) with seven patches,
 kept as files in [docs/upstream](../upstream): neighbor discovery rate-limited per address
 instead of per interface (`smoltcp-0001-neighbor-rate-limit-per-address.patch`), so a host
 resolves several neighbors within a second; a `snapshot` feature that reads and restores
@@ -319,8 +334,10 @@ without a retransmission timeout; a FIN on a segment cut at the receive window's
 ignored with the cut bytes (`smoltcp-0004-fin-past-the-receive-window.patch`), so a stream no longer
 ends with bytes missing; a fast retransmit that sends the FIN alone when only the FIN is
 unacknowledged (`smoltcp-0005-fast-retransmit-of-a-lone-fin.patch`), so a closing connection
-does not hang in that state; and `Socket::path_mtu_lowered`
-(`smoltcp-0006-path-mtu-lowered.patch`), the hook behind path MTU discovery (below).
+does not hang in that state; `Socket::path_mtu_lowered`
+(`smoltcp-0006-path-mtu-lowered.patch`), the hook behind path MTU discovery (below); and
+settable bounds of the retransmission timeout (`smoltcp-0007-settable-rto-bounds.patch`),
+behind `tcp.rto-min` (above).
 [docs/upstream/smoltcp.md](../upstream/smoltcp.md) lists every smoltcp issue found and the
 workaround in use.
 

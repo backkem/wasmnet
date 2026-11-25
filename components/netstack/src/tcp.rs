@@ -76,6 +76,12 @@ pub const MAX_BUFFER: u64 = 1 << 20;
 pub const DEFAULT_BACKLOG: u64 = 8;
 /// Largest backlog: every slot is a smoltcp socket with its own buffers.
 pub const MAX_BACKLOG: u64 = 64;
+/// The default `tcp.rto-min`: Linux's `TCP_RTO_MIN`, 200 ms ([`parse_rto_min`]).
+pub const DEFAULT_RTO_MIN_NS: u64 = 200_000_000;
+/// The smallest `tcp.rto-min`: 1 ms.
+pub const MIN_RTO_MIN_NS: u64 = 1_000_000;
+/// The largest `tcp.rto-min`: 60 s, smoltcp's largest retransmission timeout.
+pub const MAX_RTO_MIN_NS: u64 = 60_000_000_000;
 /// How long a `connect` (or a half-open accepted connection) waits for the handshake.
 pub const CONNECT_TIMEOUT_NS: u64 = 75_000_000_000;
 /// The longest a dropped socket's connection may linger before it is aborted.
@@ -152,6 +158,21 @@ impl Congestion {
     }
 }
 
+/// Parses `tcp.rto-min`, the least retransmission timeout once a connection has measured its
+/// round-trip time, into nanoseconds: a duration of whole milliseconds from
+/// [`MIN_RTO_MIN_NS`] to [`MAX_RTO_MIN_NS`].
+///
+/// It works as Linux's `TCP_RTO_MIN`: the timeout is at least the smoothed round-trip time
+/// plus this (smoltcp's minimum margin, from our smoltcp patch), and so at least this. The
+/// timeout before the first measurement stays RFC 6298's 1 s, as on Linux. A margin as large
+/// as the minimum keeps a peer's delayed ACK (10 ms here, at most 200 ms on Linux) from
+/// tripping the timeout on a long, steady path, where the variation term decays to a few
+/// milliseconds.
+pub fn parse_rto_min(value: &str) -> Option<u64> {
+    wasmnet_wire::parse_duration(value)
+        .filter(|ns| (MIN_RTO_MIN_NS..=MAX_RTO_MIN_NS).contains(ns) && ns.is_multiple_of(1_000_000))
+}
+
 /// Per-socket options. A listener's options are inherited by the sockets it accepts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Options {
@@ -169,6 +190,8 @@ pub struct Options {
     /// The node's `tcp.congestion`, copied in at `create` (no socket option changes it, so a
     /// snapshot does not store it: a restore takes the restoring node's).
     pub congestion: Congestion,
+    /// The node's `tcp.rto-min` in nanoseconds, copied in at `create` like `congestion`.
+    pub rto_min_ns: u64,
 }
 
 impl Default for Options {
@@ -184,6 +207,7 @@ impl Default for Options {
             no_delay: false,
             backlog: DEFAULT_BACKLOG,
             congestion: Congestion::default(),
+            rto_min_ns: DEFAULT_RTO_MIN_NS,
         }
     }
 }
@@ -216,6 +240,9 @@ impl Options {
             tcp::SocketBuffer::new(vec![0u8; self.tx_buffer as usize]),
         );
         sock.set_congestion_control(self.congestion.smoltcp());
+        // Linux's rule: at least SRTT + the minimum ([`parse_rto_min`]).
+        sock.set_rto_min(smol_duration(self.rto_min_ns));
+        sock.set_rto_min_margin(smol_duration(self.rto_min_ns));
         self.apply(&mut sock, default_hops);
         sock
     }
@@ -416,8 +443,9 @@ pub struct TcpSockets {
     next_port: u16,
     orphans: Vec<Orphan>,
     pub counters: TcpCounters,
-    /// The node's `tcp.congestion`, for every socket it creates.
+    /// The node's `tcp.congestion` and `tcp.rto-min`, for every socket it creates.
     congestion: Congestion,
+    rto_min_ns: u64,
 }
 
 impl Default for TcpSockets {
@@ -429,15 +457,18 @@ impl Default for TcpSockets {
             orphans: Vec::new(),
             counters: TcpCounters::default(),
             congestion: Congestion::default(),
+            rto_min_ns: DEFAULT_RTO_MIN_NS,
         }
     }
 }
 
 impl TcpSockets {
-    /// An empty table whose sockets use `congestion` (the node's `tcp.congestion`).
-    pub fn new(congestion: Congestion) -> Self {
+    /// An empty table whose sockets use `congestion` (the node's `tcp.congestion`) and the
+    /// least retransmission timeout `rto_min_ns` (its `tcp.rto-min`).
+    pub fn new(congestion: Congestion, rto_min_ns: u64) -> Self {
         Self {
             congestion,
+            rto_min_ns,
             ..Self::default()
         }
     }
@@ -445,6 +476,11 @@ impl TcpSockets {
     /// The node's congestion controller.
     pub fn congestion(&self) -> Congestion {
         self.congestion
+    }
+
+    /// The node's least retransmission timeout, in nanoseconds.
+    pub fn rto_min_ns(&self) -> u64 {
+        self.rto_min_ns
     }
 }
 
@@ -579,6 +615,7 @@ impl TcpSockets {
                 no_delay: r.bool()?,
                 backlog: r.u64()?,
                 congestion: self.congestion,
+                rto_min_ns: self.rto_min_ns,
             };
             let phase = match r.u8()? {
                 0 => Phase::Unbound,
@@ -727,6 +764,7 @@ impl TcpSockets {
             remote: None,
             opts: Options {
                 congestion: self.congestion,
+                rto_min_ns: self.rto_min_ns,
                 ..Options::default()
             },
             phase: Phase::Unbound,
