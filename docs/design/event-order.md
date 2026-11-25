@@ -70,10 +70,10 @@ times (with nothing changed at the stops) is byte-identical to one that never st
 ## Operator events
 
 An operator event (`Op`, placed with `Network::add_op`) is a change made from outside the
-simulation: a link going up or down, a new latency, an injected frame, a control call into a
-device, bytes on a device's stdin, an extension's op, or a topology change
-([topology-and-infra.md](topology-and-infra.md)). It is queued like any other event, under a
-key chosen by its `Placement`:
+simulation: a link going up or down, a new latency or new impairments ([links.md](links.md)),
+an injected frame, a control call into a device, bytes on a device's stdin, an extension's op,
+or a topology change ([topology-and-infra.md](topology-and-infra.md)). It is queued like any
+other event, under a key chosen by its `Placement`:
 
 - **Before an event** (`Placement::Before(K)`): every key level carries a *pre* number, 0 for
   every event the simulation queues itself. The n-th operator event anchored before K gets K's

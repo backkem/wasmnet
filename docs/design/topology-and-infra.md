@@ -7,9 +7,10 @@ events placed by the caller, and requests from in-world controllers through `was
 ## Topology changes are operator events the network applies
 
 `wasmnet_core::Op` has topology variants: `AddDevice`, `StopDevice`, `StartDevice`,
-`RemoveDevice`, `Wire`, `Unwire` and `SetLink`, plus name-resolved writes (`StdinNamed`,
-`ControlNamed`) and extension ops. They name devices and links by name and are resolved when
-they apply, so an op can refer to a device an earlier op creates. They are queued like every
+`RemoveDevice`, `Wire`, `Unwire`, `SetLink` and `ImpairNamed` (a link's impairments,
+[links.md](links.md)), plus name-resolved writes (`StdinNamed`, `ControlNamed`) and extension
+ops. They name devices and links by name and are resolved when they apply, so an op can refer
+to a device an earlier op creates. They are queued like every
 operator event (see [event-order.md](event-order.md)), but the network applies them, not the
 executor: the executor returns from its run at such an event, the network applies it, and the
 run goes on exactly where it was. That happens in the event's own processing context, before

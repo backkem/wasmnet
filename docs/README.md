@@ -24,6 +24,8 @@ For embedders:
 
 - [design/runtime-and-extensions.md](design/runtime-and-extensions.md): the `Runtime` backend
   contract, what `wasmnet-host` adds, and the extension points.
+- [design/links.md](design/links.md): the link model: latency, MTU, carrier, and per-direction
+  impairments (a rate with a bounded transmit queue, seeded loss and jitter).
 - [design/topology-and-infra.md](design/topology-and-infra.md): changing a network while it runs,
   and `wasmnet:infra` for in-world controllers.
 - [design/sites.md](design/sites.md): one network split over two simulators, and the site-sync

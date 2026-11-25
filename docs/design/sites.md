@@ -1,4 +1,4 @@
-# Multi-site networks: the site-sync protocol (version 1)
+# Multi-site networks: the site-sync protocol (version 2)
 
 `wasmnet_core::sites` lets two simulators run **one network split into two sites** so that the
 result is byte for byte what one simulator would have produced (**multi-site equivalence**).
@@ -9,7 +9,8 @@ be a site.
 ## Model
 
 - A network is a set of devices (numbered `0..D` in creation order) and point-to-point links
-  (numbered `0..L`), each with a one-way latency. Time is virtual, in nanoseconds.
+  (numbered `0..L`), each with a one-way latency and optional impairments per direction
+  ([links.md](links.md)). Time is virtual, in nanoseconds.
 - A **site** runs a subset of the devices; every device runs on exactly one site. Every site
   builds the whole network in the same order, the other sites' devices as placeholders
   (`Network::remote_device`), so device and link numbers and event keys are the same
@@ -138,17 +139,33 @@ uv count, count x { uv frame_id, fate }                    (arrivals of the peer
 uv count, count x { tag, uv link, uv end, uv at, u8 inbound, bytes frame }  (WAN-link taps)
 uv count, count x { tag, uv at, uv link, u8 up }           (link transitions)
 uv count, count x { string name, end a, end b, uv latency, uv mtu, u8 up, u8 removed,
-                    u8 kind (0 Ethernet, else a cable kind's code), 5 x (uv, uv) stats,
+                    u8 kind (0 Ethernet, else a cable kind's code),
+                    2 x { uv rate, uv queue, uv loss_ppm, uv jitter }   (impairments by sending end)
+                    7 x (uv, uv) stats,
                     bytes pcap }
 strings := uv n, n x string
 end     := uv device, uv port
 fate    := u8 0 (in flight) | u8 1 (delivered), uv at | u8 2 (lost)
-         | u8 3 (dropped), u8 reason (0 link down, 1 oversize, 2 operator)
+         | u8 3 (dropped), u8 reason (0 link down, 1 oversize, 2 operator, 3 queue full)
 tag     := u8 origin, u8 has_cause (0|1), [key, then uv pre per level], uv slot, uv round,
            uv device, uv n
 ```
 
-The stats pairs are frames, bytes, dropped while down, oversize and lost, each per end.
+The stats pairs are frames, bytes, dropped while down, oversize, lost, dropped at a full
+transmit queue and lost to seeded loss, each per end.
+
+Version 2 added the impairments, the last two stats pairs and drop reason 3 to RECORDS; the
+other messages are as in version 1. A site refuses a message of another version.
+
+## Impaired links
+
+A link's impairments (a rate with a bounded transmit queue, seeded loss, jitter;
+[links.md](links.md)) are decided at `wire.transmit`, on the sender's site, from the sending
+direction's own state and random streams, and they only ever add delay. A frame transmitted at
+`t` over a WAN link is still due no earlier than `t + latency`, so the lookahead holds, and a
+frame lost on the wire is simply not sent: only the sender's half of the capture records it.
+A WAN link may be impaired, and a split network with impaired links gives the same records as
+the unsplit one (`crates/wasmnet-host/tests/impairments.rs`).
 
 ## Limits
 

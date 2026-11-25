@@ -15,6 +15,13 @@ here so that nobody has to find these the hard way. Each entry names where the c
   (`crates/wasmnet-core/src/exec.rs`) advances time while a device is instantiated or answers
   `ports()`. An event that is not a timer and comes due in that window is dropped without an
   error. Adding every device before the first `run` avoids it.
+- **A link wired by an operator event starts unimpaired.** `Op::Wire` and the cables of
+  `Op::AddDevice` take a latency and an MTU but no impairments; an `Op::ImpairNamed` applies
+  them one event later, so frames sent in between cross the plain link
+  (`crates/wasmnet-core/src/network.rs`).
+- **The transmit queue is bounded in frames only**, not in bytes, and serialisation counts the
+  frame as transmitted, without Ethernet's preamble, FCS and inter-frame gap
+  ([design/links.md](design/links.md)).
 - **A compile cache directory must be trusted.** `Host::with_cache_dir` loads what it finds
   there as native code, and wasmtime checks only a header. Never point it at a directory other
   users can write.
@@ -35,6 +42,11 @@ here so that nobody has to find these the hard way. Each entry names where the c
 
 - **An IGMP or MLD query makes the driver poll every millisecond** for the length of the
   response window. It costs processor time only: results and captures are the same.
+- **No TCP congestion control.** smoltcp's congestion controllers are not enabled
+  (`components/netstack/Cargo.toml`), so TCP sends its whole window at once. Over a link with a
+  rate and a small transmit queue it loses most of each burst and recovers through
+  retransmission timeouts: in `crates/wasmnet-host/tests/impairments.rs`, 1 MB at 10 Mbit/s
+  takes 0.83 s with the default queue and about 54 virtual minutes with a queue of 4 frames.
 - **Colliding query ids in the resolver** (an A and an AAAA query drawing the same id) cost one
   timeout before the retry.
 

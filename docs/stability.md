@@ -6,7 +6,9 @@ tiers.
 ## The core
 
 What the examples and tests here exercise: building and running a network, its records and
-captures, the components and the apps.
+captures, the components and the apps. Link impairments set when a link is built
+(`Impairments`, `LinkMut::impair`, `LinkMut::impair_from`) and their counters in `LinkStats`
+are part of it ([design/links.md](design/links.md)).
 
 ## Embedder surface, unstable
 
@@ -15,9 +17,11 @@ such an embedder's own tests, not by tests in this repository, and it may change
 versions without notice. Rustdoc and the design notes mark it **embedder surface, unstable**:
 
 - operator events (`Op`, `Network::add_op`, `run_stoppable`, frame rules, the transmit hook,
-  the component resolver for dynamic topology);
+  the component resolver for dynamic topology), including `Op::Impair` and `Op::ImpairNamed`,
+  which change a link's impairments while the network runs;
 - multi-site runs (`wasmnet_core::sites` and the `Network` methods for them) and the
-  `wasmnet:wan` carrier contract;
+  `wasmnet:wan` carrier contract (the site-sync wire format is at version 2 since impairments
+  were added to its link records);
 - the extension points (`wasmnet_core::ext`, `HostExtension`, `ControlHandler`,
   `HostBuilder::unmetered_engine` and `Host::load_unmetered`);
 - the netstack's snapshot interface (`wasmnet:netstack/state`, `snapshot.paused`);
