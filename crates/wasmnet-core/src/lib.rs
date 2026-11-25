@@ -101,7 +101,7 @@ pub use clock::{
     Ctx, EventKey, HOST_DEVICE, KEY_DEPTH, KeyLevel, Nanos, Origin, Sleep, Tag, VirtualClock,
 };
 pub use commands::{COMMANDS_EXPORT, CommandAnswer, CommandCall, DeviceCommand};
-pub use config::DeviceConfig;
+pub use config::{DeviceConfig, argv};
 pub use device::{Command, CostMeter, CountersReply, DeviceCost, Inbox, Snapshot, Status};
 pub use digest::Digest;
 pub use exec::{ActorFuture, Boundary, OpState, Stalled, Stats, Step, block_on};
@@ -121,7 +121,7 @@ pub use network::{
 };
 pub use output::{CAPTURE_LIMIT, OutputCapture};
 pub use reconfigure::{RECONFIGURE_EXPORT, ReconfigureCall, Refusal};
-pub use rng::{SimRng, derive_seed};
+pub use rng::{DeviceEntropy, SimRng, derive_seed};
 pub use supply::{Admission, Supplied, SupplyLimits};
 
 /// Default wall-clock reading at virtual time 0: 2026-01-01T00:00:00Z.

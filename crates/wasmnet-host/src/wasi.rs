@@ -1,7 +1,8 @@
 //! Deterministic WASI: wasmtime-wasi for stdio/args, our clock and RNG for everything else.
 //!
 //! * `now`/`resolution` (p2 + p3, monotonic + wall) and all `wasi:random` interfaces are
-//!   served through `WasiCtxBuilder` hooks backed by [`VirtualClock`] and [`SimRng`].
+//!   served through `WasiCtxBuilder` hooks backed by [`VirtualClock`] and the sim core's
+//!   [`DeviceEntropy`].
 //! * Waits are *not* hookable in wasmtime-wasi (49 and 50): p2 `subscribe-duration`/`subscribe-instant`
 //!   and p3 `wait-for`/`wait-until` sleep on real tokio time. We therefore shadow the whole
 //!   `wasi:clocks/monotonic-clock` interface (p2 and p3) with versions whose waits are
@@ -34,7 +35,7 @@ use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 use crate::bindings::CountedAsyncDevice;
 use wasmnet_core::{
-    DeviceConfig, JournalEnd, Nanos, OutputCapture, SimRng, VirtualClock, Wire, derive_seed,
+    DeviceConfig, DeviceEntropy, JournalEnd, Nanos, OutputCapture, VirtualClock, Wire, derive_seed,
 };
 
 use crate::stdio::{InputPipe, OutputPipe};
@@ -214,25 +215,20 @@ impl HostState {
         stdout: OutputCapture,
         stderr: OutputCapture,
     ) -> Self {
-        let seed = |stream| derive_seed(sim_seed, component, stream);
-        let seed_rng = |stream| SimRng::from_seed(seed(stream));
-        let insecure_seed = {
-            let mut rng = seed_rng("insecure-seed");
-            (u128::from(rng.next_u64()) << 64) | u128::from(rng.next_u64())
-        };
+        let entropy = DeviceEntropy::new(sim_seed, component);
+        let insecure_seed = entropy.insecure_seed_u128();
 
         let stdin = wasmnet_core::InputQueue::new();
         let mut b = WasiCtxBuilder::new();
-        b.arg(component)
-            .args(args)
+        b.args(&wasmnet_core::argv(component, args))
             .envs(env)
             .stdin(InputPipe(stdin.clone()))
             .stdout(OutputPipe(stdout))
             .stderr(OutputPipe(stderr))
             .wall_clock(VirtualWallClock(clock.clone()))
             .monotonic_clock(VirtualMonotonicClock(clock.clone()))
-            .secure_random(seed_rng("random"))
-            .insecure_random(seed_rng("insecure"))
+            .secure_random(entropy.secure)
+            .insecure_random(entropy.insecure)
             .insecure_random_seed(insecure_seed);
         Self {
             ctx: b.build(),

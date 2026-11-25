@@ -29,8 +29,7 @@ use std::sync::PoisonError;
 use std::task::{Context, Poll};
 
 use wasmnet_core::{
-    ActorFuture, Command, CostMeter, Fault, Inbox, JournalEnd, Level, Nanos, Record, Status,
-    VirtualClock,
+    ActorFuture, Command, CostMeter, Fault, Inbox, JournalEnd, Nanos, Status, VirtualClock,
 };
 use wasmtime::AsContextMut;
 use wasmtime::Store;
@@ -280,25 +279,7 @@ fn app_call<'a>(
     Box::pin(async move {
         let (result,) = app.run.call_concurrent(acc, ()).await?;
         let name = app.export.strip_prefix("app-").unwrap_or(&app.export);
-        let status = if result.is_ok() { "ok" } else { "error" };
-        let now = clock.now();
-        journal.push(
-            now,
-            Record::Log {
-                level: Level::Info,
-                message: format!("app {name} exited: {status}"),
-            },
-        );
-        journal.push(
-            now,
-            Record::Event {
-                kind: "app-exit".to_owned(),
-                fields: vec![
-                    ("app".to_owned(), name.to_owned()),
-                    ("status".to_owned(), status.to_owned()),
-                ],
-            },
-        );
+        journal.app_exit(clock.now(), name, result.is_ok());
         Ok(())
     })
 }

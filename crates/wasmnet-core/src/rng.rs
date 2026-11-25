@@ -23,6 +23,42 @@ pub fn derive_seed(sim_seed: u64, component: &str, stream: &str) -> u64 {
     splitmix64(&mut state)
 }
 
+/// A device's entropy, as every backend serves it: `wasi:random/random` from the seed stream
+/// `random`, `wasi:random/insecure` from `insecure`, and `wasi:random/insecure-seed` from the
+/// first two values of `insecure-seed`. One derivation for every backend, so a device draws the
+/// same numbers from the same seed wherever it runs.
+#[derive(Clone, Debug)]
+pub struct DeviceEntropy {
+    /// `wasi:random/random`.
+    pub secure: SimRng,
+    /// `wasi:random/insecure`.
+    pub insecure: SimRng,
+    /// `wasi:random/insecure-seed` as the guest receives it: the `(low, high)` halves of
+    /// [`insecure_seed_u128`](Self::insecure_seed_u128).
+    pub insecure_seed: (u64, u64),
+}
+
+impl DeviceEntropy {
+    /// The entropy of device `device` in a network seeded with `sim_seed`.
+    pub fn new(sim_seed: u64, device: &str) -> Self {
+        let rng = |stream| SimRng::from_seed(derive_seed(sim_seed, device, stream));
+        let mut seed = rng("insecure-seed");
+        let (high, low) = (seed.next_u64(), seed.next_u64());
+        Self {
+            secure: rng("random"),
+            insecure: rng("insecure"),
+            insecure_seed: (low, high),
+        }
+    }
+
+    /// The insecure seed as one 128-bit value (`high << 64 | low`), for a WASI host that keeps
+    /// it whole and hands the guest its low half first.
+    pub fn insecure_seed_u128(&self) -> u128 {
+        let (low, high) = self.insecure_seed;
+        (u128::from(high) << 64) | u128::from(low)
+    }
+}
+
 fn splitmix64(state: &mut u64) -> u64 {
     *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
     let mut z = *state;
@@ -93,6 +129,22 @@ mod tests {
         assert_ne!(base, derive_seed(42, "probe", "insecure"));
         assert_ne!(base, derive_seed(42, "probe2", "secure"));
         assert_ne!(derive_seed(42, "ab", "c"), derive_seed(42, "a", "bc"));
+    }
+
+    #[test]
+    fn a_devices_entropy_is_its_named_streams() {
+        let e = DeviceEntropy::new(42, "web");
+        let stream = |s| SimRng::from_seed(derive_seed(42, "web", s));
+        assert_eq!(e.secure.clone().next_u64(), stream("random").next_u64());
+        assert_eq!(e.insecure.clone().next_u64(), stream("insecure").next_u64());
+        let mut seed = stream("insecure-seed");
+        let (high, low) = (seed.next_u64(), seed.next_u64());
+        // The guest gets the low half first, as a WASI host holding the u128 hands it out.
+        assert_eq!(e.insecure_seed, (low, high));
+        assert_eq!(
+            e.insecure_seed_u128(),
+            (u128::from(high) << 64) | u128::from(low)
+        );
     }
 
     #[test]

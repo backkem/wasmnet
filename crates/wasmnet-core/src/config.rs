@@ -9,3 +9,11 @@ use std::collections::BTreeMap;
 
 /// A device's configuration: flat string keys (`aging`, `port0.ip`) to string values.
 pub type DeviceConfig = BTreeMap<String, String>;
+
+/// A device's `argv`, as `wasi:cli/environment` serves it on every backend: its name in the
+/// network first (`argv[0]`), then its arguments ([`crate::DeviceOptions::args`]).
+pub fn argv<S: AsRef<str>>(name: &str, args: &[S]) -> Vec<String> {
+    std::iter::once(name.to_owned())
+        .chain(args.iter().map(|a| a.as_ref().to_owned()))
+        .collect()
+}

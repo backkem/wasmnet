@@ -255,6 +255,30 @@ impl JournalEnd {
     pub fn device(&self) -> &str {
         &self.device
     }
+
+    /// A composed node's app `app` returned from its `run` at `at` (`ok`: it returned `ok`):
+    /// the log line `app <app> exited: ok|error` and the event `app-exit {app, status}`, as
+    /// every backend journals it.
+    pub fn app_exit(&self, at: Nanos, app: &str, ok: bool) {
+        let status = if ok { "ok" } else { "error" };
+        self.push(
+            at,
+            Record::Log {
+                level: Level::Info,
+                message: format!("app {app} exited: {status}"),
+            },
+        );
+        self.push(
+            at,
+            Record::Event {
+                kind: "app-exit".to_owned(),
+                fields: vec![
+                    ("app".to_owned(), app.to_owned()),
+                    ("status".to_owned(), status.to_owned()),
+                ],
+            },
+        );
+    }
 }
 
 #[cfg(test)]
