@@ -1,0 +1,31 @@
+[package]
+name = "wasmnet-udp-punch"
+version = "0.0.0"
+description = "A test fixture: UDP hole punching between two peers through a rendezvous server."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# A wasmnet app (world `wasmnet:app/app`) used by the NAT tests: one role is a rendezvous
+# server that tells two registered peers each other's public endpoint, the other a peer that
+# registers, then punches towards that endpoint and answers whoever punched it. `src/lib.rs` is
+# the pure logic (config, messages; guest-tested in wasmtime); `src/component.rs` is the glue.
+
+[lib]
+# The artifact is named after the component, not the package: `udp_punch.wasm`.
+name = "udp_punch"
+crate-type = ["cdylib"]
+
+[dependencies]
+# What the apps share: bindings, config keys, address conversions.
+wasmnet-app-kit = { path = "../../../crates/wasmnet-app-kit" }
+wasmnet-wire = { path = "../../../crates/wasmnet-wire" }
+thiserror.workspace = true
+# The `run` export is an async func; one task, so no spawn and no inter-task wakeup.
+wit-bindgen = { workspace = true, features = ["macros", "realloc", "async"] }
+# The standard WASI 0.3 bindings: sockets and clocks, exactly as on any WASI host.
+wasip3 = { workspace = true, features = ["std"] }
+
+[lints]
+workspace = true

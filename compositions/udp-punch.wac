@@ -1,0 +1,17 @@
+// node-udp-punch = the netstack + the udp-punch test fixture.
+//
+// Same shape as udp-echo-server.wac (the one explained there). The fixture's config picks its
+// role: a rendezvous server or a peer that punches through a NAT.
+package wasmnet:node-udp-punch;
+
+let net = new wasmnet:netstack { ... };
+
+let punch = new app:udp-punch {
+    "wasi:sockets/types@0.3.0": net["wasi:sockets/types@0.3.0"],
+    ...
+};
+
+export net["wasmnet:link/device@0.1.0"];
+export net["wasmnet:link/lifecycle@0.1.0"];
+export net["wasmnet:link/counters@0.1.0"];
+export punch["wasi:cli/run@0.3.0"] as "app-udp-punch";

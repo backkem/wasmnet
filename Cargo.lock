@@ -1748,6 +1748,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "wasmnet-udp-punch"
+version = "0.0.0"
+dependencies = [
+ "thiserror",
+ "wasip3",
+ "wasmnet-app-kit",
+ "wasmnet-wire",
+ "wit-bindgen 0.61.1",
+]
+
+[[package]]
 name = "wasmnet-wan-port"
 version = "0.0.0"
 dependencies = [

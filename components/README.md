@@ -26,7 +26,7 @@ name, as a composition does: `wac` knows a fabric device as `wasmnet:<name>` and
 |---|---|---|---|
 | `netstack` | `wasmnet-netstack` | `netstack.wasm` | A smoltcp IP stack: `wasmnet:link` below, `wasi:sockets@0.3.0` and `wasmnet:sockets-ext` above. One per node: every app of a composition shares it. |
 | `switch` | `wasmnet-switch` | `switch.wasm` | A transparent learning Ethernet bridge. |
-| `router` | `wasmnet-router` | `router.wasm` | Routes IPv4 and IPv6 between its ports: ARP, NDP, ICMP errors, static routes, DHCP relay. |
+| `router` | `wasmnet-router` | `router.wasm` | Routes IPv4 and IPv6 between its ports: ARP, NDP, ICMP errors, static routes, DHCP relay, address translation (NAT44) and a packet filter. |
 | `wan-port` | `wasmnet-wan-port` | `wan-port.wasm` | One end of a bridged WAN link between two sites. |
 
 ## Apps
@@ -56,6 +56,7 @@ An app never runs alone: a composition plugs it into a netstack
 | `clock-probe` | `wasmnet-clock-probe` | `clock-probe.wasm` | A command that samples every source of time and entropy it can reach. |
 | `infra-script` | `wasmnet-infra-script` | `infra-script.wasm` | A device with no ports that makes scripted `wasmnet:infra` calls at set times. |
 | `reflector` | `wasmnet-reflector` | `reflector.wasm` | Echoes frames back out of the port they came in on. |
+| `udp-punch` | `wasmnet-udp-punch` | `udp-punch.wasm` | An app (in `components/apps`): UDP hole punching between two peers through a rendezvous server, for the NAT tests. |
 
 ## Nodes
 
@@ -77,3 +78,4 @@ A node is the netstack plus the apps in its composition, `compositions/<name>.wa
 | `node-traceroute-ping` | `netstack`, `traceroute`, `ping` |
 | `node-udp-echo-client` | `netstack`, `udp-echo-client` |
 | `node-udp-echo-server` | `netstack`, `udp-echo-server` |
+| `node-udp-punch` | `netstack`, `udp-punch` |
