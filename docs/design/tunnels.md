@@ -79,11 +79,13 @@ packet above it gets fragmentation needed or Packet Too Big like on any port; ou
 never fragmented, and an outer packet too big for its egress port is dropped
 (`tunnel-<name>-outer-drops`).
 
-**MSS clamping** (`mss-clamp`, on by default). The netstack's TCP does not act on Packet Too Big
-or fragmentation needed ([known-issues.md](../known-issues.md#the-netstack)), so a connection
-whose segments do not fit the tunnel stalls on retransmissions. The router lowers the MSS option
-of every TCP SYN that enters or leaves a tunnel to the tunnel MTU minus 60 (IPv6) or 40 (IPv4)
-bytes and recomputes the checksum (`tunnel-<name>-mss-clamped`), as home routers and VPNs do.
+**MSS clamping** (`mss-clamp`, on by default). A connection whose segments do not fit the tunnel
+is told so by Packet Too Big or fragmentation needed, and the netstack's TCP then lowers its
+segment size ([netstack.md](netstack.md)). That costs every connection a bounced segment and a
+round trip, and a host whose stack does not act on the error stalls on retransmissions. So the
+router lowers the MSS option of every TCP SYN that enters or leaves a tunnel to the tunnel MTU
+minus 60 (IPv6) or 40 (IPv4) bytes and recomputes the checksum (`tunnel-<name>-mss-clamped`), as
+home routers and VPNs do.
 
 ## What the router does
 
