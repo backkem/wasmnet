@@ -80,6 +80,20 @@ pub const CONNECT_TIMEOUT_NS: u64 = 75_000_000_000;
 pub const ORPHAN_LIMIT_NS: u64 = 120_000_000_000;
 /// The most bytes one [`TcpSockets::recv_step`] hands to the receive pump.
 pub const RECV_CHUNK: usize = 65_536;
+/// The smallest path MTU an ICMPv4 "fragmentation needed" can teach (Linux's `min_pmtu`).
+pub const MIN_PATH_MTU_V4: u32 = 552;
+/// The smallest path MTU an ICMPv6 "packet too big" can teach (IPv6's minimum link MTU).
+pub const MIN_PATH_MTU_V6: u32 = 1280;
+
+/// What a "fragmentation needed" or "packet too big" lowered ([`TcpSockets::path_mtu`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PathMtu {
+    pub peer: SocketAddr,
+    pub local_port: u16,
+    pub mtu: u32,
+    /// The connection's new send MSS: the MTU less the IP and TCP headers.
+    pub mss: u32,
+}
 
 /// Linux defaults for keep-alive (`TCP_KEEPIDLE` 2 h, `TCP_KEEPINTVL` 75 s, `TCP_KEEPCNT` 9).
 const KEEP_IDLE_NS: u64 = 7_200_000_000_000;
@@ -248,6 +262,8 @@ pub struct TcpCounters {
     pub rx_window_full: u64,
     /// Orphaned connections (dropped resources) that reached CLOSED, or were aborted.
     pub orphans_reaped: u64,
+    /// Connections whose send MSS a "fragmentation needed" or "packet too big" lowered.
+    pub path_mtu_lowered: u64,
 }
 
 /// What [`TcpSockets::recv_step`] found.
@@ -1077,6 +1093,60 @@ impl TcpSockets {
         false
     }
 
+    /// Path MTU discovery (RFC 1191, RFC 8201): an ICMP "fragmentation needed" (IPv4, code 4)
+    /// or "packet too big" (IPv6) about one of our TCP segments. Validated as Linux does before
+    /// it is trusted: it must report an MTU below the node's own (`own_mtu`), and quote a
+    /// segment of a live connection (its four-tuple) whose sequence number was sent and not
+    /// yet acknowledged. An MTU under the family's minimum counts as the minimum (552 for IPv4,
+    /// Linux's floor; 1280 for IPv6), and the send MSS is only ever lowered. The connection's
+    /// segments are at most the new MSS from then on, and its data in flight goes again at
+    /// once (smoltcp, `path_mtu_lowered`).
+    ///
+    /// The learned size belongs to that connection only: there is no per-destination cache, so
+    /// a new connection over the same path learns it again, at the cost of one bounced
+    /// segment and a round trip. Returns what was lowered.
+    pub fn path_mtu(
+        &mut self,
+        e: &IcmpError,
+        own_mtu: u16,
+        sockets: &mut SocketSet<'static>,
+    ) -> Option<PathMtu> {
+        let too_big = matches!((e.v6, e.icmp_type, e.code), (false, 3, 4) | (true, 2, _));
+        if e.proto != 6 || !too_big || e.mtu == 0 {
+            return None;
+        }
+        let (min, ip_header) = if e.v6 {
+            (MIN_PATH_MTU_V6, 40)
+        } else {
+            (MIN_PATH_MTU_V4, 20)
+        };
+        let mtu = e.mtu.max(min);
+        if mtu >= u32::from(own_mtu) {
+            return None;
+        }
+        let mss = (mtu - ip_header - 20) as usize;
+        let local = IpEndpoint::new(IpAddress::from(e.orig_src), e.sport);
+        let remote = IpEndpoint::new(IpAddress::from(e.orig_dst), e.dport);
+        let seq = smoltcp::wire::TcpSeqNumber(e.seq as i32);
+        for (_, socket) in sockets.iter_mut() {
+            if let smoltcp::socket::Socket::Tcp(sock) = socket
+                && sock.local_endpoint() == Some(local)
+                && sock.remote_endpoint() == Some(remote)
+            {
+                if !sock.path_mtu_lowered(seq, mss) {
+                    return None;
+                }
+                self.counters.path_mtu_lowered += 1;
+                return Some(PathMtu {
+                    peer: SocketAddr::new(e.orig_dst, e.dport),
+                    local_port: e.sport,
+                    mtu,
+                    mss: mss as u32,
+                });
+            }
+        }
+        None
+    }
     // -----------------------------------------------------------------------------------------
     // listen / accept
 

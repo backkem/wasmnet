@@ -36,6 +36,10 @@ struct Sim {
     /// Decides, per transmitted frame `(sender, frame)`, whether the hub loses it: a lost frame
     /// is still recorded in `frames`, but nobody receives it.
     lose: Lose,
+    /// Like a router before a narrow link: for a frame `(sender, frame)` it may return an ICMP
+    /// error for the sender instead; the frame is then lost, and the error reaches the sender
+    /// one hub latency later.
+    bounce: Bounce,
 }
 
 fn node(pairs: &[(&str, &str)], seed: u64) -> Stack {
@@ -61,6 +65,7 @@ impl Sim {
             active: 0,
             batch: false,
             lose: None,
+            bounce: None,
         };
         for i in 0..n {
             sim.step(i);
@@ -78,7 +83,17 @@ impl Sim {
         self.active = now;
         let out = self.nodes[i].poll(now);
         for frame in out.frames {
-            let lost = self.lose.as_mut().is_some_and(|lose| lose(i, &frame));
+            let bounced = self.bounce.as_mut().and_then(|bounce| bounce(i, &frame));
+            let lost = bounced.is_some() || self.lose.as_mut().is_some_and(|lose| lose(i, &frame));
+            if let Some(reply) = bounced {
+                self.push(
+                    now + self.latency,
+                    Ev::Deliver {
+                        to: i,
+                        frame: reply,
+                    },
+                );
+            }
             for to in (0..self.nodes.len()).filter(|&j| j != i && !lost) {
                 self.push(
                     now + self.latency,
@@ -2378,6 +2393,7 @@ struct TcpSeg {
 }
 
 type Lose = Option<Box<dyn FnMut(usize, &[u8]) -> bool>>;
+type Bounce = Option<Box<dyn FnMut(usize, &[u8]) -> Option<Vec<u8>>>>;
 
 impl Sim {
     /// Every IPv4 TCP segment with its sequence and acknowledgment numbers, in transmit order
@@ -2471,18 +2487,36 @@ fn transfer(
     lose: Lose,
     read_from: u64,
 ) -> Transfer {
+    transfer_over(extra, len, lose, read_from, false, None)
+}
+
+/// [`transfer`] over IPv6 when `v6`, with the hub bouncing what `bounce` picks.
+fn transfer_over(
+    extra: &[(&'static str, &'static str)],
+    len: usize,
+    lose: Lose,
+    read_from: u64,
+    v6: bool,
+    bounce: Bounce,
+) -> Transfer {
     let mut sim = two(extra, 3);
     sim.lose = lose;
+    sim.bounce = bounce;
+    let (family, any, server) = if v6 {
+        (Family::Ipv6, "[::]:80", "[2001:db8::1]:80")
+    } else {
+        (Family::Ipv4, "0.0.0.0:80", "10.0.0.1:80")
+    };
     let (t, mut net) = sim.tcp(0);
-    let l = t.create(Family::Ipv4);
+    let l = t.create(family);
     t.set_buffer_size(l, false, len as u64).unwrap();
-    t.bind(l, sa("0.0.0.0:80"), &mut net).unwrap();
+    t.bind(l, sa(any), &mut net).unwrap();
     t.listen(l, &mut net).unwrap();
     let now = sim.now;
     let (t, mut net) = sim.tcp(1);
-    let cl = t.create(Family::Ipv4);
+    let cl = t.create(family);
     t.set_buffer_size(cl, true, len as u64).unwrap();
-    t.connect(cl, sa("10.0.0.1:80"), now, &mut net).unwrap();
+    t.connect(cl, sa(server), now, &mut net).unwrap();
     sim.kick(1);
     sim.run(MS);
     sim.now = MS;
@@ -2801,4 +2835,247 @@ fn no_loss_ends_a_stream_short_or_hangs_it_while_the_reader_has_stopped() {
         "(controller, lost segment, bytes read, end) of the transfers that ended short of \
          {BULK} bytes or did not end: {bad:?}"
     );
+}
+
+// ---- Path MTU discovery ----
+
+/// An ICMP "fragmentation needed" (IPv4) or "packet too big" (IPv6) from a router at
+/// 10.0.0.254 / 2001:db8::fe, reporting `mtu`, about the IP packet in `frame` (an Ethernet
+/// frame its sender sent), quoting its IP header and the first 8 bytes after it (the least a
+/// router quotes), addressed to that sender.
+fn too_big_reply(frame: &[u8], mtu: u32) -> Option<Vec<u8>> {
+    let router_mac = [2, 0, 0, 0, 0, 0xfe];
+    let mut f = frame.get(6..12)?.to_vec();
+    f.extend_from_slice(&router_mac);
+    match frame.get(12..14)? {
+        [8, 0] => {
+            let ihl = usize::from(frame.get(14)? & 0x0f) * 4;
+            let quote = frame.get(14..14 + ihl + 8)?;
+            let mut icmp = vec![3, 4, 0, 0, 0, 0];
+            icmp.extend_from_slice(&(mtu as u16).to_be_bytes());
+            icmp.extend_from_slice(quote);
+            let c = csum(&icmp);
+            icmp[2..4].copy_from_slice(&c.to_be_bytes());
+            let mut ip = vec![0x45, 0, 0, 0, 0, 1, 0, 0, 64, 1, 0, 0, 10, 0, 0, 254];
+            ip[2..4].copy_from_slice(&((20 + icmp.len()) as u16).to_be_bytes());
+            ip.extend_from_slice(frame.get(26..30)?);
+            let c = csum(&ip);
+            ip[10..12].copy_from_slice(&c.to_be_bytes());
+            f.extend_from_slice(&[8, 0]);
+            f.extend_from_slice(&ip);
+            f.extend_from_slice(&icmp);
+        }
+        [0x86, 0xdd] => {
+            let quote = frame.get(14..14 + 48)?;
+            let router: std::net::Ipv6Addr = "2001:db8::fe".parse().unwrap();
+            let to = frame.get(22..38)?;
+            let mut icmp = vec![2, 0, 0, 0];
+            icmp.extend_from_slice(&mtu.to_be_bytes());
+            icmp.extend_from_slice(quote);
+            let len = (icmp.len() as u32).to_be_bytes();
+            let pseudo = [&router.octets()[..], to, &len[..], &[0, 0, 0, 58], &icmp].concat();
+            let c = csum(&pseudo);
+            icmp[2..4].copy_from_slice(&c.to_be_bytes());
+            let mut ip = vec![0x60, 0, 0, 0, 0, 0, 58, 64];
+            ip[4..6].copy_from_slice(&(icmp.len() as u16).to_be_bytes());
+            ip.extend_from_slice(&router.octets());
+            ip.extend_from_slice(to);
+            f.extend_from_slice(&[0x86, 0xdd]);
+            f.extend_from_slice(&ip);
+            f.extend_from_slice(&icmp);
+        }
+        _ => return None,
+    }
+    Some(f)
+}
+
+/// The IP packet length of an IPv4 or IPv6 frame.
+fn ip_len(frame: &[u8]) -> usize {
+    match frame.get(12..14) {
+        Some([8, 0]) => usize::from(u16::from_be_bytes([frame[16], frame[17]])),
+        Some([0x86, 0xdd]) => 40 + usize::from(u16::from_be_bytes([frame[18], frame[19]])),
+        _ => 0,
+    }
+}
+
+/// A router before a narrow link: node 0's packets longer than `mtu` bytes are lost and
+/// answered with a "fragmentation needed" or "packet too big" reporting `mtu`.
+fn narrow_link(mtu: u32) -> Bounce {
+    Some(Box::new(move |from, f: &[u8]| {
+        (from == 0 && ip_len(f) > mtu as usize)
+            .then(|| too_big_reply(f, mtu))
+            .flatten()
+    }))
+}
+
+#[test]
+fn a_packet_too_big_lowers_the_segment_size_and_resends_at_once() {
+    for v6 in [false, true] {
+        let t = transfer_over(&[], 60_000, None, 0, v6, narrow_link(1280));
+        assert_eq!((t.got.len(), t.end), (60_000, Some(Ok(()))), "v6={v6}");
+        assert!(t.got == t.data);
+        let sim = &t.sim;
+        let learned = sim.events(0, "path-mtu-lowered");
+        assert_eq!(
+            learned.len(),
+            1,
+            "v6={v6}: {:?}",
+            sim.events(0, "icmp-error-received")
+        );
+        let (at, e) = learned[0];
+        assert_eq!(e.get("mtu"), Some("1280"));
+        assert_eq!(e.get("mss"), Some(if v6 { "1220" } else { "1240" }));
+        let received = sim.events(0, "icmp-error-received");
+        assert_eq!(received.len(), 1, "one error, one lowering");
+        assert_eq!(received[0].1.get("effect"), Some("path-mtu-lowered"));
+        // From then on every packet fits, and the bounced data went again at once: the
+        // transfer ends within a few round trips, not after a retransmission timeout (1 s).
+        assert!(
+            sim.frames
+                .iter()
+                .filter(|(t, n, _)| *n == 0 && *t >= at)
+                .all(|(_, _, f)| ip_len(f) <= 1280),
+            "v6={v6}"
+        );
+        assert!(sim.active < 100 * MS, "v6={v6}: done at {}", sim.active);
+        assert_eq!(
+            counters(&sim.nodes[0]).get("tcp-path-mtu-lowered"),
+            Some(&1)
+        );
+    }
+}
+
+#[test]
+fn a_packet_too_big_is_trusted_only_when_it_quotes_data_in_flight() {
+    let mut sim = two(&[], 3);
+    let l = listen(&mut sim, 0, 1);
+    let cl = connect(&mut sim, 1, "10.0.0.1:80");
+    sim.run(MS);
+    sim.now = MS;
+    established(&mut sim, 1, cl);
+    let sv = accept(&mut sim, 0, l);
+    sim.tcp(0).0.start_send(sv).unwrap();
+    write(&mut sim, 0, sv, &[7u8; 30_000], false);
+    // The first flight left at 1 ms; its ACK is back at 1.2 ms. At 1.05 ms a "router" sends
+    // errors about its first segment.
+    let first = sim
+        .frames
+        .iter()
+        .find(|(_, n, f)| *n == 0 && ip_len(f) > 1000)
+        .map(|(_, _, f)| f.clone())
+        .expect("a full segment left");
+    sim.run(MS + 50 * US);
+    sim.now = MS + 50 * US;
+    let deliver = |sim: &mut Sim, frame: Vec<u8>| {
+        sim.nodes[0].receive(frame);
+        sim.kick(0);
+        let received = sim.events(0, "icmp-error-received");
+        let last = received.last().expect("received").1;
+        last.get("effect").map(str::to_owned)
+    };
+    // Not below the node's own MTU: nothing to learn.
+    let e = deliver(&mut sim, too_big_reply(&first, 1500).unwrap());
+    assert_eq!(e.as_deref(), Some("none"));
+    // Not a live connection (another local port).
+    let mut stray = first.clone();
+    stray[34..36].copy_from_slice(&81u16.to_be_bytes());
+    let e = deliver(&mut sim, too_big_reply(&stray, 1280).unwrap());
+    assert_eq!(e.as_deref(), Some("none"));
+    // A sequence number outside the send window.
+    let mut old = first.clone();
+    let seq = u32::from_be_bytes([old[38], old[39], old[40], old[41]]).wrapping_sub(5_000);
+    old[38..42].copy_from_slice(&seq.to_be_bytes());
+    let e = deliver(&mut sim, too_big_reply(&old, 1280).unwrap());
+    assert_eq!(e.as_deref(), Some("none"));
+    assert!(sim.events(0, "path-mtu-lowered").is_empty());
+    // The real thing: 1280.
+    let e = deliver(&mut sim, too_big_reply(&first, 1280).unwrap());
+    assert_eq!(e.as_deref(), Some("path-mtu-lowered"));
+    // A larger MTU never raises it again.
+    let e = deliver(&mut sim, too_big_reply(&first, 1400).unwrap());
+    assert_eq!(e.as_deref(), Some("none"));
+    // A smaller one lowers it, but not under IPv4's floor of 552.
+    let e = deliver(&mut sim, too_big_reply(&first, 300).unwrap());
+    assert_eq!(e.as_deref(), Some("path-mtu-lowered"));
+    let learned: Vec<(Option<&str>, Option<&str>)> = sim
+        .events(0, "path-mtu-lowered")
+        .iter()
+        .map(|(_, e)| (e.get("mtu"), e.get("mss")))
+        .collect();
+    assert_eq!(
+        learned,
+        [(Some("1280"), Some("1240")), (Some("552"), Some("512"))]
+    );
+    let lowered_at = sim.now;
+    // Once everything is acknowledged, an error about it is stale.
+    sim.tcp(1).0.start_recv(cl).unwrap();
+    assert_eq!(read_stream_for(&mut sim, cl, 30_000), 30_000);
+    let e = deliver(&mut sim, too_big_reply(&first, 600).unwrap());
+    assert_eq!(e.as_deref(), Some("none"));
+    assert!(
+        sim.frames
+            .iter()
+            .filter(|(t, n, _)| *n == 0 && *t > lowered_at)
+            .all(|(_, _, f)| ip_len(f) <= 552)
+    );
+    assert_eq!(
+        counters(&sim.nodes[0]).get("tcp-path-mtu-lowered"),
+        Some(&2)
+    );
+}
+
+/// Node 1's app reads socket `cl` every millisecond until `len` bytes arrived (or 10 s);
+/// returns how many did.
+fn read_stream_for(sim: &mut Sim, cl: u32, len: usize) -> usize {
+    let mut got = 0;
+    let mut at = sim.now;
+    while got < len && at < 10_000 * MS {
+        sim.run(at);
+        sim.now = sim.now.max(at);
+        got += drain(sim, 1, cl).0.len();
+        at += MS;
+    }
+    got
+}
+
+#[test]
+fn an_ipv6_packet_too_big_under_1280_counts_as_1280() {
+    // A router reports 1000 for every packet over 1280: the stack uses 1280 (IPv6's minimum
+    // link MTU), and its packets then pass.
+    let bounce: Bounce = Some(Box::new(|from, f: &[u8]| {
+        (from == 0 && ip_len(f) > 1280)
+            .then(|| too_big_reply(f, 1000))
+            .flatten()
+    }));
+    let t = transfer_over(&[], 30_000, None, 0, true, bounce);
+    assert_eq!((t.got.len(), t.end), (30_000, Some(Ok(()))));
+    let learned = t.sim.events(0, "path-mtu-lowered");
+    assert_eq!(learned.len(), 1);
+    assert_eq!(learned[0].1.get("mtu"), Some("1280"));
+    assert_eq!(learned[0].1.get("mss"), Some("1220"));
+}
+
+#[test]
+fn a_udp_socket_that_asks_for_errors_gets_the_fragmentation_needed() {
+    // A datagram longer than the path MTU: the error is queued for a socket that asked, with
+    // its type and code (the reported MTU is not part of `wasmnet:sockets-ext/udp`), and
+    // nothing is learned: the next datagram of that size goes out at full size again.
+    let mut sim = two(&[], 1);
+    sim.bounce = narrow_link(1280);
+    let (udp, mut net) = sim.nodes[0].udp();
+    let s = udp.create(Family::Ipv4);
+    udp.bind(s, sa("0.0.0.0:0"), &mut net).unwrap();
+    udp.set_recv_errors(s, true).unwrap();
+    udp.send(s, &[1; 1400], Some(sa("10.0.0.2:9")), &mut net)
+        .unwrap();
+    sim.kick(0);
+    sim.run(10 * MS);
+    let (udp, _) = sim.nodes[0].udp();
+    let e = udp.take_error(s).unwrap().expect("queued");
+    assert_eq!((e.icmp_type, e.code, e.proto, e.mtu), (3, 4, 17, 1280));
+    assert_eq!(
+        sim.events(0, "icmp-error-received")[0].1.get("effect"),
+        Some("queued")
+    );
+    assert!(sim.events(0, "path-mtu-lowered").is_empty());
 }

@@ -7,7 +7,9 @@
 //!   incoming ARP packet or Neighbor Advertisement ends it (`arp-resolved` / `ndp-resolved`);
 //! * an incoming IGMP or MLD query opens the multicast polling window ([`crate::mcast`]);
 //! * an incoming ICMP error is reported (`icmp-error-received`), fails a TCP connect still in
-//!   SYN-SENT ([`crate::tcp`]) and is queued for a UDP socket that asked for its errors
+//!   SYN-SENT ([`crate::tcp`]), lowers a TCP connection's send MSS when it is a "fragmentation
+//!   needed" or "packet too big" (path MTU discovery, [`crate::tcp::TcpSockets::path_mtu`]),
+//!   and is queued for a UDP socket that asked for its errors
 //!   (`wasmnet:sockets-ext/udp`, [`crate::udp`]). smoltcp itself ignores ICMP errors for TCP and
 //!   UDP sockets.
 //!
@@ -72,6 +74,11 @@ pub struct IcmpError {
     pub orig_dst: IpAddr,
     pub sport: u16,
     pub dport: u16,
+    /// The quoted TCP segment's sequence number (0 if the quote is not TCP or too short).
+    pub seq: u32,
+    /// The MTU a "fragmentation needed" (ICMPv4 type 3 code 4) or "packet too big" (ICMPv6
+    /// type 2) reports for the next hop; 0 for any other error, or when the router sent none.
+    pub mtu: u32,
 }
 
 impl IcmpError {
@@ -106,7 +113,7 @@ impl IcmpError {
 }
 
 /// The quoted packet inside an ICMP error body (after the 8-byte ICMP header).
-fn quoted(v6: bool, inner: &[u8]) -> Option<(u8, IpAddr, IpAddr, u16, u16)> {
+fn quoted(v6: bool, inner: &[u8]) -> Option<(u8, IpAddr, IpAddr, u16, u16, u32)> {
     let (proto, src, dst, l4): (u8, IpAddr, IpAddr, usize) = if v6 {
         (
             *inner.get(6)?,
@@ -131,7 +138,15 @@ fn quoted(v6: bool, inner: &[u8]) -> Option<(u8, IpAddr, IpAddr, u16, u16)> {
         }
         _ => (0, 0),
     };
-    Some((proto, src, dst, sport, dport))
+    // A TCP quote carries the sequence number in its first 8 bytes, the least a router quotes.
+    let seq = if proto == 6 {
+        inner
+            .get(l4 + 4..l4 + 8)
+            .map_or(0, |b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+    } else {
+        0
+    };
+    Some((proto, src, dst, sport, dport, seq))
 }
 
 fn u16_at(b: &[u8], at: usize) -> Option<u16> {
@@ -213,7 +228,13 @@ fn ipv4(p: &[u8]) -> Option<Observed> {
             if sum(&[p.get(..ihl)?]) != 0xffff || sum(&[body]) != 0xffff {
                 return None;
             }
-            let (proto, orig_src, orig_dst, sport, dport) = quoted(false, body.get(8..)?)?;
+            let (proto, orig_src, orig_dst, sport, dport, seq) = quoted(false, body.get(8..)?)?;
+            // RFC 1191: the next-hop MTU in the low 16 bits of the unused word.
+            let mtu = if body[0] == 3 && *body.get(1)? == 4 {
+                u32::from(u16_at(body, 6)?)
+            } else {
+                0
+            };
             Some(Observed::IcmpError(IcmpError {
                 v6: false,
                 from: src.into(),
@@ -225,6 +246,8 @@ fn ipv4(p: &[u8]) -> Option<Observed> {
                 orig_dst,
                 sport,
                 dport,
+                seq,
+                mtu,
             }))
         }
         1 => {
@@ -286,7 +309,13 @@ fn ipv6(p: &[u8], eth_src: MacAddr) -> Option<Observed> {
             if sum(&[&pseudo[..], &[icmp]].concat()) != 0xffff {
                 return None;
             }
-            let (proto, orig_src, orig_dst, sport, dport) = quoted(true, icmp.get(8..)?)?;
+            let (proto, orig_src, orig_dst, sport, dport, seq) = quoted(true, icmp.get(8..)?)?;
+            // RFC 4443: a packet too big carries the MTU in its second word.
+            let mtu = if t == 2 {
+                u32::from_be_bytes(icmp.get(4..8)?.try_into().ok()?)
+            } else {
+                0
+            };
             Some(Observed::IcmpError(IcmpError {
                 v6: true,
                 from: src.into(),
@@ -298,6 +327,8 @@ fn ipv6(p: &[u8], eth_src: MacAddr) -> Option<Observed> {
                 orig_dst,
                 sport,
                 dport,
+                seq,
+                mtu,
             }))
         }
         t @ (128 | 129) => Some(Observed::Echo {

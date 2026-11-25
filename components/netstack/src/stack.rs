@@ -401,7 +401,10 @@ impl Stack {
             }
             Observed::IcmpError(e) if self.iface.has_ip_addr(IpAddress::from(e.to)) => {
                 self.counters.icmp_errors_received += 1;
-                let effect = if self.tcp.icmp_error(&e, &self.sockets) {
+                let lowered = self.tcp.path_mtu(&e, self.mtu, &mut self.sockets);
+                let effect = if lowered.is_some() {
+                    "path-mtu-lowered"
+                } else if self.tcp.icmp_error(&e, &self.sockets) {
                     "connect-failed"
                 } else if self.udp.icmp_error(&e) || self.icmp.icmp_error(&e) {
                     "queued"
@@ -433,6 +436,17 @@ impl Stack {
                         ("effect", effect.to_owned()),
                     ],
                 ));
+                if let Some(p) = lowered {
+                    out.event(Event::new(
+                        "path-mtu-lowered",
+                        &[
+                            ("peer", p.peer.to_string()),
+                            ("local-port", p.local_port.to_string()),
+                            ("mtu", p.mtu.to_string()),
+                            ("mss", p.mss.to_string()),
+                        ],
+                    ));
+                }
             }
             // An echo reply to one of our ICMP sockets: its hop limit, for `receive-datagram`
             // (smoltcp's ICMP socket keeps only the payload and the source).
@@ -726,6 +740,7 @@ impl Stack {
             ("tcp-send-waits", t.send_waits),
             ("tcp-rx-window-full", t.rx_window_full),
             ("tcp-orphans-reaped", t.orphans_reaped),
+            ("tcp-path-mtu-lowered", t.path_mtu_lowered),
             ("tcp-open", self.tcp.open() as u64),
             ("tcp-orphans", self.tcp.orphans() as u64),
             ("multicast-joins", s.multicast_joins),

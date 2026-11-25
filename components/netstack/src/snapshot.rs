@@ -35,7 +35,8 @@ use crate::udp::UdpCounters;
 
 const MAGIC: &[u8; 7] = b"NSSTATE";
 /// 2: version 1 had a reserved `u32` after the ICMP sockets, always 0.
-const VERSION: u8 = 2;
+/// 3: the TCP counters gained `path_mtu_lowered`.
+const VERSION: u8 = 3;
 
 /// A snapshot writer: little-endian scalars, length-prefixed collections.
 #[derive(Default)]
@@ -283,6 +284,7 @@ counters!(TcpCounters {
     send_waits,
     rx_window_full,
     orphans_reaped,
+    path_mtu_lowered,
 });
 
 fn smol_ip(a: IpAddress) -> IpAddr {

@@ -157,7 +157,29 @@ one of its packets, journals `icmp-error-received` and then:
   an established connection is not affected;
 - queues it for a UDP socket or an ICMP echo socket that asked for its errors
   (`set-recv-errors`), at most 16 per socket;
-- ends the resolver's tries with that server one round trip after the query.
+- ends the resolver's tries with that server one round trip after the query;
+- lowers a TCP connection's segment size on a "fragmentation needed" or "packet too big"
+  (path MTU discovery, below).
+
+**Path MTU discovery** (RFC 1191, RFC 8201) is per connection. A "fragmentation needed"
+(ICMPv4 type 3 code 4) or "packet too big" (ICMPv6 type 2) about a TCP segment is trusted
+only as Linux trusts it: it reports an MTU below the node's own, it quotes a segment of a live
+connection (the four-tuple), and the quoted sequence number was sent and not yet acknowledged.
+An MTU under the family's minimum counts as the minimum (552 for IPv4, Linux's floor; 1280 for
+IPv6), and an error without an MTU (an old router's) is ignored, with no plateau search. The
+connection's send MSS becomes the MTU less the IP and TCP headers, never higher than before,
+and its data in flight goes again at once in the new size, without counting as a loss (our
+smoltcp patch `Socket::path_mtu_lowered`). The journal says `effect path-mtu-lowered` and adds
+`path-mtu-lowered` (`peer`, `local-port`, `mtu`, `mss`); the counter is
+`tcp-path-mtu-lowered`. Nothing changes on a network where no such error arrives.
+
+There is no per-destination cache: a new connection over the same path learns it again, at
+the cost of one bounced segment and one round trip, since the resend is immediate. That keeps
+the state with the connection, with nothing to expire and nothing for a snapshot to save (a
+snapshot is only taken with no connection open). UDP learns nothing: an error about a
+datagram is queued for a socket that asked for errors (`set-recv-errors`), with its type and
+code (the MTU is not part of `wasmnet:sockets-ext/udp`), and a datagram of the same size goes
+out whole again.
 
 ## DHCP and the resolver
 
@@ -178,7 +200,7 @@ with one-shot mDNS queries, DNS servers or not. The keys are in
 
 ## smoltcp, patched
 
-smoltcp is vendored in [third_party/smoltcp](../../third_party/smoltcp) with five patches,
+smoltcp is vendored in [third_party/smoltcp](../../third_party/smoltcp) with six patches,
 kept as files in [docs/upstream](../upstream): neighbor discovery rate-limited per address
 instead of per interface (`smoltcp-0001-neighbor-rate-limit-per-address.patch`), so a host
 resolves several neighbors within a second; a `snapshot` feature that reads and restores
@@ -187,9 +209,10 @@ NewReno's partial-ACK retransmission in TCP fast recovery
 (`smoltcp-0003-newreno-partial-acks.patch`), so several losses in one window are repaired
 without a retransmission timeout; a FIN on a segment cut at the receive window's right edge
 ignored with the cut bytes (`smoltcp-0004-fin-past-the-receive-window.patch`), so a stream no longer
-ends with bytes missing; and a fast retransmit that sends the FIN alone when only the FIN is
+ends with bytes missing; a fast retransmit that sends the FIN alone when only the FIN is
 unacknowledged (`smoltcp-0005-fast-retransmit-of-a-lone-fin.patch`), so a closing connection
-does not hang in that state.
+does not hang in that state; and `Socket::path_mtu_lowered`
+(`smoltcp-0006-path-mtu-lowered.patch`), the hook behind path MTU discovery (below).
 [docs/upstream/smoltcp.md](../upstream/smoltcp.md) lists every smoltcp issue found and the
 workaround in use.
 
