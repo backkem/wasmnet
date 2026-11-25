@@ -15,7 +15,7 @@
 //! | `recv-buffer`, `send-buffer` | the listener's socket buffer sizes in bytes (inherited by accepted connections) | the netstack's |
 //! | `big-max` | the largest `/big?n=` body, bytes | `16777216` |
 //! | `route.<name>.path` | a route's path, `/` or `/about` (required per route) | |
-//! | `route.<name>.body` | its body text | `""` |
+//! | `route.<name>.body` | its body text; `{args}` is replaced by the node's arguments after `argv[0]` (one space between them) and `{env:NAME}` by its environment variable `NAME` (empty if unset), both from `wasi:cli/environment` | `""` |
 //! | `route.<name>.type` | its `Content-Type` | `text/plain` |
 //! | `route.<name>.sse-events` | (embedder surface, unstable) makes the route an event stream (`text/event-stream`): events `1..=N`, see [`Sse`]; `GET` only | |
 //! | `route.<name>.sse-interval-ms` | the virtual time between two events, `0..=60000` | `1000` |
@@ -345,6 +345,57 @@ impl Config {
             c.health.get_or_insert_with(|| HEALTH_PATH.to_owned());
         }
         Ok(c)
+    }
+
+    /// Whether a route body names the node's arguments or environment (`{args}`, `{env:NAME}`).
+    pub fn wants_environment(&self) -> bool {
+        self.routes.iter().any(|r| {
+            let b = String::from_utf8_lossy(&r.body);
+            b.contains("{args}") || b.contains("{env:")
+        })
+    }
+
+    /// Replaces `{args}` in route bodies with the node's arguments after `argv[0]`, one space
+    /// between them, and `{env:NAME}` with the value of its environment variable `NAME`
+    /// (empty if it has none). What is put in is not looked at again.
+    pub fn with_environment(&mut self, args: &[String], env: &[(String, String)]) {
+        let joined = args.join(" ");
+        for r in &mut self.routes {
+            let text = String::from_utf8_lossy(&r.body).into_owned();
+            let mut out = String::with_capacity(text.len());
+            let mut rest = text.as_str();
+            loop {
+                let next = [("{args}", true), ("{env:", false)]
+                    .into_iter()
+                    .filter_map(|(m, args)| rest.find(m).map(|i| (i, m, args)))
+                    .min();
+                let Some((i, marker, is_args)) = next else {
+                    out.push_str(rest);
+                    break;
+                };
+                out.push_str(&rest[..i]);
+                let after = &rest[i + marker.len()..];
+                if is_args {
+                    out.push_str(&joined);
+                    rest = after;
+                    continue;
+                }
+                match after.find('}') {
+                    Some(end) => {
+                        let name = &after[..end];
+                        if let Some((_, v)) = env.iter().find(|(k, _)| k == name) {
+                            out.push_str(v);
+                        }
+                        rest = &after[end + 1..];
+                    }
+                    None => {
+                        out.push_str(&rest[i..]);
+                        break;
+                    }
+                }
+            }
+            r.body = out.into_bytes();
+        }
     }
 }
 
@@ -720,8 +771,30 @@ mod tests {
         );
         assert_eq!(respond_at(&c, &get("/up"), 0).status, 200);
         assert_eq!(c.identity_headers(), "X-Instance: web-3\r\n");
+        // The node's arguments and environment, where a body names them.
+        let mut e = Config::from_pairs(pairs(&[
+            ("route.e.path", "/"),
+            (
+                "route.e.body",
+                "{args}|{env:GREETING}|{env:NONE}|{env:X}|{env:open",
+            ),
+        ]))
+        .unwrap();
+        assert!(e.wants_environment());
+        let env = [
+            ("GREETING".to_owned(), "hi".to_owned()),
+            ("X".to_owned(), "{args}".to_owned()),
+        ];
+        e.with_environment(&["-v".to_owned(), "two".to_owned()], &env);
+        assert_eq!(
+            respond(&e, &get("/")).body,
+            Body::Bytes(b"-v two|hi||{args}|{env:open".to_vec()),
+            "a value is not looked at again; an unclosed name stays"
+        );
+        assert!(!c.wants_environment());
         // Without them nothing changes: no header, the old default body.
         let plain = Config::from_pairs(Vec::new()).unwrap();
+        assert!(!plain.wants_environment());
         assert_eq!(plain.identity_headers(), "");
         assert_eq!(respond(&plain, &get("/healthz")).status, 404);
         for bad in [

@@ -1,5 +1,6 @@
 /// The baseline contract of a wasmnet app: what a plain socket app imports and exports. An app
-/// may import more (for example `wasmnet:infra/devices`, for a controller the host grants it).
+/// may import more (for example `wasmnet:infra/devices`, for a controller the host grants it, or
+/// `wasi:cli/environment` for the arguments and environment variables its node was given).
 ///
 /// An app is an ordinary WASI 0.3 command: it exports `wasi:cli/run@0.3.0` and uses
 /// `wasi:sockets@0.3.0` and `wasi:clocks@0.3.0` exactly as it would on any WASI host. In a

@@ -15,6 +15,7 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::task::Poll;
 
+use wasip3::cli::environment;
 use wasip3::clocks::monotonic_clock;
 use wasip3::sockets::types::{ErrorCode, IpAddressFamily, TcpSocket};
 use wit_bindgen::{StreamReader, StreamResult, StreamWriter};
@@ -348,7 +349,12 @@ fn open(config: &Config, addr: SocketAddr) -> Result<(TcpSocket, StreamReader<Tc
 async fn listen() -> Result<(), String> {
     let started = monotonic_clock::now();
     let pairs = store::get_all().map_err(|e| format!("config: {e:?}"))?;
-    let config = Config::from_pairs(app_pairs(pairs, APP)).map_err(|e| e.to_string())?;
+    let mut config = Config::from_pairs(app_pairs(pairs, APP)).map_err(|e| e.to_string())?;
+    if config.wants_environment() {
+        // `wasi:cli/environment`: the node's arguments after argv[0], and its variables.
+        let args: Vec<String> = environment::get_arguments().into_iter().skip(1).collect();
+        config.with_environment(&args, &environment::get_environment());
+    }
     let mut listeners = Vec::new();
     let mut accepting: Vec<Option<Accepting>> = Vec::new();
     for &addr in &config.listen {
