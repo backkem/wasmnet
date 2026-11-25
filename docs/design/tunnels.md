@@ -66,7 +66,8 @@ port:
 - a request for an id the router does not have on that port gets no answer;
 - the transaction id is the kind (check or reflexive query), the tunnel id and a sequence
   number, so a response finds its tunnel and an answer to nothing it sent is ignored;
-- no `MESSAGE-INTEGRITY` or `FINGERPRINT`: there are no credentials yet.
+- without a key, no `MESSAGE-INTEGRITY` and no `FINGERPRINT`: the id is not a credential;
+  a keyed tunnel signs its checks ([below](#keyed-tunnels)).
 
 A STUN message has the magic cookie `0x2112A442` at bytes 4..8, where a Geneve header has its
 VNI and a reserved zero byte, so the two never mix up. Wireshark decodes Geneve on UDP 6081 and
@@ -111,8 +112,8 @@ A tunnel is `idle` (nothing to probe), `probing`, `up` or `failed`.
 - **Roaming**: once up, any check, response or data packet with the tunnel's id from another
   endpoint moves the peer there (`tunnel-roamed {tunnel, from, to}`). That is how a tunnel
   survives a NAT that gave the peer a new mapping (`tests/tunnel.rs`, a NAT rebinding). The id
-  is not a credential, so anyone who can send to the tunnel's port can also steer it; see
-  "Encryption".
+  is not a credential, so anyone who can send to the tunnel's port can also steer a keyless
+  tunnel; a keyed one moves only for its peer ([below](#keyed-tunnels)).
 - **Liveness**: nothing heard from the peer for `dead` (80 s) takes the tunnel down
   (`tunnel-down {tunnel, peer, silent-ns}`); it probes every candidate again, the old peer
   among them (unless a command removed it).
@@ -140,6 +141,165 @@ outer packets leave from the outside address untranslated. An inside host's mapp
 the same external port loses its inbound datagrams to the tunnel; keep `nat.port-range` clear of
 tunnel ports.
 
+## Keyed tunnels
+
+A tunnel with a `key` (64 hex digits: 32 bytes, the same at both ends) carries its data
+encrypted and authenticated, and lets only a holder of the key be its peer or move it. The
+controllers choose and hand out the key, by config (`tunnel.<name>.key`), in `tunnel-add` (`key
+<hex>`) and with `tunnel-key <name> <hex>` on a live tunnel; the router never invents,
+negotiates or prints one (answers and events name a key by its id: 8 hex digits derived from
+it). Agreeing on a key is the controllers' signalling, as pairing already is. A keyed tunnel's
+defaults are UDP port **4500** and MTU **1438**; everything else (probing, keepalives, roaming,
+liveness, the reflexive endpoint, relays, the packet filter) works as without a key, on
+authenticated messages only.
+
+### The wire format: ESP in UDP
+
+Data is [ESP](https://www.rfc-editor.org/rfc/rfc4303) (RFC 4303) in UDP
+([RFC 3948](https://www.rfc-editor.org/rfc/rfc3948)), tunnel mode, with
+[ChaCha20-Poly1305](https://www.rfc-editor.org/rfc/rfc7634) (RFC 7634), manually keyed:
+
+```text
+outer IPv4 (20) | UDP (8): port 4500 by default |
+SPI (4, top bit set) | sequence number (4) | IV (8: the sequence number, zero-extended) |
+encrypted: inner packet | padding 1, 2, 3 (to a multiple of 4) | pad length | next header 4 or 41 |
+ICV (16: the Poly1305 tag)
+```
+
+The nonce is the SA's 4-byte salt and the IV; the additional data is the SPI and the sequence
+number (no extended sequence numbers). The receiver checks the sequence number against a
+128-packet anti-replay window before it decrypts and records it only once the tag checked;
+padding and next header must be what RFC 4303 sends. A sequence number is never reused: an SA
+that has sent 2^32 - 1 packets sends no more (`tunnel-key-exhausted`) until the controller
+replaces the key. Overhead: 20 + 8 + 34 = 62 bytes (plus up to 3 bytes of padding), so the
+default MTU is 1500 - 62 = 1438, a length that needs no padding, and the MSS clamp follows it
+(1378 for IPv6 inside, 1398 for IPv4).
+
+Checks stay STUN on the same port, signed: a keyed tunnel's check and its answer carry
+`TUNNEL-SA` (a comprehension-optional attribute of this library's own, `0xC0E5`, not registered
+with IANA: the sender's inbound SPI and its epoch) and then `MESSAGE-INTEGRITY-SHA256` (RFC 8489
+§14.6, the whole 32-byte HMAC-SHA256) under a short-term password derived from the key.
+Attributes after the integrity attribute are ignored, as RFC 8489 asks. Reflexive queries (a
+Binding request without `USERNAME`) and their answers stay unsigned: they say only what a STUN
+server says to anyone.
+
+The three formats share a port without confusion: STUN has its two top bits clear and the magic
+cookie, Geneve has version 0 (its first byte below 0x40), and every SPI here has its top bit set.
+
+**Why ESP, not a record inside Geneve, and not WireGuard.** This library's premise is real
+protocols on real bytes that a capture tool decodes. Three choices were weighed:
+
+- *An AEAD record inside the existing Geneve framing* would be the smallest change, but an
+  invented format: a capture would show a Geneve header followed by bytes no tool decodes, and
+  the replay and key rules would be ours alone.
+- *WireGuard's transport data message* (type 4, receiver index, counter, ChaCha20-Poly1305) is
+  standard on the wire and Wireshark decodes its header, but its keys come from its Noise
+  handshake: without the handshake, which this design leaves to the controller, a tool can
+  neither derive nor take the keys, and a WireGuard peer could not talk to it anyway.
+- *ESP in UDP with RFC 7634* is the IPsec format with manual keys, a case RFC 4301 and every
+  IPsec stack know (`ip xfrm state add ... aead rfc7539esp(chacha20,poly1305)`): the header, the
+  replay window, padding and next header are RFC 4303's, the cipher's use is RFC 7634's,
+  checked here against RFC 7634's own example. Its cost: 8 more bytes than WireGuard's header
+  and a 4-byte alignment.
+
+So ESP. Wireshark's dissector for UDP 4500 (RFC 3948) takes what is not IKE for ESP, so it
+shows each data packet's SPI and sequence number; it likely shows the STUN checks on that port
+as ESP too, unless "Decode As" says otherwise (not checked here).
+
+**Decrypting a capture** takes an ESP SA per direction in Wireshark's ESP protocol preferences: the outer addresses, the SPI, the encryption algorithm
+ChaCha20-Poly1305 (RFC 7634) with its 36-byte key (key and salt) and no separate
+authentication. The keys per direction come from the tunnel key (below), and everything else
+they need is in the capture: each signed check's `TUNNEL-SA` (in the clear) gives its sender's
+SPI and epoch, and a direction's 36 bytes are HKDF(tunnel key, `esp`, receiver's SPI, sender's
+epoch). This library prints no key and has no tool that derives them yet. Whether a given
+Wireshark version lists ChaCha20-Poly1305 among its ESP algorithms was not checked here.
+
+### Keys, directions and epochs
+
+The tunnel key is never used directly. Everything comes from HKDF-SHA256 (RFC 5869) with the
+salt `wasmnet-tunnel-1` and a label per use (`components/router/src/tunnel/key.rs`):
+
+| label | gives |
+|---|---|
+| `stun-password` | 32 bytes, written as 64 hex digits: the STUN password, so its bytes are the HMAC key |
+| `spi`, the end's epoch, its transit address | the SPI the end receives on (top bit set) |
+| `esp`, the receiver's SPI, the sender's epoch | 36 bytes: the key and salt of that direction |
+| `key-id` | 4 bytes: the key's id in answers and events |
+
+An end's **epoch** is the instant (virtual nanoseconds) its current key was set: at
+`tunnel-add`, at a restart, at `tunnel-key`. Each signed check tells the peer the sender's SPI
+and epoch, so each end knows which SA to send under and which to open with. Because a
+direction's keys depend on the receiver's SPI and the sender's epoch, the two directions have
+different keys (a packet reflected back to its sender does not open), and an end that restarts
+or takes a new key starts fresh SAs with fresh sequence numbers and windows (its earlier
+packets no longer open). No randomness is involved: counters, epochs and HKDF make every byte a
+function of the key and virtual time.
+
+**What counts as hearing the peer.** Only a check that checks under the current (or previous)
+key, carries a `TUNNEL-SA` that is not the end's own (reflected) or older than the peer's
+latest epoch (stale), and whose check counter is above the last one seen in that epoch (a
+replay); only an answer that checks and answers one of the last 16 checks this end sent, each
+once; only an ESP packet that opens and is not a replay. Each of these may bring the tunnel up
+or move its peer (a NAT rebinding moves it on the next authenticated packet). Everything else
+is refused, counted (`tunnel-<name>-auth-failed`, replays also in `-replayed`) and journalled
+as `tunnel-auth-failed {tunnel, from, reason}`, once per reason until the tunnel comes up or
+changes its key. The reasons: `unsigned` (no integrity, or no `TUNNEL-SA`), `integrity` (another
+key, or altered), `keyed-peer` (a signed check reached a keyless tunnel), `cleartext` (Geneve
+data for a keyed tunnel), `reflected`, `stale`, `replayed`, `unexpected` (an answer to nothing
+outstanding), `no-sa` (ESP before the peer's SA is known), `esp` (it does not open). A refused
+check gets no answer. A keyed tunnel never falls back to cleartext, and a keyed end and a
+keyless end never come up together: each refuses the other, and says so.
+
+**Replacing a key** (`tunnel-key <name> <hex>`): the new key is current at once, with a new
+epoch and SPI, and the next check (at once to an up peer) is signed with it; the old one stays
+*previous*, still accepted and still used to send, until the peer proves it holds the new key
+(an authenticated message under it: `tunnel-key-confirmed`) or `dead` has passed
+(`tunnel-key-retired`). So two controllers that replace the key within `dead` of each other
+keep the tunnel up with no lost packet on in-order links; a packet sent under the old key that
+arrives after the new one was confirmed is dropped (its SPI is gone, so the router counts it in
+`tunnel-unknown-id`), which only a reordering path can show. Events: `tunnel-key-replaced {tunnel,
+key, previous}`, `tunnel-key-confirmed {tunnel, key, previous}`, `tunnel-key-retired {tunnel,
+key}`, all by id. How a controller learns that its peer moved on is its own business:
+`crates/wasmnet-host/tests/tunnel.rs` has one controller replace its box's key on a timer and
+the other on its box's first `tunnel-auth-failed`.
+
+### What a key protects, and what it does not
+
+Against an attacker on the path between the ends (it can read, drop, delay, replay, reorder and
+inject outer packets, and send from any address):
+
+- it cannot read or change what the tunnel carries, nor inject a packet into it: data is
+  ChaCha20-Poly1305 under per-direction keys, checked before anything is used;
+- it cannot replay data (the window) or checks (the counter per epoch), nor reflect either back;
+- it cannot bring a tunnel up, move its peer to an address of its choice, or get an answer to a
+  check: all three need a message signed under the key, and a captured one is refused as a
+  replay;
+- it learns from a keyed tunnel only what a keyless STUN server tells anyone: a Binding request
+  without `USERNAME` is answered with the requester's own endpoint, as before.
+
+It can still:
+
+- drop or delay packets, and so take the tunnel down (`dead`) or keep it from coming up;
+- see the outer addresses and ports, the SPIs, sequence numbers, packet sizes and timing, the
+  tunnel id (STUN `USERNAME`), and when keys change;
+- forge answers to reflexive queries (unsigned, as a STUN server's are), feeding a controller a
+  wrong reflexive endpoint;
+- learn about the inner traffic from a relay, which decrypts and re-encrypts: a relay holds both
+  pairs' keys and sees the inner packets.
+
+And the design has limits of its own: **no forward secrecy** (whoever learns a key can read
+everything captured under it, before and after) and **no rekeying of its own** (the controller
+replaces the key; nothing limits a key's age or volume except the 2^32 - 1 packets per SA); the
+key derivation, the epoch scheme and the signed checks are this library's own composition of
+standard parts, and **have had no outside review**. Within the simulation the key is in the
+network's description and in the controllers' calls like any other configuration; it never
+leaves through the router's answers, events or counters.
+
+The primitives come from RustCrypto's pure-Rust, `no_std` crates, pinned exactly in the
+workspace manifest and used only by the router: `chacha20poly1305` 0.10.1, `hkdf` 0.12.4,
+`hmac` 0.12.1 and `sha2` 0.10 (`sha1` 0.10.7 only in its tests, for RFC 5769's vectors). Tags
+and HMACs are compared through the crates' constant-time APIs.
+
 ## What a controller does
 
 The router keeps a tunnel; a controller decides which tunnels exist and where traffic goes:
@@ -148,6 +308,7 @@ The router keeps a tunnel; a controller decides which tunnels exist and where tr
 |---|---|
 | tunnel ids and transit addresses | encapsulation, decapsulation, MSS clamping |
 | `tunnel-add` and `tunnel-remove` | checks, keepalives, liveness, roaming |
+| keys: choosing one, giving it to both ends, `tunnel-key` to replace it | encryption, signing, replay protection, the previous key until the peer has the new one |
 | signaling: read its tunnel's reflexive endpoint (`tunnels`), hand it to the peer's controller, which gives it to its own tunnel with `tunnel-peer` | the reflexive endpoint, from reflectors and from the peer |
 | route choice: a shared LAN, a direct tunnel or a relay's; `route-replace` when a tunnel fails or comes up | routes as programmed |
 | which router relays | nothing: a relay is a router |
@@ -159,7 +320,8 @@ rendezvous must do here.
 
 The `tunnels` answer is meant to be parsed: one line per tunnel, by name, the name and then
 `<key> <value>` pairs in a fixed order (`id`, `udp`, `local`, `state`, `peer`, `reflexive`,
-`candidates`, `tx-packets`, `rx-packets`); later versions may append pairs, never reorder them.
+`candidates`, `tx-packets`, `rx-packets`, and `key` with its id for a keyed tunnel); later
+versions may append pairs, never reorder them.
 An embedder sends the commands with `Network::command` (or as operator events) and reads their
 answers; an in-world controller sends them with `wasmnet:infra/devices.control` and reads the
 answer with `devices.control-answer` once the command has run.
@@ -173,9 +335,12 @@ command, where a real embedder would use its own replicated state or a message o
 **Following a tunnel's state without polling.** The router journals `tunnel-reflexive
 {tunnel, endpoint, from}`, `tunnel-up {tunnel, peer, after-ns}`, `tunnel-roamed {tunnel, from,
 to}`, `tunnel-down {tunnel, peer, silent-ns}` and `tunnel-failed {tunnel, rounds, candidates}`
-as they happen (a controller could take its reflexive endpoint from `tunnel-reflexive` too).
-A controller that created the router reads them with `wasmnet:infra/events.read` and waits
-for them with `changes.wait-any` (an async controller) or `events.arm` (a stepped one), filtered to
+as they happen. `tunnel-reflexive` is how a controller that follows its router's events learns the
+tunnel's reflexive endpoint without asking: its `endpoint` is what `tunnels` would list as
+`reflexive`, journalled when it changes (the tests below still ask `tunnels` once, because the
+`infra-script` fixture cannot carry an event's field to another controller).
+A controller that created the router reads them with `wasmnet:infra/events.read` and waits for
+them with `changes.wait-any` (an async controller) or `events.arm` (a stepped one), filtered to
 `tunnel-*` so the router's other events (`route-lookup`, `route-added`) do not wake it
 ([topology-and-infra.md](topology-and-infra.md#events-of-the-devices-a-controller-created)).
 It wakes in the instant the router changed state, at the same position on every replay, and
@@ -199,8 +364,9 @@ packets in the clear.
 
 ## Determinism
 
-The router draws no random numbers: transaction ids are the tunnel's id and a counter, timers
-run on the `now` it is given, candidates and tunnels are kept in order, and its next deadline
+The router draws no random numbers: transaction ids are the tunnel's id and a counter, a keyed
+tunnel's nonces are sequence numbers and its keys come from HKDF of the key and its epoch (an
+instant), timers run on the `now` it is given, candidates and tunnels are kept in order, and its next deadline
 includes every tunnel's. The same commands at the same positions give the same packets.
 
 A tunnel that is up sends keepalives forever, so a network with one never goes quiet: run it
@@ -215,15 +381,17 @@ with `run_until`.
 - Commands are native only, like every device command ([known-issues.md](../known-issues.md)).
 - No TURN-style relaying of outer datagrams, no WebRTC data channels.
 
-**Encryption.** None yet. It would go between the Geneve header and the inner packet (or replace
-Geneve with a WireGuard-like record), keyed by the controller through a command, with the STUN
-checks carrying `MESSAGE-INTEGRITY` so that only an authenticated packet may move a tunnel's
-peer. A key log, as TLS has, would let captures be decrypted.
+- Keyed tunnels: no forward secrecy and no rekeying of their own (the controller replaces the
+  key), no outside review; see [their threat model](#what-a-key-protects-and-what-it-does-not).
 
 ## Tests
 
 - Inside wasmtime (`cargo test --target wasm32-wasip2 -p wasmnet-router`): the codecs against RFC
-  5769's vectors and arbitrary bytes, MSS clamping, the state machine (probing, up, keepalive,
+  5769's vectors and arbitrary bytes, ESP against RFC 7634's example and ChaCha20-Poly1305
+  against RFC 8439's, HKDF against RFC 5869's first test case, STUN integrity against RFC
+  5769's HMAC-SHA1 values, the replay window (late packets, the edge of the window, the top of
+  the sequence space), and two keyed ends with an attacker between them (replays, reflection,
+  forged and unsigned checks, a wrong key, a keyless peer, a key replaced, a restart), MSS clamping, the state machine (probing, up, keepalive,
   roaming, down, failed, reflectors), and through the whole router: encapsulation and
   decapsulation of IPv4 and IPv6 inner packets, an echo request to a transit address, routes by
   name surviving another tunnel's removal, tunnels from the config, Binding requests, a
@@ -234,3 +402,10 @@ peer. A key log, as TLS has, would let captures be decrypted.
   NATs failing and a relay carrying the fetch after the routes are replaced, a cut that takes the
   tunnel down and heals, roaming after a NAT rebinding, and a tunnel added and removed beside a
   transfer through the same router without changing a frame of it.
+  Keyed: HTTP across a keyed tunnel through two NATs (ESP and signed STUN only between the homes), a wrong key and a keyed end
+  facing a keyless one (neither comes up; both say why), a keyed relay behind symmetric NATs, an
+  attacker on the Internet switch who replays ESP packets and checks, sends checks without the
+  key and with a broken integrity (nothing injected, roamed or answered), two controllers that
+  replace a live tunnel's key through `devices.control` (one on a timer, one on its box's
+  `tunnel-auth-failed`) while fetches go on, the captures of a keyless tunnel pinned as they were
+  before keys existed, and what the cryptography costs in fuel.

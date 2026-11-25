@@ -146,11 +146,24 @@ here so that nobody has to find these the hard way. Each entry names where the c
   expire: fine for thousands of entries, slow for the 65536 the bound allows.
 - **A port that gets its first allow rule while traffic crosses it** does not know the flows
   already running: their answers are dropped unless a rule lets them in.
-- **The router's tunnels are unauthenticated and IPv4 outside.** A tunnel id is no credential:
-  whoever can send to a tunnel's UDP port can move its peer. Outer endpoints are IPv4 only; on a
-  translating router, an inside host's mapping on a tunnel's UDP port loses its inbound
-  datagrams to the tunnel
+- **A keyless tunnel is unauthenticated, and every tunnel is IPv4 outside.** Without a key a
+  tunnel id is no credential: whoever can send to a tunnel's UDP port can move its peer or
+  inject into it. Outer endpoints are IPv4 only; on a translating router, an inside host's
+  mapping on a tunnel's UDP port loses its inbound datagrams to the tunnel
   ([design/tunnels.md](design/tunnels.md)).
+- **A keyed tunnel's protection has limits** ([design/tunnels.md](design/tunnels.md#what-a-key-protects-and-what-it-does-not)).
+  An on-path attacker cannot read, inject, replay, reflect, bring a tunnel up or move its peer,
+  but it can drop packets (and so take the tunnel down), see addresses, ports, SPIs, sizes,
+  timing, the tunnel id and when keys change, and forge answers to unsigned reflexive queries.
+  There is no forward secrecy and no rekeying of its own: the controller replaces the key, and
+  an SA stops sending after 2^32 - 1 packets until it does. A relay sees the inner packets. The
+  key derivation, epochs and signed checks are this library's own composition of standard
+  parts (ESP in UDP with ChaCha20-Poly1305, HKDF-SHA256, STUN's `MESSAGE-INTEGRITY-SHA256` and
+  an unregistered attribute, `TUNNEL-SA`) and have had **no outside review**. Nothing derives a
+  capture's per-direction ESP keys for a decoder yet, and whether Wireshark decrypts
+  ChaCha20-Poly1305 ESP was not checked. Encryption costs fuel: about 4.6 times a keyless
+  router's per packet (see the note on fuel in
+  [design/runtime-and-extensions.md](design/runtime-and-extensions.md)).
 - **A switch's delay holds frames in the switch.** At most 4096 at once (more are dropped and
   counted, `held-dropped`); frames held for different pairs of ports may overtake each other.
   For a delay on one cable, a link's latency and jitter are the better tool

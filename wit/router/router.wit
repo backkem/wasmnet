@@ -112,6 +112,14 @@
 /// (true) are optional. A tunnel name is `a-z`, `0-9` and `-`, 1 to 32 characters, starting with
 /// a letter. A router has at most 256 tunnels.
 ///
+/// Since 0.1.6 a tunnel may have a `key` (64 hex digits, the same at both ends, chosen by the
+/// controllers; the router never makes one up). A keyed tunnel sends its data as ESP in UDP
+/// (RFC 4303, RFC 3948) with ChaCha20-Poly1305 (RFC 7634) instead of Geneve, signs its checks and
+/// their answers (`MESSAGE-INTEGRITY-SHA256`), and takes nothing unsigned, under another key,
+/// replayed or reflected: only its peer can bring it up or move it. Its defaults are `udp` 4500
+/// and `mtu` 1438. A keyed and a keyless end never come up together. A key never appears in an
+/// answer or an event: they name it by its id, 8 hex digits derived from it.
+///
 /// - `tunnel-add <name> <key> <value>...`: adds the tunnel, its port and the connected route of
 ///   its transit prefix; with candidates or reflectors its first checks leave at `now`.
 ///   `ok("added")`; `ok("unchanged")` when that tunnel exists with exactly these settings; an
@@ -125,11 +133,19 @@
 ///   failed probes again at once. `ok("added")` or `ok("unchanged")`.
 /// - `tunnel-peer-remove <name> <ip:port>`: forgets a candidate (a tunnel that is up keeps its
 ///   peer). `ok("removed")` or `ok("absent")`.
+/// - `tunnel-key <name> <key>` (0.1.6): a keyed tunnel's new key, at once: checks are signed
+///   with it from `now` (one leaves at once to an up peer), and it is used to send once the peer
+///   has proven it holds it; until then, or for `dead` at most, the previous key is still
+///   accepted and still used to send, so a tunnel whose two controllers replace the key within
+///   `dead` of each other stays up. Packets under the previous key that arrive after it was
+///   retired are dropped (counted as `auth-failed`). `ok("replaced")` or `ok("unchanged")`;
+///   an error for a keyless tunnel (remove it and add it with a key).
 /// - `tunnels` (no argument): one tunnel per line, by name. Each line is the name, then
 ///   `<key> <value>` pairs in this order: `id`, `udp`, `local`, `state` (`idle`, `probing`,
 ///   `up` or `failed`), `peer`, `reflexive` (endpoints, `-` when unknown), `candidates`
-///   (comma-separated, `-` when none), `tx-packets`, `rx-packets`. Later versions may append
-///   pairs at the end of a line; they never reorder or rename these.
+///   (comma-separated, `-` when none), `tx-packets`, `rx-packets`, and for a keyed tunnel
+///   `key` (its id, 0.1.6). Later versions may append pairs at the end of a line; they never
+///   reorder or rename these.
 ///
 /// Routes name a tunnel instead of a port: `<prefix> tunnel <name>`, with neither `via` nor
 /// `port` (`fd00:b::/64 tunnel to-b`), in the config's `routes` and in the route commands;
@@ -140,9 +156,10 @@
 ///
 /// This package names that combination; it adds no interface of its own. (A world added to
 /// `wasmnet:link` would change that package for every device.) 0.1.2 documented the forward and
-/// allow commands, 0.1.3 the tunnel commands, 0.1.4 allow rules on tunnel ports and 0.1.5
-/// `routes-replace`; nothing in the WIT changed, so a host built against 0.1.1 runs it as is.
-package wasmnet:router@0.1.5;
+/// allow commands, 0.1.3 the tunnel commands, 0.1.4 allow rules on tunnel ports, 0.1.5
+/// `routes-replace` and 0.1.6 tunnel keys (`key`, `tunnel-key`); nothing in the WIT changed, so a
+/// host built against 0.1.1 runs it as is.
+package wasmnet:router@0.1.6;
 
 world router {
     include wasmnet:link/stepped-device@0.1.0;

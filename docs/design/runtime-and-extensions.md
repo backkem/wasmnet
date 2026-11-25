@@ -124,6 +124,27 @@ to look at in the journal when a peak is larger than expected. A device that run
 with `OutOfFuel` at the same instant on every replay, so a budget too small for a new workload
 shows up as a deterministic failure, never as a slow run.
 
+**What some work costs.** Fuel counts Wasm instructions, so it is a fair, deterministic measure of
+what a device does, and a reason to read `peak_fuel` before raising a budget. Measured by
+`crates/wasmnet-host/tests/tunnel.rs` (`what_the_cryptography_costs`, seed 1), for a box router
+at one end of a tunnel ([tunnels.md](tunnels.md)) carrying a 1 MB HTTP fetch (about 1,100
+tunnel packets both ways together), everything the router does included (routing, the
+NAT-facing port, ARP, the tunnel):
+
+| | fuel per tunnel packet | whole fetch | peak in one instant |
+|---|---|---|---|
+| keyless (Geneve) | 23,772 | 25.7 M | 1.4 M |
+| keyed (ESP, ChaCha20-Poly1305) | 110,479 | 122.2 M | 7.3 M |
+
+So encryption and authentication add about 87,000 fuel per packet (about 60 per byte of a
+full-size packet), 4.6 times the keyless router's work. A check costs 6,021 fuel without a key
+and 38,811 with one (signing or checking `MESSAGE-INTEGRITY-SHA256`; measured on an idle tunnel
+with a check each way every second, per check message the router sent or received). The
+busiest instant of the keyed fetch used 7.3 M of the default 50 M per instant: a router at its
+default budget carries this bulk transfer with room to spare, and about seven times as many
+packets at one instant would exhaust it. Fuel is the guest's instruction count, not wall time:
+these figures say nothing about how fast a native build is.
+
 ## Extension points
 
 | point | registered with | called |

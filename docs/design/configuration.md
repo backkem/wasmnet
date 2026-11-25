@@ -358,11 +358,12 @@ tunnels; their ports follow the cabled ones in name order. `id` and `local` are 
 | Key | Value | Default | Meaning |
 |---|---|---|---|
 | `tunnel.<name>.id` | integer, 1..=16777215 | required | The Geneve VNI and the STUN `USERNAME` of its checks. Unique per UDP port. |
+| `tunnel.<name>.key` | 64 hex digits (32 bytes) | none | The tunnel key, the same at both ends: data becomes ESP in UDP with ChaCha20-Poly1305 and checks are signed ([tunnels.md](tunnels.md#keyed-tunnels)). Never shown again: answers and events give its id. |
 | `tunnel.<name>.local` | `addr/len`, IPv4 or IPv6, not link-local | required | The transit address and its connected route (`fd00:ff::a/128`). |
-| `tunnel.<name>.udp` | integer, 1..=65535 | `6081` | The local UDP port, shared with other tunnels of other ids. |
+| `tunnel.<name>.udp` | integer, 1..=65535 | `6081`, `4500` with a key | The local UDP port, shared with other tunnels of other ids. |
 | `tunnel.<name>.peer` | IPv4 endpoints, comma-separated, at most 8 | none | Candidate endpoints of the peer. |
 | `tunnel.<name>.reflector` | IPv4 endpoints, comma-separated, at most 8 | none | Where to ask for the tunnel's reflexive endpoint (a router's `stun-server` or tunnel port). |
-| `tunnel.<name>.mtu` | integer, 1280..=9000 | `1464` | The tunnel port's IP MTU (1500 minus 36 bytes of outer IPv4, UDP and Geneve). |
+| `tunnel.<name>.mtu` | integer, 1280..=9000 | `1464`, `1438` with a key | The tunnel port's IP MTU: 1500 minus 36 bytes of outer IPv4, UDP and Geneve, or minus 62 of outer IPv4, UDP and ESP. |
 | `tunnel.<name>.probe` | duration above zero | `100ms` | Time between two probing rounds. |
 | `tunnel.<name>.rounds` | integer, 1..=1000 | `20` | Probing rounds without an answer before the tunnel is `failed`. |
 | `tunnel.<name>.keepalive` | duration above zero | `25s` | Time between two checks to the peer while up. |
@@ -382,8 +383,9 @@ counters) changes. Their semantics are in [wit/router/router.wit](../../wit/rout
 and [topology-and-infra.md](topology-and-infra.md#commands-into-a-running-device).
 
 Tunnels change the same way: `tunnel-add <name> <key> <value>...` (the keys above),
-`tunnel-remove <name>`, `tunnel-peer <name> <ip:port>`, `tunnel-peer-remove <name> <ip:port>`
-and `tunnels`, the list a controller reads ([router.wit](../../wit/router/router.wit)).
+`tunnel-remove <name>`, `tunnel-peer <name> <ip:port>`, `tunnel-peer-remove <name> <ip:port>`,
+`tunnel-key <name> <key>` (a keyed tunnel's new key, the previous one kept until the peer has
+the new one) and `tunnels`, the list a controller reads ([router.wit](../../wit/router/router.wit)).
 
 Port forwards and allow rules change the same way: `forward-add <forward>`,
 `forward-remove <forward or proto and external port>`, `forwards`, `allow-add <port> <rule>`,

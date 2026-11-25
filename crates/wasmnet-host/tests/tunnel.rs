@@ -1670,6 +1670,32 @@ fn what_the_cryptography_costs() {
         f0 / p0.max(1),
         f1 / p1.max(1)
     ));
+    // An idle tunnel: a check each way every second, no data (the fetch comes after the end).
+    // What a check costs, with everything else the router does while idle, is the difference
+    // between two such runs 10 s apart, divided by the check messages between them.
+    let mut idle = Setup::new(nat(EI, APD), nat(EI, APD));
+    idle.keepalive = "1s";
+    idle.dead = "5s";
+    idle.fetch_at = "100s";
+    let mut per_check = Vec::new();
+    for (name, s) in [("keyless", idle.clone()), ("keyed", idle.clone().keyed())] {
+        let at = |end: u64| {
+            let mut s = s.clone();
+            s.end = end;
+            let r = run(1, &s);
+            let checks = r.counter("box-b", "tunnel-to-a-checks-sent")
+                + r.counter("box-b", "tunnel-to-a-requests-received")
+                + r.counter("box-b", "tunnel-to-a-responses-received");
+            (r.costs["box-b"].fuel, checks)
+        };
+        let ((f10, c10), (f20, c20)) = (at(10 * S), at(20 * S));
+        let each = (f20 - f10) / (c20 - c10).max(1);
+        per_check.push(each);
+        rows.push(format!(
+            "{name} idle: box-b fuel per check message (sent or received) {each}"
+        ));
+    }
     println!("{}", rows.join("\n"));
     assert!(f1 > f0, "encryption costs something");
+    assert!(per_check[1] > per_check[0], "signing costs something");
 }
