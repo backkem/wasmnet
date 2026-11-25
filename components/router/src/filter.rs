@@ -185,6 +185,8 @@ pub struct Filter {
     rules: BTreeMap<u32, Vec<Rule>>,
     /// Set once any port had a rule: from then on flows are tracked.
     active: bool,
+    /// Names for ports that go by one in events and listings (tunnel ports).
+    names: BTreeMap<u32, String>,
     flows: BTreeMap<FlowKey, Track>,
     timeouts: Timeouts,
     max_flows: usize,
@@ -215,6 +217,7 @@ impl Filter {
         Self {
             active: !rules.is_empty(),
             rules,
+            names: BTreeMap::new(),
             flows: BTreeMap::new(),
             timeouts,
             max_flows,
@@ -317,7 +320,7 @@ impl Filter {
                     ("proto".to_owned(), crate::router::proto_name(p)),
                     ("src".to_owned(), endpoint(src, sport, t.ports)),
                     ("dst".to_owned(), endpoint(dst, dport, t.ports)),
-                    ("port".to_owned(), port.to_string()),
+                    ("port".to_owned(), self.label(port)),
                 ],
             ));
         }
@@ -341,6 +344,32 @@ impl Filter {
         self.earliest
     }
 
+    /// How events and listings name `port`: its name if it has one, else its number.
+    pub fn label(&self, port: u32) -> String {
+        self.names
+            .get(&port)
+            .cloned()
+            .unwrap_or_else(|| port.to_string())
+    }
+
+    /// Names `port` (a tunnel port) for events and listings, or forgets its name.
+    pub fn set_name(&mut self, port: u32, name: Option<&str>) {
+        match name {
+            Some(n) => {
+                self.names.insert(port, n.to_owned());
+            }
+            None => {
+                self.names.remove(&port);
+            }
+        }
+    }
+
+    /// Drops every rule of `port` (a tunnel that is removed). Flows it let through end on their
+    /// own timers.
+    pub fn clear(&mut self, port: u32) {
+        self.rules.remove(&port);
+    }
+
     /// Adds `rule` to `port`'s list: `Ok("added")`, or `Ok("unchanged")` when it is there.
     pub fn add(&mut self, port: u32, rule: Rule) -> Result<&'static str, String> {
         let list = self.rules.entry(port).or_default();
@@ -348,7 +377,10 @@ impl Filter {
             return Ok("unchanged");
         }
         if list.len() >= MAX_RULES {
-            return Err(format!("port {port} has {MAX_RULES} rules already"));
+            return Err(format!(
+                "port {} has {MAX_RULES} rules already",
+                self.label(port)
+            ));
         }
         list.push(rule);
         self.active = true;
@@ -370,11 +402,15 @@ impl Filter {
         "removed"
     }
 
-    /// Every rule, one per line, `<port> <rule>`, by port then in order.
+    /// Every rule, one per line, `<port> <rule>` (a named port by its name), by port then in
+    /// order.
     pub fn listing(&self) -> String {
         self.rules
             .iter()
-            .flat_map(|(p, list)| list.iter().map(move |r| format!("{p} {r}")))
+            .flat_map(|(p, list)| {
+                let label = self.label(*p);
+                list.iter().map(move |r| format!("{label} {r}"))
+            })
             .collect::<Vec<_>>()
             .join("\n")
     }

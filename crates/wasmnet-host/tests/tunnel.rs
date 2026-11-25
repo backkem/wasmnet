@@ -56,8 +56,13 @@ struct Setup {
     /// Tunnel timers on the boxes.
     keepalive: &'static str,
     dead: &'static str,
-    /// When `node-a` fetches.
+    /// When `node-a` fetches, and what (`app.http-get.urls`), and what `node-b` serves.
     fetch_at: &'static str,
+    urls: &'static str,
+    interval: &'static str,
+    listen: &'static str,
+    /// Commands to a box (0 or 1) at an instant after the pairing (50 ms).
+    commands: Vec<(u64, usize, &'static str, &'static str)>,
     /// Use the relay when the direct tunnel failed (the controller checks at 5 s).
     relay: bool,
     /// Home B's Internet cable is down over this interval.
@@ -72,6 +77,10 @@ impl Setup {
             keepalive: "25s",
             dead: "80s",
             fetch_at: "2s",
+            urls: "http://[fd00:b::10]/big?n=20000",
+            interval: "0s",
+            listen: "[::]:80",
+            commands: Vec::new(),
             relay: false,
             cut: None,
             end: 4 * S,
@@ -206,13 +215,14 @@ fn run(seed: u64, s: &Setup) -> Run {
             ("ipv6-gateway", "fe80::1"),
         ];
         let node = if name == "a" {
-            node.push(("app.http-get.url", "http://[fd00:b::10]/big?n=20000"));
+            node.push(("app.http-get.urls", s.urls));
+            node.push(("app.http-get.interval", s.interval));
             node.push(("app.http-get.start", s.fetch_at));
             network
                 .device_with_config("node-a", &b.load("node-http-get"), pairs(&node))
                 .unwrap()
         } else {
-            node.push(("app.http-server.listen", "[::]:80"));
+            node.push(("app.http-server.listen", s.listen));
             network
                 .device_with_config("node-b", &b.load("node-http-server"), pairs(&node))
                 .unwrap()
@@ -294,6 +304,10 @@ fn run(seed: u64, s: &Setup) -> Run {
             "tunnel-peer",
             &format!("{t} {theirs}"),
         );
+    }
+    for (at, i, c, a) in &s.commands {
+        network.run_until(*at).unwrap();
+        command(&mut network, boxes[*i], c, a);
     }
     if s.relay {
         // At 5 s the controllers move each box's route to the relay if the direct tunnel failed.
@@ -739,4 +753,52 @@ fn a_tunnel_added_and_removed_beside_a_transfer_leaves_it_alone() {
         let (again, ..) = busy_run(seed, true);
         assert_eq!(journal, again, "{label}: rerun");
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The packet filter on a tunnel port
+
+#[test]
+fn allow_rules_on_a_tunnel_port_filter_what_crosses_it() {
+    // node-a asks node-b on port 8080, then 80, then 8080 again, a second apart. At 1 s box B
+    // lets in only TCP to port 80 from its tunnel, and box A only ICMPv6 from its own: the
+    // second 8080 is dropped at box B, and the answers to node-a pass box A as a known flow.
+    let mut s = Setup::new(nat(EI, APD), nat(EI, APD));
+    s.fetch_at = "500ms";
+    s.interval = "1s";
+    s.urls = "http://[fd00:b::10]:8080/big?n=1000,http://[fd00:b::10]/big?n=20000,\
+              http://[fd00:b::10]:8080/big?n=3000";
+    s.listen = "[::]:80,[::]:8080";
+    s.commands = vec![
+        (S, 1, "allow-add", "to-a tcp dport 80"),
+        (S, 0, "allow-add", "to-b icmpv6"),
+    ];
+    s.end = 6 * S;
+    each_seed(&s, |r, label| {
+        let log = transcript(&r.journal);
+        let done: Vec<String> = events(&r.journal, "node-a", "http-get-done")
+            .iter()
+            .map(|f| format!("{} {}", field(f, "url"), field(f, "body-bytes")))
+            .collect();
+        assert_eq!(
+            done,
+            [
+                "http://[fd00:b::10]:8080/big?n=1000 1000",
+                "http://[fd00:b::10]/big?n=20000 20000"
+            ],
+            "{label}\n{log}"
+        );
+        // Box B dropped the third request's SYNs at its tunnel port, and said so.
+        let drops = events(&r.journal, "box-b", "filter-drop");
+        assert!(!drops.is_empty(), "{label}");
+        assert_eq!(field(&drops[0], "port"), "to-a");
+        assert!(field(&drops[0], "dst").ends_with(":8080"), "{drops:?}");
+        assert!(r.counter("box-b", "filter-dropped") >= 1);
+        // Box A let node-b's answers in only as a known flow.
+        assert_eq!(r.counter("box-a", "filter-dropped"), 0, "{label}");
+        assert!(r.counter("box-a", "filter-tracked") > 10, "{label}");
+        let added = events(&r.journal, "box-b", "allow-added");
+        assert_eq!(field(&added[0], "port"), "to-a");
+        decode_wan(r);
+    });
 }

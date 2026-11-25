@@ -72,14 +72,16 @@
 /// - `mappings` (no argument): the translation table, one mapping per line, `<proto>
 ///   <internal> -> <external> port <n> (remote <any|addr|addr:port>|forward)`, each followed by
 ///   its sessions, `  session <remote>[ <tcp state>]`.
-/// - `allow-add <port> <rule>`: appends a rule to router port `<port>`'s allow list. A rule is
-///   `<any|tcp|udp|icmp|icmpv6> [from <prefix>] [to <prefix>] [dport <p>|<lo>-<hi>]`, as in
-///   `port<N>.allow`. `ok("added")` or `ok("unchanged")`. A port that gets its first rule
+/// - `allow-add <port> <rule>`: appends a rule to router port `<port>`'s allow list (since 0.1.4
+///   `<port>` may also be a tunnel's name: its rules judge what arrives through the tunnel). A
+///   rule is `<any|tcp|udp|icmp|icmpv6> [from <prefix>] [to <prefix>] [dport <p>|<lo>-<hi>]`,
+///   as in `port<N>.allow`. `ok("added")` or `ok("unchanged")`. A port that gets its first rule
 ///   filters from then on; flows already crossing it are not known to it. Journalled as
 ///   `allow-added {port, rule}`.
 /// - `allow-remove <port> <rule>`: removes that rule. `ok("removed")` or `ok("absent")`;
 ///   journalled as `allow-removed`.
-/// - `rules` (no argument): every rule, one per line, `<port> <rule>`, by port.
+/// - `rules` (no argument): every rule, one per line, `<port> <rule>`, by port; a tunnel's port
+///   by the tunnel's name.
 ///
 /// On a router without a translating port the forward commands and `mappings` are an `err`.
 /// The `nat-*` counters are listed only by a router with a translating port, the `filter-*`
@@ -126,9 +128,9 @@
 ///
 /// This package names that combination; it adds no interface of its own. (A world added to
 /// `wasmnet:link` would change that package for every device.) 0.1.2 documented the forward and
-/// allow commands and 0.1.3 the tunnel commands; nothing in the WIT changed, so a host built
-/// against 0.1.1 runs it as is.
-package wasmnet:router@0.1.3;
+/// allow commands, 0.1.3 the tunnel commands and 0.1.4 allow rules on tunnel ports; nothing in
+/// the WIT changed, so a host built against 0.1.1 runs it as is.
+package wasmnet:router@0.1.4;
 
 world router {
     include wasmnet:link/stepped-device@0.1.0;

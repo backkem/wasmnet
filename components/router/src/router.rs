@@ -334,6 +334,10 @@ impl Router {
             .iter()
             .enumerate()
             .map(|(i, p)| (i as u32, p.allow.clone()))
+            .chain(cfg.tunnels.iter().enumerate().map(|(i, (name, _))| {
+                let rules = cfg.tunnel_allow.get(name).cloned().unwrap_or_default();
+                ((cabled + i) as u32, rules)
+            }))
             .collect();
         let filter = Filter::new(
             rules,
@@ -2083,10 +2087,12 @@ impl Router {
         let (port, rule) = text
             .split_once(char::is_whitespace)
             .ok_or("allow-add and allow-remove need `<port> <rule>`, like `1 tcp dport 80`")?;
+        // A cabled port by its number, a tunnel's port by the tunnel's name.
         let port: u32 = port
             .parse()
             .ok()
             .filter(|&p| (p as usize) < self.cfg.ports.len())
+            .or_else(|| self.tunnel_port(port))
             .ok_or_else(|| format!("port `{port}` does not exist"))?;
         let rule = parse_rule(rule.trim())?;
         let done = if add {
@@ -2097,7 +2103,7 @@ impl Router {
         if matches!(done, "added" | "removed") {
             out.event(Event::new(
                 if add { "allow-added" } else { "allow-removed" },
-                vec![kv("port", port), kv("rule", rule)],
+                vec![kv("port", self.port_name(port)), kv("rule", rule)],
             ));
         }
         Ok(done.to_owned())

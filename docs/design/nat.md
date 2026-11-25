@@ -114,7 +114,9 @@ RFC 1624's incremental update; a UDP checksum of zero stays zero and a computed 
 
 ## The packet filter
 
-`port<N>.allow` is an allow list for packets that arrive on port N and are forwarded:
+`port<N>.allow` is an allow list for packets that arrive on port N and are forwarded (a tunnel
+port's list is `tunnel.<name>.allow`, and commands name it by the tunnel's name,
+[tunnels.md](tunnels.md)):
 
 ```text
 <proto> [from <prefix>] [to <prefix>] [dport <port>|<low>-<high>]
@@ -148,7 +150,7 @@ of new commands; no interface changed).
 
 NAT64 and NAT66, UPnP, PCP and NAT-PMP, application-level gateways (FTP, SIP), translation of
 IPv4 fragments and a NAT that pools several outside addresses. The filter has no deny rules, no
-source-port match and no rate limits, and does not filter packets from tunnel ports.
+source-port match and no rate limits.
 
 A translating router can also be a tunnel end ([tunnels.md](tunnels.md)): datagrams to a
 tunnel's UDP port on the outside address are the tunnel's before the translation table is

@@ -157,6 +157,8 @@ impl Router {
         let tunnels = self.cfg.tunnels.clone();
         for (name, spec) in tunnels {
             self.tunnels.used = true;
+            let port = (self.cabled() + self.tunnels.slots.len()) as u32;
+            self.filter.set_name(port, Some(&name));
             self.tunnels.slots.push(Some(Tunnel::new(&name, spec, now)));
         }
     }
@@ -224,6 +226,7 @@ impl Router {
             None => self.ports.push(p),
         }
         self.routes.insert(connected_route(&spec, port));
+        self.filter.set_name(port, Some(name));
         self.traced_dsts.clear();
         out.event(Event::new(
             "tunnel-added",
@@ -267,6 +270,9 @@ impl Router {
         self.traced_dsts.clear();
         let statics = over.iter().filter(|r| r.kind == RouteKind::Static).count();
         self.tunnels.slots[slot] = None;
+        // Its allow rules go with it; flows it let through end on their own timers.
+        self.filter.clear(port);
+        self.filter.set_name(port, None);
         // The port stays as a free slot: without addresses, down.
         let p = &mut self.ports[port as usize];
         p.up = false;

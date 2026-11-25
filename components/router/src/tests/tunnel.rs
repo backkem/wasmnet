@@ -551,3 +551,105 @@ fn on_a_translating_router_the_tunnel_port_comes_before_translation() {
     assert_eq!(counter(&r, "nat-no-mapping"), Some(0));
     assert_eq!(counter(&r, "nat-mappings"), Some(0));
 }
+
+/// A TCP segment from `src:sport` to `dst:dport` with `flags`, as an IPv6 packet.
+fn tcp6(src: &str, sport: u16, dst: &str, dport: u16, flags: u8) -> Vec<u8> {
+    let ps = wire::pseudo_v6(v6(src), v6(dst), PROTO_TCP, 20);
+    let seg = wire::tcp_segment(sport, dport, 1, 0, flags, ps);
+    wire::ipv6(v6(src), v6(dst), PROTO_TCP, 64, &seg)
+}
+
+#[test]
+fn allow_rules_name_a_tunnel_and_keep_state() {
+    let (mut r, mut out) = tunnel_up(&[]);
+    let cmd = |r: &mut Router, out: &mut Out, c: &str, a: &str| r.command(MS, c, a, out);
+    assert_eq!(
+        cmd(&mut r, &mut out, "allow-add", "to-b tcp dport 80").as_deref(),
+        Ok("added")
+    );
+    assert_eq!(out.event("allow-added").get("port"), Some("to-b"));
+    assert!(cmd(&mut r, &mut out, "allow-add", "nope tcp").is_err());
+    assert_eq!(
+        cmd(&mut r, &mut out, "rules", "").as_deref(),
+        Ok("to-b tcp dport 80")
+    );
+    out.take();
+    // B's host learnt by ARP, so what passes reaches it.
+    let from_tunnel = |r: &mut Router, out: &mut Out, now: u64, p: &[u8]| {
+        let d = geneve::encap(7, p);
+        r.receive(
+            now,
+            0,
+            &udp_in(P_MAC, PEER, 6081, "10.0.1.1", 6081, &d),
+            out,
+        );
+        out.take()
+    };
+    // Inbound through the tunnel: TCP to port 80 passes, to port 22 does not.
+    let ok = from_tunnel(
+        &mut r,
+        &mut out,
+        3 * MS,
+        &tcp6("fd00:b::10", 4000, "fd00:2::10", 80, 0x02),
+    );
+    assert!(!ok.is_empty(), "to port 80: B's neighbour is asked for");
+    assert_eq!(counter(&r, "filter-dropped"), Some(0));
+    let no = from_tunnel(
+        &mut r,
+        &mut out,
+        4 * MS,
+        &tcp6("fd00:b::10", 4001, "fd00:2::10", 22, 0x02),
+    );
+    assert!(no.is_empty());
+    assert_eq!(counter(&r, "filter-dropped"), Some(1));
+    // A flow B opened through the tunnel gets its answers back through it without a rule.
+    let syn = tcp6("fd00:2::10", 5000, "fd00:b::10", 443, 0x02);
+    r.receive(
+        5 * MS,
+        1,
+        &wire::eth_frame(RTR1, mac(B_MAC), ETHERTYPE_IPV6, &syn),
+        &mut out,
+    );
+    out.take();
+    let back = from_tunnel(
+        &mut r,
+        &mut out,
+        6 * MS,
+        &tcp6("fd00:b::10", 443, "fd00:2::10", 5000, 0x12),
+    );
+    // It waits behind B's neighbour solicitation like the SYN to port 80: passed, not dropped.
+    assert!(back.is_empty());
+    assert_eq!(
+        counter(&r, "filter-dropped"),
+        Some(1),
+        "the answer to a flow from inside passes"
+    );
+    assert_eq!(counter(&r, "filter-tracked"), Some(1));
+    // Removing the tunnel takes its rules; a new tunnel in its place starts with none.
+    assert_eq!(
+        cmd(&mut r, &mut out, "tunnel-remove", "to-b").as_deref(),
+        Ok("removed")
+    );
+    assert_eq!(cmd(&mut r, &mut out, "rules", "").as_deref(), Ok(""));
+}
+
+#[test]
+fn allow_rules_for_a_tunnel_from_the_config() {
+    let (mut r, mut out) = router(&[
+        ("tunnel.to-b.id", "7"),
+        ("tunnel.to-b.local", "fd00:ff::a/128"),
+        ("tunnel.to-b.allow", "tcp dport 80,icmpv6"),
+        ("port1.allow", "udp"),
+    ]);
+    assert_eq!(
+        r.command(MS, "rules", "", &mut out).as_deref(),
+        Ok("1 udp\nto-b tcp dport 80\nto-b icmpv6")
+    );
+    let mut bad = vec![
+        ("port0.ipv4", "10.0.1.1/24"),
+        ("tunnel.to-b.id", "7"),
+        ("tunnel.to-b.local", "fd00:ff::a/128"),
+    ];
+    bad.push(("tunnel.to-b.allow", "tcp dport"));
+    assert!(Config::from_pairs(bad).is_err());
+}

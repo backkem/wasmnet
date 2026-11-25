@@ -147,6 +147,8 @@ pub struct Config {
     /// Tunnel ports from `tunnel.<name>.<key>`, by name: the first is port `ports.len()`, the
     /// next one after it, and so on (`docs/design/tunnels.md`).
     pub tunnels: Vec<(String, TunnelSpec)>,
+    /// `tunnel.<name>.allow`: allow rules for packets that arrive through a tunnel.
+    pub tunnel_allow: BTreeMap<String, Vec<Rule>>,
     /// A UDP port on which the router answers STUN Binding requests without a tunnel id.
     pub stun_server: Option<u16>,
 }
@@ -457,12 +459,37 @@ impl Config {
             )));
         }
         let mut tunnels: Vec<(String, TunnelSpec)> = Vec::new();
+        let mut tunnel_allow: BTreeMap<String, Vec<Rule>> = BTreeMap::new();
         for (name, pairs) in tunnel_pairs {
             if !tunnel::valid_name(name) {
                 return Err(ConfigError::Other(format!(
                     "tunnel.{name}: a tunnel name is a-z, 0-9 and -, 1 to 32 characters, \
                      starting with a letter"
                 )));
+            }
+            // `allow` holds rules with spaces: the filter's key, not one of the tunnel's settings.
+            let (allow, pairs): (Vec<_>, Vec<_>) =
+                pairs.into_iter().partition(|(k, _)| *k == "allow");
+            if let Some((_, list)) = allow.first() {
+                let rules = list
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty())
+                    .map(|t| {
+                        parse_rule(t).map_err(|why| ConfigError::Invalid {
+                            key: format!("tunnel.{name}.allow"),
+                            value: t.to_owned(),
+                            expected: why,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                if rules.len() > crate::filter::MAX_RULES {
+                    return Err(ConfigError::Other(format!(
+                        "tunnel.{name}.allow has more than {} rules",
+                        crate::filter::MAX_RULES
+                    )));
+                }
+                tunnel_allow.insert(name.to_owned(), rules);
             }
             let spec = TunnelSpec::from_pairs(pairs)
                 .map_err(|why| ConfigError::Other(format!("tunnel.{name}: {why}")))?;
@@ -594,6 +621,7 @@ impl Config {
             trace_nat_filtered,
             trace_filter_drop,
             tunnels,
+            tunnel_allow,
             stun_server,
         })
     }

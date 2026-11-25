@@ -124,6 +124,16 @@ Inner packets are routed like any others: each router on the way decrements the 
 an ICMP error about a packet that came from a tunnel goes back through it, from the
 tunnel's transit address when it has the family. Neighbour Discovery does not cross a tunnel.
 
+**The packet filter** ([nat.md](nat.md#the-packet-filter)) takes rules for a tunnel's port by
+the tunnel's name: `tunnel.<name>.allow` in the config, `allow-add <name> <rule>` and
+`allow-remove <name> <rule>` as commands, and `rules` lists them under that name. Such a rule
+sees the inner packets that arrive through the tunnel (decapsulated, with their own addresses
+and ports), as a cabled port's rule sees what arrives on its cable; the flows they start, and
+the flows that left through the tunnel, pass back as on any port. A rule on the cabled port the
+outer packets use sees none of them: the tunnel's datagrams are addressed to the router, and
+the filter only judges what it forwards. A router in front (a home's NAT router) filters the
+outer UDP like any other forwarded traffic. A tunnel's rules go with it when it is removed.
+
 **On a translating router** the tunnel's UDP port belongs to the router: datagrams to it on the
 outside address are the tunnel's before the translation table is asked, and the tunnel's own
 outer packets leave from the outside address untranslated. An inside host's mapping that gets
@@ -175,8 +185,6 @@ with `run_until`.
 - At most 256 tunnels per router, 8 candidates and 8 reflectors per tunnel.
 - Outer packets are IPv4 only: no IPv6 outer endpoints, no choice between several outer
   families (Happy Eyeballs).
-- The packet filter's `allow` rules name cabled ports only: packets from a tunnel are not
-  filtered.
 - No path MTU discovery for the outer path: the tunnel MTU is configured.
 - Commands are native only, like every device command ([known-issues.md](../known-issues.md)).
 - No TURN-style relaying of outer datagrams, no WebRTC data channels.

@@ -17,8 +17,9 @@
 //! * **Address translation** ([`nat`], optional: `port<N>.nat = masquerade`): NAT44 with port
 //!   translation for UDP, TCP and ICMP echo, RFC 4787 mapping and filtering behaviours,
 //!   hairpinning, port forwards, ICMP errors translated with their quotes, idle timeouts.
-//! * **A packet filter** ([`filter`], optional: `port<N>.allow`): allow rules per ingress port,
-//!   stateful on the connection tracking ([`track`]) the translation shares.
+//! * **A packet filter** ([`filter`], optional: `port<N>.allow`, `tunnel.<name>.allow`): allow
+//!   rules per ingress port, cabled or tunnel, stateful on the connection tracking ([`track`])
+//!   the translation shares.
 //! * **Tunnel ports** ([`tunnel`], optional: `tunnel.<name>.*` or `tunnel-add`): point-to-point
 //!   ports without a cable whose packets cross the network in Geneve over UDP, from the
 //!   router's own address; STUN Binding checks find the peer through NATs, keep it and follow

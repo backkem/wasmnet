@@ -303,6 +303,7 @@ tunnels; their ports follow the cabled ones in name order. `id` and `local` are 
 | `tunnel.<name>.keepalive` | duration above zero | `25s` | Time between two checks to the peer while up. |
 | `tunnel.<name>.dead` | duration above `keepalive` | `80s` | Silence from the peer that takes the tunnel down. |
 | `tunnel.<name>.mss-clamp` | `true` or `false` | `true` | Lower the MSS of TCP SYNs crossing the tunnel to fit its MTU. |
+| `tunnel.<name>.allow` | a comma-separated list of allow rules (see below), at most 256 | none: everything | The packet filter for packets that arrive through the tunnel, like `port<N>.allow`. |
 
 Besides the errors above, the component traps if `get-all` itself fails.
 
@@ -320,7 +321,7 @@ and `tunnels`, the list a controller reads ([router.wit](../../wit/router/router
 
 Port forwards and allow rules change the same way: `forward-add <forward>`,
 `forward-remove <forward or proto and external port>`, `forwards`, `allow-add <port> <rule>`,
-`allow-remove <port> <rule>` and `rules`, in the syntax above; `mappings` lists the translation
+`allow-remove <port> <rule>` (a tunnel's port by the tunnel's name) and `rules`, in the syntax above; `mappings` lists the translation
 table. The behaviours (`nat.mapping` and the rest), the timeouts and which ports translate are
 fixed when the router starts.
 
