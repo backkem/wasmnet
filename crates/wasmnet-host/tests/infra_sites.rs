@@ -1,0 +1,882 @@
+//! In-world controllers (`wasmnet:infra`) in a network split over two sites.
+//!
+//! A controller creates, commands, stops, removes and re-creates devices on its own site while
+//! the network runs; traffic reaches them across the WAN link. The split run, driven in
+//! lockstep on this thread with every message through the site-sync wire format, must merge
+//! into exactly the unsplit run: journal, frame log, link transitions, every link's name,
+//! counters and capture, the outcome, every device's counters, the operator events' states,
+//! and each controller's whole view of the device table (`list` and the full `watch` feed).
+//!
+//! The controllers are the `infra-script` fixture (a controller with a script of calls at set
+//! virtual times).
+//!
+//! ```text
+//! one controller:                site 0                  |            site 1
+//!   ctl ~> r1 (router) ── sw-a ═══════ 1 ms WAN ═══════ sw-b ── gw (router) ── client
+//!          └── web (http-server)                         |
+//!
+//! two controllers:   ctl-a ~> a-web, a-get ── sw-a ═══ WAN ═══ sw-b ── b-web, b-get <~ ctl-b
+//! ```
+//!
+//! Needs `wac` and `wasm-tools` on `PATH` (see `support`).
+
+mod support;
+
+use std::collections::VecDeque;
+
+use sha2::{Digest as _, Sha256};
+use support::{built, config, events, field, transcript};
+use wasmnet_det_cbor::Value;
+use wasmnet_host::sim::infra::{Change, DeviceView};
+use wasmnet_host::sim::sites::{self, Msg, SiteRecords, SiteSync, Step};
+use wasmnet_host::sim::{CREATOR_RANGE, DeviceCommand, Op, OpState, Placement};
+use wasmnet_host::{
+    DeviceConfig, DeviceId, DeviceOptions, FrameRecord, JournalEntry, LinkTransition, Nanos,
+    Network, sim,
+};
+
+const US: Nanos = 1_000;
+const MS: Nanos = 1_000_000;
+/// The WAN link's latency: the lookahead.
+const WAN: Nanos = MS;
+
+/// One device of the network's description.
+struct Dev {
+    name: &'static str,
+    /// The file `cargo xtask build` wrote (`node-http-get`), and the catalog name it has.
+    file: &'static str,
+    component: &'static str,
+    config: DeviceConfig,
+    options: DeviceOptions,
+    site: usize,
+}
+
+/// A setup link: `((device, port), (device, port), latency)`, by device index.
+type SetupLink = ((usize, u32), (usize, u32), Nanos);
+
+/// A network: devices (built in this order on every site), setup links, timed operator
+/// events, and the deadline.
+struct Plan {
+    devices: Vec<Dev>,
+    links: Vec<SetupLink>,
+    ops: Vec<(Nanos, usize, DeviceCommand)>,
+    deadline: Nanos,
+}
+
+/// Everything the equivalence compares.
+#[derive(Debug, PartialEq)]
+struct Run {
+    outcome: String,
+    journal: Vec<JournalEntry>,
+    frames: Vec<FrameRecord>,
+    transitions: Vec<LinkTransition>,
+    /// Per link: name, counters, capture digest.
+    links: Vec<String>,
+    /// Per device that reports counters, by name.
+    counters: Vec<(String, Vec<(String, u64)>)>,
+    /// The operator events' states (on the site of the device each one names), without the
+    /// boundary ordinal (`events`), which counts only the events of that site.
+    op_states: Vec<OpState>,
+    /// Each controller's view: `list` of everything, then the whole `watch` feed.
+    tables: Vec<(String, String)>,
+    /// Every device's number in event keys, by name (the devices that run on each site).
+    numbers: Vec<(String, u32)>,
+}
+
+fn sha(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn infra(prefix: Option<&str>) -> DeviceOptions {
+    DeviceOptions {
+        infra: true,
+        infra_prefix: prefix.map(str::to_owned),
+        ..DeviceOptions::default()
+    }
+}
+
+/// A device spec for `devices.apply`: a component, its config and its cables.
+fn spec(component: &str, cfg: &[(&str, &str)], wire: &[(u64, &str)]) -> Vec<u8> {
+    let config = cfg
+        .iter()
+        .map(|(k, v)| (Value::text(*k), Value::text(*v)))
+        .collect();
+    let cables = wire
+        .iter()
+        .map(|(port, to)| {
+            Value::Map(vec![
+                (Value::text("port"), Value::Uint(*port)),
+                (Value::text("to"), Value::text(*to)),
+                (Value::text("latency"), Value::Uint(100 * US)),
+            ])
+        })
+        .collect();
+    Value::Map(vec![
+        (Value::text("component"), Value::text(component)),
+        (Value::text("config"), Value::Map(config)),
+        (Value::text("wire"), Value::Array(cables)),
+    ])
+    .encode()
+}
+
+/// An `infra-script` controller's config: one step per line.
+fn script(steps: &[String]) -> DeviceConfig {
+    steps
+        .iter()
+        .enumerate()
+        .map(|(n, s)| (format!("step.{n}"), s.clone()))
+        .collect()
+}
+
+fn controller(name: &'static str, prefix: Option<&str>, steps: &[String], site: usize) -> Dev {
+    Dev {
+        name,
+        file: "infra_script",
+        component: "infra-script",
+        config: script(steps),
+        options: infra(prefix),
+        site,
+    }
+}
+
+fn switch(name: &'static str, ports: &str, site: usize) -> Dev {
+    Dev {
+        name,
+        file: "switch",
+        component: "switch",
+        config: config(&[("ports", ports)]),
+        options: DeviceOptions::default(),
+        site,
+    }
+}
+
+// ---- the networks ----
+
+/// One controller, on site 0. `ctl` creates the router `r1` (to `sw-a`) and the web server
+/// `web` behind it, gives `r1` the route back to the client's network (without it no answer
+/// gets back), then stops, removes and re-creates `web` while the client on site 1 fetches
+/// from it five times through `gw` and the WAN link. An operator event adds a host route to
+/// `gw` on site 1 meanwhile. `wire_web_to` is where `web`'s cable goes (`r1:1`; the refusal
+/// test sends it to another site).
+fn one_controller(wire_web_to: &str) -> Plan {
+    let r1 = spec(
+        "router",
+        &[
+            ("mac", "02:00:00:00:fe:10"),
+            ("port0.ipv4", "10.0.2.1/24"),
+            ("port1.ipv4", "10.0.1.1/24"),
+        ],
+        &[(0, "sw-a")],
+    );
+    let web = spec(
+        "node:http-server",
+        &[
+            ("mac", "02:00:00:00:01:10"),
+            ("ipv4", "10.0.1.10/24"),
+            ("ipv4-gateway", "10.0.1.1"),
+        ],
+        &[(0, wire_web_to)],
+    );
+    let steps = [
+        format!("0ms apply r1 {}", hex(&r1)),
+        format!("0ms apply web {}", hex(&web)),
+        "100ms control r1 route-add 10.0.3.0/24 via 10.0.2.2".to_owned(),
+        "700ms stop web".to_owned(),
+        "800ms remove web".to_owned(),
+        format!("900ms apply web {}", hex(&web)),
+    ];
+    Plan {
+        devices: vec![
+            switch("sw-a", "4", 0),
+            controller("ctl", None, &steps, 0),
+            switch("sw-b", "3", 1),
+            Dev {
+                name: "gw",
+                file: "router",
+                component: "router",
+                config: config(&[
+                    ("mac", "02:00:00:00:fe:20"),
+                    ("port0.ipv4", "10.0.2.2/24"),
+                    ("port1.ipv4", "10.0.3.1/24"),
+                    ("routes", "10.0.1.0/24 via 10.0.2.1"),
+                ]),
+                options: DeviceOptions::default(),
+                site: 1,
+            },
+            Dev {
+                name: "client",
+                file: "node-http-get",
+                component: "node:http-get",
+                config: config(&[
+                    ("mac", "02:00:00:00:03:10"),
+                    ("ipv4", "10.0.3.10/24"),
+                    ("ipv4-gateway", "10.0.3.1"),
+                    ("app.http-get.url", "http://10.0.1.10/"),
+                    ("app.http-get.start", "200ms"),
+                    ("app.http-get.interval", "300ms"),
+                    ("app.http-get.repeat", "5"),
+                ]),
+                options: DeviceOptions::default(),
+                site: 1,
+            },
+        ],
+        links: vec![
+            ((0, 0), (2, 0), WAN),
+            ((3, 0), (2, 1), 100 * US),
+            ((4, 0), (3, 1), 100 * US),
+        ],
+        ops: vec![(
+            1_200 * MS,
+            3,
+            DeviceCommand::new("route-add", "10.0.1.10/32 via 10.0.2.1"),
+        )],
+        deadline: 4_000 * MS,
+    }
+}
+
+/// A controller on each site, each with a name prefix. Each creates a web server and a client
+/// of the other site's server: `b-get` fetches from `a-web`, `a-get` from `b-web`, across the
+/// WAN link. `ctl-b` stops, removes and re-creates `b-web` while `a-get` fetches from it. The
+/// creations interleave between the creators (a-web, b-web, b-get, a-get, b-web again), so
+/// the merge must put them back into the unsplit order. `extra` adds a step to `ctl-a` and to
+/// `ctl-b` (the refusal tests); `prefixes` turns the prefixes off (refused when split).
+fn two_controllers(extra: [Option<String>; 2], prefixes: bool) -> Plan {
+    let [extra_a, extra_b] = extra;
+    let web = |mac: &str, ip: &str, to: &str| {
+        spec(
+            "node:http-server",
+            &[("mac", mac), ("ipv4", ip)],
+            &[(0, to)],
+        )
+    };
+    let get = |mac: &str, ip: &str, url: &str, to: &str| {
+        spec(
+            "node:http-get",
+            &[
+                ("mac", mac),
+                ("ipv4", ip),
+                ("app.http-get.url", url),
+                ("app.http-get.start", "100ms"),
+                ("app.http-get.interval", "250ms"),
+                ("app.http-get.repeat", "6"),
+            ],
+            &[(0, to)],
+        )
+    };
+    let a_web = web("02:00:00:00:0a:10", "10.0.0.10/24", "sw-a");
+    let a_get = get(
+        "02:00:00:00:0a:11",
+        "10.0.0.11/24",
+        "http://10.0.0.20/",
+        "sw-a",
+    );
+    let b_web = web("02:00:00:00:0b:20", "10.0.0.20/24", "sw-b");
+    let b_get = get(
+        "02:00:00:00:0b:21",
+        "10.0.0.21/24",
+        "http://10.0.0.10/",
+        "sw-b",
+    );
+    let mut a = vec![
+        format!("0ms apply a-web {}", hex(&a_web)),
+        format!("300ms apply a-get {}", hex(&a_get)),
+    ];
+    a.extend(extra_a);
+    let mut b = vec![
+        format!("0ms apply b-web {}", hex(&b_web)),
+        format!("100ms apply b-get {}", hex(&b_get)),
+        "700ms stop b-web".to_owned(),
+        "800ms remove b-web".to_owned(),
+        format!("900ms apply b-web {}", hex(&b_web)),
+    ];
+    b.extend(extra_b);
+    let prefix = |p| prefixes.then_some(p);
+    Plan {
+        devices: vec![
+            switch("sw-a", "6", 0),
+            controller("ctl-a", prefix("a-"), &a, 0),
+            switch("sw-b", "6", 1),
+            controller("ctl-b", prefix("b-"), &b, 1),
+        ],
+        links: vec![((0, 0), (2, 0), WAN)],
+        ops: Vec::new(),
+        deadline: 3_000 * MS,
+    }
+}
+
+// ---- running a plan ----
+
+/// The devices of `plan` as site `site` builds them (`None`: the unsplit network): its own,
+/// and the others as placeholders with their description. [`wire`] adds the rest.
+fn build(plan: &Plan, seed: u64, site: Option<usize>) -> (Network<'static>, Vec<DeviceId>) {
+    let b = built();
+    let mut network = Network::new(&b.host, seed);
+    network.set_component_resolver(Box::new(move |name, instantiate| {
+        let file = match name {
+            "router" => "router",
+            "node:http-server" => "node-http-server",
+            "node:http-get" => "node-http-get",
+            other => return Err(sim::Error::Refused(format!("no component {other}"))),
+        };
+        instantiate(&b.load(file))
+    }));
+    network.set_infra_catalog(
+        ["router", "node:http-server", "node:http-get"]
+            .map(String::from)
+            .to_vec(),
+    );
+    let mut ids = Vec::new();
+    for d in &plan.devices {
+        let id = if site.is_none_or(|s| s == d.site) {
+            network
+                .device_with_options(d.name, &b.load(d.file), d.config.clone(), d.options.clone())
+                .unwrap_or_else(|e| panic!("{}: {e}", d.name))
+        } else {
+            network
+                .remote_device_with(d.name, d.config.clone(), d.options.clone())
+                .unwrap_or_else(|e| panic!("{}: {e}", d.name))
+        };
+        network.set_device_component(id, d.component);
+        ids.push(id);
+    }
+    (network, ids)
+}
+
+/// Wires `plan`'s links and places its operator events (every site places them all).
+fn wire(plan: &Plan, network: &mut Network<'static>, ids: &[DeviceId]) {
+    for ((a, pa), (b, pb), latency) in &plan.links {
+        network
+            .link(ids[*a].port(*pa), ids[*b].port(*pb))
+            .unwrap()
+            .latency(*latency);
+    }
+    for (at, device, command) in &plan.ops {
+        network
+            .add_op(
+                Op::Control {
+                    device: ids[*device],
+                    call: command.clone().into_control(),
+                },
+                Placement::StartOf(*at),
+            )
+            .unwrap();
+    }
+}
+
+/// Controller `name`'s view of the table as text: `list`, then the whole `watch` feed.
+fn table(network: &Network, name: &str) -> String {
+    let line = |d: &DeviceView| {
+        format!(
+            "{} uid={} gen={} rv={} labels={:?} owner={:?} phase={:?} target={:?} since={} \
+             apps={:?} message={:?} spec={}",
+            d.name,
+            d.uid,
+            d.generation,
+            d.rv,
+            d.labels,
+            d.owner,
+            d.phase,
+            d.target,
+            d.since,
+            d.apps,
+            d.message,
+            sha(&d.spec)
+        )
+    };
+    let (rv, items) = network.infra().list_for(name, &[]);
+    let mut out = format!("list rv={rv}\n");
+    for d in &items {
+        out += &format!("  {}\n", line(d));
+    }
+    let (rv, changes) = network.infra().watch_for(name, &[], 0, u32::MAX);
+    out += &format!("watch rv={rv}\n");
+    for Change { kind, device } in &changes {
+        out += &format!("  {kind:?} {}\n", line(device));
+    }
+    out
+}
+
+/// The numbers of the devices of `network` that run here.
+fn numbers(network: &Network) -> Vec<(String, u32)> {
+    network
+        .devices()
+        .into_iter()
+        .filter(|&d| !network.is_remote(d))
+        .map(|d| (network.device_name(d).to_owned(), network.device_number(d)))
+        .collect()
+}
+
+/// What the devices of `network` that run here report: their counters, by name.
+fn counters(network: &mut Network) -> Vec<(String, Vec<(String, u64)>)> {
+    let mut out = Vec::new();
+    for d in network.devices() {
+        if network.is_remote(d) || network.device_phase(d) != sim::DevicePhase::Running {
+            continue;
+        }
+        if let Some(c) = network.counters(d).unwrap() {
+            out.push((network.device_name(d).to_owned(), c));
+        }
+    }
+    out
+}
+
+fn controllers(plan: &Plan) -> Vec<&'static str> {
+    plan.devices
+        .iter()
+        .filter(|d| d.options.infra)
+        .map(|d| d.name)
+        .collect()
+}
+
+/// The unsplit run.
+fn run_whole(plan: &Plan, seed: u64) -> Run {
+    let (mut network, ids) = build(plan, seed, None);
+    wire(plan, &mut network, &ids);
+    let outcome = network.run_until(plan.deadline);
+    let journal = network.journal();
+    let outcome = format!("{:?}", outcome.map_err(|e| e.to_string()));
+    let links = network
+        .links()
+        .into_iter()
+        .map(|l| {
+            format!(
+                "{} {:?} {}",
+                network.link_name(l),
+                network.link_stats(l),
+                sha(&network.pcap(l))
+            )
+        })
+        .collect();
+    let mut counters = counters(&mut network);
+    counters.sort();
+    let mut numbers = numbers(&network);
+    numbers.sort();
+    Run {
+        outcome,
+        frames: network.frames(),
+        transitions: network.link_transitions(),
+        links,
+        counters,
+        op_states: network
+            .op_states()
+            .into_iter()
+            .map(without_ordinal)
+            .collect(),
+        tables: controllers(plan)
+            .into_iter()
+            .map(|c| (c.to_owned(), table(&network, c)))
+            .collect(),
+        numbers,
+        journal,
+    }
+}
+
+/// An operator event's state without its boundary ordinal: a site counts only its own
+/// events.
+fn without_ordinal(state: OpState) -> OpState {
+    match state {
+        OpState::Applied { at, .. } => OpState::Applied { at, events: 0 },
+        OpState::Failed { at, message, .. } => OpState::Failed {
+            at,
+            events: 0,
+            message,
+        },
+        other => other,
+    }
+}
+
+/// Through the wire format, as a carrier would move it.
+fn carry(m: Msg) -> Msg {
+    Msg::decode(&m.encode()).expect("a message decodes")
+}
+
+/// The split run: both sites on this thread in lockstep, every message through the wire
+/// format, RECORDS too. `Err((site, now, message))` if a site's run failed.
+fn run_split(plan: &Plan, seed: u64) -> Result<Run, (usize, Nanos, String)> {
+    let (mut nets, ids): (Vec<Network<'static>>, Vec<Vec<DeviceId>>) =
+        (0..2).map(|s| build(plan, seed, Some(s))).unzip();
+    // Each site's HELLO before the links are wired.
+    let hellos: Vec<Msg> = nets.iter().map(|n| carry(sites::hello(n))).collect();
+    for (s, network) in nets.iter_mut().enumerate() {
+        sites::apply_hello(network, &hellos[1 - s]).unwrap();
+        wire(plan, network, &ids[s]);
+    }
+    let mut sync = [
+        SiteSync::new(WAN, Some(plan.deadline)),
+        SiteSync::new(WAN, Some(plan.deadline)),
+    ];
+    let mut inbox: [VecDeque<Msg>; 2] = Default::default();
+    let mut window = [true, true];
+    let mut done = [false, false];
+    while !(done[0] && done[1]) {
+        let mut progress = false;
+        for i in 0..2 {
+            if done[i] {
+                continue;
+            }
+            if window[i] {
+                let out = sync[i]
+                    .window(&mut nets[i])
+                    .map_err(|e| (i, nets[i].now(), e.to_string()))?;
+                for m in out {
+                    inbox[1 - i].push_back(carry(m));
+                }
+                window[i] = false;
+                progress = true;
+            }
+            while let Some(m) = inbox[i].pop_front() {
+                progress = true;
+                match sync[i]
+                    .handle(&mut nets[i], m)
+                    .map_err(|e| (i, nets[i].now(), e.to_string()))?
+                {
+                    Step::Wait => {}
+                    Step::Window => {
+                        window[i] = true;
+                        break;
+                    }
+                    Step::Done { send_done } => {
+                        if send_done {
+                            inbox[1 - i].push_back(Msg::Done);
+                        }
+                        done[i] = true;
+                        break;
+                    }
+                }
+            }
+        }
+        assert!(progress, "the sites wait for each other");
+    }
+    let mut records = Vec::new();
+    for i in 0..2 {
+        let outcome = sync[i]
+            .finish(&mut nets[i])
+            .map_err(|e| (i, nets[i].now(), e.to_string()))?;
+        let r = SiteRecords::collect(&nets[i], Ok(outcome));
+        match carry(Msg::Records(Box::new(r))) {
+            Msg::Records(r) => records.push(*r),
+            other => panic!("{other:?}"),
+        }
+    }
+    let names: Vec<String> = plan.devices.iter().map(|d| d.name.to_owned()).collect();
+    let merged = sites::merge([&records[0], &records[1]], &names, Some(plan.deadline))
+        .expect("the records merge");
+    let links = merged
+        .link_infos
+        .iter()
+        .zip(&merged.links)
+        .map(|(info, (stats, pcap))| format!("{} {stats:?} {}", info.name, sha(pcap)))
+        .collect();
+    let mut counters: Vec<_> = nets.iter_mut().flat_map(counters).collect();
+    counters.sort();
+    let mut numbers: Vec<_> = nets.iter().flat_map(numbers).collect();
+    numbers.sort();
+    // Each operator event from the site of the device it names.
+    let site_of = |device: usize| plan.devices[device].site;
+    let op_states = plan
+        .ops
+        .iter()
+        .enumerate()
+        .map(|(i, (_, device, _))| without_ordinal(nets[site_of(*device)].op_states()[i].clone()))
+        .collect();
+    let tables = plan
+        .devices
+        .iter()
+        .filter(|d| d.options.infra)
+        .map(|d| (d.name.to_owned(), table(&nets[d.site], d.name)))
+        .collect();
+    Ok(Run {
+        outcome: format!("{:?}", merged.outcome.map_err(|(_, m)| m)),
+        journal: merged.journal,
+        frames: merged.frames,
+        transitions: merged.transitions,
+        links,
+        counters,
+        op_states,
+        tables,
+        numbers,
+    })
+}
+
+/// Compares two runs field by field, so a failure names what differs.
+fn assert_same(whole: &Run, split: &Run, label: &str) {
+    assert_eq!(whole.outcome, split.outcome, "{label}: outcome");
+    if whole.journal != split.journal {
+        let at = whole
+            .journal
+            .iter()
+            .zip(&split.journal)
+            .position(|(a, b)| a != b)
+            .unwrap_or(whole.journal.len().min(split.journal.len()));
+        panic!(
+            "{label}: journals differ at entry {at} ({} vs {} entries)\nunsplit:\n{}\nsplit:\n{}",
+            whole.journal.len(),
+            split.journal.len(),
+            transcript(&whole.journal[at.saturating_sub(3)..(at + 3).min(whole.journal.len())]),
+            transcript(&split.journal[at.saturating_sub(3)..(at + 3).min(split.journal.len())]),
+        );
+    }
+    if whole.frames != split.frames {
+        let at = whole
+            .frames
+            .iter()
+            .zip(&split.frames)
+            .position(|(a, b)| a != b);
+        panic!(
+            "{label}: frame logs differ ({} vs {} frames), first at {at:?}: {:?} vs {:?}",
+            whole.frames.len(),
+            split.frames.len(),
+            at.map(|i| &whole.frames[i]),
+            at.map(|i| &split.frames[i]),
+        );
+    }
+    assert_eq!(whole.transitions, split.transitions, "{label}: transitions");
+    assert_eq!(whole.links, split.links, "{label}: links");
+    assert_eq!(whole.counters, split.counters, "{label}: counters");
+    assert_eq!(whole.op_states, split.op_states, "{label}: operator events");
+    assert_eq!(whole.numbers, split.numbers, "{label}: device numbers");
+    for ((name, a), (_, b)) in whole.tables.iter().zip(&split.tables) {
+        assert_eq!(a, b, "{label}: {name}'s view of the device table");
+    }
+    assert_eq!(whole, split, "{label}");
+}
+
+// ---- the tests ----
+
+#[test]
+fn one_controller_on_one_site_matches_the_unsplit_run() {
+    let plan = one_controller("r1:1");
+    for seed in [42, 7] {
+        let whole = run_whole(&plan, seed);
+        let log = transcript(&whole.journal);
+        // The run did what the story says: five fetches, all answered but the one made
+        // while `web` was away; the route command applied (without it nothing comes back);
+        // `web` created twice; the operator's route on `gw`.
+        let summary = events(&whole.journal, "client", "http-get-summary");
+        assert_eq!(summary.len(), 1, "seed {seed}:\n{log}");
+        assert_eq!(
+            (field(&summary[0], "ok"), field(&summary[0], "failed")),
+            ("4", "1"),
+            "seed {seed}:\n{log}"
+        );
+        assert_eq!(
+            events(&whole.journal, "r1", "route-added").len(),
+            1,
+            "{log}"
+        );
+        assert_eq!(
+            events(&whole.journal, "gw", "route-added").len(),
+            1,
+            "{log}"
+        );
+        assert_eq!(
+            events(&whole.journal, "web", "device-added").len(),
+            2,
+            "{log}"
+        );
+        assert_eq!(
+            events(&whole.journal, "web", "device-stopped").len(),
+            1,
+            "{log}"
+        );
+        assert_eq!(
+            events(&whole.journal, "web", "device-removed").len(),
+            1,
+            "{log}"
+        );
+        assert!(
+            whole.links.iter().any(|l| l.starts_with("web.0-r1.1-2 ")),
+            "the re-created web's cable has a fresh name: {:?}",
+            whole.links
+        );
+        assert!(matches!(whole.op_states[0], OpState::Applied { .. }));
+        // One creator: the created devices' numbers are their indices, as before.
+        let created: Vec<_> = whole.numbers.iter().filter(|(_, k)| *k >= 5).collect();
+        assert_eq!(
+            created,
+            [
+                &("r1".to_owned(), 5),
+                &("web".to_owned(), 6),
+                &("web".to_owned(), 7)
+            ]
+        );
+
+        let split = run_split(&plan, seed).unwrap_or_else(|e| panic!("seed {seed}: {e:?}"));
+        assert_same(&whole, &split, &format!("seed {seed}"));
+        let again = run_split(&plan, seed).unwrap_or_else(|e| panic!("seed {seed}: {e:?}"));
+        assert_eq!(
+            split, again,
+            "seed {seed}: the split rerun is byte-identical"
+        );
+    }
+}
+
+#[test]
+fn a_controller_on_each_site_matches_the_unsplit_run() {
+    let plan = two_controllers([None, None], true);
+    for seed in [42, 7] {
+        let whole = run_whole(&plan, seed);
+        let log = transcript(&whole.journal);
+        for client in ["a-get", "b-get"] {
+            let done = events(&whole.journal, client, "http-get-done");
+            assert_eq!(done.len(), 6, "seed {seed}, {client}:\n{log}");
+        }
+        // Numbers follow the creator: `ctl-b`'s first device is number 4 + CREATOR_RANGE
+        // although it was the network's sixth device; the re-created `b-web` is its third.
+        let number = |name: &str| {
+            whole
+                .numbers
+                .iter()
+                .filter(|(n, _)| n == name)
+                .map(|(_, k)| *k)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(number("a-web"), [4]);
+        assert_eq!(number("a-get"), [5]);
+        assert_eq!(number("b-web"), [4 + CREATOR_RANGE, 6 + CREATOR_RANGE]);
+        assert_eq!(number("b-get"), [5 + CREATOR_RANGE]);
+        // Each controller sees the network's own devices and its own.
+        let b_view = &whole.tables[1].1;
+        assert!(b_view.contains("b-get uid=") && !b_view.contains("a-web uid="));
+
+        let split = run_split(&plan, seed).unwrap_or_else(|e| panic!("seed {seed}: {e:?}"));
+        assert_same(&whole, &split, &format!("seed {seed}"));
+        let again = run_split(&plan, seed).unwrap_or_else(|e| panic!("seed {seed}: {e:?}"));
+        assert_eq!(
+            split, again,
+            "seed {seed}: the split rerun is byte-identical"
+        );
+    }
+}
+
+/// A cable to a device of another site cannot be wired on the controller's site: the split
+/// run fails at the request's event, with the same site, instant and message every time,
+/// where the unsplit run wires it.
+#[test]
+fn a_cable_to_another_site_fails_the_split_run_deterministically() {
+    // `web`'s cable to `sw-b`, a device the network was built with, on site 1.
+    let plan = one_controller("sw-b");
+    let whole = run_whole(&plan, 42);
+    assert!(
+        events(&whole.journal, "web", "link-added")
+            .iter()
+            .any(|f| field(f, "link") == "web.0-sw-b.2"),
+        "the unsplit network wires it"
+    );
+    let failure = |plan: &Plan| match run_split(plan, 42) {
+        Ok(_) => panic!("the split run should fail"),
+        Err(e) => e,
+    };
+    let (site, at, message) = failure(&plan);
+    assert_eq!((site, at), (0, 0), "{message}");
+    assert!(
+        message
+            .contains("`ctl` asked for a cable from `web` to `sw-b`, which runs on another site"),
+        "{message}"
+    );
+    assert_eq!(failure(&plan), (site, at, message));
+
+    // `a-x`'s cable to `b-r`, a router `ctl-b` created on site 1 (its prefix says so).
+    let b_r = spec(
+        "router",
+        &[
+            ("mac", "02:00:00:00:0b:f0"),
+            ("port0.ipv4", "10.0.9.1/24"),
+            ("port1.ipv4", "10.0.8.1/24"),
+        ],
+        &[(0, "sw-b")],
+    );
+    let to_b = spec(
+        "node:http-server",
+        &[("mac", "02:00:00:00:0a:30"), ("ipv4", "10.0.9.30/24")],
+        &[(0, "b-r")],
+    );
+    let plan = two_controllers(
+        [
+            Some(format!("500ms apply a-x {}", hex(&to_b))),
+            Some(format!("200ms apply b-r {}", hex(&b_r))),
+        ],
+        true,
+    );
+    let whole = run_whole(&plan, 42);
+    assert_eq!(
+        events(&whole.journal, "a-x", "device-added").len(),
+        1,
+        "the unsplit network creates it:\n{}",
+        transcript(&whole.journal)
+    );
+    let (site, at, message) = failure(&plan);
+    assert_eq!((site, at), (0, 500 * MS), "{message}");
+    assert!(message.contains("from `a-x` to `b-r`"), "{message}");
+    assert_eq!(failure(&plan), (site, at, message));
+}
+
+/// Controllers on both sites need disjoint name prefixes; a controller creates only names
+/// under its own, split or not.
+#[test]
+fn controllers_on_two_sites_need_name_prefixes() {
+    let plan = two_controllers([None, None], false);
+    let b = built();
+    let mut network = Network::new(&b.host, 1);
+    network
+        .device_with_options(
+            "ctl-a",
+            &b.load("infra_script"),
+            DeviceConfig::new(),
+            infra(None),
+        )
+        .unwrap();
+    let refused = network
+        .remote_device_with("ctl-b", DeviceConfig::new(), infra(None))
+        .expect_err("a second site's controller without prefixes");
+    assert!(refused.to_string().contains("infra_prefix"), "{refused}");
+    // Unsplit, the same network is fine.
+    let whole = run_whole(&plan, 42);
+    assert!(
+        whole.outcome.starts_with("Ok(Deadline"),
+        "{}",
+        whole.outcome
+    );
+    // Overlapping prefixes are refused everywhere.
+    let mut network = Network::new(&b.host, 1);
+    network
+        .device_with_options(
+            "ctl-a",
+            &b.load("infra_script"),
+            DeviceConfig::new(),
+            infra(Some("web")),
+        )
+        .unwrap();
+    let overlap = network
+        .device_with_options(
+            "ctl-b",
+            &b.load("infra_script"),
+            DeviceConfig::new(),
+            infra(Some("web-a")),
+        )
+        .expect_err("overlapping prefixes");
+    assert!(overlap.to_string().contains("overlaps"), "{overlap}");
+    // A name outside the prefix is denied, in the journal of the unsplit run too.
+    let outside = spec("node:http-server", &[], &[(0, "sw-a")]);
+    let plan = two_controllers(
+        [Some(format!("500ms apply web {}", hex(&outside))), None],
+        true,
+    );
+    let whole = run_whole(&plan, 42);
+    let results: Vec<_> = events(&whole.journal, "ctl-a", "infra-script")
+        .into_iter()
+        .filter(|f| field(f, "name") == "web")
+        .collect();
+    assert_eq!(results.len(), 1);
+    assert!(
+        field(&results[0], "result").contains("outside this controller's names"),
+        "{results:?}"
+    );
+}
