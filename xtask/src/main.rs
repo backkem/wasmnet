@@ -594,7 +594,7 @@ fn web(args: &[String]) -> Result<()> {
             "build",
             "--release",
             "-p",
-            "wasmnet-web",
+            "wasmnet-pad",
             "--example",
             "pad-page",
             "--target",

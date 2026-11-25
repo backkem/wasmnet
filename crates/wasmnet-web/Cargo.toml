@@ -18,7 +18,7 @@ wasmnet-core = { path = "../wasmnet-core" }
 thiserror.workspace = true
 
 [dev-dependencies]
-# The tests of portable extensions, and the page module of `examples/pad_page.rs`: their fixture.
+# The tests of portable extensions: their fixture.
 wasmnet-pad = { path = "../wasmnet-pad" }
 # Reading pcap packet directions back in the tests.
 wasmnet-wire = { path = "../wasmnet-wire" }
@@ -32,11 +32,3 @@ etherparse.workspace = true
 
 [lints]
 workspace = true
-
-# The page module with the test fixture `wasmnet-pad` installed: an embedder's own build of
-# the simulator (`wasmnet_web::install`), which the page test loads for its portable-extension
-# step. `cargo build --release --target wasm32-unknown-unknown -p wasmnet-web --example pad-page`.
-[[example]]
-name = "pad-page"
-path = "examples/pad_page.rs"
-crate-type = ["cdylib"]

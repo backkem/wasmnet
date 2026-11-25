@@ -13,3 +13,16 @@ wasmnet-core = { path = "../wasmnet-core" }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+# `examples/pad_page.rs`: the page's simulator with this extension in it.
+wasmnet-web = { path = "../wasmnet-web" }
+
+# The page's simulator module with this extension installed: what an embedder builds to run its
+# own extensions in a page (`wasmnet_web::install`). The page test loads it for its
+# portable-extension steps.
+# `cargo build --release --target wasm32-unknown-unknown -p wasmnet-pad --example pad-page`.
+[[example]]
+name = "pad-page"
+path = "examples/pad_page.rs"
+crate-type = ["cdylib"]
