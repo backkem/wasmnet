@@ -31,8 +31,9 @@ A refused change (a name taken, a port in use, an unknown component) becomes the
 - **Stop.** The device's store is dropped and its links go down, so their far ends see the
   carrier drop. Its name, ports and links stay.
 - **Start.** A fresh instance of the same component and config in the same slot; the links its
-  stop took down come back up. The network must know the device's catalog name: a device added
-  by an op has it, one built with `Network::device*` needs `Network::set_device_component`. The
+  stop took down come back up. The network keeps every device's component from its creation
+  (an owned copy, `Runtime::Component: ToOwned`), so no component resolver is needed: a device
+  built with `Network::device*` starts again as well as one an op or a controller added. The
   new instance must declare the same ports.
 - **Remove.** Stopped if running, every link unwired, the name free for a new device.
 - **Seeds.** A device instantiated again under a name draws fresh numbers, as a rebooted host
@@ -53,9 +54,12 @@ Every change is journalled under the device it concerns (`device-added`, `device
 manage sibling devices: `apply`, `start`, `stop` (with a grace
 period), `remove`, `control` (a command into a running device, [below](#commands-into-a-running-device)),
 `get`, `list` (by label selector), `watch` (a change feed polled from a
-resource version) and `logs`. Every function is sync and never yields; a controller polls a
-watch on its own period. Specs are deterministic CBOR: the device's component, config and
-options plus the cables to plug in. Calls are idempotent by name and by request id.
+resource version) and `logs`, plus `changes.wait`, which waits for a change. Every `devices`
+function is sync and never yields; a controller polls a watch on its own period, or waits on
+`changes.wait` ([below](#a-change-feed-that-wakes-a-controller)). Specs are deterministic
+CBOR: the device's component, config and options (its output journalled, its arguments and
+environment, its fuel) plus the cables to plug in. Calls are idempotent by name and by request
+id.
 
 **The grant.** Only a device created with `DeviceOptions::infra` gets an `InfraEnd`
 (`DeviceContext::infra`). The wasmtime host refuses to instantiate a component that imports
@@ -106,6 +110,47 @@ share the history up to that event ([event-order.md](event-order.md)), agree on 
 only that device (its links go down), journals `device-crashed` with a one-line message, and
 shows it as `crashed`; `start` runs it again. A trap anywhere else still fails the whole
 network.
+
+**Arguments and environment.** A device's `wasi:cli/environment` serves `argv[0]` (its name),
+then `DeviceOptions::args`, and `DeviceOptions::env` in the order given; a controller sets
+them with the spec keys `args` (text) and `env` (a map of text, sorted by name), at most 256
+each, 4 KiB a text, no NUL, no `=` in a name. In a composed node every app and the netstack
+share them. Without any, a device sees `argv[0]` alone and no variables, as before. The
+`http-server` app puts them in a route's body (`{args}`, `{env:NAME}`).
+
+**A device's output, for its controller.** `logs` reads the lines a device wrote on stdout or
+stderr, which the journal has only for a device with `DeviceOptions::journal_stdio`; a spec asks
+for that with `"stdio": "journal"`. A controller can then read why a device it created failed:
+a component that traps on a bad configuration usually says why on stderr first, and the lines
+are journalled even when the device never got as far as running (a failed creation keeps its
+name in the table, `failed`, with its lines).
+
+**Devices with their controller.** `DeviceOptions::infra_cascade` says what becomes of the
+devices a controller created when the controller stops or is removed (an operator event):
+`Keep` (the default: they run on, as before), `Stop` (they stop with it, at once and in
+creation order, as on a power cut; starting the controller again does not start them) or
+`Remove` (they are removed with it). Each is journalled as `device-stopped` or
+`device-removed` with `with-owner`. A request the controller made before it stopped and that
+has not applied yet fails when it would apply (`infra-failed`: the controller stopped), so
+nothing it asked for appears after the cut.
+
+### A change feed that wakes a controller
+
+`wasmnet:infra/changes.wait(selector, since, deadline)` (package 0.1.2) is an async function:
+it returns at once if the caller's view has a change after `since` to a device matching
+`selector`, and otherwise waits until one is made or virtual time reaches `deadline`, then
+returns the view's latest version. A controller calls it between two reconciles instead of
+sleeping for its period (the `replicas` app does with `wake = true`), so it sees a stopped
+device, an exit or a crash in the same instant.
+
+It is served by the core (`InfraEnd::wait`, a future): a change wakes the waiting task through
+its waker in the processing context the change is made in (a derived event applying, an
+operator event, a device's app exit, which the table folds in as it is journalled), and the
+executor polls the controller in that event's next round. So the wake is at the same position
+in every run, and the same in a split network, where everything in a controller's view
+changes on its own site ([sites.md](sites.md)). The deadline is an ordinary timer, cancelled
+when the call returns early or is dropped. A stepped controller cannot await: it keeps polling
+`watch` from its `poll`.
 
 **Split networks.** A controller works in a split (multi-site) network on its own site: its
 devices and their cables stay there. A creation cabled to a device of another site fails the
@@ -166,18 +211,22 @@ answered from the record and not sent again; without a request id, every call se
 command, so commands should be idempotent (the router's are). In a split network it reaches
 the controller's own devices, which are on its site.
 
-The package went from `wasmnet:infra@0.1.0` to `0.1.1`: an addition, so a component built
-against 0.1.0 still links (wasmtime matches `0.1.x` imports semver-compatibly).
+The package went from `wasmnet:infra@0.1.0` to `0.1.1` (`devices.control`) and to `0.1.2`
+(`changes.wait`, the spec keys `args` and `env`): additions, so a component built against an
+earlier `0.1` still links (wasmtime matches `0.1.x` imports semver-compatibly).
 
 The `infra-script` test fixture ([components/infra-script](../../components/infra-script)) is
 a controller with a script: a stepped device with no ports that makes `apply`, `control`,
-`start`, `stop` and `remove` calls at set virtual times, which
+`start`, `stop`, `remove` and `logs` calls at set virtual times, which
 [crates/wasmnet-host/tests/routes.rs](../../crates/wasmnet-host/tests/routes.rs) uses to change
-the routes of a router it created while traffic crosses it.
+the routes of a router it created while traffic crosses it, and
+[crates/wasmnet-host/tests/infra_verbs.rs](../../crates/wasmnet-host/tests/infra_verbs.rs) to
+create devices with arguments and environment, read a failed device's output and stop its
+devices with it.
 
 **Not covered yet.** Commands to a device of another site (a controller's own devices are on its
 site; a timed `Op::Control` is applied by the device's site, [sites.md](sites.md)). Changing a
 device's configuration in place through infra (`apply` with a new spec still recreates it),
-and `wire` and `unwire` verbs for controllers. The router's port forwards and allow rules take the
-same `commands` export ([nat.md](nat.md)), with no change to the host, the core or
-`wasmnet:infra`.
+`wire` and `unwire` verbs for controllers, and limits: on the devices one controller may
+create, and on a device's memory. The router's port forwards and allow rules take the same
+`commands` export ([nat.md](nat.md)), with no change to the host, the core or `wasmnet:infra`.

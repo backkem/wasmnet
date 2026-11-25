@@ -39,6 +39,10 @@ here so that nobody has to find these the hard way. Each entry names where the c
   optional exports, so it does not serve `wasmnet:control/commands`: an `Op::Control` with a
   `DeviceCommand` is refused when added, and a controller's `devices.control` is refused when it
   applies (`infra-failed`).
+- **Arguments and environment are native only.** The browser backend does not serve
+  `DeviceOptions::args` and `env`: its devices see neither.
+- **A controller has no limits.** Nothing bounds how many devices a controller creates (beyond
+  its 2^20 device numbers per run) or what they allocate.
 - **Split networks keep changes on one site.** A controller changes only devices on its own
   site; a creation cabled to another site's device fails the split run (`Error::Refused`), and
   WAN links cannot be created while a network runs. Operator events there are limited to
