@@ -40,7 +40,8 @@ const MAGIC: &[u8; 7] = b"NSSTATE";
 /// 4: several ports: a port count, then each port's interface state, tables and counters;
 ///    every socket slot names its port; a UDP membership names its interface; a listener lists
 ///    its ports.
-const VERSION: u8 = 4;
+/// 5: the TCP counters gained `listen_overflows`.
+const VERSION: u8 = 5;
 
 /// A snapshot writer: little-endian scalars, length-prefixed collections.
 #[derive(Default)]
@@ -312,6 +313,7 @@ counters!(TcpCounters {
     rx_window_full,
     orphans_reaped,
     path_mtu_lowered,
+    listen_overflows,
 });
 
 fn smol_ip(a: IpAddress) -> IpAddr {

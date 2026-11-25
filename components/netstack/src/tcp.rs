@@ -17,9 +17,14 @@
 //!   (WASI asks for implicit `SO_REUSEADDR`).
 //! * **The listen backlog is N smoltcp sockets in LISTEN** on the port (smoltcp has no
 //!   backlog of its own). Every socket takes one SYN. Connections that are mid-handshake, or
-//!   established but not yet taken by the app, count against the backlog; while the backlog is
-//!   full no socket listens, so a further SYN draws smoltcp's RST (Linux would drop it). The
-//!   backlog is clamped to [1, [`MAX_BACKLOG`]] and defaults to [`DEFAULT_BACKLOG`].
+//!   established but not yet taken by the app, count against the backlog. While the backlog is
+//!   full no socket listens, and smoltcp would answer a further SYN with an RST, as it does for
+//!   a port nobody listens on. **The stack drops such a SYN instead, as Linux does**
+//!   ([`TcpSockets::hold_back_syns`], counter `tcp-listen-overflows`): the client sends its SYN
+//!   again after its retransmission timeout and gets in once the app has accepted. A SYN to a
+//!   port without a live listener of its family and address still draws the RST
+//!   (`connection-refused` at once). The backlog is clamped to [1, [`MAX_BACKLOG`]] and
+//!   defaults to [`DEFAULT_BACKLOG`].
 //! * **Families never conflict** (every WASI IPv6 socket is `IPV6_V6ONLY`): `0.0.0.0:80` and
 //!   `[::]:80` listen side by side (smoltcp issue #7). smoltcp ignores the
 //!   family, so whichever wildcard LISTEN socket comes first takes a SYN of either family;
@@ -53,9 +58,14 @@ use std::net::{IpAddr, SocketAddr};
 
 use crate::sockets::{Handle, Sockets};
 use crate::stack::{Port, Routing};
+use smoltcp::iface::{Interface, SocketSet};
 use smoltcp::socket::tcp::{self, State};
 use smoltcp::time::Duration;
-use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint};
+use smoltcp::wire::{
+    EthernetFrame, EthernetProtocol, IpAddress, IpEndpoint, IpListenEndpoint, IpProtocol,
+    Ipv4Packet, Ipv6Packet, TcpPacket,
+};
+use wasmnet_wire::MacAddr;
 
 use crate::observe::IcmpError;
 use crate::route::StaticRoute;
@@ -171,6 +181,54 @@ impl Congestion {
 pub fn parse_rto_min(value: &str) -> Option<u64> {
     wasmnet_wire::parse_duration(value)
         .filter(|ns| (MIN_RTO_MIN_NS..=MAX_RTO_MIN_NS).contains(ns) && ns.is_multiple_of(1_000_000))
+}
+
+/// A TCP SYN off the wire that opens a connection: SYN set, ACK and RST clear.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Syn {
+    pub src: SocketAddr,
+    pub dst: SocketAddr,
+}
+
+/// Reads `frame` as a [`Syn`] to the port whose MAC is `mac`: an Ethernet frame to `mac`
+/// carrying IPv4 (unfragmented, its header checksum valid) or IPv6 (TCP as its first next
+/// header), and a TCP segment with a valid checksum. Anything else is `None`: smoltcp handles
+/// it as before. Bounds-checked reads only; it never panics.
+pub fn bare_syn(frame: &[u8], mac: MacAddr) -> Option<Syn> {
+    let eth = EthernetFrame::new_checked(frame).ok()?;
+    if MacAddr::from_slice(&eth.dst_addr().0) != Some(mac) {
+        return None;
+    }
+    let (src, dst, segment): (IpAddr, IpAddr, &[u8]) = match eth.ethertype() {
+        EthernetProtocol::Ipv4 => {
+            let ip = Ipv4Packet::new_checked(eth.payload()).ok()?;
+            if !ip.verify_checksum()
+                || ip.more_frags()
+                || ip.frag_offset() != 0
+                || ip.next_header() != IpProtocol::Tcp
+            {
+                return None;
+            }
+            (ip.src_addr().into(), ip.dst_addr().into(), ip.payload())
+        }
+        EthernetProtocol::Ipv6 => {
+            let ip = Ipv6Packet::new_checked(eth.payload()).ok()?;
+            if ip.next_header() != IpProtocol::Tcp {
+                return None;
+            }
+            (ip.src_addr().into(), ip.dst_addr().into(), ip.payload())
+        }
+        _ => return None,
+    };
+    let tcp = TcpPacket::new_checked(segment).ok()?;
+    let checksum_ok = tcp.verify_checksum(&IpAddress::from(src), &IpAddress::from(dst));
+    if !checksum_ok || !tcp.syn() || tcp.ack() || tcp.rst() {
+        return None;
+    }
+    Some(Syn {
+        src: SocketAddr::new(src, tcp.src_port()),
+        dst: SocketAddr::new(dst, tcp.dst_port()),
+    })
 }
 
 /// Per-socket options. A listener's options are inherited by the sockets it accepts.
@@ -302,6 +360,9 @@ pub struct TcpCounters {
     pub orphans_reaped: u64,
     /// Connections whose send MSS a "fragmentation needed" or "packet too big" lowered.
     pub path_mtu_lowered: u64,
+    /// SYNs dropped because the listener that owns their port had its backlog full (Linux's
+    /// `ListenOverflows`): no RST, so the client's retransmission gets in later.
+    pub listen_overflows: u64,
 }
 
 /// What [`TcpSockets::recv_step`] found.
@@ -1753,6 +1814,83 @@ impl TcpSockets {
             true
         });
         progress
+    }
+
+    /// Takes out of `rx`, the frames a port (MAC `mac`, interface `iface`, sockets `set`) is
+    /// about to hand smoltcp, every SYN that a full backlog would answer with an RST, and
+    /// counts each in `listen_overflows`. Linux drops such a SYN, so that the client's
+    /// retransmission gets in once the app has accepted; smoltcp resets it, as if nobody
+    /// listened.
+    ///
+    /// A SYN stays when smoltcp will take it: a socket of `set` has its connection (a
+    /// retransmitted SYN, a simultaneous open), or a LISTEN socket of its port and address is
+    /// free. Each LISTEN socket takes one new connection, so the SYNs of one batch claim them in
+    /// order, as smoltcp's poll will. Of the rest, a SYN is dropped only when it is to one of
+    /// the interface's addresses and a live listener of its family owns its port and address
+    /// ([`owning_listener`](Self::owning_listener)); every other SYN still draws the RST, so a
+    /// connect to a port nobody listens on is refused at once.
+    pub fn hold_back_syns(
+        &mut self,
+        rx: &mut VecDeque<Vec<u8>>,
+        mac: MacAddr,
+        iface: &Interface,
+        set: &SocketSet<'static>,
+    ) {
+        if !rx.iter().any(|f| bare_syn(f, mac).is_some()) {
+            return;
+        }
+        let mut connections: Vec<(IpEndpoint, IpEndpoint)> = Vec::new();
+        let mut free: Vec<IpListenEndpoint> = Vec::new();
+        for (_, socket) in set.iter() {
+            let smoltcp::socket::Socket::Tcp(sock) = socket else {
+                continue;
+            };
+            match sock.state() {
+                State::Closed => {}
+                State::Listen => free.push(sock.listen_endpoint()),
+                _ => {
+                    if let (Some(l), Some(r)) = (sock.local_endpoint(), sock.remote_endpoint()) {
+                        connections.push((l, r));
+                    }
+                }
+            }
+        }
+        let mut kept = VecDeque::with_capacity(rx.len());
+        for frame in rx.drain(..) {
+            let Some(syn) = bare_syn(&frame, mac) else {
+                kept.push_back(frame);
+                continue;
+            };
+            let (local, remote) = (endpoint(syn.dst), endpoint(syn.src));
+            if connections.contains(&(local, remote)) {
+                kept.push_back(frame);
+                continue;
+            }
+            let listening = free
+                .iter()
+                .position(|l| l.port == local.port && l.addr.is_none_or(|a| a == local.addr));
+            if let Some(i) = listening {
+                free.remove(i);
+                connections.push((local, remote));
+                kept.push_back(frame);
+                continue;
+            }
+            let family = if syn.dst.is_ipv4() {
+                Family::Ipv4
+            } else {
+                Family::Ipv6
+            };
+            let owned = iface.has_ip_addr(local.addr)
+                && self
+                    .owning_listener(syn.dst.port(), family, Some(syn.dst.ip()))
+                    .is_some();
+            if owned {
+                self.counters.listen_overflows += 1;
+            } else {
+                kept.push_back(frame);
+            }
+        }
+        *rx = kept;
     }
 
     /// The live listener on `port` that owns a connection of `family` to local address `dst`:

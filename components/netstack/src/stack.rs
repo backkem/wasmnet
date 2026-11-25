@@ -608,6 +608,13 @@ impl Stack {
             for n in 0..self.ports.len() {
                 self.counters.iface_polls += 1;
                 let port = &mut self.ports[n];
+                // A SYN for a listener whose backlog is full is dropped, not reset (Linux).
+                self.tcp.hold_back_syns(
+                    &mut port.dev.rx,
+                    port.mac,
+                    &port.iface,
+                    self.sockets.set(n),
+                );
                 let result = port
                     .iface
                     .poll(to_smol(now), &mut port.dev, self.sockets.set_mut(n));
@@ -1146,6 +1153,7 @@ impl Stack {
             ("tcp-rx-window-full", t.rx_window_full),
             ("tcp-orphans-reaped", t.orphans_reaped),
             ("tcp-path-mtu-lowered", t.path_mtu_lowered),
+            ("tcp-listen-overflows", t.listen_overflows),
             ("tcp-open", self.tcp.open() as u64),
             ("tcp-orphans", self.tcp.orphans() as u64),
             ("multicast-joins", s.multicast_joins),

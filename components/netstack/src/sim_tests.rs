@@ -915,23 +915,36 @@ fn the_backlog_is_n_listen_sockets_so_two_syns_in_one_poll_both_get_in() {
         }
         let ok = results.iter().filter(|r| **r == Some(Ok(()))).count();
         assert_eq!(ok, connected, "backlog {backlog}: {results:?}");
-        if connected == 1 {
-            assert!(results.contains(&Some(Err(SockError::ConnectionRefused))));
-        }
+        // Backlog 1: the second SYN found no LISTEN socket and was dropped, as Linux drops it;
+        // its connect is still waiting.
+        let waiting = results.iter().filter(|r| r.is_none()).count();
+        assert_eq!(waiting, 2 - connected, "backlog {backlog}: {results:?}");
         let (t, net) = sim.tcp(0);
         let mut accepted = 0;
         while let Some(Accept::Conn(_)) = t.accept(l, net.sockets) {
+            t.delivered(l);
             accepted += 1;
         }
         assert_eq!(accepted, connected);
         assert_eq!(t.counters.backlog_peak, connected as u64);
-        // Backlog 1: the second SYN found no LISTEN socket and drew smoltcp's RST.
-        let rsts = sim
-            .tcp_segments()
-            .iter()
-            .filter(|s| s.1 == 0 && s.2 & RST != 0)
-            .count();
-        assert_eq!(rsts, 2 - connected);
+        assert_eq!(t.counters.listen_overflows, (2 - connected) as u64);
+        sim.kick(0);
+        // The first connection was accepted: the dropped SYN's retransmission (after the
+        // client's initial timeout, 1 s) gets in.
+        sim.run(1_500 * MS);
+        let now = sim.now;
+        for ((i, s), first) in [(1, one), (2, two)].into_iter().zip(&results) {
+            if first.is_none() {
+                let (t, net) = sim.tcp(i);
+                assert_eq!(
+                    t.connect_poll(s, now, net.sockets),
+                    Some(Ok(())),
+                    "node {i}"
+                );
+            }
+        }
+        let rsts = sim.tcp_segments().iter().filter(|s| s.2 & RST != 0).count();
+        assert_eq!(rsts, 0, "backlog {backlog}: no RST");
     }
 }
 
@@ -3208,4 +3221,109 @@ fn a_delayed_ack_after_steady_round_trips_is_no_reason_to_retransmit() {
         let rtt = if round < 20 { 600 * MS } else { 610 * MS };
         assert_eq!(acked_at - d.at, rtt, "round {round}");
     }
+}
+
+// ---- The listen backlog: a SYN past it is dropped ----
+
+/// Client `n` (1..=9) of a burst: `02:00:00:00:01:0n`, `10.0.0.10n/24`.
+fn burst_client(n: usize) -> Stack {
+    let mac = format!("02:00:00:00:01:0{n}");
+    let ipv4 = format!("10.0.0.10{n}/24");
+    node(
+        &[("mac", mac.as_str()), ("ipv4", ipv4.as_str())],
+        10 + n as u64,
+    )
+}
+
+#[test]
+fn a_burst_past_the_backlog_gets_in_by_retransmitted_syns_and_never_draws_an_rst() {
+    // Five clients connect at once to a listener with a backlog of 2 whose app accepts one
+    // connection every 500 ms. Two SYNs find a LISTEN socket; the three others are dropped
+    // (Linux's behaviour), not reset. Each client sends its SYN again after its initial
+    // timeout (1 s, then 2 s more): two get in at 1 s, once two connections were accepted,
+    // and the last at 3 s.
+    let mut nodes = vec![node(&a(&[]), 1)];
+    nodes.extend((1..=5).map(burst_client));
+    let mut sim = Sim::new(nodes, 100 * US);
+    sim.batch = true;
+    let l = listen(&mut sim, 0, 2);
+    let clients: Vec<(usize, u32)> = (1..=5)
+        .map(|i| (i, connect(&mut sim, i, "10.0.0.1:80")))
+        .collect();
+    let mut accepted = Vec::new();
+    for step in 1..=12u64 {
+        let at = step * 500 * MS;
+        sim.run(at);
+        sim.now = at;
+        let (t, net) = sim.tcp(0);
+        if let Some(Accept::Conn(s)) = t.accept(l, net.sockets) {
+            t.delivered(l);
+            accepted.push((at, s));
+        }
+        sim.kick(0);
+    }
+    sim.run(10_000 * MS);
+    let now = sim.now;
+    for &(i, s) in &clients {
+        let (t, net) = sim.tcp(i);
+        assert_eq!(
+            t.connect_poll(s, now, net.sockets),
+            Some(Ok(())),
+            "client {i}"
+        );
+    }
+    assert_eq!(accepted.len(), 5, "{accepted:?}");
+    let segs = sim.tcp_segs();
+    assert!(segs.iter().all(|s| s.flags & RST == 0), "an RST: {segs:?}");
+    // SYNs per client, by when they left: three clients needed retransmissions.
+    let mut syns: BTreeMap<usize, Vec<u64>> = BTreeMap::new();
+    for s in segs
+        .iter()
+        .filter(|s| s.flags & SYN != 0 && s.flags & ACK == 0)
+    {
+        syns.entry(s.from).or_default().push(s.at);
+    }
+    let mut tries: Vec<usize> = syns.values().map(Vec::len).collect();
+    tries.sort();
+    assert_eq!(tries, [1, 1, 2, 2, 3], "{syns:?}");
+    // Three SYNs dropped at first, then one of the three retransmitted at 1 s.
+    let (t, _) = sim.tcp(0);
+    assert_eq!(t.counters.listen_overflows, 4);
+    assert_eq!(t.counters.backlog_peak, 2);
+    assert_eq!(
+        counters(&sim.nodes[0]).get("tcp-listen-overflows"),
+        Some(&4)
+    );
+}
+
+#[test]
+fn a_port_nobody_listens_on_still_refuses_at_once_while_a_backlog_is_full() {
+    // The listener on port 80 has its one backlog slot taken; a connect to port 81 (no
+    // listener) draws the RST and fails within its round trip, and one to port 80 waits.
+    let mut sim = Sim::new(
+        vec![node(&a(&[]), 1), node(&b(), 2), node(&c(), 3)],
+        100 * US,
+    );
+    listen(&mut sim, 0, 1);
+    let first = connect(&mut sim, 1, "10.0.0.1:80");
+    sim.run(10 * MS);
+    sim.now = 10 * MS;
+    established(&mut sim, 1, first);
+    let full = connect(&mut sim, 2, "10.0.0.1:80");
+    let refused = connect(&mut sim, 2, "10.0.0.1:81");
+    sim.run(20 * MS);
+    let now = sim.now;
+    let (t, net) = sim.tcp(2);
+    assert_eq!(
+        t.connect_poll(refused, now, net.sockets),
+        Some(Err(SockError::ConnectionRefused))
+    );
+    assert_eq!(t.connect_poll(full, now, net.sockets), None);
+    let rsts: Vec<_> = sim
+        .tcp_segs()
+        .into_iter()
+        .filter(|s| s.flags & RST != 0)
+        .collect();
+    assert_eq!(rsts.len(), 1, "one RST, for port 81: {rsts:?}");
+    assert_eq!(sim.tcp(0).0.counters.listen_overflows, 1);
 }

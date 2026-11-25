@@ -115,6 +115,12 @@ here so that nobody has to find these the hard way. Each entry names where the c
   ([design/netstack.md](design/netstack.md#tcp-congestion-control)).
   In `crates/wasmnet-host/tests/congestion.rs`, 1 MB at 10 Mbit/s through a 4-frame queue
   takes 1.05 s (0.83 s of it serialisation), and with 1 % loss 0.85 s to 2.07 s.
+- **A full listen backlog drops a SYN, and the client waits a timeout** (1 s for the first
+  SYN, then 2 s, 4 s, ...), as on Linux, with no SYN cookies and no queue of half-open
+  connections beyond the backlog itself ([design/netstack.md](design/netstack.md#sockets-on-smoltcp),
+  counter `tcp-listen-overflows`). The stack recognises the SYN in an IPv4 packet or directly
+  behind the IPv6 header; one behind IPv6 extension headers still draws smoltcp's RST when
+  the backlog is full.
 - **Colliding query ids in the resolver** (an A and an AAAA query drawing the same id) cost one
   timeout before the retry.
 

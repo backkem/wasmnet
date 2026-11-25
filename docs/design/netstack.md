@@ -83,7 +83,13 @@ finish, park until the driver's next pass.
 - **TCP** ([src/tcp.rs](../../components/netstack/src/tcp.rs)). `connect` and `listen` create
   smoltcp sockets with the buffer sizes set so far (64 KiB per direction by default, clamped to
   536 B to 1 MiB). The listen backlog is N smoltcp sockets in LISTEN (default 8, at most 64),
-  since smoltcp has no backlog. A connect waits at most 75 s for the handshake. Every
+  since smoltcp has no backlog. While a listener's backlog is full, a SYN for it is dropped,
+  as Linux drops it, and counted (`tcp-listen-overflows`): smoltcp would answer it with an RST,
+  as for a closed port. The client sends the SYN again after its retransmission timeout (1 s,
+  then 2 s, 4 s, ...) and gets in once the app has accepted; a SYN to a port without a listener
+  of its family and address still draws the RST, so that connect is refused at once. The
+  stack decides before smoltcp sees the frame: a SYN stays when a socket has its connection or
+  a LISTEN socket of its port is free. A connect waits at most 75 s for the handshake. Every
   connection has a congestion controller, Reno by default (below).
 - **ICMP echo** ([src/icmp.rs](../../components/netstack/src/icmp.rs)): Linux-style ping
   sockets. The stack picks each identifier from a rover that starts at an identifier drawn
