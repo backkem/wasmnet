@@ -1069,6 +1069,7 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
             infra: options.infra.then(|| {
                 self.infra.end(
                     name,
+                    idx,
                     options.infra_prefix.clone(),
                     options.infra_max_devices,
                     options.infra_supply,

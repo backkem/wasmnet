@@ -574,7 +574,7 @@ fn supplied_components_compile_once_per_digest() {
     network.set_supply_admission(|_| Ok(()));
     let ctl = network
         .infra()
-        .end("ctl", None, None, Some(SupplyLimits::default()));
+        .end("ctl", 0, None, None, Some(SupplyLimits::default()));
     let spec = |component: &str| det_cbor_spec(component, &[]);
     let good = ctl.supply(None, b"tick=10").unwrap();
     let bad = ctl.supply(None, b"bad").unwrap();

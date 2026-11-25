@@ -78,6 +78,7 @@ mod clock;
 pub mod commands;
 mod config;
 mod device;
+mod device_events;
 pub mod digest;
 mod exec;
 pub mod ext;

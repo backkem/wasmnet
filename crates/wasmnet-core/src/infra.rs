@@ -33,6 +33,11 @@ use det_cbor::Value;
 use crate::clock::{Nanos, VirtualClock};
 use crate::commands::DeviceCommand;
 use crate::config::DeviceConfig;
+use crate::device_events::Ring;
+pub use crate::device_events::{
+    DeviceEvent, EVENT_BYTES_KEPT, EVENT_OVERHEAD, EVENTS_KEPT, EventPage, Follow, MAX_FOLLOWS,
+    MAX_KIND, MAX_KINDS, Ready, TableSince,
+};
 use crate::journal::{Journal, JournalEnd, JournalEntry, Record, Stream};
 use crate::network::DeviceOptions;
 
@@ -313,6 +318,52 @@ struct State {
     queued_supplied: BTreeMap<usize, (String, String)>,
     /// The embedder's verdict on supplied components ([`crate::Network::set_supply_admission`]).
     admission: Option<crate::supply::Admission>,
+    /// The events kept of the devices controllers created, by device name
+    /// ([`crate::device_events`]).
+    rings: BTreeMap<String, Ring>,
+    /// The last event number of each device name that had one: numbers go on across a
+    /// name's incarnations, so a cursor never goes back.
+    seqs: BTreeMap<String, u64>,
+    /// The tasks and armed waits waiting for a device's events, by device name.
+    event_waiters: BTreeMap<String, Vec<EventWaiter>>,
+    /// Each stepped controller's armed wait ([`InfraEnd::arm`]), by controller.
+    arms: BTreeMap<String, Arm>,
+}
+
+/// A wait for a device's events: woken by an event matching `kinds` after `since`, by a gap
+/// after `since`, or by the device leaving the table.
+struct EventWaiter {
+    kinds: Vec<String>,
+    since: u64,
+    waker: Waker,
+}
+
+/// A stepped controller's armed wait: its waker queues one more `poll` of the controller, once.
+struct Arm {
+    wake: Arc<PollWake>,
+    waker: Waker,
+    /// The devices it follows.
+    names: Vec<String>,
+}
+
+/// Wakes a stepped controller by queueing one more `poll` of it at the current instant
+/// ([`VirtualClock::wake_poll`]), the first time it is woken only.
+struct PollWake {
+    clock: VirtualClock,
+    device: usize,
+    live: std::sync::atomic::AtomicBool,
+}
+
+impl std::task::Wake for PollWake {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        if self.live.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            self.clock.wake_poll(self.device);
+        }
+    }
 }
 
 /// One network's device table and derived requests. Cloning gives another handle to the same table.
@@ -358,6 +409,23 @@ impl Infra {
             stores: BTreeMap::new(),
             queued_supplied: BTreeMap::new(),
             admission: None,
+            rings: BTreeMap::new(),
+            seqs: BTreeMap::new(),
+            event_waiters: BTreeMap::new(),
+            arms: BTreeMap::new(),
+        }));
+        // The events of the devices controllers created are kept as they are journalled, in
+        // the journalling device's own processing context, so a wake they cause is at the same
+        // place in every run and on every site (a controller's devices are on its site).
+        let rings = Arc::downgrade(&inner);
+        journal.set_event_sink(Arc::new(move |e: &JournalEntry| {
+            if let Some(table) = rings.upgrade() {
+                let woken =
+                    Self::keep_event(&mut table.lock().unwrap_or_else(PoisonError::into_inner), e);
+                for w in woken {
+                    w.wake();
+                }
+            }
         }));
         // App exits are folded in as they are journalled, in the exiting device's own
         // processing context, so the change (and the wake it causes) is at the same place in
@@ -475,6 +543,175 @@ impl Infra {
         (changed, latest)
     }
 
+    // ---- device events ------------------------------------------------------------------
+
+    /// Keeps a journalled `log.event` of a device a controller created in its ring; returns the
+    /// waits it wakes (they are woken once the state is unlocked).
+    fn keep_event(s: &mut State, e: &JournalEntry) -> Vec<Waker> {
+        let Record::Event { kind, fields } = &e.record else {
+            return Vec::new();
+        };
+        if s.items.get(&e.device).is_none_or(|i| i.owner.is_none()) {
+            return Vec::new();
+        }
+        let last = s.seqs.entry(e.device.clone()).or_insert(0);
+        let base = *last;
+        *last += 1;
+        let seq = *last;
+        let s = &mut *s;
+        let ring = s
+            .rings
+            .entry(e.device.clone())
+            .or_insert_with(|| Ring::new(base));
+        ring.push(seq, e.at, kind.clone(), fields.clone());
+        let mut woken = Vec::new();
+        if let Some(ws) = s.event_waiters.get_mut(&e.device) {
+            ws.retain(|w| {
+                let ready = ring.ready(&w.kinds, w.since);
+                if ready {
+                    woken.push(w.waker.clone());
+                }
+                !ready
+            });
+            if ws.is_empty() {
+                s.event_waiters.remove(&e.device);
+            }
+        }
+        woken
+    }
+
+    /// Device `name` left the table: its events go (its number goes on), and whoever waits
+    /// for them is woken (a read now answers `not-found`). A controller that leaves is
+    /// disarmed.
+    fn forget_events(s: &mut State, name: &str) -> Vec<Waker> {
+        s.rings.remove(name);
+        Self::disarm(s, name);
+        s.event_waiters
+            .remove(name)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|w| w.waker)
+            .collect()
+    }
+
+    /// Takes back `controller`'s armed wait, if any: it wakes nothing any more.
+    fn disarm(s: &mut State, controller: &str) {
+        let Some(arm) = s.arms.remove(controller) else {
+            return;
+        };
+        arm.wake
+            .live
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        Self::unregister(s, controller, &arm.names, &arm.waker);
+    }
+
+    /// Removes `waker`'s registrations: on `controller`'s table changes and on `names`' events.
+    fn unregister(s: &mut State, controller: &str, names: &[String], waker: &Waker) {
+        if let Some(ws) = s.waiters.get_mut(controller) {
+            ws.retain(|x| !x.will_wake(waker));
+        }
+        for name in names {
+            if let Some(ws) = s.event_waiters.get_mut(name) {
+                ws.retain(|x| !x.waker.will_wake(waker));
+                if ws.is_empty() {
+                    s.event_waiters.remove(name);
+                }
+            }
+        }
+    }
+
+    /// Registers `waker` for `controller`'s table changes (if `table`) and `follows`' events.
+    fn register(
+        s: &mut State,
+        controller: &str,
+        table: Option<&TableSince>,
+        follows: &[Follow],
+        waker: &Waker,
+    ) {
+        if table.is_some() {
+            let ws = s.waiters.entry(controller.to_owned()).or_default();
+            if !ws.iter().any(|x| x.will_wake(waker)) {
+                ws.push(waker.clone());
+            }
+        }
+        for f in follows {
+            s.event_waiters
+                .entry(f.name.clone())
+                .or_default()
+                .push(EventWaiter {
+                    kinds: f.kinds.clone(),
+                    since: f.since,
+                    waker: waker.clone(),
+                });
+        }
+    }
+
+    /// What is ready for `controller`: a table change after `table.since` matching its
+    /// selector, and the followed devices with an event they wait for, a gap, or gone from its
+    /// devices.
+    fn ready_for(
+        s: &State,
+        controller: &str,
+        table: Option<&TableSince>,
+        follows: &[Follow],
+    ) -> Ready {
+        let seen = s
+            .views
+            .get(controller)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let changed = table.is_some_and(|t| {
+            seen.iter()
+                .skip(usize::try_from(t.since).unwrap_or(usize::MAX))
+                .any(|&i| matches(&s.changes[i].device.labels, &t.selector))
+        });
+        let devices = follows
+            .iter()
+            .filter(|f| match s.items.get(&f.name) {
+                Some(i) if i.owner.as_deref() == Some(controller) => s
+                    .rings
+                    .get(&f.name)
+                    .is_some_and(|r| r.ready(&f.kinds, f.since)),
+                _ => true,
+            })
+            .map(|f| f.name.clone())
+            .collect();
+        Ready {
+            rv: seen.len() as u64,
+            changed,
+            devices,
+        }
+    }
+
+    /// The events kept of device `name` (a device a controller created) after `since` matching
+    /// `kinds`, at most `max`: what its controller reads ([`InfraEnd::events`]), for tools and
+    /// tests. `not-found` for a device not in the table.
+    pub fn events(
+        &self,
+        name: &str,
+        kinds: &[String],
+        since: u64,
+        max: u32,
+    ) -> Result<EventPage, InfraError> {
+        crate::device_events::check_kinds(kinds)?;
+        let s = self.state();
+        if !s.items.contains_key(name) {
+            return Err(InfraError::NotFound(format!("no device `{name}`")));
+        }
+        Ok(Self::page(&s, name, kinds, since, max))
+    }
+
+    fn page(s: &State, name: &str, kinds: &[String], since: u64, max: u32) -> EventPage {
+        match s.rings.get(name) {
+            Some(r) => r.read(kinds, since, max),
+            None => EventPage {
+                events: Vec::new(),
+                next: since,
+                missed: 0,
+            },
+        }
+    }
+
     // ---- what the network tells the table ------------------------------------------------
 
     /// The components controllers may create ([`crate::Network::set_infra_catalog`]); without a
@@ -489,14 +726,18 @@ impl Infra {
     pub(crate) fn end(
         &self,
         device: &str,
+        index: usize,
         prefix: Option<String>,
         max_devices: Option<u32>,
         supply: Option<crate::supply::SupplyLimits>,
     ) -> InfraEnd {
         self.add_view(device);
+        // A new instance of a controller has armed nothing yet.
+        Self::disarm(&mut self.state(), device);
         InfraEnd {
             infra: self.clone(),
             device: device.to_owned(),
+            index,
             prefix,
             max_devices,
             supply,
@@ -695,6 +936,9 @@ impl Infra {
         // A stop says why only when it was its owner's ([`Self::stopped_with`]); a crash
         // is `crashed`, with the trap ([`Self::crashed`]).
         item.message = None;
+        if phase != Phase::Running {
+            Self::disarm(&mut s, name);
+        }
         Self::change(&mut s, ChangeKind::Modified, name);
     }
 
@@ -707,6 +951,7 @@ impl Infra {
         item.phase = Phase::Stopped;
         item.since = at;
         item.message = Some(format!("stopped with its owner `{owner}`"));
+        Self::disarm(&mut s, name);
         Self::change(&mut s, ChangeKind::Modified, name);
     }
 
@@ -719,6 +964,7 @@ impl Infra {
         item.phase = Phase::Crashed;
         item.since = at;
         item.message = Some(message.to_owned());
+        Self::disarm(&mut s, name);
         Self::change(&mut s, ChangeKind::Modified, name);
     }
 
@@ -734,6 +980,7 @@ impl Infra {
         item.phase = Phase::Removed;
         item.since = at;
         item.target = None;
+        let woken = Self::forget_events(&mut s, name);
         Self::change(&mut s, ChangeKind::Deleted, name);
         s.items.remove(name);
         // A removed controller holds no components any more; a removed device names none.
@@ -743,6 +990,9 @@ impl Infra {
             }
         }
         drop(s);
+        for w in woken {
+            w.wake();
+        }
         self.collect_supplied();
     }
 
@@ -1091,6 +1341,8 @@ pub struct InfraEnd {
     pub(crate) infra: Infra,
     /// The caller's device name.
     pub(crate) device: String,
+    /// Its index in the network (what an armed wait polls).
+    pub(crate) index: usize,
     /// The names it may create, if limited ([`crate::DeviceOptions::infra_prefix`]).
     pub(crate) prefix: Option<String>,
     /// The most devices it may have ([`crate::DeviceOptions::infra_max_devices`]).
@@ -1672,8 +1924,13 @@ impl InfraEnd {
                 i.phase = Phase::Removed;
                 i.since = now;
             }
+            let woken = Infra::forget_events(&mut s, name);
             Infra::change(&mut s, ChangeKind::Deleted, name);
             s.items.remove(name);
+            drop(s);
+            for w in woken {
+                w.wake();
+            }
             return Ok((true, false));
         }
         let req = Request {
@@ -1954,6 +2211,190 @@ impl InfraEnd {
             sleep: None,
             waker: None,
         }
+    }
+
+    // ---- events of the devices it created (`wasmnet:infra/events`) -------------------------
+
+    /// Refuses `name` unless this controller created it: `not-found` for a device not in its
+    /// view, `denied` for the network's own devices (in a split network their events may be on
+    /// another site) and the caller itself.
+    fn readable(&self, s: &State, name: &str) -> Result<(), InfraError> {
+        match s.items.get(name).filter(|i| Infra::sees(i, &self.device)) {
+            None => Err(InfraError::NotFound(format!("no device `{name}`"))),
+            Some(i) if i.owner.as_deref() != Some(self.device.as_str()) => {
+                Err(InfraError::Denied(format!(
+                    "`{name}` was not created by this controller: events are for the devices it \
+                     created"
+                )))
+            }
+            Some(_) => Ok(()),
+        }
+    }
+
+    /// Checks what a wait follows: at most [`MAX_FOLLOWS`] devices this controller created,
+    /// each with a valid filter.
+    fn check_follows(&self, s: &State, follows: &[Follow]) -> Result<(), InfraError> {
+        if follows.len() > MAX_FOLLOWS {
+            return Err(InfraError::Invalid(format!(
+                "a wait follows at most {MAX_FOLLOWS} devices"
+            )));
+        }
+        for f in follows {
+            crate::device_events::check_kinds(&f.kinds)?;
+            self.readable(s, &f.name)?;
+        }
+        Ok(())
+    }
+
+    /// `events.read`: the events device `name` (one this controller created, also while
+    /// `pending`) journalled after `since` whose kind matches `kinds` (a kind, or a prefix and
+    /// `*`; none: every kind), at most `max` (at least 1), with the cursor to read from next
+    /// and how many events after `since` the ring dropped unread.
+    pub fn events(
+        &self,
+        name: &str,
+        kinds: &[String],
+        since: u64,
+        max: u32,
+    ) -> Result<EventPage, InfraError> {
+        crate::device_events::check_kinds(kinds)?;
+        let s = self.infra.state();
+        self.readable(&s, name)?;
+        Ok(Infra::page(&s, name, kinds, since, max))
+    }
+
+    /// `changes.wait-any`: a future that completes once something is ready for this controller (a
+    /// change of its view after `table.since` matching `table.selector`, if `table` is given;
+    /// an event a follow waits for, a gap after its cursor, or a followed device leaving the
+    /// table), or once virtual time reaches `deadline` (with nothing ready). An event wakes the
+    /// waiting task in the journalling device's processing context, a change in the context it
+    /// is made in, so the task runs in that event's next round: the same on every replay and,
+    /// since a controller's devices are on its site, in a split network. Refused at once (an
+    /// error, nothing waits) for a follow of a device this controller did not create or a
+    /// malformed filter.
+    pub fn wait_any(
+        &self,
+        table: Option<TableSince>,
+        follows: Vec<Follow>,
+        deadline: Option<Nanos>,
+    ) -> Result<EventWait, InfraError> {
+        self.check_follows(&self.infra.state(), &follows)?;
+        Ok(EventWait {
+            end: self.clone(),
+            table,
+            follows,
+            deadline,
+            sleep: None,
+            waker: None,
+        })
+    }
+
+    /// `events.arm`: the wait of a controller without async tasks (a stepped device). If
+    /// something is ready already (as for [`Self::wait_any`]) it says what, and arms
+    /// nothing. Otherwise it arms a one-shot wake: the first event, change or departure that
+    /// would end the wait queues one more `poll` of the controller at that instant, in that
+    /// processing context ([`VirtualClock::wake_poll`]), which no poll deadline replaces. A new
+    /// `arm` replaces the armed one (with nothing to follow and no table, it only disarms), and
+    /// a stop, a crash or a new instance of the controller disarms it.
+    pub fn arm(
+        &self,
+        table: Option<TableSince>,
+        follows: Vec<Follow>,
+    ) -> Result<Option<Ready>, InfraError> {
+        let mut s = self.infra.state();
+        self.check_follows(&s, &follows)?;
+        Infra::disarm(&mut s, &self.device);
+        let ready = Infra::ready_for(&s, &self.device, table.as_ref(), &follows);
+        if ready.any() {
+            return Ok(Some(ready));
+        }
+        if table.is_none() && follows.is_empty() {
+            return Ok(None);
+        }
+        let wake = Arc::new(PollWake {
+            clock: self.infra.clock.clone(),
+            device: self.index,
+            live: std::sync::atomic::AtomicBool::new(true),
+        });
+        let waker = Waker::from(wake.clone());
+        Infra::register(&mut s, &self.device, table.as_ref(), &follows, &waker);
+        s.arms.insert(
+            self.device.clone(),
+            Arm {
+                wake,
+                waker,
+                names: follows.into_iter().map(|f| f.name).collect(),
+            },
+        );
+        Ok(None)
+    }
+}
+
+/// The future of [`InfraEnd::wait_any`]. Dropping it stops waiting (and cancels its
+/// deadline).
+pub struct EventWait {
+    end: InfraEnd,
+    table: Option<TableSince>,
+    follows: Vec<Follow>,
+    deadline: Option<Nanos>,
+    sleep: Option<crate::clock::Sleep>,
+    /// The waker it registered last (taken out again when it is dropped or done).
+    waker: Option<Waker>,
+}
+
+impl EventWait {
+    fn unregister(&mut self, s: &mut State) {
+        if let Some(w) = self.waker.take() {
+            let names: Vec<String> = self.follows.iter().map(|f| f.name.clone()).collect();
+            Infra::unregister(s, &self.end.device, &names, &w);
+        }
+    }
+}
+
+impl Drop for EventWait {
+    fn drop(&mut self) {
+        if self.waker.is_some() {
+            let infra = self.end.infra.clone();
+            self.unregister(&mut infra.state());
+        }
+    }
+}
+
+impl std::future::Future for EventWait {
+    type Output = Ready;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Ready> {
+        let this = &mut *self;
+        let infra = this.end.infra.clone();
+        let mut s = infra.state();
+        this.unregister(&mut s);
+        let ready = Infra::ready_for(&s, &this.end.device, this.table.as_ref(), &this.follows);
+        if ready.any() {
+            return std::task::Poll::Ready(ready);
+        }
+        Infra::register(
+            &mut s,
+            &this.end.device,
+            this.table.as_ref(),
+            &this.follows,
+            cx.waker(),
+        );
+        this.waker = Some(cx.waker().clone());
+        drop(s);
+        if let Some(deadline) = this.deadline {
+            let clock = infra.clock.clone();
+            let sleep = this
+                .sleep
+                .get_or_insert_with(|| clock.sleep_until(deadline));
+            if std::pin::Pin::new(sleep).poll(cx).is_ready() {
+                this.unregister(&mut infra.state());
+                return std::task::Poll::Ready(ready);
+            }
+        }
+        std::task::Poll::Pending
     }
 }
 
@@ -2566,8 +3007,8 @@ mod tests {
     fn calls_queue_requests_and_the_table_follows_the_network() {
         let clock = VirtualClock::new(std::time::Duration::ZERO);
         let infra = Infra::new(clock.clone(), Journal::new(clock.clone()));
-        let ctl = infra.end("ctl", None, None, None);
-        let other = infra.end("other", None, None, None);
+        let ctl = infra.end("ctl", 0, None, None, None);
+        let other = infra.end("other", 0, None, None, None);
         infra.added(
             "ctl",
             spec_value(
@@ -2670,7 +3111,7 @@ mod tests {
     fn commands_queue_for_the_callers_running_devices() {
         let clock = VirtualClock::new(std::time::Duration::ZERO);
         let infra = Infra::new(clock.clone(), Journal::new(clock.clone()));
-        let end = |device: &str| infra.end(device, None, None, None);
+        let end = |device: &str| infra.end(device, 0, None, None, None);
         let (ctl, other) = (end("ctl"), end("other"));
         let spec_of = |c: &str| spec_value(c, &DeviceConfig::new(), DeviceOptions::default(), None);
         infra.added("ctl", spec_of("node:ctl"), 0, None);
@@ -2782,8 +3223,8 @@ mod tests {
         let infra = Infra::new(clock.clone(), Journal::new(clock.clone()));
         let spec_of = |c: &str| spec_value(c, &DeviceConfig::new(), DeviceOptions::default(), None);
         infra.added("sw", spec_of("switch"), 0, None);
-        let ctl = infra.end("ctl", None, Some(2), None);
-        let other = infra.end("other", None, None, None);
+        let ctl = infra.end("ctl", 0, None, Some(2), None);
+        let other = infra.end("other", 0, None, None, None);
         ctl.apply(None, "web", vec![], &spec("node:web")).unwrap();
         other
             .apply(None, "theirs", vec![], &spec("node:web"))
@@ -2852,7 +3293,7 @@ mod tests {
     fn a_controller_reads_its_commands_answers() {
         let clock = VirtualClock::new(std::time::Duration::ZERO);
         let infra = Infra::new(clock.clone(), Journal::new(clock.clone()));
-        let ctl = infra.end("ctl", None, None, None);
+        let ctl = infra.end("ctl", 0, None, None, None);
         infra.added(
             "ctl",
             spec_value("ctl", &DeviceConfig::new(), DeviceOptions::default(), None),
@@ -2870,7 +3311,7 @@ mod tests {
             Err(InfraError::NotFound(_))
         ));
         assert!(matches!(
-            infra.end("other", None, None, None).control_answer("q"),
+            infra.end("other", 0, None, None, None).control_answer("q"),
             Err(InfraError::NotFound(_))
         ));
         infra.added("r1", vec![], 0, Some(0));
@@ -2907,8 +3348,8 @@ mod tests {
         infra.added("sw", spec_of("switch"), 0, None);
         infra.added("ctl-a", spec_of("node:ctl"), 0, None);
         infra.added("ctl-b", spec_of("node:ctl"), 0, None);
-        let a = infra.end("ctl-a", Some("a-".to_owned()), None, None);
-        let b = infra.end("ctl-b", None, None, None);
+        let a = infra.end("ctl-a", 0, Some("a-".to_owned()), None, None);
+        let b = infra.end("ctl-b", 0, None, None, None);
         b.apply(None, "b-1", vec![], &spec("node:web")).unwrap();
         a.apply(None, "a-1", vec![], &spec("node:web")).unwrap();
         infra.added("b-1", vec![], 0, Some(0));
@@ -2988,9 +3429,9 @@ mod tests {
             max_components: 2,
             max_total: 10,
         };
-        let ctl = infra.end("ctl", None, None, Some(limits));
-        let plain = infra.end("plain", None, None, None);
-        let other = infra.end("other", None, None, Some(limits));
+        let ctl = infra.end("ctl", 0, None, None, Some(limits));
+        let plain = infra.end("plain", 0, None, None, None);
+        let other = infra.end("other", 0, None, None, Some(limits));
         let events = |kind: &str| {
             journal
                 .entries()
@@ -3130,5 +3571,258 @@ mod tests {
             ctl.apply(None, "g", vec![], &granting),
             Err(InfraError::Denied(_))
         ));
+    }
+
+    /// A device journals an event through `wasmnet:link/log.event`.
+    fn journal_event(
+        journal: &Journal,
+        device: &str,
+        at: Nanos,
+        kind: &str,
+        fields: &[(&str, &str)],
+    ) {
+        JournalEnd {
+            journal: journal.clone(),
+            device: device.to_owned(),
+        }
+        .event(
+            at,
+            kind.to_owned(),
+            fields
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect(),
+        );
+    }
+
+    /// A waker that counts its wakes.
+    struct Count(std::sync::atomic::AtomicUsize);
+
+    impl std::task::Wake for Count {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn kinds(k: &[&str]) -> Vec<String> {
+        k.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn controllers_read_the_events_of_the_devices_they_created() {
+        let clock = VirtualClock::new(std::time::Duration::ZERO);
+        let journal = Journal::new(clock.clone());
+        let infra = Infra::new(clock.clone(), journal.clone());
+        let spec_of = |c: &str| spec_value(c, &DeviceConfig::new(), DeviceOptions::default(), None);
+        infra.added("sw", spec_of("switch"), 0, None);
+        infra.added("ctl", spec_of("node:ctl"), 0, None);
+        infra.added("other", spec_of("node:ctl"), 0, None);
+        let ctl = infra.end("ctl", 1, None, None, None);
+        let other = infra.end("other", 2, None, None, None);
+        ctl.apply(None, "r1", vec![], &spec("router")).unwrap();
+        other.apply(None, "o1", vec![], &spec("router")).unwrap();
+        // Pending: readable, nothing yet.
+        let p = ctl.events("r1", &[], 0, 10).unwrap();
+        assert_eq!((p.events.len(), p.next, p.missed), (0, 0, 0));
+        infra.added("r1", vec![], 0, Some(0));
+        infra.applied(0, None, 0);
+        infra.added("o1", vec![], 0, Some(1));
+        infra.applied(1, None, 0);
+        // The network's own devices keep none (and nobody reads them).
+        journal_event(&journal, "sw", 1, "mac-learned", &[]);
+        // Three events at one instant, then one more.
+        for kind in ["route-added", "tunnel-up", "route-added"] {
+            journal_event(&journal, "r1", 5, kind, &[("tunnel", "to-b")]);
+        }
+        journal_event(&journal, "r1", 6, "tunnel-down", &[("tunnel", "to-b")]);
+        let journalled = journal
+            .entries()
+            .iter()
+            .filter(|e| e.device == "sw" || e.device == "r1")
+            .count();
+        assert_eq!(journalled, 5, "the journal has them all, as before");
+        // Read one at a time: each exactly once, in order, at its instant.
+        let (mut since, mut seen) = (0, Vec::new());
+        loop {
+            let p = ctl.events("r1", &[], since, 1).unwrap();
+            let Some(e) = p.events.first() else { break };
+            seen.push((e.seq, e.at, e.kind.clone()));
+            since = p.next;
+        }
+        assert_eq!(
+            seen,
+            [
+                (1, 5, "route-added".to_owned()),
+                (2, 5, "tunnel-up".to_owned()),
+                (3, 5, "route-added".to_owned()),
+                (4, 6, "tunnel-down".to_owned())
+            ]
+        );
+        assert_eq!(ctl.events("r1", &[], 4, 10).unwrap().events.len(), 0);
+        // A filter: a kind and a prefix; the cursor moves past what it leaves out.
+        let p = ctl.events("r1", &kinds(&["tunnel-*"]), 0, 10).unwrap();
+        assert_eq!(p.events.iter().map(|e| e.seq).collect::<Vec<_>>(), [2, 4]);
+        assert_eq!(p.next, 4);
+        assert_eq!(
+            p.events[0].fields,
+            [("tunnel".to_owned(), "to-b".to_owned())]
+        );
+        let p = ctl.events("r1", &kinds(&["route-added"]), 1, 1).unwrap();
+        assert_eq!(
+            (p.events[0].seq, p.next),
+            (3, 4),
+            "nothing after it matches"
+        );
+        assert!(matches!(
+            ctl.events("r1", &kinds(&["a b"]), 0, 1),
+            Err(InfraError::Invalid(_))
+        ));
+        // Outside its view or not its own: refused.
+        assert!(matches!(
+            ctl.events("o1", &[], 0, 1),
+            Err(InfraError::NotFound(_))
+        ));
+        assert!(matches!(
+            ctl.events("sw", &[], 0, 1),
+            Err(InfraError::Denied(_))
+        ));
+        assert!(matches!(
+            ctl.events("ctl", &[], 0, 1),
+            Err(InfraError::Denied(_))
+        ));
+        assert!(matches!(
+            ctl.events("nope", &[], 0, 1),
+            Err(InfraError::NotFound(_))
+        ));
+        assert!(matches!(
+            ctl.arm(None, vec![Follow::new("o1", vec![], 0)]),
+            Err(InfraError::NotFound(_))
+        ));
+        assert!(matches!(
+            ctl.wait_any(None, vec![Follow::new("sw", vec![], 0)], None),
+            Err(InfraError::Denied(_))
+        ));
+        // A tool reads the whole table.
+        assert_eq!(infra.events("o1", &[], 0, 10).unwrap().events.len(), 0);
+        // Overflow: a reader that fell behind learns how many it missed.
+        for k in 0..EVENTS_KEPT as u64 {
+            journal_event(&journal, "r1", 7, &format!("n{k}"), &[]);
+        }
+        let p = ctl.events("r1", &[], 0, u32::MAX).unwrap();
+        assert_eq!(p.missed, 4, "the first four were dropped");
+        assert_eq!(p.events.len(), EVENTS_KEPT);
+        assert_eq!(p.events[0].seq, 5);
+        assert_eq!(p.next, 4 + EVENTS_KEPT as u64);
+        assert_eq!(ctl.events("r1", &[], 2, 1).unwrap().missed, 2);
+        assert_eq!(ctl.events("r1", &[], 4, 1).unwrap().missed, 0);
+        // Removed and created again: the numbers go on, and nothing of before is missed.
+        infra.removed("r1", 8);
+        assert!(matches!(
+            ctl.events("r1", &[], 0, 1),
+            Err(InfraError::NotFound(_))
+        ));
+        ctl.apply(None, "r1", vec![], &spec("router")).unwrap();
+        infra.added("r1", vec![], 9, Some(2));
+        journal_event(&journal, "r1", 9, "tunnel-up", &[]);
+        let p = ctl.events("r1", &[], 0, 10).unwrap();
+        assert_eq!((p.events[0].seq, p.missed), (5 + EVENTS_KEPT as u64, 0));
+    }
+
+    #[test]
+    fn waits_end_on_the_events_they_follow_and_arms_poll_once() {
+        let clock = VirtualClock::new(std::time::Duration::ZERO);
+        let journal = Journal::new(clock.clone());
+        let infra = Infra::new(clock.clone(), journal.clone());
+        let spec_of = |c: &str| spec_value(c, &DeviceConfig::new(), DeviceOptions::default(), None);
+        infra.added("ctl", spec_of("node:ctl"), 0, None);
+        let ctl = infra.end("ctl", 3, None, None, None);
+        ctl.apply(None, "r1", vec![], &spec("router")).unwrap();
+        infra.added("r1", vec![], 0, Some(0));
+        infra.applied(0, None, 0);
+        let woken = |c: &Arc<Count>| c.0.load(std::sync::atomic::Ordering::SeqCst);
+        // An async wait: noise does not wake it, the kind it follows does.
+        let count = Arc::new(Count(Default::default()));
+        let waker = Waker::from(count.clone());
+        let mut cx = std::task::Context::from_waker(&waker);
+        let follow = || vec![Follow::new("r1", kinds(&["tunnel-*"]), 0)];
+        let mut wait = Box::pin(ctl.wait_any(None, follow(), None).unwrap());
+        assert!(wait.as_mut().poll(&mut cx).is_pending());
+        journal_event(&journal, "r1", 1, "route-added", &[]);
+        assert_eq!(woken(&count), 0, "noise");
+        journal_event(&journal, "r1", 1, "tunnel-up", &[]);
+        assert_eq!(woken(&count), 1);
+        let std::task::Poll::Ready(r) = wait.as_mut().poll(&mut cx) else {
+            panic!("ready")
+        };
+        assert_eq!(
+            (r.changed, r.devices.clone()),
+            (false, vec!["r1".to_owned()])
+        );
+        drop(wait);
+        assert!(
+            infra.state().event_waiters.is_empty(),
+            "a done wait leaves nothing"
+        );
+        // Ready at once: a wait after a cursor with matching events does not wait.
+        let mut now = Box::pin(ctl.wait_any(None, follow(), None).unwrap());
+        assert!(now.as_mut().poll(&mut cx).is_ready());
+        // A dropped wait unregisters.
+        let mut later = Box::pin(
+            ctl.wait_any(None, vec![Follow::new("r1", vec![], 2)], None)
+                .unwrap(),
+        );
+        assert!(later.as_mut().poll(&mut cx).is_pending());
+        drop(later);
+        assert!(infra.state().event_waiters.is_empty());
+        // An armed wait: ready at once says so and arms nothing.
+        assert_eq!(
+            ctl.arm(None, follow()).unwrap().map(|r| r.devices),
+            Some(vec!["r1".to_owned()])
+        );
+        assert!(infra.state().arms.is_empty());
+        // Armed after the last event: the next matching one queues one poll of device 3, once,
+        // beside the device's own deadline (which a later deadline replaces, not the wake).
+        assert_eq!(
+            ctl.arm(None, vec![Follow::new("r1", kinds(&["tunnel-*"]), 2)])
+                .unwrap(),
+            None
+        );
+        let polls = |clock: &VirtualClock| {
+            let mut n = 0;
+            while let Some((_, e)) = clock.pop(None) {
+                if matches!(e, crate::clock::Event::Poll(3)) {
+                    n += 1;
+                }
+            }
+            n
+        };
+        journal_event(&journal, "r1", 2, "route-added", &[]);
+        assert_eq!(polls(&clock), 0, "noise polls nothing");
+        clock.set_poll(3, Some(50));
+        journal_event(&journal, "r1", 2, "tunnel-down", &[]);
+        journal_event(&journal, "r1", 2, "tunnel-up", &[]);
+        clock.set_poll(3, Some(60));
+        assert_eq!(polls(&clock), 2, "the wake (once) and the last deadline");
+        // A table change ends an armed wait too; a stop of the controller disarms it.
+        let rv = ctl.list(&[]).0;
+        assert_eq!(
+            ctl.arm(Some(TableSince::new(vec![], rv)), vec![]).unwrap(),
+            None
+        );
+        infra.set_phase("ctl", Phase::Stopped, 3);
+        infra.set_phase("r1", Phase::Stopped, 3);
+        assert_eq!(polls(&clock), 0, "disarmed by its stop");
+        assert!(infra.state().arms.is_empty());
+        // Removal of a followed device ends a wait: it is gone.
+        let mut gone = Box::pin(
+            ctl.wait_any(None, vec![Follow::new("r1", vec![], 100)], None)
+                .unwrap(),
+        );
+        assert!(gone.as_mut().poll(&mut cx).is_pending());
+        infra.removed("r1", 4);
+        let std::task::Poll::Ready(r) = gone.as_mut().poll(&mut cx) else {
+            panic!("ready")
+        };
+        assert_eq!(r.devices, ["r1"]);
     }
 }

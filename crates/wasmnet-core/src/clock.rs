@@ -472,6 +472,16 @@ impl VirtualClock {
         }
     }
 
+    /// Queues one more `poll` of `device` at the current instant in the current processing
+    /// context, beside its deadline: no deadline the device sets replaces it, so a wake that
+    /// comes while the device itself runs is not lost (a stepped controller's armed wait,
+    /// `wasmnet:infra/events.arm`).
+    pub(crate) fn wake_poll(&self, device: DeviceIdx) {
+        let mut s = self.state();
+        let now = s.now;
+        s.insert(now, Event::Poll(device));
+    }
+
     /// Pops the earliest event and advances `now` to its time. Returns `None` if the queue is
     /// empty or the earliest event lies after `limit`.
     pub(crate) fn pop(&self, limit: Option<Nanos>) -> Option<(EventKey, Event)> {

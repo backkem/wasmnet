@@ -114,12 +114,17 @@ pub(crate) struct Journal {
 /// Sees every record the journal keeps, as it is appended, in the appending context.
 pub(crate) type Observer = Arc<dyn Fn(&JournalEntry) + Send + Sync>;
 
+/// Sees every `wasmnet:link/log.event` call of a device, in the device's processing context,
+/// whether or not the journal still keeps records.
+pub(crate) type EventSink = Arc<dyn Fn(&JournalEntry) + Send + Sync>;
+
 #[derive(Default)]
 struct JournalState {
     entries: Vec<JournalEntry>,
     tags: Vec<Tag>,
     dropped: u64,
     observer: Option<Observer>,
+    events: Option<EventSink>,
 }
 
 impl Journal {
@@ -139,6 +144,12 @@ impl Journal {
     /// journal is not locked meanwhile, so the observer may read it).
     pub(crate) fn set_observer(&self, observer: Observer) {
         self.state().observer = Some(observer);
+    }
+
+    /// Calls `sink` with every event a device journals through `wasmnet:link/log.event` from
+    /// now on ([`JournalEnd::event`]), before it is appended, kept or not.
+    pub(crate) fn set_event_sink(&self, sink: EventSink) {
+        self.state().events = Some(sink);
     }
 
     pub(crate) fn push(&self, entry: JournalEntry) {
@@ -242,13 +253,20 @@ impl JournalEnd {
             .into_iter()
             .map(|(k, v)| (truncate(k), truncate(v)))
             .collect();
-        self.push(
+        let entry = JournalEntry {
             at,
-            Record::Event {
+            device: self.device.clone(),
+            record: Record::Event {
                 kind: truncate(kind),
                 fields,
             },
-        );
+        };
+        // Not locked while the sink runs: it may wake controllers, which may read the journal.
+        let sink = self.journal.state().events.clone();
+        if let Some(sink) = sink {
+            sink(&entry);
+        }
+        self.journal.push(entry);
     }
 
     /// The device's name in the network.
