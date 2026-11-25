@@ -37,7 +37,11 @@ reports for measuring it (`crates/wasmnet-host/tests/measure.rs`): `DeviceCost` 
 fuel per instant, `Network::link_stats` read between runs with `LinkStats::since` and `add`, a
 link's series (`SeriesOptions`, `Network::link_series`), and what links record
 (`CaptureOptions`, `Network::set_capture_defaults`, `LinkMut::capture`, `FrameRecord::len`) with
-the `wasmnet-link-end/1` end descriptions (`pcap::LinkEnd`) ([design/links.md](design/links.md)).
+the `wasmnet-link-end/1` end descriptions (`pcap::LinkEnd`) and the notes a capture carries
+(`LinkMut::capture_notes`, `Network::set_capture_notes`, `LinkInfo::capture_notes`,
+`pcap::Capture::comments`, `pcap::check_notes`) ([design/links.md](design/links.md)). So are
+`tcp.rto-min` (`crates/wasmnet-host/tests/congestion.rs`) and the netstack's drop of a SYN that
+finds a listen backlog full, with its counter `tcp-listen-overflows` ([design/netstack.md](design/netstack.md)).
 So is a netstack with several ports and static routes, its `port<N>.*`, `ports` and `routes`
 keys (`crates/wasmnet-host/tests/multihomed.rs`, [design/netstack.md](design/netstack.md)).
 
