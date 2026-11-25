@@ -1827,7 +1827,7 @@ impl TcpSockets {
     /// free. Each LISTEN socket takes one new connection, so the SYNs of one batch claim them in
     /// order, as smoltcp's poll will. Of the rest, a SYN is dropped only when it is to one of
     /// the interface's addresses and a live listener of its family owns its port and address
-    /// ([`owning_listener`](Self::owning_listener)); every other SYN still draws the RST, so a
+    /// (`owning_listener`); every other SYN still draws the RST, so a
     /// connect to a port nobody listens on is refused at once.
     pub fn hold_back_syns(
         &mut self,
