@@ -270,3 +270,24 @@ fn page_scenario_native() {
         "{text}"
     );
 }
+
+/// A device that imports a portable interface no extension serves it faults at its first call,
+/// with the same words the page uses.
+#[test]
+fn an_interface_without_a_server_faults_the_device() {
+    let w = world();
+    let mut net = Network::new(&w.host, 1);
+    net.device_with_options(
+        "lonely",
+        &w.probe,
+        config(&[("period", "10ms")]),
+        DeviceOptions::default().crash_alone(true),
+    )
+    .unwrap();
+    net.run_until(5 * MS).unwrap();
+    let crashed = events(&net.journal(), "lonely", "device-crashed");
+    assert_eq!(
+        field(&crashed[0], "message"),
+        "wasmnet-test:pad/notes@0.1.0 is not served to this device (no extension gave it a server)"
+    );
+}
