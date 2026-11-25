@@ -58,9 +58,10 @@ Embedder surface, unstable. Tested end to end in
 
 ### Pause and resume
 
-`Op::PauseDevice { device, link_down }` puts a running device to sleep, as a laptop's lid
-closing does: it keeps its store (memory, sockets, connections, timers) but does not run, and
-misses the time it sleeps. `Op::ResumeDevice` wakes it. Precisely:
+`Op::pause_device(device)` (`.with_link_down(true)` drops its carrier) puts a running
+device to sleep, as a laptop's lid closing does: it keeps its store (memory, sockets,
+connections, timers) but does not run, and misses the time it sleeps. `Op::ResumeDevice` wakes
+it. Precisely:
 
 - **Its store** is kept and never polled while paused. Its phase is `DevicePhase::Paused`.
 - **Frames** that reach its ports are dropped there, as a powered-down NIC drops them. They
@@ -99,7 +100,7 @@ misses the time it sleeps. `Op::ResumeDevice` wakes it. Precisely:
 
 A device faults when its own code traps, when it runs out of fuel or memory, when a host
 extension's import returns an error (a trap raised by the host), or when an operator event
-says so: `Op::CrashDevice { device, message }` faults a running or paused device at the op's
+says so: `Op::crash_device(device, message)` faults a running or paused device at the op's
 position, as if its guest had trapped there. Whatever raised it, one rule decides what follows:
 
 - a device that **crashes alone** stops as crashed: its store is dropped, its links go down
@@ -123,8 +124,8 @@ message, an operator's crash is `crashed` with its message, the same as a trap.
 
 ### Embedder actions
 
-`Network::register_action(name, closure)` registers a closure; `Op::Action { name, device,
-argument }` calls it when the op applies, at its placement among the instant's operator events,
+`Network::register_action(name, closure)` registers a closure; `Op::action(name, device,
+argument)` calls it when the op applies, at its placement among the instant's operator events,
 journalled first as `action {name, argument}` on `device` (which must exist). The closure gets
 an `OpContext` (the op's instant, device phases, journal events, control calls, the network's
 extensions through `extension_mut`, and `add_op` for further operator events) and an
@@ -242,8 +243,8 @@ device, so it stays on its site.
 
 A cable's `impair` is one impairment for both directions or two by sending end (from `name`'s
 port first), set before any frame crosses it. The operator's cables take them too:
-`Op::Wire::impairments` and `Cable::impairments` (by sending end), so a link an operator event
-wires no longer starts unimpaired for one event.
+`Op::wire(a, b).with_impairments(..)` and `Cable::impairments` (by sending end), so a link
+an operator event wires no longer starts unimpaired for one event.
 
 **Limits.** `DeviceOptions::infra_max_devices` bounds how many devices a controller may have
 at once (every device it created that is in the table, whatever its phase): an `apply` of a
@@ -434,8 +435,8 @@ instant and is followed by a `poll` of the device at that instant:
 
 - **Between runs**: `Network::command(device, command, argument)` answers the device's
   `ok` text or its refusal (`None`: the device takes no commands), like `Network::counters`.
-- **Operator events** (embedder surface, unstable): `Op::Control { device, call }` or
-  `Op::ControlNamed { device, call }` with `call = DeviceCommand::new(command, argument)
+- **Operator events** (embedder surface, unstable): `Op::control(device, call)` or
+  `Op::control_named(device, call)` with `call = DeviceCommand::new(command, argument)
   .into_control()`, at any placement. `add_op` refuses a device that takes no commands; the
   device's refusal becomes the op's state (`OpState::Failed` with its message).
 - **Controllers**: `wasmnet:infra/devices.control(request-id, name, command, argument)`, below.

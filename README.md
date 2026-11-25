@@ -84,7 +84,8 @@ The full version is [`crates/wasmnet-host/examples/http.rs`](crates/wasmnet-host
   an app.
 - [docs/design/configuration.md](docs/design/configuration.md): every config key.
 - [docs/known-issues.md](docs/known-issues.md): what we know is wrong today.
-- [docs/stability.md](docs/stability.md): which parts of the API are the core, and which move.
+- [docs/stability.md](docs/stability.md): which parts of the API are the core, which move, and
+  how to build its types so that a new field never breaks your build.
 - [CONTRIBUTING.md](CONTRIBUTING.md): building, testing and the rules a change keeps.
 
 ```sh

@@ -208,7 +208,7 @@ instant, `running(name)`, `phase(name)`, `require_export`, `journal_event`, `con
 `Network::add_op`'s refusals). An `Err` is the op's refusal (`OpState::Failed`).
 
 **Embedder actions** are the same without a type: `Network::register_action(name, closure)`,
-called by `Op::Action { name, device, argument }` with the same `OpContext` and an
+called by `Op::action(name, device, argument)` with the same `OpContext` and an
 `ActionCall`, after an `action {name, argument}` record on `device`. What they may do, and what
 replay means for them, is in [topology-and-infra.md](topology-and-infra.md#embedder-actions).
 

@@ -84,10 +84,10 @@ draws, and neither does a loss of 0 or 1 000 000 ppm.
 - At build time: `LinkMut::impair(Impairments)` for both directions, or
   `LinkMut::impair_from(end, Impairments)` for one. `Impairments::rate`, `queue`, `loss_ppm` and
   `jitter` build a value: `Impairments::default().rate(10_000_000).queue(64)`.
-- While the network runs (embedder surface, unstable): `Op::Impair { link, from, impairments }`
-  by link id and `Op::ImpairNamed` by link name (a link an earlier op wires; journalled as
-  `link-changed`). They apply to frames transmitted from then on; frames already queued keep
-  their schedule.
+- While the network runs (embedder surface, unstable): `Op::impair(link, impairments)`
+  by link id and `Op::impair_named` by link name (a link an earlier op wires; journalled as
+  `link-changed`), one direction with `.with_from(end)`. They apply to frames transmitted
+  from then on; frames already queued keep their schedule.
 - `LinkInfo::impairments` reads them back, per sending end; `LinkStats` counts `dropped_queue`
   and `lost_random` next to the other counters.
 - The browser binding links with impairments through `wasmnet_web::Network::link_impaired`
@@ -117,7 +117,7 @@ would have arrived. Every count uses the whole frame, whatever the capture keeps
   current instant's included. Two reads subtracted (`LinkStats::since`) give the traffic of
   the interval between them, without parsing a capture; `LinkStats::add` sums.
 - **Per interval.** A link can also keep a series: buckets of a fixed width, each the
-  `LinkStats` counted in it (`LinkMut::series(SeriesOptions { width, keep })`, or
+  `LinkStats` counted in it (`LinkMut::series(SeriesOptions::new(width, keep))`, or
   `Network::set_series_defaults` for every link created from then on). Only buckets in which
   something was counted exist, and the link keeps the last `keep` of them, so its memory is
   bounded. `Network::link_series` returns `(bucket start, counters)`, oldest first; while no
