@@ -41,6 +41,8 @@ use crate::wire::{
 };
 use crate::{Event, Sink};
 
+mod tunnels;
+
 /// `first`-mode trace sets stop growing here (further first-time items are not reported).
 const TRACE_CAP: usize = 4096;
 /// RFC 1812: an ICMPv4 error is at most 576 bytes.
@@ -145,6 +147,8 @@ pub struct Router {
     nat: Option<Nat>,
     /// The allow lists and the flows they let through (inactive without rules).
     filter: Filter,
+    /// Tunnel ports, after the cabled ones (`docs/design/tunnels.md`).
+    tunnels: tunnels::Tunnels,
 }
 
 pub(crate) fn proto_name(p: u8) -> String {
@@ -236,14 +240,6 @@ fn forward_event(kind: &'static str, f: &crate::nat::Forward) -> Event {
     )
 }
 
-/// A command's refusal to touch a connected route.
-fn connected(r: &Route) -> String {
-    format!(
-        "{} is connected to port {}: its route cannot be changed",
-        r.prefix, r.port
-    )
-}
-
 /// ICMPv4 error types (an error is never sent about one of these).
 fn is_icmpv4_error(t: u8) -> bool {
     matches!(t, 3 | 4 | 5 | 11 | 12)
@@ -287,6 +283,12 @@ impl Router {
                 });
             }
         }
+        // Tunnels from the config: their ports follow the cabled ones, their transit prefixes are
+        // connected routes (inserted before the static ones, which may name the tunnels).
+        let cabled = cfg.ports.len();
+        for (i, (_, spec)) in cfg.tunnels.iter().enumerate() {
+            routes.insert(tunnels::connected_route(spec, (cabled + i) as u32));
+        }
         for r in &cfg.routes {
             routes.insert(Route {
                 prefix: r.prefix,
@@ -295,7 +297,7 @@ impl Router {
                 kind: RouteKind::Static,
             });
         }
-        let ports = cfg
+        let mut ports: Vec<Port> = cfg
             .ports
             .iter()
             .map(|p| Port {
@@ -304,6 +306,13 @@ impl Router {
                 c: PortCounters::default(),
             })
             .collect();
+        for (i, (_, spec)) in cfg.tunnels.iter().enumerate() {
+            ports.push(Port {
+                cfg: tunnels::port_config(spec, (cabled + i) as u32),
+                up: false,
+                c: PortCounters::default(),
+            });
+        }
         let nat = cfg.nat.clone().map(|n| {
             let addrs: BTreeMap<u32, Ipv4Addr> = cfg
                 .ports
@@ -332,7 +341,8 @@ impl Router {
             cfg.conntrack_max,
             cfg.trace_filter_drop,
         );
-        Self {
+        let mut router = Self {
+            tunnels: tunnels::Tunnels::new(cfg.stun_server),
             cfg,
             ports,
             routes,
@@ -343,7 +353,9 @@ impl Router {
             counters: Counters::default(),
             nat,
             filter,
-        }
+        };
+        router.tunnels_from_config(0);
+        router
     }
 
     /// The translation table, if a port translates.
@@ -375,11 +387,11 @@ impl Router {
     pub fn describe(&self) -> Vec<String> {
         let mut lines = vec![format!(
             "router: {} port(s), {} route(s), ttl {}",
-            self.ports.len(),
+            self.cfg.ports.len(),
             self.routes.len(),
             self.cfg.ttl
         )];
-        for (n, p) in self.ports.iter().enumerate() {
+        for (n, p) in self.ports.iter().take(self.cfg.ports.len()).enumerate() {
             let mut s = format!("  port {n}: mac {} mtu {}", p.cfg.mac, p.cfg.mtu);
             if let Some((a, l)) = p.cfg.ipv4 {
                 s.push_str(&format!(" {a}/{l}"));
@@ -415,8 +427,9 @@ impl Router {
                 n.forwards().len()
             ));
         }
+        self.tunnel_lines(&mut lines);
         for r in self.routes.routes() {
-            lines.push(format!("  route {r}"));
+            lines.push(format!("  route {}", self.route_text(r)));
         }
         lines
     }
@@ -428,7 +441,12 @@ impl Router {
     pub fn receive(&mut self, now: u64, port: u32, frame: &[u8], out: &mut impl Sink) {
         self.counters.rx_frames += 1;
         self.counters.rx_bytes += frame.len() as u64;
-        let Some(p) = self.ports.get_mut(port as usize) else {
+        let cabled = self.cfg.ports.len();
+        let Some(p) = self
+            .ports
+            .get_mut(port as usize)
+            .filter(|_| (port as usize) < cabled)
+        else {
             self.counters.malformed += 1;
             return;
         };
@@ -509,7 +527,8 @@ impl Router {
             next = earliest(next, nat.next_deadline());
         }
         self.filter.expire(now);
-        earliest(next, self.filter.next_deadline())
+        next = earliest(next, self.filter.next_deadline());
+        earliest(next, self.tunnel_poll(now, out))
     }
 
     /// A port's carrier changed.
@@ -558,6 +577,11 @@ impl Router {
 
     /// Transmits a frame and counts it.
     fn send_frame(&mut self, port: u32, frame: Vec<u8>, out: &mut impl Sink) {
+        if self.is_tunnel(port) {
+            // A tunnel has no link layer: nothing it would send as a frame (an NDP answer to a
+            // solicitation that came through it) leaves.
+            return;
+        }
         let p = &mut self.ports[port as usize];
         p.c.tx_frames += 1;
         p.c.tx_bytes += frame.len() as u64;
@@ -698,6 +722,10 @@ impl Router {
         from: Option<u32>,
         out: &mut impl Sink,
     ) {
+        if self.is_tunnel(port) {
+            self.tunnel_send(now, port, packet, out);
+            return;
+        }
         let ethertype = if next_hop.is_ipv6() {
             ETHERTYPE_IPV6
         } else {
@@ -793,7 +821,7 @@ impl Router {
                         "via",
                         r.via.map_or("on-link".to_owned(), |v| v.to_string()),
                     ));
-                    fields.push(kv("port", r.port));
+                    fields.push(kv("port", self.port_name(r.port)));
                 }
             }
             out.event(Event::new("route-lookup", fields));
@@ -843,8 +871,8 @@ impl Router {
                     kv("dst", endpoint(dst, ports.map(|p| p.1))),
                     kv("ttl-in", ttl),
                     kv("ttl-out", ttl - 1),
-                    kv("from-port", from),
-                    kv("to-port", to),
+                    kv("from-port", self.port_name(from)),
+                    kv("to-port", self.port_name(to)),
                 ],
             ));
         }
@@ -875,7 +903,7 @@ impl Router {
                 kv("src", src),
                 kv("dst", dst),
                 kv("proto", proto_name(proto)),
-                kv("port", port),
+                kv("port", self.port_name(port)),
             ],
         ));
     }
@@ -1099,6 +1127,9 @@ impl Router {
             return;
         }
         if self.is_mine_v4(dst) {
+            if self.tunnel_in(now, packet, out) {
+                return;
+            }
             let outside = self.nat.as_ref().and_then(|n| n.port_with_addr(dst));
             let taken = match outside {
                 Some(w) if w == port => self.nat_in(now, port, packet, out),
@@ -1955,14 +1986,19 @@ impl Router {
                 .routes
                 .routes()
                 .iter()
-                .map(Route::to_string)
+                .map(|r| self.route_text(r))
                 .collect::<Vec<_>>()
                 .join("\n")),
+            "tunnel-add" => self.tunnel_add(now, argument, out),
+            "tunnel-remove" => self.tunnel_remove(argument, out),
+            "tunnel-peer" => self.tunnel_peer(now, argument, true, out),
+            "tunnel-peer-remove" => self.tunnel_peer(now, argument, false, out),
+            "tunnels" if argument.is_empty() => Ok(self.tunnel_listing()),
             "forward-add" => self.forward_add(now, argument, out),
             "forward-remove" => self.forward_remove(argument, out),
             "allow-add" => self.allow_change(argument, true, out),
             "allow-remove" => self.allow_change(argument, false, out),
-            "forwards" | "rules" | "mappings" if !argument.is_empty() => {
+            "forwards" | "rules" | "mappings" | "tunnels" if !argument.is_empty() => {
                 Err(format!("`{command}` takes no argument"))
             }
             "forwards" => Ok(self
@@ -1977,7 +2013,8 @@ impl Router {
             "routes" => Err("`routes` takes no argument".to_owned()),
             other => Err(format!(
                 "unknown command `{other}` (route-add, route-replace, route-remove, routes, \
-                 forward-add, forward-remove, forwards, mappings, allow-add, allow-remove, rules)"
+                 forward-add, forward-remove, forwards, mappings, allow-add, allow-remove, rules, \
+                 tunnel-add, tunnel-remove, tunnel-peer, tunnel-peer-remove, tunnels)"
             )),
         }
     }
@@ -2049,7 +2086,7 @@ impl Router {
         let port: u32 = port
             .parse()
             .ok()
-            .filter(|&p| (p as usize) < self.ports.len())
+            .filter(|&p| (p as usize) < self.cfg.ports.len())
             .ok_or_else(|| format!("port `{port}` does not exist"))?;
         let rule = parse_rule(rule.trim())?;
         let done = if add {
@@ -2068,7 +2105,7 @@ impl Router {
 
     /// A static route from a command's argument, checked against the ports like the config's.
     fn parse_static(&self, text: &str) -> Result<Route, String> {
-        let r = crate::config::parse_route(text, &self.cfg.ports)
+        let r = crate::config::parse_route_with(text, &self.cfg.ports, |n| self.tunnel_port(n))
             .map_err(|why| format!("route `{text}`: {why}"))?;
         Ok(Route {
             prefix: r.prefix,
@@ -2086,11 +2123,12 @@ impl Router {
     ) -> Result<String, String> {
         let new = self.parse_static(text)?;
         match self.routes.get(new.prefix).copied() {
-            Some(old) if old.kind == RouteKind::Connected => Err(connected(&old)),
+            Some(old) if old.kind == RouteKind::Connected => Err(self.connected(&old)),
             Some(old) if old == new => Ok("unchanged".to_owned()),
             Some(old) if !replace => Err(format!(
-                "a route for {} exists ({old}): use route-replace",
-                old.prefix
+                "a route for {} exists ({}): use route-replace",
+                old.prefix,
+                self.route_text(&old)
             )),
             old => {
                 self.routes.replace(new);
@@ -2125,16 +2163,31 @@ impl Router {
         };
         match self.routes.get(prefix).copied() {
             None => Ok("absent".to_owned()),
-            Some(old) if old.kind == RouteKind::Connected => Err(connected(&old)),
-            Some(old) if exact.is_some_and(|e| e != old) => {
-                Err(format!("the route for {prefix} is `{old}`, not `{text}`"))
-            }
+            Some(old) if old.kind == RouteKind::Connected => Err(self.connected(&old)),
+            Some(old) if exact.is_some_and(|e| e != old) => Err(format!(
+                "the route for {prefix} is `{}`, not `{text}`",
+                self.route_text(&old)
+            )),
             Some(old) => {
                 self.routes.remove(prefix);
                 self.route_changed("route-removed", &old, out);
                 Ok("removed".to_owned())
             }
         }
+    }
+
+    /// A command's refusal to touch a connected route.
+    fn connected(&self, r: &Route) -> String {
+        let what = if self.is_tunnel(r.port) {
+            "tunnel"
+        } else {
+            "port"
+        };
+        format!(
+            "{} is connected to {what} {}: its route cannot be changed",
+            r.prefix,
+            self.port_name(r.port)
+        )
     }
 
     /// Journals one change and counts it. Every destination's next lookup is traced again.
@@ -2150,7 +2203,7 @@ impl Router {
             vec![
                 kv("prefix", r.prefix),
                 kv("via", r.via.map_or("on-link".to_owned(), |v| v.to_string())),
-                kv("port", r.port),
+                kv("port", self.port_name(r.port)),
             ],
         ));
     }
@@ -2268,7 +2321,7 @@ impl Router {
                 v.push((k.to_owned(), val));
             }
         }
-        for (n, p) in self.ports.iter().enumerate() {
+        for (n, p) in self.ports.iter().take(self.cfg.ports.len()).enumerate() {
             let pc = p.c;
             for (k, val) in [
                 ("rx-frames", pc.rx_frames),
@@ -2282,6 +2335,7 @@ impl Router {
                 v.push((format!("p{n}-{k}"), val));
             }
         }
+        self.tunnel_counters(&mut v);
         // Appears only once the neighbor table was full (`neighbor::MAX_ENTRIES`).
         if self.neigh.evicted > 0 {
             v.push(("neighbors-evicted".to_owned(), self.neigh.evicted));

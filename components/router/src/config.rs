@@ -48,6 +48,7 @@ use crate::filter::{Rule, parse_rule};
 use crate::nat::{Allocation, Dependence, NatConfig, parse_forward};
 use crate::route::Prefix;
 use crate::track::Timeouts;
+use crate::tunnel::{self, Spec as TunnelSpec};
 
 /// Most ports a router may have.
 pub const MAX_PORTS: u32 = 16;
@@ -134,6 +135,11 @@ pub struct Config {
     pub conntrack_max: usize,
     pub trace_nat_filtered: Trace,
     pub trace_filter_drop: Trace,
+    /// Tunnel ports from `tunnel.<name>.<key>`, by name: the first is port `ports.len()`, the
+    /// next one after it, and so on (`docs/design/tunnels.md`).
+    pub tunnels: Vec<(String, TunnelSpec)>,
+    /// A UDP port on which the router answers STUN Binding requests without a tunnel id.
+    pub stun_server: Option<u16>,
 }
 
 /// The default base MAC (`R` = 0x52).
@@ -183,6 +189,7 @@ const TOP_KEYS: &[&str] = &[
     "conntrack.max-entries",
     "trace.nat-filtered",
     "trace.filter-drop",
+    "stun-server",
 ];
 
 /// The link-local address of `mac` (RFC 4291 modified EUI-64).
@@ -289,8 +296,16 @@ impl Config {
         let r = Reader { map: &map };
 
         let mut highest: Option<u32> = None;
-        for key in map.keys() {
+        let mut tunnel_pairs: BTreeMap<&str, Vec<(&str, &str)>> = BTreeMap::new();
+        for (key, value) in &map {
             if TOP_KEYS.contains(&key.as_str()) {
+                continue;
+            }
+            if let Some((name, k)) = key
+                .strip_prefix("tunnel.")
+                .and_then(|rest| rest.split_once('.'))
+            {
+                tunnel_pairs.entry(name).or_default().push((k, value));
                 continue;
             }
             match port_key(key) {
@@ -426,15 +441,55 @@ impl Config {
             });
         }
 
+        if tunnel_pairs.len() > tunnel::MAX_TUNNELS {
+            return Err(ConfigError::Other(format!(
+                "more than {} tunnels",
+                tunnel::MAX_TUNNELS
+            )));
+        }
+        let mut tunnels: Vec<(String, TunnelSpec)> = Vec::new();
+        for (name, pairs) in tunnel_pairs {
+            if !tunnel::valid_name(name) {
+                return Err(ConfigError::Other(format!(
+                    "tunnel.{name}: a tunnel name is a-z, 0-9 and -, 1 to 32 characters, \
+                     starting with a letter"
+                )));
+            }
+            let spec = TunnelSpec::from_pairs(pairs)
+                .map_err(|why| ConfigError::Other(format!("tunnel.{name}: {why}")))?;
+            if tunnels
+                .iter()
+                .any(|(_, s)| (s.udp, s.id) == (spec.udp, spec.id))
+            {
+                return Err(ConfigError::Other(format!(
+                    "tunnel.{name}: another tunnel has id {} on udp {}",
+                    spec.id, spec.udp
+                )));
+            }
+            tunnels.push((name.to_owned(), spec));
+        }
+        let stun_server = r.get(
+            "stun-server",
+            "a UDP port from 1 to 65535",
+            int(1u16, 65535),
+        )?;
+        let tunnel_port = |name: &str| {
+            tunnels
+                .iter()
+                .position(|(n, _)| n == name)
+                .map(|i| (port_configs.len() + i) as u32)
+        };
+
         let mut routes = Vec::new();
         if let Some(list) = map.get("routes") {
             for text in list.split(',').map(str::trim).filter(|t| !t.is_empty()) {
-                let route =
-                    parse_route(text, &port_configs).map_err(|why| ConfigError::Invalid {
+                let route = parse_route_with(text, &port_configs, tunnel_port).map_err(|why| {
+                    ConfigError::Invalid {
                         key: "routes".to_owned(),
                         value: text.to_owned(),
                         expected: why,
-                    })?;
+                    }
+                })?;
                 routes.push(route);
             }
         }
@@ -529,6 +584,8 @@ impl Config {
             conntrack_max,
             trace_nat_filtered,
             trace_filter_drop,
+            tunnels,
+            stun_server,
         })
     }
 }
@@ -614,8 +671,19 @@ fn nat_config(
     })
 }
 
-/// Parses one static route against the ports (see [`StaticRoute`]).
+/// Parses one static route against the ports (see [`StaticRoute`]); it names no tunnel.
 pub fn parse_route(text: &str, ports: &[PortConfig]) -> Result<StaticRoute, String> {
+    parse_route_with(text, ports, |_| None)
+}
+
+/// Parses one static route against the ports and the tunnels: `tunnel(name)` is the port of
+/// tunnel `name`, if there is one. A route over a tunnel is `<prefix> tunnel <name>`: on-link
+/// through that tunnel port, with neither `via` nor `port`.
+pub fn parse_route_with(
+    text: &str,
+    ports: &[PortConfig],
+    tunnel: impl Fn(&str) -> Option<u32>,
+) -> Result<StaticRoute, String> {
     let words: Vec<&str> = text.split_whitespace().collect();
     let syntax = || {
         "a route like `10.0.3.0/24 via 10.0.2.2`, `default via 10.0.2.2`, \
@@ -625,6 +693,7 @@ pub fn parse_route(text: &str, ports: &[PortConfig]) -> Result<StaticRoute, Stri
     let (dest, rest) = words.split_first().ok_or_else(syntax)?;
     let mut via: Option<IpAddr> = None;
     let mut port: Option<u32> = None;
+    let mut over: Option<u32> = None;
     let mut it = rest.iter();
     while let Some(word) = it.next() {
         let value = it.next().ok_or_else(syntax)?;
@@ -639,8 +708,31 @@ pub fn parse_route(text: &str, ports: &[PortConfig]) -> Result<StaticRoute, Stri
                 }
                 port = Some(n);
             }
+            "tunnel" if over.is_none() => {
+                over = Some(tunnel(value).ok_or_else(|| format!("no tunnel `{value}`"))?);
+            }
             _ => return Err(syntax()),
         }
+    }
+    if let Some(t) = over {
+        if via.is_some() || port.is_some() {
+            return Err("a route over a tunnel takes neither `via` nor `port`".to_owned());
+        }
+        if *dest == "default" {
+            return Err("`default` needs `via`; over a tunnel write 0.0.0.0/0 or ::/0".to_owned());
+        }
+        let prefix: Prefix = dest.parse().map_err(|_| syntax())?;
+        if !prefix.is_canonical() {
+            return Err(format!(
+                "{dest}: host bits are set (use {})",
+                prefix.masked()
+            ));
+        }
+        return Ok(StaticRoute {
+            prefix,
+            via: None,
+            port: t,
+        });
     }
     let prefix = match *dest {
         "default" => match via {
