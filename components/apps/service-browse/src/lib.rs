@@ -250,6 +250,8 @@ pub fn note(e: &Event) -> Note {
                 ),
             ],
         ),
+        // An event a later browser reports and this app does not know yet.
+        _ => ("dnssd-event", Vec::new()),
     }
 }
 
@@ -333,14 +335,12 @@ mod tests {
     }
 
     fn resolved() -> Resolved {
-        Resolved {
-            name: "Alpha Web._http._tcp.local".into(),
-            instance: "Alpha Web".into(),
-            host: "alpha.local".into(),
-            port: 80,
-            txt: vec![b"path=/".to_vec(), b"secure".to_vec()],
-            addresses: vec!["10.0.0.10".parse().unwrap(), "fd00::10".parse().unwrap()],
-        }
+        Resolved::new("Alpha Web._http._tcp.local", "Alpha Web", "alpha.local", 80)
+            .txt(vec![b"path=/".to_vec(), b"secure".to_vec()])
+            .addresses(vec![
+                "10.0.0.10".parse().unwrap(),
+                "fd00::10".parse().unwrap(),
+            ])
     }
 
     #[test]

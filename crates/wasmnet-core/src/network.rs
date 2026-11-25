@@ -95,6 +95,7 @@ pub trait Runtime {
 }
 
 /// Everything a backend needs to run one device deterministically.
+#[non_exhaustive]
 pub struct DeviceContext {
     /// The device's index in the network (what [`VirtualClock::set_poll`] and friends take).
     pub index: usize,
@@ -142,6 +143,7 @@ pub struct DeclaredPort {
 }
 
 /// A device the backend created.
+#[non_exhaustive]
 pub struct DeviceInstance {
     /// Its `ports()` answer.
     pub ports: Vec<DeclaredPort>,
@@ -154,6 +156,38 @@ pub struct DeviceInstance {
     pub exports: Vec<String>,
     /// A composed node's apps (its `app-<name>` exports, by name, in the order they start).
     pub apps: Vec<String>,
+}
+
+impl DeviceInstance {
+    /// A device with these ports and this actor, no `counters`, no optional exports and no
+    /// apps.
+    pub fn new(ports: Vec<DeclaredPort>, actor: ActorFuture) -> Self {
+        Self {
+            ports,
+            actor,
+            has_counters: false,
+            exports: Vec::new(),
+            apps: Vec::new(),
+        }
+    }
+
+    /// Sets [`has_counters`](Self::has_counters).
+    pub fn has_counters(mut self, on: bool) -> Self {
+        self.has_counters = on;
+        self
+    }
+
+    /// Sets [`exports`](Self::exports).
+    pub fn exports(mut self, exports: Vec<String>) -> Self {
+        self.exports = exports;
+        self
+    }
+
+    /// Sets [`apps`](Self::apps).
+    pub fn apps(mut self, apps: Vec<String>) -> Self {
+        self.apps = apps;
+        self
+    }
 }
 
 /// A device in a network.
@@ -281,6 +315,7 @@ impl LinkMut<'_> {
 /// Per-device settings beyond its config. The defaults: the network's [`Guard`] fuel budget,
 /// and stdio captured but not journalled.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DeviceOptions {
     /// This device's fuel per virtual instant instead of [`Guard::fuel_per_instant`]. A
     /// device that does heavy work in one instant (an interpreter, a large copy) needs far more
@@ -334,9 +369,89 @@ pub struct DeviceOptions {
     pub ext: ExtOptions,
 }
 
+/// Chainable setters, one per field, for building options that survive new fields:
+/// `DeviceOptions::default().infra(true).crash_alone(true)`.
+impl DeviceOptions {
+    /// Sets [`fuel_per_instant`](Self::fuel_per_instant).
+    pub fn fuel_per_instant(mut self, fuel: u64) -> Self {
+        self.fuel_per_instant = Some(fuel);
+        self
+    }
+
+    /// Sets [`journal_stdio`](Self::journal_stdio).
+    pub fn journal_stdio(mut self, on: bool) -> Self {
+        self.journal_stdio = on;
+        self
+    }
+
+    /// Sets [`infra`](Self::infra).
+    pub fn infra(mut self, on: bool) -> Self {
+        self.infra = on;
+        self
+    }
+
+    /// Sets [`infra_prefix`](Self::infra_prefix).
+    pub fn infra_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.infra_prefix = Some(prefix.into());
+        self
+    }
+
+    /// Sets [`infra_cascade`](Self::infra_cascade).
+    pub fn infra_cascade(mut self, cascade: Cascade) -> Self {
+        self.infra_cascade = cascade;
+        self
+    }
+
+    /// Sets [`infra_max_devices`](Self::infra_max_devices).
+    pub fn infra_max_devices(mut self, max: u32) -> Self {
+        self.infra_max_devices = Some(max);
+        self
+    }
+
+    /// Sets [`infra_supply`](Self::infra_supply).
+    pub fn infra_supply(mut self, limits: crate::supply::SupplyLimits) -> Self {
+        self.infra_supply = Some(limits);
+        self
+    }
+
+    /// Sets [`memory`](Self::memory), in bytes.
+    pub fn memory(mut self, bytes: u64) -> Self {
+        self.memory = Some(bytes);
+        self
+    }
+
+    /// Sets [`crash_alone`](Self::crash_alone).
+    pub fn crash_alone(mut self, on: bool) -> Self {
+        self.crash_alone = on;
+        self
+    }
+
+    /// Sets [`args`](Self::args).
+    pub fn args<S: Into<String>>(mut self, args: impl IntoIterator<Item = S>) -> Self {
+        self.args = args.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Sets [`env`](Self::env).
+    pub fn env<K: Into<String>, V: Into<String>>(
+        mut self,
+        env: impl IntoIterator<Item = (K, V)>,
+    ) -> Self {
+        self.env = env.into_iter().map(|(k, v)| (k.into(), v.into())).collect();
+        self
+    }
+
+    /// Sets [`ext`](Self::ext) (embedder surface, unstable).
+    pub fn ext(mut self, ext: ExtOptions) -> Self {
+        self.ext = ext;
+        self
+    }
+}
+
 /// What becomes of the devices a controller created when the controller stops or is removed
 /// ([`DeviceOptions::infra_cascade`], `docs/design/topology-and-infra.md`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Cascade {
     /// They keep running (and stay its).
     #[default]
@@ -380,6 +495,7 @@ struct DeviceRecord {
 
 /// What a device is doing (its status under operator events).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DevicePhase {
     Running,
     /// Paused by an operator event ([`Op::PauseDevice`]): its store is kept and does not run;
@@ -2876,6 +2992,7 @@ impl Records {
 /// A cable of a device an operator event adds ([`Op::AddDevice`]), plugged in before the
 /// device first runs.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Cable {
     /// The new device's port.
     pub port: u32,
@@ -2892,35 +3009,82 @@ pub struct Cable {
     pub impairments: Option<[Impairments; 2]>,
 }
 
+impl Cable {
+    /// A cable from the new device's `port` to `to_device`'s `to_port`: no latency, the
+    /// default MTU, unimpaired.
+    pub fn new(port: u32, to_device: impl Into<String>, to_port: u32) -> Self {
+        Self {
+            port,
+            to_device: to_device.into(),
+            to_port,
+            latency: 0,
+            mtu: None,
+            impairments: None,
+        }
+    }
+
+    /// Sets [`latency`](Self::latency).
+    pub fn latency(mut self, ns: Nanos) -> Self {
+        self.latency = ns;
+        self
+    }
+
+    /// Sets [`mtu`](Self::mtu).
+    pub fn mtu(mut self, mtu: u32) -> Self {
+        self.mtu = Some(mtu);
+        self
+    }
+
+    /// Sets [`impairments`](Self::impairments): from the new device's port, then from the far
+    /// end.
+    pub fn impairments(mut self, impairments: [Impairments; 2]) -> Self {
+        self.impairments = Some(impairments);
+        self
+    }
+}
+
 /// An operator event the sim core applies (`docs/design/event-order.md`).
+///
+/// Build one with its constructor (`Op::wire`, `Op::stop_device`, ...) and set what it leaves
+/// at its default with the `with_*` methods: every variant with fields is
+/// `#[non_exhaustive]`, so a field added later is never a compile error
+/// (`docs/stability.md`). A `with_*` method on an op it does not apply to panics. Match a
+/// variant with `..`: `Op::Wire { a, b, .. }`.
 ///
 /// Embedder surface, unstable (operator events).
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Op {
     /// A carrier change of a whole link.
+    #[non_exhaustive]
     LinkState { link: LinkId, up: bool },
     /// A link's one-way latency, for frames transmitted from then on.
+    #[non_exhaustive]
     Latency { link: LinkId, ns: Nanos },
     /// A link's impairments (`docs/design/links.md`), for frames transmitted from then on: the
     /// direction sent from end `from` (0: `a`, 1: `b`, as in [`LinkInfo::ends`]), or both with
     /// `None`. Frames already queued keep their schedule.
+    #[non_exhaustive]
     Impair {
         link: LinkId,
         from: Option<usize>,
         impairments: Impairments,
     },
     /// A frame transmitted from a port, as if its device had sent it.
+    #[non_exhaustive]
     Inject { from: PortRef, bytes: Vec<u8> },
     /// Bytes for the device's stdin, appended at the op's instant ([`crate::InputQueue`]).
+    #[non_exhaustive]
     Stdin { device: DeviceId, bytes: Vec<u8> },
     /// A control call into one of the device's optional exports, served in the op's own
     /// processing context (an extension's write, probe or the like). Refused when added if the
     /// device does not report the call's export; the device's own refusal is the op's state.
+    #[non_exhaustive]
     Control { device: DeviceId, call: Control },
     // ---- dynamic topology (docs/design/topology-and-infra.md): resolved by name when applied
     /// A new device from the catalog (the network's component resolver), created in the op's
     /// own processing context: its first poll, `start` and seeds follow from there.
+    #[non_exhaustive]
     AddDevice {
         name: String,
         component: String,
@@ -2932,6 +3096,7 @@ pub enum Op {
     },
     /// Stops a running (or paused) device: its store is dropped and its links go down (the
     /// far ends see the carrier drop). Its name, ports and links stay.
+    #[non_exhaustive]
     StopDevice { device: String },
     /// Pauses a running device, as a laptop sleeps: its store (memory, sockets, timers) is
     /// kept but does not run, and it misses time (`docs/design/topology-and-infra.md`). Frames
@@ -2939,19 +3104,23 @@ pub enum Op {
     /// poll deadline are held as they come due; link changes, stdin and wakes wait for it.
     /// With `link_down` its links go down for the far ends, as a sleeping NIC's carrier does,
     /// and come up at the resume; without, they stay up, as a frozen machine's do.
+    #[non_exhaustive]
     PauseDevice { device: String, link_down: bool },
     /// Resumes a paused device. Its clocks read the network's time, so they jump by the pause;
     /// the timers and poll deadline that came due meanwhile fire right after this op, at this
     /// instant, one event each in the order they came due, before anything else still queued.
+    #[non_exhaustive]
     ResumeDevice { device: String },
     /// The device faults at this position, as if its own code trapped there, with `message`:
     /// a device that crashes alone ([`DeviceOptions::crash_alone`], or one a controller
     /// created) is stopped as crashed (`device-crashed`, phase `crashed`); a fault of any other
     /// device fails the network ([`Error::Trap`]), as its guest's trap would.
+    #[non_exhaustive]
     CrashDevice { device: String, message: String },
     /// Calls the embedder action registered as `name` ([`Network::register_action`]) with
     /// `argument`, journalled as `action {name, argument}` on `device` (which must exist; it
     /// need not run). The action's refusal is the op's state.
+    #[non_exhaustive]
     Action {
         name: String,
         device: String,
@@ -2959,10 +3128,13 @@ pub enum Op {
     },
     /// Starts a stopped device again from its component and config (a fresh instance), and
     /// brings up the links its stop took down.
+    #[non_exhaustive]
     StartDevice { device: String },
     /// Removes a device: stopped if running, unwired, its name free for a new device.
+    #[non_exhaustive]
     RemoveDevice { device: String },
     /// Wires two free ports (`(device, port)`) with a new link, up at once.
+    #[non_exhaustive]
     Wire {
         a: (String, u32),
         b: (String, u32),
@@ -2977,8 +3149,10 @@ pub enum Op {
         impairments: Option<[Impairments; 2]>,
     },
     /// Unwires a link by name: it goes down and its ports are free again.
+    #[non_exhaustive]
     Unwire { link: String },
     /// A link by name (one that an earlier op wires): its carrier and/or latency.
+    #[non_exhaustive]
     SetLink {
         link: String,
         up: Option<bool>,
@@ -2986,6 +3160,7 @@ pub enum Op {
     },
     /// [`Op::Impair`] on the link called `link` when the op applies (one that an earlier op
     /// wires); journalled as `link-changed`.
+    #[non_exhaustive]
     ImpairNamed {
         link: String,
         from: Option<usize>,
@@ -2993,12 +3168,335 @@ pub enum Op {
     },
     /// [`Op::Stdin`] into the device called `device` when the op applies (a device that an
     /// earlier op creates).
+    #[non_exhaustive]
     StdinNamed { device: String, bytes: Vec<u8> },
     /// [`Op::Control`] into the device called `device` when the op applies.
+    #[non_exhaustive]
     ControlNamed { device: String, call: Control },
     /// An extension's op ([`crate::ext::ExtOp`]), applied by the network in the op's own
     /// processing context.
     Extension(ExtensionOp),
+}
+
+/// Constructors, one per variant with fields, taking what the op cannot do without; the rest
+/// starts at its default and is set with the `with_*` methods below.
+impl Op {
+    /// [`Op::LinkState`].
+    pub fn link_state(link: LinkId, up: bool) -> Self {
+        Op::LinkState { link, up }
+    }
+
+    /// [`Op::Latency`].
+    pub fn latency(link: LinkId, ns: Nanos) -> Self {
+        Op::Latency { link, ns }
+    }
+
+    /// [`Op::Impair`], both directions (one with [`with_from`](Self::with_from)).
+    pub fn impair(link: LinkId, impairments: Impairments) -> Self {
+        Op::Impair {
+            link,
+            from: None,
+            impairments,
+        }
+    }
+
+    /// [`Op::Inject`].
+    pub fn inject(from: PortRef, bytes: impl Into<Vec<u8>>) -> Self {
+        Op::Inject {
+            from,
+            bytes: bytes.into(),
+        }
+    }
+
+    /// [`Op::Stdin`].
+    pub fn stdin(device: DeviceId, bytes: impl Into<Vec<u8>>) -> Self {
+        Op::Stdin {
+            device,
+            bytes: bytes.into(),
+        }
+    }
+
+    /// [`Op::Control`].
+    pub fn control(device: DeviceId, call: Control) -> Self {
+        Op::Control { device, call }
+    }
+
+    /// [`Op::AddDevice`]: an empty config, default options and no cables (set with
+    /// [`with_config`](Self::with_config), [`with_options`](Self::with_options) and
+    /// [`with_cable`](Self::with_cable)).
+    pub fn add_device(name: impl Into<String>, component: impl Into<String>) -> Self {
+        Op::AddDevice {
+            name: name.into(),
+            component: component.into(),
+            config: DeviceConfig::new(),
+            options: DeviceOptions::default(),
+            wire: Vec::new(),
+        }
+    }
+
+    /// [`Op::StopDevice`].
+    pub fn stop_device(device: impl Into<String>) -> Self {
+        Op::StopDevice {
+            device: device.into(),
+        }
+    }
+
+    /// [`Op::PauseDevice`], its links left up (down with
+    /// [`with_link_down`](Self::with_link_down)).
+    pub fn pause_device(device: impl Into<String>) -> Self {
+        Op::PauseDevice {
+            device: device.into(),
+            link_down: false,
+        }
+    }
+
+    /// [`Op::ResumeDevice`].
+    pub fn resume_device(device: impl Into<String>) -> Self {
+        Op::ResumeDevice {
+            device: device.into(),
+        }
+    }
+
+    /// [`Op::CrashDevice`].
+    pub fn crash_device(device: impl Into<String>, message: impl Into<String>) -> Self {
+        Op::CrashDevice {
+            device: device.into(),
+            message: message.into(),
+        }
+    }
+
+    /// [`Op::Action`].
+    pub fn action(
+        name: impl Into<String>,
+        device: impl Into<String>,
+        argument: impl Into<String>,
+    ) -> Self {
+        Op::Action {
+            name: name.into(),
+            device: device.into(),
+            argument: argument.into(),
+        }
+    }
+
+    /// [`Op::StartDevice`].
+    pub fn start_device(device: impl Into<String>) -> Self {
+        Op::StartDevice {
+            device: device.into(),
+        }
+    }
+
+    /// [`Op::RemoveDevice`].
+    pub fn remove_device(device: impl Into<String>) -> Self {
+        Op::RemoveDevice {
+            device: device.into(),
+        }
+    }
+
+    /// [`Op::Wire`] between ports `a` and `b` (`(device, port)`): an Ethernet link with no
+    /// latency, the default MTU, no cable setup and unimpaired (set with
+    /// [`with_latency`](Self::with_latency), [`with_mtu`](Self::with_mtu),
+    /// [`with_kind`](Self::with_kind), [`with_cable_setup`](Self::with_cable_setup) and
+    /// [`with_impairments`](Self::with_impairments)).
+    pub fn wire(a: (impl Into<String>, u32), b: (impl Into<String>, u32)) -> Self {
+        Op::Wire {
+            a: (a.0.into(), a.1),
+            b: (b.0.into(), b.1),
+            latency: 0,
+            mtu: None,
+            kind: LinkKind::Ethernet,
+            cable: None,
+            impairments: None,
+        }
+    }
+
+    /// [`Op::Unwire`].
+    pub fn unwire(link: impl Into<String>) -> Self {
+        Op::Unwire { link: link.into() }
+    }
+
+    /// [`Op::SetLink`], changing nothing yet (set with [`with_up`](Self::with_up) and
+    /// [`with_latency`](Self::with_latency)).
+    pub fn set_link(link: impl Into<String>) -> Self {
+        Op::SetLink {
+            link: link.into(),
+            up: None,
+            latency: None,
+        }
+    }
+
+    /// [`Op::ImpairNamed`], both directions (one with [`with_from`](Self::with_from)).
+    pub fn impair_named(link: impl Into<String>, impairments: Impairments) -> Self {
+        Op::ImpairNamed {
+            link: link.into(),
+            from: None,
+            impairments,
+        }
+    }
+
+    /// [`Op::StdinNamed`].
+    pub fn stdin_named(device: impl Into<String>, bytes: impl Into<Vec<u8>>) -> Self {
+        Op::StdinNamed {
+            device: device.into(),
+            bytes: bytes.into(),
+        }
+    }
+
+    /// [`Op::ControlNamed`].
+    pub fn control_named(device: impl Into<String>, call: Control) -> Self {
+        Op::ControlNamed {
+            device: device.into(),
+            call,
+        }
+    }
+
+    /// Sets an [`Op::Impair`]'s or [`Op::ImpairNamed`]'s sending end (0: `a`, 1: `b`).
+    ///
+    /// # Panics
+    ///
+    /// On any other op.
+    pub fn with_from(mut self, end: usize) -> Self {
+        match &mut self {
+            Op::Impair { from, .. } | Op::ImpairNamed { from, .. } => *from = Some(end),
+            other => not_for("with_from", other),
+        }
+        self
+    }
+
+    /// Sets an [`Op::AddDevice`]'s config.
+    ///
+    /// # Panics
+    ///
+    /// On any other op.
+    pub fn with_config(mut self, config: DeviceConfig) -> Self {
+        match &mut self {
+            Op::AddDevice { config: c, .. } => *c = config,
+            other => not_for("with_config", other),
+        }
+        self
+    }
+
+    /// Sets an [`Op::AddDevice`]'s options.
+    ///
+    /// # Panics
+    ///
+    /// On any other op.
+    pub fn with_options(mut self, options: DeviceOptions) -> Self {
+        match &mut self {
+            Op::AddDevice { options: o, .. } => *o = options,
+            other => not_for("with_options", other),
+        }
+        self
+    }
+
+    /// Adds a cable to an [`Op::AddDevice`] (after those added before).
+    ///
+    /// # Panics
+    ///
+    /// On any other op.
+    pub fn with_cable(mut self, cable: Cable) -> Self {
+        match &mut self {
+            Op::AddDevice { wire, .. } => wire.push(cable),
+            other => not_for("with_cable", other),
+        }
+        self
+    }
+
+    /// Sets an [`Op::PauseDevice`]'s `link_down`.
+    ///
+    /// # Panics
+    ///
+    /// On any other op.
+    pub fn with_link_down(mut self, on: bool) -> Self {
+        match &mut self {
+            Op::PauseDevice { link_down, .. } => *link_down = on,
+            other => not_for("with_link_down", other),
+        }
+        self
+    }
+
+    /// Sets an [`Op::Wire`]'s or [`Op::SetLink`]'s latency.
+    ///
+    /// # Panics
+    ///
+    /// On any other op.
+    pub fn with_latency(mut self, ns: Nanos) -> Self {
+        match &mut self {
+            Op::Wire { latency, .. } => *latency = ns,
+            Op::SetLink { latency, .. } => *latency = Some(ns),
+            other => not_for("with_latency", other),
+        }
+        self
+    }
+
+    /// Sets an [`Op::SetLink`]'s carrier.
+    ///
+    /// # Panics
+    ///
+    /// On any other op.
+    pub fn with_up(mut self, on: bool) -> Self {
+        match &mut self {
+            Op::SetLink { up, .. } => *up = Some(on),
+            other => not_for("with_up", other),
+        }
+        self
+    }
+
+    /// Sets an [`Op::Wire`]'s MTU.
+    ///
+    /// # Panics
+    ///
+    /// On any other op.
+    pub fn with_mtu(mut self, bytes: u32) -> Self {
+        match &mut self {
+            Op::Wire { mtu, .. } => *mtu = Some(bytes),
+            other => not_for("with_mtu", other),
+        }
+        self
+    }
+
+    /// Sets what an [`Op::Wire`] carries.
+    ///
+    /// # Panics
+    ///
+    /// On any other op.
+    pub fn with_kind(mut self, link_kind: LinkKind) -> Self {
+        match &mut self {
+            Op::Wire { kind, .. } => *kind = link_kind,
+            other => not_for("with_kind", other),
+        }
+        self
+    }
+
+    /// Sets an [`Op::Wire`]'s cable setup value ([`LinkMut::cable_setup`]).
+    ///
+    /// # Panics
+    ///
+    /// On any other op.
+    pub fn with_cable_setup(mut self, setup: ExtValue) -> Self {
+        match &mut self {
+            Op::Wire { cable, .. } => *cable = Some(setup),
+            other => not_for("with_cable_setup", other),
+        }
+        self
+    }
+
+    /// Sets an [`Op::Wire`]'s impairments by sending end (from `a`, then from `b`).
+    ///
+    /// # Panics
+    ///
+    /// On any other op.
+    pub fn with_impairments(mut self, impairments: [Impairments; 2]) -> Self {
+        match &mut self {
+            Op::Wire { impairments: i, .. } => *i = Some(impairments),
+            other => not_for("with_impairments", other),
+        }
+        self
+    }
+}
+
+#[track_caller]
+fn not_for(method: &str, op: &Op) -> ! {
+    panic!("Op::{method} does not apply to {op:?}")
 }
 
 impl Op {

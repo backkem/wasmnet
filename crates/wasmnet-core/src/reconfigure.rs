@@ -31,6 +31,7 @@ pub const RECONFIGURE_EXPORT: &str = "wasmnet:reconfigure/reconfigure";
 
 /// Why a device did not take a configuration in place.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Refusal {
     /// The change needs a restart (a different number of ports, say): recreate it.
     Restart(String),

@@ -149,6 +149,7 @@ pub fn valid_name(name: &str) -> bool {
 
 /// A message that could not be parsed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum DnsError {
     #[error("DNS message truncated")]
     Truncated,
@@ -188,6 +189,7 @@ impl Record {
 
 /// Typed record data.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RData {
     A(Ipv4Addr),
     Aaaa(Ipv6Addr),

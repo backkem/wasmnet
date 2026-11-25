@@ -49,6 +49,7 @@ pub const MAX_RECORDS: usize = 4_096;
 
 /// Why an instance went away.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Removal {
     /// Its PTR came with TTL 0 (the service was withdrawn).
     Goodbye,
@@ -67,6 +68,7 @@ impl Removal {
 
 /// What a resolved instance is: where to connect and its attributes.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Resolved {
     /// Its full name, `Alpha Web._http._tcp.local` (escaped as [`dns`] does).
     pub name: String,
@@ -82,6 +84,36 @@ pub struct Resolved {
 }
 
 impl Resolved {
+    /// An instance at `host:port`, without TXT strings or addresses (set with
+    /// [`txt`](Self::txt) and [`addresses`](Self::addresses)).
+    pub fn new(
+        name: impl Into<String>,
+        instance: impl Into<String>,
+        host: impl Into<String>,
+        port: u16,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            instance: instance.into(),
+            host: host.into(),
+            port,
+            txt: Vec::new(),
+            addresses: Vec::new(),
+        }
+    }
+
+    /// Sets [`txt`](Self::txt).
+    pub fn txt(mut self, txt: Vec<Vec<u8>>) -> Self {
+        self.txt = txt;
+        self
+    }
+
+    /// Sets [`addresses`](Self::addresses).
+    pub fn addresses(mut self, addresses: Vec<IpAddr>) -> Self {
+        self.addresses = addresses;
+        self
+    }
+
     /// The TXT attributes (RFC 6763 §6).
     pub fn attributes(&self) -> Vec<TxtPair> {
         txt_pairs(&self.txt)
@@ -102,6 +134,7 @@ impl Resolved {
 
 /// What the browser saw.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Event {
     /// A new instance of a browsed type.
     Found {

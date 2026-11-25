@@ -645,6 +645,12 @@ impl Server {
             MessageType::Offer | MessageType::Ack | MessageType::Nak => {
                 ignore(notes, mac.to_string(), kind_name, "a server message")
             }
+            _ => ignore(
+                notes,
+                mac.to_string(),
+                kind_name,
+                "a message type it does not serve",
+            ),
         }
     }
 

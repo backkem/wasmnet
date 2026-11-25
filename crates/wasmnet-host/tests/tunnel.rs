@@ -959,10 +959,7 @@ fn controlled_run(seed: u64) -> Run {
                 &format!("ctl-{me}"),
                 &b.load("infra_script"),
                 pairs(&script),
-                DeviceOptions {
-                    infra: true,
-                    ..DeviceOptions::default()
-                },
+                DeviceOptions::default().infra(true),
             )
             .unwrap();
         controllers.push(ctl);

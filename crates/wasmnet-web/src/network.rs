@@ -17,6 +17,7 @@ use crate::runtime::{JsRuntime, Registry};
 
 /// How a run ended, as [`Network::finish`] reports it.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RunOutcome {
     /// The network ran to its end: quiescent, or stopped at the deadline.
     Finished(Outcome),
@@ -41,12 +42,9 @@ impl<H: JsHost + Clone + Unpin + 'static> Network<H> {
     /// An empty network with `seed` and the default wall epoch.
     pub fn new(host: H, seed: u64) -> Self {
         let runtime: &'static JsRuntime<H> = Box::leak(Box::new(JsRuntime::new(host)));
-        let guard = Guard {
-            // A busy guest that never lets the network move would otherwise spin forever; jco
-            // needs more polls per instant than wasmtime, as its work arrives in small pieces.
-            max_polls_per_instant: 100_000,
-            ..Guard::default()
-        };
+        // A busy guest that never lets the network move would otherwise spin forever; jco
+        // needs more polls per instant than wasmtime, as its work arrives in small pieces.
+        let guard = Guard::default().max_polls_per_instant(100_000);
         let sim = wasmnet_core::Network::with_config(runtime, SimConfig::seeded(seed), guard);
         runtime.registry().set_clock(sim.clock().clone());
         Self {

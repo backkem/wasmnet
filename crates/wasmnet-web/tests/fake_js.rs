@@ -79,16 +79,12 @@ impl JsHost for FakeJs {
         _: &DeviceConfig,
     ) -> Result<Instance, String> {
         let instance = match component {
-            "pinger" | "echo" | "crasher" => Instance {
-                ports: vec![port(0)],
-                ..Instance::default()
-            },
-            "napper" => Instance {
-                ports: vec![port(0)],
-                apps: vec!["nap".to_owned()],
-                counters: true,
-                lifecycle: true,
-            },
+            "pinger" | "echo" | "crasher" => Instance::default().ports(vec![port(0)]),
+            "napper" => Instance::default()
+                .ports(vec![port(0)])
+                .apps(vec!["nap".to_owned()])
+                .counters(true)
+                .lifecycle(true),
             other => return Err(format!("no component {other}")),
         };
         // What JavaScript answers crosses the boundary in the codec's encoding.
@@ -341,13 +337,7 @@ fn an_async_nodes_calls_complete_later() {
 
     // Run to a deadline before the app's timer: the run is resumable.
     let early = drive(&js, &mut net, Some(3_000_000));
-    assert_eq!(
-        early,
-        RunOutcome::Finished(Outcome::Deadline {
-            at: 3_000_000,
-            pending_events: 1
-        })
-    );
+    assert_eq!(early, RunOutcome::Finished(Outcome::deadline(3_000_000, 1)));
     assert!(events(&net, "app-exit").is_empty());
 
     let outcome = drive(&js, &mut net, None);

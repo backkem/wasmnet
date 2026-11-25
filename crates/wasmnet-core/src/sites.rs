@@ -964,6 +964,7 @@ pub enum Step {
 
 /// Site-sync counters, for reports and benchmarks.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SyncStats {
     /// Windows run.
     pub windows: u64,
@@ -1149,6 +1150,7 @@ impl SiteSync {
 
 /// Everything one site recorded, tagged for merging.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SiteRecords {
     /// The site's end state (`Err((at, message))` if it failed).
     pub outcome: std::result::Result<Outcome, (Nanos, String)>,
@@ -1229,6 +1231,7 @@ impl SiteRecords {
 
 /// The records of a whole multi-site network, as one site would have produced them.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct Merged {
     pub outcome: std::result::Result<Outcome, (Nanos, String)>,
     pub end: Nanos,

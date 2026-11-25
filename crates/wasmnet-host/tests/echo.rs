@@ -72,10 +72,7 @@ struct Run {
 /// The echo network: blaster:0 <-latency-> reflector:0, run to quiescence.
 fn run_echo(seed: u64, latency: u64) -> Run {
     let g = guests();
-    let guard = Guard {
-        paranoid: true,
-        ..Guard::default()
-    };
+    let guard = Guard::default().paranoid(true);
     let mut network = Network::with_config(&g.host, SimConfig::seeded(seed), guard);
     let a = network.device("blaster", &g.blaster).unwrap();
     let b = network.device("reflector", &g.reflector).unwrap();
@@ -170,11 +167,7 @@ fn echoes_arrive_exactly_two_latencies_after_each_probe() {
         // Quiescent once the last echo has arrived and been polled: nothing parked, nothing owed.
         assert_eq!(
             run.outcome,
-            Outcome::Quiescent {
-                at: (COUNT - 1) * INTERVAL + 2 * latency,
-                parked: vec![],
-                daemons: vec![],
-            },
+            Outcome::quiescent((COUNT - 1) * INTERVAL + 2 * latency, vec![], vec![]),
             "{ctx}"
         );
         let cap = pcap::parse(&run.pcap).unwrap();
@@ -338,7 +331,8 @@ fn stopping_at_a_deadline_and_resuming_gives_the_same_pcap() {
             mid,
             Outcome::Deadline {
                 at: 3_100_000,
-                pending_events: 1..
+                pending_events: 1..,
+                ..
             }
         ),
         "{mid:?}"
@@ -490,24 +484,16 @@ fn a_device_can_have_its_own_fuel_budget() {
     use wasmnet_host::{DeviceConfig, DeviceOptions, Error};
     let g = guests();
     let run = |guard_fuel: u64, blaster_fuel: Option<u64>| {
-        let guard = Guard {
-            fuel_per_instant: guard_fuel,
-            ..Guard::default()
-        };
+        let guard = Guard::default().fuel_per_instant(guard_fuel);
         let mut network = Network::with_config(&g.host, SimConfig::seeded(42), guard);
-        let options = DeviceOptions {
-            fuel_per_instant: blaster_fuel,
-            ..DeviceOptions::default()
-        };
+        let mut options = DeviceOptions::default();
+        options.fuel_per_instant = blaster_fuel;
         let a = network.device_with_options("blaster", &g.blaster, DeviceConfig::new(), options)?;
         let b = network.device_with_options(
             "reflector",
             &g.reflector,
             DeviceConfig::new(),
-            DeviceOptions {
-                fuel_per_instant: Some(Guard::default().fuel_per_instant),
-                ..DeviceOptions::default()
-            },
+            DeviceOptions::default().fuel_per_instant(Guard::default().fuel_per_instant),
         )?;
         network.link(a.port(0), b.port(0))?.latency(250 * US);
         network.run_until_quiescent()

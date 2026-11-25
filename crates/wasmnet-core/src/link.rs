@@ -49,6 +49,7 @@ pub struct PortInfo {
 
 /// Counters for one link. Each array is indexed by the *sending* end (0 = `a`, 1 = `b`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct LinkStats {
     /// Frames that entered the wire (tapped outbound).
     pub frames: [u64; 2],
@@ -124,6 +125,7 @@ impl LinkStats {
 /// assert_eq!(headers.kept(60), 60);
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub struct CaptureOptions {
     /// Keep frame bytes at all. Off, the capture holds its header and no packet, and the frame
     /// log keeps each transmission's record (link, ends, time, fate, length) without its
@@ -183,11 +185,19 @@ impl CaptureOptions {
 /// buckets of `width` ns, the last `keep` of those in which a counter changed. A link keeps
 /// at most `keep` [`LinkStats`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub struct SeriesOptions {
     /// The bucket width in ns (0 counts as 1).
     pub width: Nanos,
     /// How many buckets to keep (0 counts as 1): the oldest goes when one more starts.
     pub keep: u32,
+}
+
+impl SeriesOptions {
+    /// Buckets of `width` ns, the last `keep` kept.
+    pub const fn new(width: Nanos, keep: u32) -> Self {
+        Self { width, keep }
+    }
 }
 
 /// One link's bucketed counters.
@@ -250,6 +260,7 @@ pub const PPM: u32 = 1_000_000;
 /// assert_eq!(slow.serialisation(1514), 1_211_200);
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub struct Impairments {
     /// Bits per second; 0: unlimited (no serialisation delay, so no queue either). A frame of
     /// `n` bytes (as transmitted: header and payload, no preamble or FCS) occupies the
@@ -325,6 +336,7 @@ impl Impairments {
 
 /// Static and current properties of a link.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct LinkInfo {
     /// File-name safe: `<device>.<port>-<device>.<port>`.
     pub name: String,
@@ -410,6 +422,7 @@ impl DropReason {
 
 /// What an operator does to one transmission, at `wire.transmit`.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FrameAction {
     /// It never enters the wire (fate `dropped`, reason `operator`).
     Drop,
@@ -420,6 +433,7 @@ pub enum FrameAction {
 }
 
 /// A transmission on a wired port, as a [`TransmitHook`] sees it before it enters the wire.
+#[non_exhaustive]
 pub struct Transmit<'a> {
     /// The tag its frame record will get, and that tag's causal digest (`fr:`).
     pub tag: &'a Tag,
@@ -441,6 +455,7 @@ pub type TransmitHook = Arc<dyn Fn(&Transmit<'_>) -> Option<FrameAction> + Send 
 
 /// What happened to a transmitted frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FrameFate {
     /// On the wire, not yet arrived (the run stopped at a deadline first).
     InFlight,
@@ -455,6 +470,7 @@ pub enum FrameFate {
 
 /// One `wire.transmit` on a wired port, in transmit order.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct FrameRecord {
     pub link: LinkId,
     pub from: PortRef,
@@ -490,6 +506,7 @@ pub struct RemoteFrame {
 /// One pcap record of a WAN link, as one site saw it (its own end only). Merging both sites'
 /// records by `tag` rebuilds the single-site capture.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Tap {
     pub tag: Tag,
     pub link: LinkId,
@@ -507,6 +524,7 @@ pub struct Tap {
 /// What became of a frame that another site sent to this one (its record is in the sender's
 /// frame log, at `frame_id`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct RemoteArrival {
     pub frame_id: usize,
     pub fate: FrameFate,
@@ -514,6 +532,7 @@ pub struct RemoteArrival {
 
 /// A carrier change of a whole link, as it happened (scripted; creating a link is not one).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct LinkTransition {
     pub at: Nanos,
     pub link: LinkId,
@@ -1954,13 +1973,7 @@ mod tests {
     #[test]
     fn a_series_counts_per_bucket_and_keeps_the_last_ones() {
         let (clock, panel, link) = panel();
-        panel.set_series(
-            link,
-            Some(SeriesOptions {
-                width: 100,
-                keep: 3,
-            }),
-        );
+        panel.set_series(link, Some(SeriesOptions::new(100, 3)));
         // One frame a -> b at 0, 50, 150, 420 and 430; one b -> a oversize at 420 (MTU 100).
         for t in [0, 50, 150, 420, 430] {
             clock.advance_to(t);

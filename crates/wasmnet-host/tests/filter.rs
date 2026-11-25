@@ -168,11 +168,10 @@ fn run(seed: u64, command: bool) -> Run {
     if command {
         network
             .add_op(
-                Op::Control {
-                    device: fw,
-                    call: DeviceCommand::new("allow-add", "1 udp to 10.0.1.30/32 dport 7")
-                        .into_control(),
-                },
+                Op::control(
+                    fw,
+                    DeviceCommand::new("allow-add", "1 udp to 10.0.1.30/32 dport 7").into_control(),
+                ),
                 Placement::StartOf(T_ALLOW),
             )
             .unwrap();

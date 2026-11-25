@@ -348,10 +348,7 @@ pub extern "C" fn wn_add_device(
         Ok(c) => c,
         Err(e) => return fail(format!("config: {e}")),
     };
-    let options = DeviceOptions {
-        journal_stdio: flags & 1 != 0,
-        ..DeviceOptions::default()
-    };
+    let options = DeviceOptions::default().journal_stdio(flags & 1 != 0);
     match with_network(|n| n.device_with_options(&name, &component, config, options)) {
         Ok(Ok(id)) => i32::try_from(id.index()).unwrap_or(i32::MAX),
         Ok(Err(e)) => fail(e),
@@ -409,11 +406,12 @@ fn decode_impairments(b: &[u8]) -> Option<[Impairments; 2]> {
     }
     let u64_at = |i: usize| u64::from_le_bytes(b[i..i + 8].try_into().expect("8 bytes"));
     let u32_at = |i: usize| u32::from_le_bytes(b[i..i + 4].try_into().expect("4 bytes"));
-    Some([0, 24].map(|o| Impairments {
-        rate: u64_at(o),
-        queue: u32_at(o + 8),
-        loss_ppm: u32_at(o + 12),
-        jitter: u64_at(o + 16),
+    Some([0, 24].map(|o| {
+        Impairments::default()
+            .rate(u64_at(o))
+            .queue(u32_at(o + 8))
+            .loss_ppm(u32_at(o + 12))
+            .jitter(u64_at(o + 16))
     }))
 }
 

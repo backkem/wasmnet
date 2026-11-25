@@ -53,6 +53,7 @@ impl Wake for WokenFlag {
 /// finish (a deadlock).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("stalled at t={at}ns: the future is pending and no timer is left to fire")]
+#[non_exhaustive]
 pub struct Stalled {
     /// The virtual time it stalled at.
     pub at: Nanos,
@@ -151,6 +152,7 @@ impl<T> Flow<T> {
 
 /// Counters for reports and benchmarks. They do not affect behaviour.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Stats {
     /// Actor polls (phase 1), excluding paranoid re-polls.
     pub actor_polls: u64,
@@ -165,6 +167,7 @@ pub struct Stats {
 /// has not fired. The only place a world stops, a control call runs or an operator event is
 /// placed.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Boundary {
     /// Events popped so far (operator events excluded): the boundary's ordinal `e`.
     pub events: u64,
@@ -216,6 +219,7 @@ pub enum CoreOp {
 
 /// What became of an operator event.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum OpState {
     /// Not popped yet.
     Pending,
@@ -983,10 +987,7 @@ mod tests {
 
     #[test]
     fn actors_share_one_timeline_and_quiesce() {
-        let (clock, mut exec) = executor(Guard {
-            paranoid: true,
-            ..Guard::default()
-        });
+        let (clock, mut exec) = executor(Guard::default().paranoid(true));
         let log = Arc::new(Mutex::new(Vec::new()));
         add(
             &mut exec,
@@ -1027,10 +1028,7 @@ mod tests {
     fn settle_runs_woken_actors_without_advancing_time() {
         // Control calls (`Network::counters`) settle the current instant: woken actors run, but no
         // queued event fires and virtual time stays put.
-        let (clock, mut exec) = executor(Guard {
-            paranoid: true,
-            ..Guard::default()
-        });
+        let (clock, mut exec) = executor(Guard::default().paranoid(true));
         let log = Arc::new(Mutex::new(Vec::new()));
         add(
             &mut exec,
@@ -1058,10 +1056,7 @@ mod tests {
     #[test]
     fn stopping_and_resuming_changes_nothing() {
         let run = |stops: &[u64]| {
-            let (clock, mut exec) = executor(Guard {
-                paranoid: true,
-                ..Guard::default()
-            });
+            let (clock, mut exec) = executor(Guard::default().paranoid(true));
             let log = Arc::new(Mutex::new(Vec::new()));
             add(
                 &mut exec,
@@ -1100,10 +1095,7 @@ mod tests {
 
     #[test]
     fn a_self_waking_actor_is_a_runaway() {
-        let guard = Guard {
-            max_polls_per_instant: 100,
-            ..Guard::default()
-        };
+        let guard = Guard::default().max_polls_per_instant(100);
         let (_, mut exec) = executor(guard);
         let spin = poll_fn(|cx| {
             cx.waker().wake_by_ref();
@@ -1175,10 +1167,7 @@ mod tests {
 
     #[test]
     fn the_paranoid_round_catches_a_missed_wake() {
-        let (_, mut exec) = executor(Guard {
-            paranoid: true,
-            ..Guard::default()
-        });
+        let (_, mut exec) = executor(Guard::default().paranoid(true));
         // Idle on its first poll without registering anything, then finds work on the next one.
         // It has a call in flight: a quiet actor (nothing in flight, no live guest task) has no
         // wake to miss and is not re-polled.

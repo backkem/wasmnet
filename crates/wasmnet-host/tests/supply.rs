@@ -90,10 +90,7 @@ fn run(case: &Case, seed: u64) -> Run {
         .device_with_config("sw", &b.load("switch"), config(&[("ports", "8")]))
         .unwrap();
     // Decoding megabytes of base64 config costs more than the default fuel of one instant.
-    let heavy = DeviceOptions {
-        fuel_per_instant: Some(4_000_000_000),
-        ..DeviceOptions::default()
-    };
+    let heavy = DeviceOptions::default().fuel_per_instant(4_000_000_000);
     let store = network
         .device_with_options(
             "store",
@@ -125,11 +122,8 @@ fn run(case: &Case, seed: u64) -> Run {
         )
         .unwrap();
     let digest = case.digest.clone().unwrap_or_else(|| reference(&web));
-    let options = DeviceOptions {
-        infra: true,
-        infra_supply: case.grant.then(SupplyLimits::default),
-        ..DeviceOptions::default()
-    };
+    let mut options = DeviceOptions::default().infra(true);
+    options.infra_supply = case.grant.then(SupplyLimits::default);
     let ctl = network
         .device_with_options(
             "ctl",

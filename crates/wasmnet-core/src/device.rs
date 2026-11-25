@@ -43,6 +43,7 @@ pub type CountersReply = Arc<Mutex<Option<Vec<(String, u64)>>>>;
 
 /// What a device cost in a run: reports and regression gates only, never behaviour.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DeviceCost {
     /// Wasm fuel consumed (the backend's metering; 0 without one). Deterministic.
     pub fuel: u64,
@@ -203,6 +204,7 @@ struct StatusState {
 
 /// What a device is still busy with when the network looks at it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Snapshot {
     /// In-flight calls the host waits for (not daemons), in start order.
     pub outstanding: Vec<String>,

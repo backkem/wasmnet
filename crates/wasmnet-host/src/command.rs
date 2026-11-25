@@ -9,6 +9,7 @@ use wasmnet_core::{Nanos, OutputCapture, VirtualClock, block_on};
 
 /// What a command component left behind.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CommandOutput {
     /// `true` if `run` returned `ok`.
     pub success: bool,

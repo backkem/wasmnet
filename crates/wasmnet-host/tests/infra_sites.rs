@@ -95,11 +95,9 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 fn infra(prefix: Option<&str>) -> DeviceOptions {
-    DeviceOptions {
-        infra: true,
-        infra_prefix: prefix.map(str::to_owned),
-        ..DeviceOptions::default()
-    }
+    let mut options = DeviceOptions::default().infra(true);
+    options.infra_prefix = prefix.map(str::to_owned);
+    options
 }
 
 /// A device spec for `devices.apply`: a component, its config and its cables.
@@ -404,10 +402,7 @@ fn supplying_controller() -> Plan {
                     ("app.replicas.template.wire.0.port", "0"),
                     ("app.replicas.template.wire.0.to", "sw-a"),
                 ]),
-                options: DeviceOptions {
-                    infra_supply: Some(SupplyLimits::default()),
-                    ..infra(None)
-                },
+                options: infra(None).infra_supply(SupplyLimits::default()),
                 site: 0,
             },
             switch("sw-b", "4", 1),
@@ -417,10 +412,7 @@ fn supplying_controller() -> Plan {
                 component: "node:http-server",
                 config: store,
                 // Decoding the base64 body costs more than an instant's default fuel.
-                options: DeviceOptions {
-                    fuel_per_instant: Some(4_000_000_000),
-                    ..DeviceOptions::default()
-                },
+                options: DeviceOptions::default().fuel_per_instant(4_000_000_000),
                 site: 1,
             },
             Dev {
@@ -499,10 +491,7 @@ fn wire(plan: &Plan, network: &mut Network<'static>, ids: &[DeviceId]) {
     for (at, device, command) in &plan.ops {
         network
             .add_op(
-                Op::Control {
-                    device: ids[*device],
-                    call: command.clone().into_control(),
-                },
+                Op::control(ids[*device], command.clone().into_control()),
                 Placement::StartOf(*at),
             )
             .unwrap();
@@ -536,7 +525,7 @@ fn table(network: &Network, name: &str) -> String {
     }
     let (rv, changes) = network.infra().watch_for(name, &[], 0, u32::MAX);
     out += &format!("watch rv={rv}\n");
-    for Change { kind, device } in &changes {
+    for Change { kind, device, .. } in &changes {
         out += &format!("  {kind:?} {}\n", line(device));
     }
     out

@@ -47,6 +47,7 @@ use crate::Result;
 /// How the cache was used so far (wall-clock numbers are for humans only, never in a
 /// simulation's output).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CacheStats {
     /// Components loaded from a precompiled artifact.
     pub hits: u64,

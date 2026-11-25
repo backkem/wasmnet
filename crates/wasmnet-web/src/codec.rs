@@ -48,6 +48,7 @@ use crate::network::RunOutcome;
 /// Why bytes from the other side could not be read.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("malformed {what} at byte {at}")]
+#[non_exhaustive]
 pub struct DecodeError {
     /// Where reading stopped.
     pub at: usize,
@@ -425,7 +426,7 @@ pub fn decode_journal(bytes: &[u8]) -> Result<Vec<JournalEntry>, DecodeError> {
                         });
                     }
                 };
-                Ok(JournalEntry { at, device, record })
+                Ok(JournalEntry::new(at, device, record))
             })
             .collect()
     })
@@ -441,14 +442,21 @@ pub fn encode_outcome(outcome: &RunOutcome) -> Vec<u8> {
             at,
             parked,
             daemons,
+            ..
         }) => {
             w.u8(0).u64(*at).strs(parked).strs(daemons);
         }
-        RunOutcome::Finished(Outcome::Deadline { at, pending_events }) => {
+        RunOutcome::Finished(Outcome::Deadline {
+            at, pending_events, ..
+        }) => {
             w.u8(1).u64(*at).u64(*pending_events as u64);
         }
         RunOutcome::Failed { at, message } => {
             w.u8(2).u64(*at).str(message);
+        }
+        // An outcome this encoding does not know yet reaches the page as a failure.
+        RunOutcome::Finished(other) => {
+            w.u8(2).u64(0).str(&format!("unencoded outcome: {other:?}"));
         }
     }
     w.finish()
@@ -459,15 +467,11 @@ pub fn decode_outcome(bytes: &[u8]) -> Result<RunOutcome, DecodeError> {
     whole(bytes, |r| {
         let pos = r.at;
         Ok(match r.u8()? {
-            0 => RunOutcome::Finished(Outcome::Quiescent {
-                at: r.u64()?,
-                parked: r.strs()?,
-                daemons: r.strs()?,
-            }),
-            1 => RunOutcome::Finished(Outcome::Deadline {
-                at: r.u64()?,
-                pending_events: usize::try_from(r.u64()?).unwrap_or(usize::MAX),
-            }),
+            0 => RunOutcome::Finished(Outcome::quiescent(r.u64()?, r.strs()?, r.strs()?)),
+            1 => RunOutcome::Finished(Outcome::deadline(
+                r.u64()?,
+                usize::try_from(r.u64()?).unwrap_or(usize::MAX),
+            )),
             2 => RunOutcome::Failed {
                 at: r.u64()?,
                 message: r.str()?,
@@ -547,43 +551,40 @@ mod tests {
         );
 
         let journal = vec![
-            JournalEntry {
-                at: 5,
-                device: "sw".to_owned(),
-                record: Record::Log {
+            JournalEntry::new(
+                5,
+                "sw",
+                Record::Log {
                     level: Level::Warn,
                     message: "hello".to_owned(),
                 },
-            },
-            JournalEntry {
-                at: 6,
-                device: "sw".to_owned(),
-                record: Record::Event {
+            ),
+            JournalEntry::new(
+                6,
+                "sw",
+                Record::Event {
                     kind: "k".to_owned(),
                     fields,
                 },
-            },
-            JournalEntry {
-                at: 7,
-                device: "cli".to_owned(),
-                record: Record::Output {
+            ),
+            JournalEntry::new(
+                7,
+                "cli",
+                Record::Output {
                     stream: Stream::Stderr,
                     line: "oops".to_owned(),
                 },
-            },
+            ),
         ];
         assert_eq!(decode_journal(&encode_journal(&journal)), Ok(journal));
 
         for outcome in [
-            RunOutcome::Finished(Outcome::Quiescent {
-                at: 9,
-                parked: vec!["a".to_owned()],
-                daemons: vec!["b: app-x.run".to_owned()],
-            }),
-            RunOutcome::Finished(Outcome::Deadline {
-                at: 10,
-                pending_events: 2,
-            }),
+            RunOutcome::Finished(Outcome::quiescent(
+                9,
+                vec!["a".to_owned()],
+                vec!["b: app-x.run".to_owned()],
+            )),
+            RunOutcome::Finished(Outcome::deadline(10, 2)),
             RunOutcome::Failed {
                 at: 11,
                 message: "trap".to_owned(),

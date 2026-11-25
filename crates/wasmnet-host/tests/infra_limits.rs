@@ -17,7 +17,7 @@ mod support;
 use support::{built, config, events, field, transcript};
 use wasmnet_det_cbor::Value;
 use wasmnet_host::sim::infra::Phase;
-use wasmnet_host::sim::{Impairments, LinkInfo, LinkKind, Op, Placement};
+use wasmnet_host::sim::{Impairments, LinkInfo, Op, Placement};
 use wasmnet_host::{
     DeviceConfig, DeviceOptions, FrameRecord, JournalEntry, Nanos, Network, Record, sim,
 };
@@ -76,10 +76,7 @@ fn script(steps: &[String]) -> DeviceConfig {
 }
 
 fn controller() -> DeviceOptions {
-    DeviceOptions {
-        infra: true,
-        ..DeviceOptions::default()
-    }
+    DeviceOptions::default().infra(true)
 }
 
 /// A network with the catalog controllers create from.
@@ -227,15 +224,9 @@ fn cabling_network(seed: u64) -> Network<'static> {
     let lossy = Impairments::default().loss_ppm(100_000);
     network
         .add_op(
-            Op::Wire {
-                a: ("spare".to_owned(), 0),
-                b: ("sw".to_owned(), 3),
-                latency: 50 * US,
-                mtu: None,
-                kind: LinkKind::Ethernet,
-                cable: None,
-                impairments: Some([lossy, Impairments::default()]),
-            },
+            Op::wire(("spare", 0), ("sw", 3))
+                .with_latency(50 * US)
+                .with_impairments([lossy, Impairments::default()]),
             Placement::StartOf(5 * MS),
         )
         .unwrap();
@@ -430,19 +421,11 @@ fn limited_network(seed: u64) -> Network<'static> {
                 format!("0ms apply fit {}", hex(&client(32, 8 << 20))),
                 format!("0ms apply more {}", hex(&client(33, 8 << 20))),
             ]),
-            DeviceOptions {
-                infra_max_devices: Some(2),
-                ..controller()
-            },
+            controller().infra_max_devices(2),
         )
         .unwrap();
     network
-        .add_op(
-            Op::StopDevice {
-                device: "fit".to_owned(),
-            },
-            Placement::StartOf(500 * MS),
-        )
+        .add_op(Op::stop_device("fit"), Placement::StartOf(500 * MS))
         .unwrap();
     network
 }

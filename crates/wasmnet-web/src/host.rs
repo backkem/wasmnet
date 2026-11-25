@@ -14,6 +14,7 @@ use wasmnet_core::{DeclaredPort, DeviceConfig, Nanos};
 
 /// A device JavaScript has instantiated: its `ports()` answer and what it exports.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Instance {
     /// Its `ports()` answer, in its order.
     pub ports: Vec<DeclaredPort>,
@@ -25,8 +26,36 @@ pub struct Instance {
     pub lifecycle: bool,
 }
 
+/// Chainable setters, one per field: `Instance::default().ports(ports).counters(true)`.
+impl Instance {
+    /// Sets [`ports`](Self::ports).
+    pub fn ports(mut self, ports: Vec<DeclaredPort>) -> Self {
+        self.ports = ports;
+        self
+    }
+
+    /// Sets [`apps`](Self::apps).
+    pub fn apps(mut self, apps: Vec<String>) -> Self {
+        self.apps = apps;
+        self
+    }
+
+    /// Sets [`counters`](Self::counters).
+    pub fn counters(mut self, on: bool) -> Self {
+        self.counters = on;
+        self
+    }
+
+    /// Sets [`lifecycle`](Self::lifecycle).
+    pub fn lifecycle(mut self, on: bool) -> Self {
+        self.lifecycle = on;
+        self
+    }
+}
+
 /// How an async export call ended.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CallEnd {
     /// Returned (`start()` returned, or an app's `run` returned `ok`).
     Ok,

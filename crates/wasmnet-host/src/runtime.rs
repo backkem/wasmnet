@@ -144,13 +144,10 @@ impl Runtime for Host {
             fuel_per_instant: ctx.fuel_per_instant,
             metered,
         };
-        Ok(DeviceInstance {
-            ports,
-            actor: actor.into_future(),
-            has_counters,
-            exports,
-            apps: app_names,
-        })
+        Ok(DeviceInstance::new(ports, actor.into_future())
+            .has_counters(has_counters)
+            .exports(exports)
+            .apps(app_names))
     }
 
     fn install(&self, network: &mut wasmnet_core::Network<'_, Self>) {

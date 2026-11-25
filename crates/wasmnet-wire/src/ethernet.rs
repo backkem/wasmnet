@@ -90,6 +90,7 @@ impl VlanTag {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum FrameError {
     #[error("frame truncated: {len} bytes, need at least {needed}")]
     Truncated { len: usize, needed: usize },

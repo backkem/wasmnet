@@ -83,12 +83,24 @@ impl Stream {
 
 /// One journal record, stamped by the host.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct JournalEntry {
     /// Virtual time of the call.
     pub at: Nanos,
     /// The device's name in the network.
     pub device: String,
     pub record: Record,
+}
+
+impl JournalEntry {
+    /// `record`, made by `device` at virtual time `at`.
+    pub fn new(at: Nanos, device: impl Into<String>, record: Record) -> Self {
+        Self {
+            at,
+            device: device.into(),
+            record,
+        }
+    }
 }
 
 /// Shared, append-only journal of one network. With a clock, every record is also stamped with the

@@ -20,6 +20,7 @@ pub const DIGEST_PREFIX: &str = "sha256:";
 /// What a controller's store of supplied components may hold
 /// ([`crate::DeviceOptions::infra_supply`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SupplyLimits {
     /// The largest component, in bytes.
     pub max_bytes: u64,
@@ -40,8 +41,29 @@ impl Default for SupplyLimits {
     }
 }
 
+impl SupplyLimits {
+    /// Sets [`max_bytes`](Self::max_bytes).
+    pub const fn max_bytes(mut self, bytes: u64) -> Self {
+        self.max_bytes = bytes;
+        self
+    }
+
+    /// Sets [`max_components`](Self::max_components).
+    pub const fn max_components(mut self, components: u32) -> Self {
+        self.max_components = components;
+        self
+    }
+
+    /// Sets [`max_total`](Self::max_total).
+    pub const fn max_total(mut self, bytes: u64) -> Self {
+        self.max_total = bytes;
+        self
+    }
+}
+
 /// A component a controller supplies, as the embedder's [`Admission`] callback sees it.
 #[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
 pub struct Supplied<'a> {
     /// The controller that supplies it.
     pub controller: &'a str,
@@ -59,6 +81,7 @@ pub type Admission = Arc<dyn Fn(&Supplied<'_>) -> Result<(), String> + Send + Sy
 
 /// One component a controller's store keeps (`wasmnet:infra/components.list`).
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct StoredComponent {
     /// `sha256:<hex>`.
     pub digest: String,

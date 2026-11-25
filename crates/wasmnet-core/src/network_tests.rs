@@ -158,15 +158,12 @@ fn a_paused_device_misses_time_and_its_overdue_timers_fire_first_in_order() {
         network.device("b", "tick=25").unwrap();
         add(
             &mut network,
-            Op::PauseDevice {
-                device: named("a"),
-                link_down: false,
-            },
+            Op::pause_device(named("a")),
             Placement::StartOf(12),
         );
         add(
             &mut network,
-            Op::ResumeDevice { device: named("a") },
+            Op::resume_device(named("a")),
             Placement::StartOf(50),
         );
         network.run_until(66).unwrap();
@@ -212,17 +209,12 @@ fn a_paused_device_drops_frames_and_hears_link_changes_when_it_resumes() {
             .id();
         add(
             &mut network,
-            Op::PauseDevice {
-                device: named("rx"),
-                link_down,
-            },
+            Op::pause_device(named("rx")).with_link_down(link_down),
             Placement::StartOf(15),
         );
         add(
             &mut network,
-            Op::ResumeDevice {
-                device: named("rx"),
-            },
+            Op::resume_device(named("rx")),
             Placement::StartOf(45),
         );
         network.run_until(55).unwrap();
@@ -275,44 +267,31 @@ fn a_paused_device_takes_no_control_call_and_keeps_its_stdin() {
     let mut network = Network::new(&fake, 1);
     let a = network.device("a", "").unwrap();
     let pause = |n: &mut Network<'_, Fake>, at| {
-        add(
-            n,
-            Op::PauseDevice {
-                device: named("a"),
-                link_down: false,
-            },
-            Placement::StartOf(at),
-        )
+        add(n, Op::pause_device(named("a")), Placement::StartOf(at))
     };
     let resume_running = add(
         &mut network,
-        Op::ResumeDevice { device: named("a") },
+        Op::resume_device(named("a")),
         Placement::StartOf(5),
     );
     pause(&mut network, 10);
     let twice = pause(&mut network, 11);
     let command = add(
         &mut network,
-        Op::ControlNamed {
-            device: named("a"),
-            call: crate::DeviceCommand::new("x", "").into_control(),
-        },
+        Op::control_named(
+            named("a"),
+            crate::DeviceCommand::new("x", "").into_control(),
+        ),
         Placement::StartOf(12),
     );
     let crash_stopped = add(
         &mut network,
-        Op::CrashDevice {
-            device: named("nobody"),
-            message: "x".into(),
-        },
+        Op::crash_device(named("nobody"), "x"),
         Placement::StartOf(12),
     );
     add(
         &mut network,
-        Op::StdinNamed {
-            device: named("a"),
-            bytes: b"hi".to_vec(),
-        },
+        Op::stdin_named(named("a"), b"hi".to_vec()),
         Placement::StartOf(13),
     );
     network.run_until(20).unwrap();
@@ -334,7 +313,7 @@ fn a_paused_device_takes_no_control_call_and_keeps_its_stdin() {
     assert_eq!(failed(crash_stopped), "no device `nobody`");
     add(
         &mut network,
-        Op::ResumeDevice { device: named("a") },
+        Op::resume_device(named("a")),
         Placement::StartOf(30),
     );
     network.run_until(40).unwrap();
@@ -354,20 +333,10 @@ fn a_split_network_refuses_pauses_crashes_and_actions() {
     network.remote_device("far").unwrap();
     network.register_action("noop", |_, _| Ok(()));
     for op in [
-        Op::PauseDevice {
-            device: named("a"),
-            link_down: false,
-        },
-        Op::ResumeDevice { device: named("a") },
-        Op::CrashDevice {
-            device: named("a"),
-            message: "x".into(),
-        },
-        Op::Action {
-            name: "noop".into(),
-            device: named("a"),
-            argument: String::new(),
-        },
+        Op::pause_device(named("a")),
+        Op::resume_device(named("a")),
+        Op::crash_device(named("a"), "x"),
+        Op::action("noop", named("a"), String::new()),
     ] {
         assert!(matches!(
             network.add_op(op, Placement::StartOf(5)),
@@ -380,10 +349,7 @@ fn a_split_network_refuses_pauses_crashes_and_actions() {
 fn a_crash_follows_the_one_rule_whatever_raised_it() {
     let fake = Fake::new();
     let mut network = Network::new(&fake, 1);
-    let alone = DeviceOptions {
-        crash_alone: true,
-        ..DeviceOptions::default()
-    };
+    let alone = DeviceOptions::default().crash_alone(true);
     let a = network
         .device_with_options("a", "tick=10", DeviceConfig::new(), alone.clone())
         .unwrap();
@@ -396,15 +362,12 @@ fn a_crash_follows_the_one_rule_whatever_raised_it() {
     // ... and an operator's crash of one at 15: both stop alone.
     add(
         &mut network,
-        Op::CrashDevice {
-            device: named("a"),
-            message: "power cut\nsecond line".into(),
-        },
+        Op::crash_device(named("a"), "power cut\nsecond line"),
         Placement::StartOf(15),
     );
     add(
         &mut network,
-        Op::StartDevice { device: named("a") },
+        Op::start_device(named("a")),
         Placement::StartOf(30),
     );
     network.run_until(35).unwrap();
@@ -426,10 +389,7 @@ fn a_crash_follows_the_one_rule_whatever_raised_it() {
     // guest's trap would.
     add(
         &mut network,
-        Op::CrashDevice {
-            device: named("peer"),
-            message: "power cut".into(),
-        },
+        Op::crash_device(named("peer"), "power cut"),
         Placement::EndOf(40),
     );
     match network.run_until(50) {
@@ -480,32 +440,17 @@ fn extensions_hear_a_devices_life_right_after_its_record() {
             "a",
             "",
             DeviceConfig::new(),
-            DeviceOptions {
-                crash_alone: true,
-                ..DeviceOptions::default()
-            },
+            DeviceOptions::default().crash_alone(true),
         )
         .unwrap();
     let ops = [
-        (
-            Op::PauseDevice {
-                device: named("a"),
-                link_down: true,
-            },
-            10,
-        ),
-        (Op::ResumeDevice { device: named("a") }, 20),
-        (Op::StopDevice { device: named("a") }, 30),
-        (Op::StartDevice { device: named("a") }, 40),
-        (
-            Op::CrashDevice {
-                device: named("a"),
-                message: "x".into(),
-            },
-            50,
-        ),
-        (Op::StartDevice { device: named("a") }, 60),
-        (Op::RemoveDevice { device: named("a") }, 70),
+        (Op::pause_device(named("a")).with_link_down(true), 10),
+        (Op::resume_device(named("a")), 20),
+        (Op::stop_device(named("a")), 30),
+        (Op::start_device(named("a")), 40),
+        (Op::crash_device(named("a"), "x"), 50),
+        (Op::start_device(named("a")), 60),
+        (Op::remove_device(named("a")), 70),
     ];
     for (op, at) in ops {
         add(&mut network, op, Placement::StartOf(at));
@@ -552,9 +497,7 @@ fn an_action_runs_at_its_place_changes_extensions_and_places_ops() {
         ctx.extension_mut::<Recorder>().unwrap().wipes += 1;
         // Stops the device right after, at this instant.
         ctx.add_op(
-            Op::StopDevice {
-                device: call.device.to_owned(),
-            },
+            Op::stop_device(call.device.to_owned()),
             Placement::EndOf(ctx.at()),
         )?;
         Ok(())
@@ -562,11 +505,7 @@ fn an_action_runs_at_its_place_changes_extensions_and_places_ops() {
     network.register_action("refuse", |_, _| Err("not today".into()));
     assert!(matches!(
         network.add_op(
-            Op::Action {
-                name: "unknown".into(),
-                device: named("a"),
-                argument: String::new(),
-            },
+            Op::action("unknown", named("a"), String::new()),
             Placement::StartOf(1),
         ),
         Err(Error::Refused(_))
@@ -574,28 +513,17 @@ fn an_action_runs_at_its_place_changes_extensions_and_places_ops() {
     // At 20: stdin at the start of the instant, the action at its end (it stops `a` then).
     let wipe = add(
         &mut network,
-        Op::Action {
-            name: "wipe".into(),
-            device: named("a"),
-            argument: "disk0".into(),
-        },
+        Op::action("wipe", named("a"), "disk0"),
         Placement::EndOf(20),
     );
     add(
         &mut network,
-        Op::StdinNamed {
-            device: named("a"),
-            bytes: b"x".to_vec(),
-        },
+        Op::stdin_named(named("a"), b"x".to_vec()),
         Placement::StartOf(20),
     );
     let refused = add(
         &mut network,
-        Op::Action {
-            name: "refuse".into(),
-            device: named("a"),
-            argument: String::new(),
-        },
+        Op::action("refuse", named("a"), String::new()),
         Placement::StartOf(30),
     );
     network.run_until(40).unwrap();
@@ -630,19 +558,14 @@ fn supplied_components_compile_once_per_digest() {
     use crate::supply::{SupplyLimits, reference_of};
     let fake = Fake::new();
     let mut network = Network::new(&fake, 1);
-    let options = DeviceOptions {
-        infra: true,
-        infra_supply: Some(SupplyLimits::default()),
-        ..DeviceOptions::default()
-    };
+    let options = DeviceOptions::default()
+        .infra(true)
+        .infra_supply(SupplyLimits::default());
     network
         .device_with_options("ctl", "", DeviceConfig::new(), options)
         .unwrap();
     // A supply grant needs `infra`.
-    let ungranted = DeviceOptions {
-        infra_supply: Some(SupplyLimits::default()),
-        ..DeviceOptions::default()
-    };
+    let ungranted = DeviceOptions::default().infra_supply(SupplyLimits::default());
     assert!(
         network
             .device_with_options("x", "", DeviceConfig::new(), ungranted)

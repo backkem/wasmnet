@@ -17,6 +17,7 @@ const BYTE_ORDER_MAGIC: u32 = 0x1A2B_3C4D;
 /// Why a capture is invalid, and where.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("invalid pcap-ng at byte {offset}: {reason}")]
+#[non_exhaustive]
 pub struct PcapError {
     pub offset: usize,
     pub reason: String,
@@ -24,6 +25,7 @@ pub struct PcapError {
 
 /// One Interface Description Block.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Interface {
     pub linktype: u16,
     pub snaplen: u32,
@@ -37,6 +39,7 @@ pub struct Interface {
 
 /// One Enhanced Packet Block.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Packet {
     pub interface: u32,
     /// Raw timestamp in the interface's `if_tsresol` units (nanoseconds for wasmnet captures).
@@ -49,6 +52,7 @@ pub struct Packet {
 
 /// A parsed capture.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Capture {
     /// `shb_userappl`, if present.
     pub user_appl: Option<String>,
@@ -77,24 +81,21 @@ pub struct Capture {
 ///
 /// ```
 /// # use wasmnet_core::pcap::LinkEnd;
-/// let end = LinkEnd {
-///     link: "web.0-sw.1-2".to_owned(),
-///     end: 0,
-///     device: "web".to_owned(),
-///     port: 0,
-///     peer_device: "sw".to_owned(),
-///     peer_port: 1,
-///     created_at: 5_000_000,
-/// };
-/// let text = end.to_string();
+/// let text = "wasmnet-link-end/1 link=web.0-sw.1-2 end=a device=web port=0 peer-device=sw \
+///             peer-port=1 created-at=5000000";
+/// let end = LinkEnd::parse(text).unwrap();
+/// assert_eq!((end.link.as_str(), end.end), ("web.0-sw.1-2", 0));
+/// assert_eq!((end.device.as_str(), end.port), ("web", 0));
+/// assert_eq!((end.peer_device.as_str(), end.peer_port), ("sw", 1));
+/// assert_eq!(end.created_at, 5_000_000);
 /// assert_eq!(
-///     text,
+///     end.to_string(),
 ///     "wasmnet-link-end/1 link=web.0-sw.1-2 end=a device=web port=0 peer-device=sw \
 ///      peer-port=1 created-at=5000000"
 /// );
-/// assert_eq!(LinkEnd::parse(&text), Some(end));
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub struct LinkEnd {
     /// The link's name.
     pub link: String,

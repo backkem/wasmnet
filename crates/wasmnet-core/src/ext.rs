@@ -139,6 +139,7 @@ pub enum SetupOrigin {
 }
 
 /// The device a [`NetworkExtension::device_setup`] call is about.
+#[non_exhaustive]
 pub struct DeviceSetup<'a> {
     /// Its index in the network.
     pub index: usize,
@@ -204,6 +205,7 @@ pub enum LifeEvent<'a> {
 }
 
 /// The device a [`NetworkExtension::device_life`] call is about.
+#[non_exhaustive]
 pub struct DeviceLife<'a> {
     /// Its index in the network.
     pub index: usize,
@@ -261,6 +263,7 @@ impl CableKind {
 }
 
 /// One message entering a cable, as its model sees it.
+#[non_exhaustive]
 pub struct CableSend<'a> {
     /// The virtual instant of the transmission.
     pub at: Nanos,
@@ -277,6 +280,7 @@ pub struct CableSend<'a> {
 }
 
 /// What a message does to a cable.
+#[non_exhaustive]
 pub enum Carry {
     /// Nothing reaches anyone (it was counted).
     Nothing,
@@ -487,6 +491,7 @@ pub struct OpContext<'a> {
 
 /// An embedder action being called ([`crate::Op::Action`], [`crate::Network::register_action`]).
 #[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
 pub struct ActionCall<'a> {
     /// The name it was registered under.
     pub name: &'a str,

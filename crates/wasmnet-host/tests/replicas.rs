@@ -88,10 +88,7 @@ fn controlled(seed: u64) -> Vec<JournalEntry> {
                 ("app.replicas.lb", "10.0.1.2:8080"),
                 ("app.replicas.backend", "10.0.1.{n+10}:80"),
             ]),
-            DeviceOptions {
-                infra: true,
-                ..DeviceOptions::default()
-            },
+            DeviceOptions::default().infra(true),
         )
         .unwrap();
     for (i, dev) in [lb, client, ctl].into_iter().enumerate() {

@@ -81,11 +81,7 @@ fn script(steps: &[String]) -> DeviceConfig {
 }
 
 fn controller(cascade: Cascade) -> DeviceOptions {
-    DeviceOptions {
-        infra: true,
-        infra_cascade: cascade,
-        ..DeviceOptions::default()
-    }
+    DeviceOptions::default().infra(true).infra_cascade(cascade)
 }
 
 /// A network with the catalog controllers create from.
@@ -200,14 +196,9 @@ fn a_device_gets_its_arguments_and_environment() {
                 "web-a",
                 &b.load("node-http-server"),
                 web_config,
-                DeviceOptions {
-                    args: vec!["-v".to_owned(), "two words".to_owned()],
-                    env: vec![
-                        ("GREETING".to_owned(), "hello".to_owned()),
-                        ("UNUSED".to_owned(), "x".to_owned()),
-                    ],
-                    ..DeviceOptions::default()
-                },
+                DeviceOptions::default()
+                    .args(["-v", "two words"])
+                    .env([("GREETING", "hello"), ("UNUSED", "x")]),
             )
             .unwrap();
         network
@@ -376,13 +367,9 @@ fn cascade_network(seed: u64, cascade: Cascade, remove: bool) -> Network<'static
         .unwrap()
         .latency(100 * US);
     let op = if remove {
-        Op::RemoveDevice {
-            device: "ctl".to_owned(),
-        }
+        Op::remove_device("ctl")
     } else {
-        Op::StopDevice {
-            device: "ctl".to_owned(),
-        }
+        Op::stop_device("ctl")
     };
     network.add_op(op, Placement::StartOf(400 * MS)).unwrap();
     network
@@ -428,6 +415,7 @@ fn owned_devices_stop_or_go_with_their_controller() {
                     }
                     Cascade::Remove => assert!(network.infra().get("web-1").is_err()),
                     Cascade::Keep => {}
+                    _ => unreachable!("a cascade this test does not run"),
                 }
                 // The client's fetches at 100 and 300 ms are answered; after 400 ms only
                 // while `web-1` still runs.
@@ -477,12 +465,7 @@ fn waking_network(seed: u64, wake: bool) -> Network<'static> {
         .unwrap()
         .latency(100 * US);
     network
-        .add_op(
-            Op::StopDevice {
-                device: "web-1".to_owned(),
-            },
-            Placement::StartOf(1_500 * MS),
-        )
+        .add_op(Op::stop_device("web-1"), Placement::StartOf(1_500 * MS))
         .unwrap();
     network
 }
@@ -552,18 +535,8 @@ fn a_device_built_directly_starts_again_without_a_resolver() {
             .unwrap()
             .latency(100 * US);
         for (at, op) in [
-            (
-                250 * MS,
-                Op::StopDevice {
-                    device: "web".to_owned(),
-                },
-            ),
-            (
-                450 * MS,
-                Op::StartDevice {
-                    device: "web".to_owned(),
-                },
-            ),
+            (250 * MS, Op::stop_device("web")),
+            (450 * MS, Op::start_device("web")),
         ] {
             network.add_op(op, Placement::StartOf(at)).unwrap();
         }

@@ -50,6 +50,7 @@ impl Direction {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum PcapNgError {
     #[error("interface {0} was never added to this section")]
     UnknownInterface(u32),

@@ -26,6 +26,7 @@ use crate::host::{CallEnd, JsHost};
 /// Entropy streams, seeded like the native host's, so a device draws the same numbers from the
 /// same seed on both backends.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Entropy {
     /// `wasi:random/random` (seed stream `random`).
     Secure,
@@ -320,14 +321,10 @@ impl<H: JsHost + Clone + Unpin + 'static> Runtime for JsRuntime<H> {
             calls: BTreeMap::new(),
             timers: Vec::new(),
         };
-        Ok(DeviceInstance {
-            ports: instance.ports,
-            actor: Box::pin(actor),
-            has_counters: instance.counters,
-            // No optional exports are served: control calls never reach these devices.
-            exports: Vec::new(),
-            apps: instance.apps,
-        })
+        // No optional exports are served: control calls never reach these devices.
+        Ok(DeviceInstance::new(instance.ports, Box::pin(actor))
+            .has_counters(instance.counters)
+            .apps(instance.apps))
     }
 }
 

@@ -29,8 +29,8 @@ use std::sync::PoisonError;
 use std::task::{Context, Poll};
 
 use wasmnet_core::{
-    ActorFuture, Command, CostMeter, Detail, Fault, Inbox, JournalEnd, Level, Nanos, Record,
-    Status, VirtualClock,
+    ActorFuture, Command, CostMeter, Fault, Inbox, JournalEnd, Level, Nanos, Record, Status,
+    VirtualClock,
 };
 use wasmtime::AsContextMut;
 use wasmtime::Store;
@@ -46,12 +46,10 @@ type DeviceIdx = usize;
 /// A guest trap or host error as the sim's [`Fault`]: the message as the executor always
 /// formatted it, and the `wasmtime::Trap` (if any) as its detail.
 pub(crate) fn fault(error: wasmtime::Error) -> Fault {
-    Fault {
-        message: format!("{error:?}"),
-        detail: error
-            .downcast_ref::<wasmtime::Trap>()
-            .copied()
-            .map(Detail::new),
+    let message = format!("{error:?}");
+    match error.downcast_ref::<wasmtime::Trap>().copied() {
+        Some(trap) => Fault::with_detail(message, trap),
+        None => Fault::new(message),
     }
 }
 

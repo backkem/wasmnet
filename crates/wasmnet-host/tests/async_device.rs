@@ -78,10 +78,7 @@ fn async_reflector_echoes_after_a_virtual_wait() {
     let g = guests();
     let mut runs = Vec::new();
     for _ in 0..2 {
-        let guard = Guard {
-            paranoid: true,
-            ..Guard::default()
-        };
+        let guard = Guard::default().paranoid(true);
         let mut network = Network::with_config(&g.host, SimConfig::seeded(42), guard);
         let a = network.device("blaster", &g.blaster).unwrap();
         let b = network.device("reflector", &g.async_reflector).unwrap();
@@ -96,11 +93,11 @@ fn async_reflector_echoes_after_a_virtual_wait() {
         // The echo task is still parked waiting for frames; nothing the host awaits is owed.
         assert_eq!(
             outcome,
-            Outcome::Quiescent {
-                at: (COUNT - 1) * INTERVAL + 2 * LATENCY + DELAY,
-                parked: vec!["reflector".to_owned()],
-                daemons: vec![],
-            }
+            Outcome::quiescent(
+                (COUNT - 1) * INTERVAL + 2 * LATENCY + DELAY,
+                vec!["reflector".to_owned()],
+                vec![]
+            )
         );
         let log: String = network
             .journal()

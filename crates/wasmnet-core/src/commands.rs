@@ -33,6 +33,7 @@ pub const COMMANDS_EXPORT: &str = "wasmnet:control/commands";
 ///
 /// As an operator event's payload it makes a fresh [`CommandCall`] each time the op applies.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DeviceCommand {
     pub command: String,
     pub argument: String,

@@ -477,35 +477,19 @@ fn operator_events_change_impairments_while_the_network_runs() {
     // direction loses everything; from 400 µs, by name, both directions are plain again.
     network
         .add_op(
-            Op::Impair {
-                link,
-                from: Some(1),
-                impairments: all,
-            },
+            Op::impair(link, all).with_from(1),
             Placement::StartOf(255 * US),
         )
         .unwrap();
     network
         .add_op(
-            Op::ImpairNamed {
-                link: "blaster.0-reflector.0".to_owned(),
-                from: None,
-                impairments: Impairments::default(),
-            },
+            Op::impair_named("blaster.0-reflector.0", Impairments::default()),
             Placement::StartOf(400 * US),
         )
         .unwrap();
-    let bad = Op::Impair {
-        link,
-        from: Some(2),
-        impairments: all,
-    };
+    let bad = Op::impair(link, all).with_from(2);
     assert!(network.add_op(bad, Placement::StartOf(US)).is_err());
-    let missing = Op::ImpairNamed {
-        link: "no-such-link".to_owned(),
-        from: None,
-        impairments: all,
-    };
+    let missing = Op::impair_named("no-such-link", all);
     let missing = network.add_op(missing, Placement::StartOf(US)).unwrap();
     network.run_until_quiescent().unwrap();
 

@@ -70,6 +70,7 @@ pub mod opt {
 
 /// A message that could not be parsed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum DhcpError {
     #[error("DHCP message shorter than its 240-byte header")]
     Truncated,
@@ -81,6 +82,7 @@ pub enum DhcpError {
 
 /// Option 53, the DHCP message type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[non_exhaustive]
 pub enum MessageType {
     Discover,
     Offer,

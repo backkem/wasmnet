@@ -154,6 +154,7 @@ impl fmt::Debug for Detail {
 
 /// Why a device's actor stopped: a guest trap or a host-detected contract violation.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct Fault {
     /// Human-readable, as the backend formats it (it ends up in error messages and run records).
     pub message: String,
@@ -267,24 +268,46 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Normal end states of a network run.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Outcome {
     /// Nothing is queued, every store is idle and no host call is outstanding. `parked` lists
     /// devices whose guest still has live tasks (e.g. a stack loop waiting for frames). That is
     /// fine: nothing the host awaits is pending. `daemons` lists the apps' `run` calls that are
     /// still running (`<device>: app-<name>.run`, e.g. a server waiting for requests): they
     /// never count as a deadlock.
+    #[non_exhaustive]
     Quiescent {
         at: Nanos,
         parked: Vec<String>,
         daemons: Vec<String>,
     },
     /// Stopped at the requested deadline with `pending_events` still queued. Resumable.
+    #[non_exhaustive]
     Deadline { at: Nanos, pending_events: usize },
+}
+
+/// For code that rebuilds an outcome it carried elsewhere (a decoder): the variants are
+/// `#[non_exhaustive]`, so a field added later is never a compile error.
+impl Outcome {
+    /// [`Outcome::Quiescent`].
+    pub fn quiescent(at: Nanos, parked: Vec<String>, daemons: Vec<String>) -> Self {
+        Outcome::Quiescent {
+            at,
+            parked,
+            daemons,
+        }
+    }
+
+    /// [`Outcome::Deadline`].
+    pub fn deadline(at: Nanos, pending_events: usize) -> Self {
+        Outcome::Deadline { at, pending_events }
+    }
 }
 
 /// Runaway guards. All of them are deterministic: they trip at the same virtual instant and
 /// with the same error on every replay.
 #[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
 pub struct Guard {
     /// Fuel each device store gets at the start of every virtual instant it runs in, unless
     /// the device has its own budget ([`DeviceOptions::fuel_per_instant`]). A backend
@@ -307,8 +330,29 @@ impl Default for Guard {
     }
 }
 
+impl Guard {
+    /// Sets [`fuel_per_instant`](Self::fuel_per_instant).
+    pub const fn fuel_per_instant(mut self, fuel: u64) -> Self {
+        self.fuel_per_instant = fuel;
+        self
+    }
+
+    /// Sets [`max_polls_per_instant`](Self::max_polls_per_instant).
+    pub const fn max_polls_per_instant(mut self, polls: u32) -> Self {
+        self.max_polls_per_instant = polls;
+        self
+    }
+
+    /// Sets [`paranoid`](Self::paranoid).
+    pub const fn paranoid(mut self, on: bool) -> Self {
+        self.paranoid = on;
+        self
+    }
+}
+
 /// Parameters that fully determine a simulation's nondeterminism.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct SimConfig {
     /// Root seed; per-component RNG seeds derive from `(seed, component name)`.
     pub seed: u64,
@@ -323,5 +367,11 @@ impl SimConfig {
             seed,
             wall_epoch: DEFAULT_WALL_EPOCH,
         }
+    }
+
+    /// Sets [`wall_epoch`](Self::wall_epoch).
+    pub const fn wall_epoch(mut self, epoch: Duration) -> Self {
+        self.wall_epoch = epoch;
+        self
     }
 }

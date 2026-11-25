@@ -61,6 +61,7 @@ pub enum ChangeKind {
 
 /// One device as the API returns it (`wasmnet:infra/types.device`).
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DeviceView {
     pub name: String,
     pub uid: String,
@@ -79,6 +80,7 @@ pub struct DeviceView {
 
 /// One watch event.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Change {
     pub kind: ChangeKind,
     pub device: DeviceView,
@@ -86,6 +88,7 @@ pub struct Change {
 
 /// The answer to a command a controller sent with a request id (`devices.control-answer`).
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CommandAnswer {
     /// The device it went to, and the command.
     pub name: String,
@@ -122,6 +125,7 @@ fn cut(mut text: String) -> String {
 
 /// One journalled output line.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct LogLine {
     pub at: Nanos,
     pub stream: Stream,

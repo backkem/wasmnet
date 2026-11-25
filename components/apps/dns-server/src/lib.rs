@@ -207,7 +207,8 @@ fn rtype_of(d: &RData) -> u16 {
         RData::Srv { .. } => rtype::SRV,
         RData::Txt(_) => rtype::TXT,
         RData::Nsec { .. } => rtype::NSEC,
-        RData::Other(_) => 0,
+        // `Other`, and record data a later codec reads that this server does not know.
+        _ => 0,
     }
 }
 

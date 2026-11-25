@@ -201,10 +201,7 @@ fn run(seed: u64, how: How) -> Run {
             ] {
                 network
                     .add_op(
-                        Op::Control {
-                            device: r1,
-                            call: DeviceCommand::new(command, argument).into_control(),
-                        },
+                        Op::control(r1, DeviceCommand::new(command, argument).into_control()),
                         Placement::StartOf(at),
                     )
                     .unwrap();
@@ -230,10 +227,7 @@ fn run(seed: u64, how: How) -> Run {
                     "ctl",
                     &b.load("infra_script"),
                     config(&pairs),
-                    DeviceOptions {
-                        infra: true,
-                        ..DeviceOptions::default()
-                    },
+                    DeviceOptions::default().infra(true),
                 )
                 .unwrap();
         }

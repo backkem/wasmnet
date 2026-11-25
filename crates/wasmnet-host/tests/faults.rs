@@ -262,10 +262,7 @@ fn disk_device(network: &mut Network<'_>, name: &str, crash_alone: bool) {
             name,
             &disk_world().device,
             config(&[("period", "10ms")]),
-            DeviceOptions {
-                crash_alone,
-                ..DeviceOptions::default()
-            },
+            DeviceOptions::default().crash_alone(crash_alone),
         )
         .unwrap();
     network.set_device_component(network.live_device(name).unwrap(), "disk");
@@ -368,10 +365,7 @@ fn controller(network: &mut Network<'_>, steps: &[String]) {
                 .load(built().path("infra_script"))
                 .expect("infra_script"),
             script,
-            DeviceOptions {
-                infra: true,
-                ..DeviceOptions::default()
-            },
+            DeviceOptions::default().infra(true),
         )
         .unwrap();
 }
@@ -452,20 +446,12 @@ fn an_operator_crash_is_a_crash_and_an_operator_stop_is_a_stop() {
         );
         network
             .add_op(
-                Op::CrashDevice {
-                    device: "c1".into(),
-                    message: "power supply failed".into(),
-                },
+                Op::crash_device("c1", "power supply failed"),
                 Placement::StartOf(25 * MS),
             )
             .unwrap();
         network
-            .add_op(
-                Op::StopDevice {
-                    device: "c2".into(),
-                },
-                Placement::StartOf(25 * MS),
-            )
+            .add_op(Op::stop_device("c2"), Placement::StartOf(25 * MS))
             .unwrap();
         network
     };
@@ -518,33 +504,15 @@ fn living(seed: u64) -> Network<'static> {
     let mut network = disk_network(seed, &[]);
     disk_device(&mut network, "a", true);
     let ops = [
+        (Op::pause_device("a"), 100),
+        (Op::resume_device("a"), 150),
+        (Op::stop_device("a"), 200),
+        (Op::start_device("a"), 250),
+        (Op::crash_device("a", "kernel panic"), 300),
+        (Op::start_device("a"), 350),
+        (Op::remove_device("a"), 400),
         (
-            Op::PauseDevice {
-                device: "a".into(),
-                link_down: false,
-            },
-            100,
-        ),
-        (Op::ResumeDevice { device: "a".into() }, 150),
-        (Op::StopDevice { device: "a".into() }, 200),
-        (Op::StartDevice { device: "a".into() }, 250),
-        (
-            Op::CrashDevice {
-                device: "a".into(),
-                message: "kernel panic".into(),
-            },
-            300,
-        ),
-        (Op::StartDevice { device: "a".into() }, 350),
-        (Op::RemoveDevice { device: "a".into() }, 400),
-        (
-            Op::AddDevice {
-                name: "a".into(),
-                component: "disk".into(),
-                config: config(&[("period", "10ms")]),
-                options: DeviceOptions::default(),
-                wire: Vec::new(),
-            },
+            Op::add_device("a", "disk").with_config(config(&[("period", "10ms")])),
             450,
         ),
     ];
@@ -648,22 +616,15 @@ fn wiping(seed: u64) -> Network<'static> {
     let at = 30 * MS;
     for d in ["a", "b"] {
         network
-            .add_op(Op::StopDevice { device: d.into() }, Placement::StartOf(at))
+            .add_op(Op::stop_device(d), Placement::StartOf(at))
             .unwrap();
     }
     network
-        .add_op(
-            Op::Action {
-                name: "wipe".into(),
-                device: "a".into(),
-                argument: String::new(),
-            },
-            Placement::EndOf(at),
-        )
+        .add_op(Op::action("wipe", "a", String::new()), Placement::EndOf(at))
         .unwrap();
     for d in ["a", "b"] {
         network
-            .add_op(Op::StartDevice { device: d.into() }, Placement::EndOf(at))
+            .add_op(Op::start_device(d), Placement::EndOf(at))
             .unwrap();
     }
     network
@@ -764,15 +725,12 @@ fn paused_transfer(seed: u64, sleeper: &str, link_down: bool) -> Network<'static
     let device = sleeper.to_owned();
     network
         .add_op(
-            Op::PauseDevice {
-                device: device.clone(),
-                link_down,
-            },
+            Op::pause_device(device.clone()).with_link_down(link_down),
             Placement::StartOf(PAUSE),
         )
         .unwrap();
     network
-        .add_op(Op::ResumeDevice { device }, Placement::StartOf(RESUME))
+        .add_op(Op::resume_device(device), Placement::StartOf(RESUME))
         .unwrap();
     network
 }

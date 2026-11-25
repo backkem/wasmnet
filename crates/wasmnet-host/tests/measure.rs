@@ -23,7 +23,7 @@ use wasmnet_host::sim::{
     CaptureOptions, DeviceCost, Impairments, LinkStats, Op, Placement, SeriesOptions,
     sites::{self, Msg, SiteRecords, SiteSync, Step},
 };
-use wasmnet_host::{DeviceOptions, FrameRecord, JournalEntry, LinkId, Nanos, Network, Outcome};
+use wasmnet_host::{FrameRecord, JournalEntry, LinkId, Nanos, Network, Outcome};
 
 const US: Nanos = 1_000;
 const MS: Nanos = 1_000_000;
@@ -55,10 +55,7 @@ fn fetch(seed: u64, bulk: u64, rate: u64, capture: CaptureOptions, stops: &[Nano
     let b = built();
     let mut network = Network::new(&b.host, seed);
     network.set_capture_defaults(capture);
-    network.set_series_defaults(Some(SeriesOptions {
-        width: BUCKET,
-        keep: 1_000,
-    }));
+    network.set_series_defaults(Some(SeriesOptions::new(BUCKET, 1_000)));
     let server = network
         .device_with_config(
             "server",
@@ -427,29 +424,13 @@ fn a_recreated_device_is_followed_by_its_capture_headers() {
             .unwrap()
             .latency(100 * US);
         network
-            .add_op(
-                Op::RemoveDevice {
-                    device: "web".to_owned(),
-                },
-                Placement::StartOf(100 * MS),
-            )
+            .add_op(Op::remove_device("web"), Placement::StartOf(100 * MS))
             .unwrap();
         network
             .add_op(
-                Op::AddDevice {
-                    name: "web".to_owned(),
-                    component: "node:http-server".to_owned(),
-                    config: web_config,
-                    options: DeviceOptions::default(),
-                    wire: vec![wasmnet_host::sim::Cable {
-                        port: 0,
-                        to_device: "sw".to_owned(),
-                        to_port: 1,
-                        latency: 100 * US,
-                        mtu: None,
-                        impairments: None,
-                    }],
-                },
+                Op::add_device("web", "node:http-server")
+                    .with_config(web_config)
+                    .with_cable(wasmnet_host::sim::Cable::new(0, "sw", 1).latency(100 * US)),
                 Placement::StartOf(150 * MS),
             )
             .unwrap();
