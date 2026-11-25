@@ -11,10 +11,14 @@ here so that nobody has to find these the hard way. Each entry names where the c
   recording off keeps none ([design/links.md](design/links.md#what-a-link-records)), but the
   frame log still adds one fixed-size record per transmission, and captures are only held in
   memory (nothing streams them out). The journal and captured stdio have caps.
-- **A memory limit is opt-in and native only.** `DeviceOptions::memory` (or a spec's `memory`)
-  bounds a device's linear memory on wasmtime; a device without one may allocate as much as
-  wasmtime lets it. The browser backend neither enforces it nor measures memory
-  (`DeviceCost::memory` stays 0 there). Tables are not counted.
+- **A memory limit is opt-in, and checked late in a browser.** `DeviceOptions::memory` (or a
+  spec's `memory`) bounds a device's linear memory; a device without one may allocate as much as
+  its runtime lets it. Wasmtime refuses the growth that would pass the limit, at the growing
+  instruction. A browser grows memories itself, so the page reads their sizes after every poll
+  of the device and the device faults there, with the same message, after the growth
+  ([design/browser.md](design/browser.md#memory)): work in between can use more than the limit
+  for a while, and a growth past what the tab can give fails as the browser decides. Tables are
+  not counted on either backend.
 - **An event can be lost while a device is created.** `block_on`
   (`crates/wasmnet-core/src/exec.rs`) advances time while a device is instantiated or answers
   `ports()`. An event that is not a timer and comes due in that window is dropped without an
@@ -56,13 +60,14 @@ here so that nobody has to find these the hard way. Each entry names where the c
   device that set them; a timer it set while being instantiated by an operator event is not
   held, and completes at the resume's rounds instead of in its order. Its overdue work all runs
   at the resume instant, under one instant's fuel.
-- **What the browser backend does not do yet** ([design/browser.md](design/browser.md#what-each-backend-does-itself)):
-  stdin (`Op::Stdin` is dropped), fuel metering (`fuel_per_instant` is ignored; the guard is
-  `Guard::max_polls_per_instant`), memory (neither measured nor bounded), host extensions'
-  imports, and sites. A page creates a device while the network runs with JSPI (Chromium's
-  `WebAssembly.Suspending`), and checks a component's imports against the `wasmnet:infra` grant
-  only when it knows them (`ComponentSource.imports`; without them, every infra call of an
-  ungranted device is `denied` instead).
+- **What the browser backend does not do** ([design/browser.md](design/browser.md#what-each-backend-does-itself)):
+  fuel (`fuel_per_instant` is ignored and fuel costs are 0: neither jco nor the page can meter a
+  core module's instructions; the guard is `Guard::max_polls_per_instant`, 100 000 polls of one
+  instant), host extensions' imports, and sites. A page creates a device while the network runs
+  with JSPI (Chromium's `WebAssembly.Suspending`), and checks a component's imports against the
+  `wasmnet:infra` grant only when it knows them (`ComponentSource.imports`; without them, every
+  infra call of an ungranted device is `denied` instead). A WASI 0.2 stdin read with nothing
+  queued waits in a page, where natively it is the end of the stream.
 - **Supplied components are kept in memory, and a page cannot transpile them.** A browser page
   runs a supplied component only from a transpile it already has: a `ComponentSource` with that
   digest, or the embedder's `NetworkOptions.supply` hook. The kit's transpiler (`codelib-web/transpile`)
@@ -83,10 +88,10 @@ here so that nobody has to find these the hard way. Each entry names where the c
 - **`Network` is large.** About ninety methods on one type; the core and the embedder surface
   are told apart only by their doc comments.
 - **The browser binding reports errors as strings** (`wasmnet_web::Network::link`, the
-  `JsHost` methods), where the native API has one typed error. Its TypeScript `Network` covers
-  devices with their options, links, runs, device commands (now or at an instant), counters,
-  the journal and captures; the other operator events, link impairments and capture options are
-  reachable only from Rust (`wasmnet_web::Network::sim_mut`).
+  `JsHost` methods), where the native API has one typed error. Its TypeScript `Network` reaches
+  operator events, device options and link options as plain objects that the simulator reads
+  (`crates/wasmnet-web/src/ops.rs`); embedder actions and extensions' ops take Rust closures and
+  values and are reachable only from Rust (`wasmnet_web::Network::sim_mut`).
 
 ## The netstack
 

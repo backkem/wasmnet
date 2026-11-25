@@ -27,9 +27,16 @@ const web = await net.device('web', 'node-http-server', { ipv4: '10.0.0.1/24', /
 net.link(web.port(0), sw.port(1), 150_000n); // nanoseconds
 await net.command(sw, 'block', '0 3');        // { ok: 'blocked' }: wasmnet:control/commands
 net.scheduleCommand(sw, 5_000_000n, 'unblock', '0 3'); // the same, as an operator event at 5 ms
+net.op({ kind: 'link-state', link: 'web.0-sw.1', up: false, at: 9_000_000n }); // any operator event
 const outcome = await net.run({ onJournal: (entries) => console.log(entries) });
 const pcap = net.pcap(net.links()[0]); // open it in Wireshark
 ```
+
+Device options (`DeviceOptions`, also `memory`), link options (`LinkOptions`: MTU, impairments
+by direction, capture options) and operator events (`Op`: `stdin`, `link-state`, `add-device`,
+`stop-device`, ...) are plain objects the simulator reads and checks (`crates/wasmnet-web/src/ops.rs`):
+the binding mirrors none of them. `opStates()` and `costs()` (memory and peak memory per device)
+read results back the same way.
 
 A device's options also grant `wasmnet:infra` (`infra: true`, with `infraPrefix`,
 `infraCascade`, `infraMaxDevices`, `infraSupply`): its calls are served by the simulator, as
@@ -70,8 +77,9 @@ scenario (the switch programmed by command between runs and by an operator event
 answering with its arguments and an environment variable; `window.wasmnetScenario`) and checks
 the answers, the switch's events and the page the client fetched, runs the `runtime` scenario
 (devices created while the network runs: an `infra-script` controller creating, commanding and
-restarting a router and reading its events, a `replicas` controller woken by `changes.wait-any`,
-one that supplies a
+restarting a router and reading its events, a `replicas` controller woken by `changes.wait-any`
+and given a line on its stdin, operator events, capture options and a memory limit through the
+generic path, one that supplies a
 component fetched from a store node, and an ungranted `wasmnet:infra` importer refused), and
 checks the message a browser without JSPI gets. With `NATIVE_JOURNAL` pointing at the native example's output
 (`cargo run -p wasmnet-host --example http > target/http-native.txt`) it also checks that every

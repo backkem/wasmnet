@@ -159,6 +159,73 @@ Chromium only: jco's async runtime needs WebAssembly JSPI (`WebAssembly.Suspendi
 runtime and the kit's event loop are global; a page runs each network in a fresh Worker and can
 compile the core modules once and pass them in.
 
+## Memory
+
+A device's memories are measured and bounded by the core's `MemoryBudget`, as natively, but the
+page learns of a growth only after it happened: jco's runtime grows a core module's memory
+itself, and no JavaScript runs before a `memory.grow`. So the page records every core instance a
+component makes (the kit's `instantiateCore` hook) and reports the sum of their memories' sizes,
+each memory once (`js_memory`); the simulator counts it after the device is instantiated and
+after every poll of its actor (`MemoryBudget::observe`). What differs from wasmtime:
+
+- **When:** natively the growth past `DeviceOptions::memory` is refused at the growing
+  instruction; in a page the device faults at the end of the poll in which its memories were
+  found past the limit, with the same message ("memory limit: growing a linear memory by N
+  bytes would take the device to M bytes, past its L bytes", N being everything grown since the
+  last look). Until then the memory is really allocated; work that runs between steps (a guest's
+  async tasks) is seen at the device's next poll.
+- **What:** the same thing, every linear memory of the component's core instances; tables are
+  counted on neither backend. A limit too small for a device to start fails its creation on
+  both.
+- `DeviceCost::memory` and `peak_memory` are the measured sizes (they include the memory jco's
+  own shims allocate, which wasmtime does not have).
+
+## Stdin
+
+`Op::Stdin` (and `StdinNamed`) queue bytes in the device's core `InputQueue`, as natively, and
+the simulator tells the page (`js_stdin_ready`). A guest's read takes what is queued
+(`wn_stdin`); with nothing queued it waits, and the kit treats that wait as patient (the network
+may go idle meanwhile). Natively a WASI 0.3 read waits the same way, while a WASI 0.2 read with
+nothing queued is the end of the stream; in a page a WASI 0.2 read waits as well.
+
+## Fuel
+
+Not metered. Native fuel comes from wasmtime instrumenting the compiled code; in a page the core
+modules run on the browser's engine, which counts nothing, and neither jco nor the kit can make
+it (instrumenting the modules at build time would change what runs, and its cost would be the
+page's). `fuel_per_instant` is accepted and ignored, and fuel costs stay 0. The guard an embedder
+does get is `Guard::max_polls_per_instant` (100 000 polls of one virtual instant, set by
+`wasmnet_web::Network::new`; past it the run fails) and, for a guest that never yields, the
+Worker's own timeout (the kit's `runInWorker`).
+
+## Options and operator events from TypeScript
+
+The page's binding does not mirror the core's options and ops. Device options, link options and
+operator events cross as plain objects (`value` messages); `crates/wasmnet-web/src/ops.rs` reads
+them onto the core's own types and constructors (`DeviceOptions`, `CaptureOptions`,
+`Impairments`, `Op::stop_device`, ...) and refuses an unknown field or kind, and op states and
+costs come back the same way. A new op or option of the core needs a case there and, at most, a
+type in `web/src/codec.ts` (`Op`, `DeviceOptions`, `LinkOptions` are guides, not mirrors). A
+typed TypeScript surface per op was not built: it would be a second list of the core's ops to
+keep in step, which is what this avoids; a thin typed wrapper over `Network.op` is easy to add
+where an embedder wants one. Embedder actions and extensions' ops carry Rust closures and values
+and stay Rust-only (`wasmnet_web::Network::sim_mut`).
+
+## Sites and host extensions
+
+Not served in a page, and not planned here. What an embedder would need:
+
+- **Host extensions** (`HostExtension`, wasmtime only) link imports of their own. In a page the
+  equivalent is the import object: the embedder adds its interface's functions next to the ones
+  `network.ts` serves, and serves them from its own state or, to keep them deterministic, from
+  a `NetworkExtension` in the simulator through new device-side exports of its own build of
+  `wasmnet-web`. The core's extension points (`NetworkExtension`, cable kinds, extension ops) are
+  backend-independent already.
+- **Sites** (a network split over processes, `docs/design/sites.md`): each site is a network of
+  its own driven in lockstep with the others; a page could run one site per Worker and pass the
+  site-sync messages between them, but the stepping protocol and the WAN carriers (real
+  sockets) have no browser form yet.
+
 ## What each backend does itself
 
 One library, two backends: `wasmnet-host` runs devices on wasmtime, `wasmnet-web` hands them to
@@ -174,6 +241,8 @@ call to the core. What the core decides for both:
 | `wasmnet:infra`: every call, the answers to a device without the grant, the stream names of `logs`, the refusal of an ungranted importer (`infra::Calls`, `infra::require_grant`); the events kept of the devices controllers created, and the wake of an armed wait (`events.arm`: one more `poll` of the controller, queued by the core) | the host's bindings; the browser's `wn_infra` |
 | commands and their answers, a controller's `control-answer` (`commands`, `CommandCall::finish`) | both actors |
 | reconfiguration, and which config `wasi:config/store` serves after it (`ReconfigureCall::finish_serving`) | both actors |
+| a device's memory: what is counted, the limit and its error text (`MemoryBudget`: `growing` before a growth, `observe` after one) | the host's limiter; the browser's actor |
+| a device's stdin queue (`InputQueue`) | the host's stdio streams; the browser's registry |
 | which supplied bytes are admitted (`ImportPolicy`, `component_imports`) and how a refusal is worded (`supply::not_compiled`, `not_linked`) | the host's `compile_supplied`; the browser's `compile_supplied` |
 | validation, ordering, operator events, the device table, limits, digests, admission, the journal, captures | the network itself |
 
@@ -187,18 +256,19 @@ What each backend still does itself, module by module:
 | `infra` (WIT types to and from the core's) | wasmtime-specific glue |
 | `glue` (`wasmnet:link` and `wasi:config/store` to the core's wire, journal and config) | wasmtime-specific glue |
 | `stdio` (wasmtime-wasi streams over the core's captures and stdin queue) | wasmtime-specific glue |
-| `wasi` (the deterministic WASI linker; its memory limiter decides the limit and its error) | wasmtime-specific, but the limit's decision would move to the core with a browser memory limit |
+| `wasi` (the deterministic WASI linker; its memory limiter tells the core's budget of each growth) | wasmtime-specific |
 | `cache`, `extension`, `command` (`Sim`), `lib` (engines, fuel) | wasmtime-specific |
 
 | `wasmnet-web` module | Kind |
 |---|---|
 | `runtime` (the registry the page serves imports from, one actor per device calling JavaScript) | browser-specific |
 | `infra` (a call's generic values to the core's `infra::Calls` and back, in jco's shapes) | browser-specific glue |
+| `ops` (device options, link options and operator events from plain JavaScript objects, onto the core's types and constructors; op states and costs back) | browser-specific glue |
 | `codec`, `ffi` (the boundary) | browser-specific |
 | `web/src/network.ts` (instantiate with the kit, call exports, forward imports) | browser-specific glue; it decides nothing |
 
-What the browser backend does not do yet: stdin, fuel, memory (measured or bounded), host
-extensions and sites ([known-issues.md](../known-issues.md)).
+What the browser backend does not do: fuel, host extensions' imports and sites (below, and
+[known-issues.md](../known-issues.md)).
 
 **One set of scenarios for both.** `crates/wasmnet-web/tests/parity.rs` runs the same
 scenarios on the wasmtime backend and on the browser backend's Rust half, and requires the
