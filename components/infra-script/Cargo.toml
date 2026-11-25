@@ -1,0 +1,26 @@
+[package]
+name = "wasmnet-infra-script"
+version = "0.0.0"
+description = "Test fixture: a controller device that makes scripted wasmnet:infra calls at set virtual times."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# A stepped device with no ports that imports `wasmnet:infra/devices` (an in-world controller;
+# the network must grant it `DeviceOptions::infra`). `src/lib.rs` is the pure logic (the script),
+# unit-tested inside wasmtime with `cargo test --target wasm32-wasip2 -p wasmnet-infra-script`;
+# `src/component.rs` is the wit-bindgen glue, left out of test builds.
+
+[lib]
+# The artifact is named after the component, not the package: `infra_script.wasm`.
+name = "infra_script"
+crate-type = ["cdylib"]
+
+[dependencies]
+wasmnet-wire = { path = "../../crates/wasmnet-wire" }
+thiserror.workspace = true
+wit-bindgen = { workspace = true, features = ["macros", "realloc"] }
+
+[lints]
+workspace = true

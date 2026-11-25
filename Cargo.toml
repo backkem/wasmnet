@@ -6,6 +6,7 @@ members = [
     "crates/*",
     "components/blaster",
     "components/clock-probe",
+    "components/infra-script",
     "components/netstack",
     "components/reflector",
     "components/router",
