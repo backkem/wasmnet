@@ -19,6 +19,8 @@ and [the main README](../README.md) shows a network in ten lines.
 6. [design/socket-extensions.md](design/socket-extensions.md): `wasmnet:sockets-ext`, what WASI
    0.3 lacks.
 7. [design/configuration.md](design/configuration.md): every config key of every device and app.
+8. [design/nat.md](design/nat.md): address translation and the packet filter in the router: why
+   they are a mode of the router, RFC 4787 behaviours, connection tracking, ICMP errors.
 
 For embedders:
 

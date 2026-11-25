@@ -55,6 +55,7 @@ built as `node-<name>.wasm`. The node has one config. It holds the netstack's ke
 | [`traceroute-ping.wac`](../../compositions/traceroute-ping.wac) | `traceroute`, `ping` |
 | [`udp-echo-client.wac`](../../compositions/udp-echo-client.wac) | `udp-echo-client` |
 | [`udp-echo-server.wac`](../../compositions/udp-echo-server.wac) | `udp-echo-server` |
+| [`udp-punch.wac`](../../compositions/udp-punch.wac) | `udp-punch` (test fixture) |
 
 ### Invalid configuration
 
@@ -186,7 +187,8 @@ Source of truth: `Config::from_lookup` in
 ### Router
 
 An IPv4/IPv6 router with ARP, NDP, ICMP, static routes, optional Router Advertisements and an
-optional DHCP relay per port. Ports are named `p0` to `p<N-1>`.
+optional DHCP relay per port, and optional address translation and a packet filter
+([nat.md](nat.md)). Ports are named `p0` to `p<N-1>`.
 
 Source of truth: `Config::from_pairs` and `parse_route` in
 [components/router/src/config.rs](../../components/router/src/config.rs). It reads the whole
@@ -204,6 +206,8 @@ config with `get-all`. Unknown keys are errors. At least one port must exist.
 | `neighbor.lifetime` | duration above zero | `300s` | How long a learned neighbor is trusted (checked when used). |
 | `trace.route-lookup` | `first`, `all` or `none` | `first` | Which `route-lookup` events are logged: once per destination address, every one, or none. |
 | `trace.ttl-decrement` | `first`, `all` or `none` | `first` | Which `ttl-decrement` events are logged: once per flow (protocol, addresses and ports), every one, or none. |
+| `trace.nat-filtered` | `first`, `all` or `none` | `first` | Which `nat-filtered` events (an inbound packet refused by NAT filtering) are logged: once per remote endpoint and external endpoint, every one, or none. |
+| `trace.filter-drop` | `first`, `all` or `none` | `first` | Which `filter-drop` events are logged: once per flow, every one, or none. |
 
 Per-port keys, `port<N>.<key>` with `N` in 0..=15 written without leading zeros (`port00` is
 unknown):
@@ -217,6 +221,8 @@ unknown):
 | `port<N>.ipv6-link-local` | IPv6 address in `fe80::/10` | EUI-64 from the port's MAC | The port's link-local address. |
 | `port<N>.ra` | `true` or `false` | `false` | Send a Router Advertisement when the link comes up and answer Router Solicitations. Requires `port<N>.ipv6` (the advertised prefix). |
 | `port<N>.dhcp-relay` | one IPv4 address or a comma-separated list | none | DHCP servers to relay this port's DHCP client broadcasts to (an RFC 1542 relay agent, with the port's IPv4 address as `giaddr`). Requires `port<N>.ipv4`. The addresses may not be unspecified, multicast, broadcast or loopback. |
+| `port<N>.nat` | `masquerade` | none | Port N is an outside port: IPv4 packets routed out of it from a port without `nat` leave with its address (NAT44 with port translation, see below). Requires `port<N>.ipv4`. |
+| `port<N>.allow` | a comma-separated list of allow rules (see below), at most 256 | none: everything is forwarded | The packet filter for packets that arrive on port N and are forwarded. |
 
 **Route syntax.** Each item of `routes` is whitespace-separated words:
 
@@ -237,6 +243,44 @@ unknown):
 Examples: `10.0.3.0/24 via 10.0.2.2`, `default via 10.0.2.2`, `fd00:3::/64 via fe80::2 port 1`,
 `10.9.0.0/16 port 0`. A full value: `routes = "10.0.3.0/24 via 10.0.2.2,default via fd00:1::fe"`.
 
+**Address translation** ([nat.md](nat.md)). These keys need at least one `port<N>.nat`; on a
+router without one they are an error. All are optional.
+
+| Key | Value | Default | Meaning |
+|---|---|---|---|
+| `nat.mapping` | `endpoint-independent`, `address-dependent` or `address-and-port-dependent` | `endpoint-independent` | RFC 4787 mapping: which outbound packets of one inside endpoint share an external port (any remote, one remote address, one remote endpoint). |
+| `nat.filtering` | the same three | `address-and-port-dependent` | RFC 4787 filtering: which remotes may send to a mapping (anyone, an address it sent to, an endpoint it sent to). |
+| `nat.hairpin` | `true` or `false` | `true` | Inside hosts reach mapped ports of the outside address, appearing from their own external endpoint. |
+| `nat.port-allocation` | `preserve` or `sequential` | `preserve` | `preserve`: the inside port when it is free, else the next free port of the range; `sequential`: always the next free port of the range. Deterministic either way. |
+| `nat.port-range` | `<low>-<high>`, 1..=65535, low first | `1024-65535` | External ports (and ICMP echo identifiers) the allocation draws from. |
+| `nat.forwards` | a comma-separated list of forwards (see below), at most 256 | none | Static port forwards. |
+
+**Connection tracking**, shared by translation and the filter; accepted on any router, it only
+matters with `nat` or `allow`. Timeouts shorter than the RFC minimums are allowed, for tests.
+
+| Key | Value | Default | Meaning |
+|---|---|---|---|
+| `conntrack.udp-timeout` | duration above zero | `300s` | Idle timeout of a UDP session or flow (RFC 4787 REQ-5). |
+| `conntrack.tcp-established-timeout` | duration above zero | `7440s` | Idle timeout of an established TCP connection (RFC 5382 REQ-5). |
+| `conntrack.tcp-transitory-timeout` | duration above zero | `240s` | Idle timeout of a TCP connection that is opening or closing. |
+| `conntrack.icmp-timeout` | duration above zero | `60s` | Idle timeout of an ICMP echo session (RFC 5508 REQ-1), and of other non-TCP, non-UDP flows. |
+| `conntrack.max-entries` | integer, 1..=65536 | `4096` | NAT sessions, and filter flows (each). A packet that needs one more is dropped (`nat-table-full`) or passes untracked (`filter-table-full`). |
+
+**Forward syntax.** `<proto> <external-port> to <addr>:<port> [port <n>]`: `proto` is `tcp` or
+`udp`, the external port 1..=65535, the inside endpoint a unicast IPv4 address and a port, and
+`port <n>` the translating router port (default: the lowest one). An external port is
+forwarded once per protocol and port, and an inside endpoint has one forward per port.
+Example: `nat.forwards = "tcp 8080 to 192.168.1.10:80,udp 5000 to 192.168.1.20:5000"`.
+
+**Rule syntax.** `<proto> [from <prefix>] [to <prefix>] [dport <port>|<low>-<high>]`:
+`proto` is `any`, `tcp`, `udp`, `icmp` (IPv4) or `icmpv6`; the prefixes have no host bits
+set and share one family, and a rule with a prefix matches only that family; `dport` (a port
+or a range, 1..=65535) needs `tcp` or `udp`. Each word may appear once. Example:
+`port1.allow = "tcp to 10.0.1.10/32 dport 80,udp from 10.0.2.0/24 dport 5000-5010,icmp"`. A
+packet passes a port with rules when it matches one, belongs to a flow the router already let
+through in either direction, or is an ICMP error about such a flow; traffic to the router
+itself is not filtered.
+
 Besides the errors above, the component traps if `get-all` itself fails.
 
 **Changing routes while it runs.** The config is read once, but the static routes can change
@@ -246,6 +290,12 @@ syntax above. An embedder sends them with `Network::command` or as operator even
 with `wasmnet:infra/devices.control`; nothing else about the router (ports, neighbours, links,
 counters) changes. Their semantics are in [wit/router/router.wit](../../wit/router/router.wit)
 and [topology-and-infra.md](topology-and-infra.md#commands-into-a-running-device).
+
+Port forwards and allow rules change the same way: `forward-add <forward>`,
+`forward-remove <forward or proto and external port>`, `forwards`, `allow-add <port> <rule>`,
+`allow-remove <port> <rule>` and `rules`, in the syntax above; `mappings` lists the translation
+table. The behaviours (`nat.mapping` and the rest), the timeouts and which ports translate are
+fixed when the router starts.
 
 ### WAN port
 
@@ -621,6 +671,31 @@ reads no config: its MAC is always seeded.
 A plain `wasm32-wasip2` command that samples clocks and random sources twice and prints them
 to stdout. It reads no configuration
 ([components/clock-probe/src/main.rs](../../components/clock-probe/src/main.rs)).
+
+### udp-punch (test fixture)
+
+An app (node `node-udp-punch`, [compositions/udp-punch.wac](../../compositions/udp-punch.wac))
+for the NAT tests: a rendezvous server that tells two registered peers each other's public
+endpoint, or a peer that registers, punches towards that endpoint, answers whoever punched it
+and reports `punch-done {result: connected|failed|no-peer}`
+([crates/wasmnet-host/tests/nat.rs](../../crates/wasmnet-host/tests/nat.rs)). A peer exits `ok`
+when it heard the other; the rendezvous server never returns.
+
+Source of truth: `Config::from_pairs` in
+[components/apps/udp-punch/src/lib.rs](../../components/apps/udp-punch/src/lib.rs). Unknown
+keys are errors.
+
+| Key | Value | Default | Meaning |
+|---|---|---|---|
+| `role` | `rendezvous` or `peer` | **required** | What it is. |
+| `listen` | socket address | `0.0.0.0:3478` | Rendezvous: the local socket address. |
+| `server` | IPv4 socket address | **required** for a peer | The rendezvous server. |
+| `name` | `a-z`, `0-9` and `-`, 1 to 32 characters | **required** for a peer | The peer's name. |
+| `local` | socket address | `0.0.0.0:4000` | Peer: the local socket address. |
+| `start` | duration | `0` | Peer: wait before registering. |
+| `interval` | duration above zero | `100ms` | Peer: time between two registrations, or two punch rounds. |
+| `register-tries` | integer, 1..=1000 | `20` | Peer: registrations before it gives up (`no-peer`). |
+| `tries` | integer, 1..=1000 | `10` | Peer: punch rounds. |
 
 ## Example: a full node config
 

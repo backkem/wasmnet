@@ -10,7 +10,9 @@ captures, the components and the apps. Link impairments set when a link is built
 (`Impairments`, `LinkMut::impair`, `LinkMut::impair_from`) and their counters in `LinkStats`
 are part of it ([design/links.md](design/links.md)). So are device commands: the
 `wasmnet:control/commands` export, the router's commands, `Network::command` and
-`wasmnet:infra/devices.control` (`crates/wasmnet-host/tests/routes.rs`). Sending them as
+`wasmnet:infra/devices.control` (`crates/wasmnet-host/tests/routes.rs`), and the router's
+address translation and packet filter with their keys and commands (`tests/nat.rs`,
+`tests/filter.rs`). Sending them as
 operator events (`Op::Control` with a `DeviceCommand`) is embedder surface like every
 operator event, though that test exercises it too.
 

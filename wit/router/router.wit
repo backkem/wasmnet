@@ -3,9 +3,10 @@
 /// A router is a stepped device (`wasmnet:link/stepped-device`: `ports`, `receive`, `poll`,
 /// `link-state`; config through `wasi:config/store`; events through `wasmnet:link/log`) that also
 /// exports `wasmnet:link/counters`, so tests can read its per-port and forwarding counters after a
-/// run, and `wasmnet:control/commands`, so its static routes can change while it runs. It needs
-/// no clock and no randomness: time arrives as `now` arguments, and its next deadline (an
-/// ARP/NDP retry) is `poll`'s answer.
+/// run, and `wasmnet:control/commands`, so its static routes, port forwards and allow rules can
+/// change while it runs. It needs no clock and no randomness: time arrives as `now` arguments,
+/// and its next deadline (an ARP/NDP retry, or the earliest expiry of a translation session or
+/// a filter flow) is `poll`'s answer.
 ///
 /// # Commands
 ///
@@ -50,9 +51,44 @@
 ///   changes (a replacement counts in both) and are listed once a command has changed the
 ///   table, so a router whose routes never change keeps its counter list.
 ///
+/// # Port forwards and allow rules
+///
+/// Since 0.1.2. On a router with a translating port (`port<N>.nat = masquerade`), port forwards
+/// change through these commands; on any router, the allow rules of the packet filter
+/// (`docs/design/nat.md`). Both are idempotent like the route commands, apply to packets from
+/// `now` on, and are journalled.
+///
+/// - `forward-add <forward>`: a forward in the configuration's syntax (`nat.forwards`):
+///   `<tcp|udp> <external-port> to <addr>:<port> [port <n>]`, where `port <n>` names the
+///   translating router port (the lowest one by default). `ok("added")`, `ok("unchanged")`
+///   when that forward exists; an error when its external port is forwarded already or held by
+///   a live mapping (until it expires), or when the inside endpoint has a forward on that port.
+///   Journalled as `nat-forward-added {proto, external, internal, port}`.
+/// - `forward-remove <forward>` or `forward-remove <proto> <external-port> [port <n>]`: removes
+///   the forward and the sessions through it (given a whole forward, only if it is that one).
+///   `ok("removed")` or `ok("absent")`; journalled as `nat-forward-removed`.
+/// - `forwards` (no argument): one forward per line, `<proto> <external> to <addr>:<port> port
+///   <n>`, in the order they were added.
+/// - `mappings` (no argument): the translation table, one mapping per line, `<proto>
+///   <internal> -> <external> port <n> (remote <any|addr|addr:port>|forward)`, each followed by
+///   its sessions, `  session <remote>[ <tcp state>]`.
+/// - `allow-add <port> <rule>`: appends a rule to router port `<port>`'s allow list. A rule is
+///   `<any|tcp|udp|icmp|icmpv6> [from <prefix>] [to <prefix>] [dport <p>|<lo>-<hi>]`, as in
+///   `port<N>.allow`. `ok("added")` or `ok("unchanged")`. A port that gets its first rule
+///   filters from then on; flows already crossing it are not known to it. Journalled as
+///   `allow-added {port, rule}`.
+/// - `allow-remove <port> <rule>`: removes that rule. `ok("removed")` or `ok("absent")`;
+///   journalled as `allow-removed`.
+/// - `rules` (no argument): every rule, one per line, `<port> <rule>`, by port.
+///
+/// On a router without a translating port the forward commands and `mappings` are an `err`.
+/// The `nat-*` counters are listed only by a router with a translating port, the `filter-*`
+/// counters only by one that has, or had, an allow rule.
+///
 /// This package names that combination; it adds no interface of its own. (A world added to
-/// `wasmnet:link` would change that package for every device.)
-package wasmnet:router@0.1.1;
+/// `wasmnet:link` would change that package for every device.) 0.1.2 documents the forward and
+/// allow commands; nothing in the WIT changed, so a host built against 0.1.1 runs it as is.
+package wasmnet:router@0.1.2;
 
 world router {
     include wasmnet:link/stepped-device@0.1.0;

@@ -84,6 +84,14 @@ here so that nobody has to find these the hard way. Each entry names where the c
 - **`http-get` takes a 1xx response as the final one.**
 - **The router forwards a unicast IP packet that arrived as a link-layer broadcast.** Real
   routers drop those.
+- **The router's NAT drops IPv4 fragments** in both directions (`nat-fragments`), translates
+  only UDP, TCP and ICMP echo, and has no application-level gateways, NAT64/NAT66, UPnP, PCP
+  or NAT-PMP ([design/nat.md](design/nat.md)). Unsolicited packets to its outside address get
+  no answer.
+- **The router scans its whole translation table and flow table** when a session or flow may
+  expire: fine for thousands of entries, slow for the 65536 the bound allows.
+- **A port that gets its first allow rule while traffic crosses it** does not know the flows
+  already running: their answers are dropped unless a rule lets them in.
 - **The switch scans its whole MAC table on every frame** to age entries: fine for tens of
   hosts, slow for thousands.
 

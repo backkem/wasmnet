@@ -178,5 +178,6 @@ the routes of a router it created while traffic crosses it.
 **Not covered yet.** Commands to a device of another site (a controller's own devices are on its
 site; a timed `Op::Control` is applied by the device's site, [sites.md](sites.md)). Changing a
 device's configuration in place through infra (`apply` with a new spec still recreates it),
-and `wire` and `unwire` verbs for controllers. A NAT or a packet filter would take its rules
-through the same `commands` export, with no change to the host, the core or `wasmnet:infra`.
+and `wire` and `unwire` verbs for controllers. The router's port forwards and allow rules take the
+same `commands` export ([nat.md](nat.md)), with no change to the host, the core or
+`wasmnet:infra`.
