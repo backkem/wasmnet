@@ -532,6 +532,21 @@ impl VirtualClock {
         key
     }
 
+    /// Queues `event` again under the key it was popped with (a paused device's timer or poll
+    /// deadline, held while it slept). A key before now pops before every other queued event,
+    /// and time does not move back for it. A poll deadline becomes the device's again, unless
+    /// it has a newer one, which wins.
+    pub(crate) fn requeue(&self, key: EventKey, event: Event) {
+        let mut s = self.state();
+        if let Event::Poll(device) = event {
+            if s.polls.contains_key(&device) {
+                return;
+            }
+            s.polls.insert(device, key.clone());
+        }
+        s.queue.insert(key, event);
+    }
+
     /// Queues operator event `op` under `key`. Returns false if the key is taken.
     pub(crate) fn schedule_op(&self, key: EventKey, op: usize) -> bool {
         let mut s = self.state();

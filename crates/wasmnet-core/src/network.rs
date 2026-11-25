@@ -17,8 +17,9 @@ use crate::device::{Command, CountersReply, Inbox, Status};
 use crate::digest::Digest;
 use crate::exec::{ActorFuture, Boundary, CoreOp, Executor, Flow, OpState, Stats, Step};
 use crate::ext::{
-    CableKind, CableModel, Control, ControlCall, DeviceExt, DeviceSetup, ExtOptions, ExtValue,
-    ExtensionOp, NetworkExtension, OpContext, OpError, OpTarget, SetupOrigin,
+    Action, ActionCall, CableKind, CableModel, Control, ControlCall, DeviceExt, DeviceLife,
+    DeviceSetup, ExtOptions, ExtValue, ExtensionOp, LifeEvent, NetworkExtension, OpContext,
+    OpError, OpTarget, SetupOrigin,
 };
 use crate::infra::{Infra, InfraEnd, Phase};
 use crate::journal::{Journal, JournalEnd, JournalEntry, Stream};
@@ -292,6 +293,12 @@ pub struct DeviceOptions {
     /// as when it runs out of fuel. `None`: no limit (the backend's own). Backends that cannot
     /// enforce it (the browser) ignore it.
     pub memory: Option<u64>,
+    /// A fault of this device is a crash of the device alone, not the network's failure: when
+    /// it traps (its own code, its fuel, its memory, a host extension's import, or
+    /// [`Op::CrashDevice`]) it stops as crashed (`device-crashed`, phase `crashed`) and the
+    /// network runs on, as a device an in-world controller created always does. Without it a
+    /// fault of a device the embedder created fails the network ([`Error::Trap`]).
+    pub crash_alone: bool,
     /// The device's arguments after `argv[0]` (its name), served by `wasi:cli/environment`.
     pub args: Vec<String>,
     /// Its environment variables, in this order, served by `wasi:cli/environment`.
@@ -338,15 +345,21 @@ struct DeviceRecord {
     config: DeviceConfig,
     options: DeviceOptions,
     phase: DevicePhase,
-    /// Links its stop took down (a start brings them up again).
+    /// Links its stop (or its pause with `link_down`) took down (a start or the resume brings
+    /// them up again).
     downed: Vec<usize>,
+    /// Paused with its links down ([`Op::PauseDevice`]'s `link_down`).
+    paused_down: bool,
 }
 
 /// What a device is doing (its status under operator events).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DevicePhase {
     Running,
-    /// Stopped by an operator event: no store, its links down, its name kept.
+    /// Paused by an operator event ([`Op::PauseDevice`]): its store is kept and does not run;
+    /// its name, ports and links stay.
+    Paused,
+    /// Stopped by an operator event, or crashed: no store, its links down, its name kept.
     Stopped,
     /// Removed by an operator event: unwired, its name free again.
     Removed,
@@ -401,6 +414,8 @@ pub struct Network<'r, R: Runtime + ?Sized> {
     /// The links created while the network ran (operator events, controllers' cables), with
     /// the tag of the processing context that created each, in creation order.
     created_links: Vec<(usize, Tag)>,
+    /// The embedder's actions, by name ([`Network::register_action`]).
+    embedder_actions: std::collections::BTreeMap<String, Action<'r>>,
 }
 
 /// The size of each creator's range of device numbers: a creator can create this many devices
@@ -455,6 +470,7 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
             components: std::collections::BTreeMap::new(),
             numbering: None,
             created_links: Vec::new(),
+            embedder_actions: std::collections::BTreeMap::new(),
         };
         runtime.install(&mut network);
         network
@@ -528,6 +544,7 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
         if !record.exports.iter().any(|e| e == call.export()) {
             return Ok(false);
         }
+        refuse_paused(record)?;
         let answer = call.answer();
         let what = call.name().to_owned();
         record.inbox.push(Command::Control(call));
@@ -642,7 +659,9 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
             SetupOrigin::Created,
         );
         let instance = self.runtime.instantiate(context, component)?;
+        let crash_alone = options.crash_alone;
         self.register(idx, number, name, config, options, instance, handles, false)?;
+        self.exec.set_contain(idx, crash_alone);
         if let Some(rank) = rank {
             self.take_number(rank);
         }
@@ -938,6 +957,7 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
                 options,
                 phase: DevicePhase::Running,
                 downed: Vec::new(),
+                paused_down: false,
             });
         }
         // The first poll, at the device's first instant (after its link-state calls).
@@ -1026,9 +1046,17 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
                     declared: self.panel.ports(d).iter().map(|p| p.id).collect(),
                 },
             })?;
-        let stopped = [ea, eb]
-            .into_iter()
-            .find(|&(d, _)| self.devices[d].phase != DevicePhase::Running);
+        // An end without power keeps the link down: a stopped device, or one paused with its
+        // links down (its resume brings the link up). A paused device that keeps its carrier
+        // hears the new link when it resumes.
+        let stopped = [ea, eb].into_iter().find(|&(d, _)| {
+            let r = &self.devices[d];
+            match r.phase {
+                DevicePhase::Running => false,
+                DevicePhase::Paused => r.paused_down,
+                DevicePhase::Stopped | DevicePhase::Removed => true,
+            }
+        });
         match stopped {
             None => {
                 for (device, port) in [ea, eb] {
@@ -1089,7 +1117,14 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
                 Flow::Network { op, network } => {
                     let at = self.clock.now();
                     let change = self.network_ops[network].clone();
-                    if let Err(message) = self.apply_change(Some(op), change, at) {
+                    let applied = match change {
+                        // A crash may fail the whole network: the one rule decides.
+                        Op::CrashDevice { device, message } => {
+                            self.crash_device(&device, message, at)?
+                        }
+                        change => self.apply_change(Some(op), change, at),
+                    };
+                    if let Err(message) = applied {
                         self.exec.fail_op(op, message);
                     }
                 }
@@ -1109,14 +1144,68 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
     /// is stopped as crashed (its links go down, the far ends see it), journalled
     /// as `device-crashed {message}`, and the network goes on.
     fn crash(&mut self, idx: usize, message: String, at: Nanos) {
-        if self.devices[idx].phase != DevicePhase::Running {
+        if !matches!(
+            self.devices[idx].phase,
+            DevicePhase::Running | DevicePhase::Paused
+        ) {
             return;
         }
         self.stop_device(idx, at);
         let name = self.devices[idx].name.clone();
         let message = self.runtime.summarize(&message);
         self.infra.crashed(&name, &message, at);
-        self.journal_event(&name, at, "device-crashed", vec![("message", message)]);
+        self.journal_event(
+            &name,
+            at,
+            "device-crashed",
+            vec![("message", message.clone())],
+        );
+        self.life(idx, at, LifeEvent::Crashed { message: &message });
+    }
+
+    /// [`Op::CrashDevice`]: the device faults at the op's position, as if its guest trapped
+    /// there, and the one rule decides: a contained device crashes alone ([`crash`](Self::crash),
+    /// before the op's rounds, so the far ends see the carrier drop in them); any other fails
+    /// the network ([`Error::Trap`]). The inner `Err` is the op's refusal (no such device, or
+    /// not running or paused).
+    fn crash_device(
+        &mut self,
+        device: &str,
+        message: String,
+        at: Nanos,
+    ) -> Result<std::result::Result<(), String>> {
+        let Some(id) = self.live_device(device) else {
+            return Ok(Err(format!("no device `{device}`")));
+        };
+        if !matches!(
+            self.devices[id.0].phase,
+            DevicePhase::Running | DevicePhase::Paused
+        ) {
+            return Ok(Err(format!("`{device}` is not running")));
+        }
+        if self.exec.fault(id.0, crate::Fault::new(message.clone()))? {
+            self.crash(id.0, message, at);
+        }
+        Ok(Ok(()))
+    }
+
+    /// Tells the network's extensions about device `idx`'s life (after its journal record).
+    fn life(&mut self, idx: usize, at: Nanos, event: LifeEvent<'_>) {
+        if self.extensions.is_empty() {
+            return;
+        }
+        let name = self.devices[idx].name.clone();
+        let journal = self.journal_end(&name);
+        let life = DeviceLife {
+            index: idx,
+            name: &name,
+            at,
+            event,
+            journal: &journal,
+        };
+        for e in &mut self.extensions {
+            e.device_life(&life);
+        }
     }
 
     /// Applies the contained traps a control call's settle met.
@@ -1147,7 +1236,8 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
             .iter()
             .rfind(|d| d.name == req.caller)
             .is_some_and(|d| {
-                d.options.infra_cascade != Cascade::Keep && d.phase != DevicePhase::Running
+                d.options.infra_cascade != Cascade::Keep
+                    && !matches!(d.phase, DevicePhase::Running | DevicePhase::Paused)
             });
         let result = if caller_gone {
             Err(format!(
@@ -1285,7 +1375,7 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
             Verb::Start if phase == Some(DevicePhase::Stopped) => {
                 self.apply_change(None, Op::StartDevice { device: name }, at)
             }
-            Verb::Stop if phase == Some(DevicePhase::Running) => {
+            Verb::Stop if matches!(phase, Some(DevicePhase::Running | DevicePhase::Paused)) => {
                 self.apply_change(None, Op::StopDevice { device: name }, at)
             }
             Verb::Remove if phase.is_some() => {
@@ -1294,6 +1384,9 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
             // Served in this event's rounds; the device's refusal reaches the table from its
             // answer (`CommandCall::finish`).
             Verb::Control(command) => {
+                if phase == Some(DevicePhase::Paused) {
+                    return Err(format!("`{name}` is paused"));
+                }
                 let id = self
                     .live_device(&name)
                     .filter(|_| phase == Some(DevicePhase::Running))
@@ -1449,6 +1542,17 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
                 .ok_or_else(|| format!("no device `{name}`"))?;
             match l.devices[id.0].phase {
                 DevicePhase::Running => Ok(id),
+                DevicePhase::Paused => Err(format!("`{name}` is paused")),
+                _ => Err(format!("`{name}` is not running")),
+            }
+        };
+        // Running or paused: it has a store.
+        let alive = |l: &Self, name: &str| -> std::result::Result<DeviceId, String> {
+            let id = l
+                .live_device(name)
+                .ok_or_else(|| format!("no device `{name}`"))?;
+            match l.devices[id.0].phase {
+                DevicePhase::Running | DevicePhase::Paused => Ok(id),
                 _ => Err(format!("`{name}` is not running")),
             }
         };
@@ -1498,10 +1602,10 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
                 self.devices[idx].created = Some(created);
                 self.devices[idx].component = Some(component.clone());
                 self.infra_added(idx, self.applying);
-                // A controller's device crashes alone: a trap stops it, not the network.
-                if self.applying.is_some() {
-                    self.exec.set_contain(idx, true);
-                }
+                // A controller's device crashes alone, and so does one whose options say so: a
+                // trap stops it, not the network.
+                let crash_alone = self.applying.is_some() || self.devices[idx].options.crash_alone;
+                self.exec.set_contain(idx, crash_alone);
                 self.journal_event(&name, at, "device-added", vec![("component", component)]);
                 // Its cables, before it first runs (this op's rounds come after).
                 for (port, far, latency, mtu, impairments) in ends {
@@ -1516,11 +1620,93 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
                 }
             }
             Op::StopDevice { device } => {
-                let id = running(self, &device)?;
+                let id = alive(self, &device)?;
                 self.stop_device(id.0, at);
                 self.infra.set_phase(&device, Phase::Stopped, at);
                 self.journal_event(&device, at, "device-stopped", Vec::new());
+                self.life(id.0, at, LifeEvent::Stopped);
                 self.cascade(id.0, at);
+            }
+            Op::PauseDevice { device, link_down } => {
+                let id = running(self, &device)?;
+                let idx = id.0;
+                self.exec.pause_actor(idx);
+                self.devices[idx].phase = DevicePhase::Paused;
+                self.devices[idx].paused_down = link_down;
+                if link_down {
+                    for l in self.panel.links_of(idx) {
+                        if self.carrier(l, at, false) {
+                            self.devices[idx].downed.push(l);
+                        }
+                    }
+                }
+                let carrier = if link_down { "down" } else { "up" };
+                self.journal_event(
+                    &device,
+                    at,
+                    "device-paused",
+                    vec![("carrier", carrier.to_owned())],
+                );
+                self.life(idx, at, LifeEvent::Paused);
+            }
+            Op::ResumeDevice { device } => {
+                let id = self
+                    .live_device(&device)
+                    .ok_or_else(|| format!("no device `{device}`"))?;
+                let idx = id.0;
+                if self.devices[idx].phase != DevicePhase::Paused {
+                    return Err(format!("`{device}` is not paused"));
+                }
+                self.devices[idx].phase = DevicePhase::Running;
+                self.devices[idx].paused_down = false;
+                let (overdue, dropped) = self.exec.resume_actor(idx);
+                for l in std::mem::take(&mut self.devices[idx].downed) {
+                    self.carrier(l, at, true);
+                }
+                self.journal_event(
+                    &device,
+                    at,
+                    "device-resumed",
+                    vec![
+                        ("overdue", overdue.to_string()),
+                        ("dropped", dropped.to_string()),
+                    ],
+                );
+                self.life(idx, at, LifeEvent::Resumed);
+            }
+            Op::Action {
+                name,
+                device,
+                argument,
+            } => {
+                if self.live_device(&device).is_none() {
+                    return Err(format!("no device `{device}`"));
+                }
+                let mut action = self
+                    .embedder_actions
+                    .remove(&name)
+                    .ok_or_else(|| format!("no action `{name}`"))?;
+                self.journal_event(
+                    &device,
+                    at,
+                    "action",
+                    vec![("name", name.clone()), ("argument", argument.clone())],
+                );
+                let call = ActionCall {
+                    name: &name,
+                    device: &device,
+                    argument: &argument,
+                };
+                let result = action(
+                    &mut OpContext {
+                        at,
+                        op,
+                        network: self,
+                    },
+                    &call,
+                );
+                self.embedder_actions.insert(name, action);
+                result.map_err(|e| e.to_string())?;
             }
             Op::StartDevice { device } => {
                 let id = self
@@ -1568,6 +1754,7 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
                 }
                 self.infra.set_phase(&device, Phase::Running, at);
                 self.journal_event(&device, at, "device-started", Vec::new());
+                self.life(idx, at, LifeEvent::Started);
             }
             Op::RemoveDevice { device } => {
                 let id = self
@@ -1654,7 +1841,8 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
                 self.journal_event(&device, at, "link-removed", vec![("link", link)]);
             }
             Op::StdinNamed { device, bytes } => {
-                let id = running(self, &device)?;
+                // A paused device's stdin keeps what is typed for when it resumes.
+                let id = alive(self, &device)?;
                 self.devices[id.0].inbox.push(Command::Stdin(bytes));
             }
             Op::Extension(ext) => {
@@ -1720,7 +1908,10 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
     /// Removes device `idx` at `at`: stopped if running, every link unwired, its name free;
     /// journalled as `device-removed` with `fields`.
     fn remove_device(&mut self, idx: usize, at: Nanos, fields: Vec<(&str, String)>) {
-        if self.devices[idx].phase == DevicePhase::Running {
+        if matches!(
+            self.devices[idx].phase,
+            DevicePhase::Running | DevicePhase::Paused
+        ) {
             self.stop_device(idx, at);
         }
         for l in self.panel.links_of(idx) {
@@ -1731,6 +1922,7 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
         let name = self.devices[idx].name.clone();
         self.infra.removed(&name, at);
         self.journal_event(&name, at, "device-removed", fields);
+        self.life(idx, at, LifeEvent::Removed);
     }
 
     /// Controller `idx` just stopped or was removed: its [`Cascade`] stops or removes the
@@ -1753,10 +1945,16 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
             let name = self.devices[i].name.clone();
             let fields = vec![("with-owner", owner.clone())];
             match cascade {
-                Cascade::Stop if self.devices[i].phase == DevicePhase::Running => {
+                Cascade::Stop
+                    if matches!(
+                        self.devices[i].phase,
+                        DevicePhase::Running | DevicePhase::Paused
+                    ) =>
+                {
                     self.stop_device(i, at);
                     self.infra.stopped_with(&name, &owner, at);
                     self.journal_event(&name, at, "device-stopped", fields);
+                    self.life(i, at, LifeEvent::Stopped);
                 }
                 Cascade::Remove => self.remove_device(i, at, fields),
                 _ => {}
@@ -1773,6 +1971,16 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
         }
         self.exec.stop_actor(idx);
         self.devices[idx].phase = DevicePhase::Stopped;
+        self.devices[idx].paused_down = false;
+    }
+
+    /// Whether device `idx` gets `link-state` calls: a running one at once, a paused one when
+    /// it resumes (they wait in its inbox).
+    fn hears_links(&self, idx: usize) -> bool {
+        matches!(
+            self.devices[idx].phase,
+            DevicePhase::Running | DevicePhase::Paused
+        )
     }
 
     /// Sets link `l`'s carrier at `at`; running ends get `link-state`. Whether it changed.
@@ -1781,7 +1989,7 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
             return false;
         };
         for (device, port) in ends {
-            if self.devices[device].phase == DevicePhase::Running {
+            if self.hears_links(device) {
                 self.devices[device]
                     .inbox
                     .push(Command::LinkState { port, up });
@@ -1795,7 +2003,7 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
     fn unwire(&mut self, l: usize, at: Nanos) {
         if let Some(ends) = self.panel.disconnect(&self.clock, at, l) {
             for (device, port) in ends {
-                if self.devices[device].phase == DevicePhase::Running {
+                if self.hears_links(device) {
                     self.devices[device]
                         .inbox
                         .push(Command::LinkState { port, up: false });
@@ -1985,6 +2193,7 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
         if !record.has_counters {
             return Ok(None);
         }
+        refuse_paused(record)?;
         let reply = CountersReply::default();
         record.inbox.push(Command::Counters(reply.clone()));
         let settled = self.exec.settle(u64::from(self.devices[device.0].number));
@@ -2070,6 +2279,7 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
             options,
             phase: DevicePhase::Running,
             downed: Vec::new(),
+            paused_down: false,
         });
         self.infra_added(idx, None);
         Ok(DeviceId(idx))
@@ -2399,6 +2609,11 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
                             .to_owned(),
                     ));
                 }
+                if let Op::Action { name, .. } = &op
+                    && !self.embedder_actions.contains_key(name)
+                {
+                    return Err(Error::Refused(format!("no action `{name}` is registered")));
+                }
                 self.network_ops.push(op);
                 CoreOp::Network(self.network_ops.len() - 1)
             }
@@ -2441,6 +2656,30 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
                 self.devices[device.0].name
             )))
         }
+    }
+
+    /// Registers an embedder action under `name` (replacing an earlier one), for
+    /// [`Op::Action`]: a way for an operator event to act on state outside the simulation (an
+    /// extension's, through [`OpContext::extension_mut`], or the embedder's own) at an exact
+    /// position among the instant's events.
+    ///
+    /// The action runs when its op applies, in the op's own processing context, before the
+    /// op's rounds: it gets the op's instant ([`OpContext::at`]), may read device phases,
+    /// journal on devices, queue control calls, change the network's extensions and place
+    /// further operator events ([`OpContext::add_op`]). It cannot run guest code itself,
+    /// change the topology directly (it places an op for that) or move time. It is code
+    /// outside the simulation, so a rerun replays it only as far as it is deterministic: its
+    /// effects must depend only on what it is given (the instant, the argument, the state it
+    /// changes); one that reads anything else (a wall clock, a file) makes the network a
+    /// function of that too.
+    ///
+    /// Embedder surface, unstable (operator events).
+    pub fn register_action(
+        &mut self,
+        name: impl Into<String>,
+        action: impl FnMut(&mut OpContext<'_>, &ActionCall<'_>) -> std::result::Result<(), OpError> + 'r,
+    ) {
+        self.embedder_actions.insert(name.into(), Box::new(action));
     }
 
     /// What became of every operator event so far, by index.
@@ -2569,9 +2808,33 @@ pub enum Op {
         /// before power-on).
         wire: Vec<Cable>,
     },
-    /// Stops a running device: its store is dropped and its links go down (the far ends see
-    /// the carrier drop). Its name, ports and links stay.
+    /// Stops a running (or paused) device: its store is dropped and its links go down (the
+    /// far ends see the carrier drop). Its name, ports and links stay.
     StopDevice { device: String },
+    /// Pauses a running device, as a laptop sleeps: its store (memory, sockets, timers) is
+    /// kept but does not run, and it misses time (`docs/design/topology-and-infra.md`). Frames
+    /// that reach its ports are dropped there (counted in `device-resumed`); its timers and
+    /// poll deadline are held as they come due; link changes, stdin and wakes wait for it.
+    /// With `link_down` its links go down for the far ends, as a sleeping NIC's carrier does,
+    /// and come up at the resume; without, they stay up, as a frozen machine's do.
+    PauseDevice { device: String, link_down: bool },
+    /// Resumes a paused device. Its clocks read the network's time, so they jump by the pause;
+    /// the timers and poll deadline that came due meanwhile fire right after this op, at this
+    /// instant, one event each in the order they came due, before anything else still queued.
+    ResumeDevice { device: String },
+    /// The device faults at this position, as if its own code trapped there, with `message`:
+    /// a device that crashes alone ([`DeviceOptions::crash_alone`], or one a controller
+    /// created) is stopped as crashed (`device-crashed`, phase `crashed`); a fault of any other
+    /// device fails the network ([`Error::Trap`]), as its guest's trap would.
+    CrashDevice { device: String, message: String },
+    /// Calls the embedder action registered as `name` ([`Network::register_action`]) with
+    /// `argument`, journalled as `action {name, argument}` on `device` (which must exist; it
+    /// need not run). The action's refusal is the op's state.
+    Action {
+        name: String,
+        device: String,
+        argument: String,
+    },
     /// Starts a stopped device again from its component and config (a fresh instance), and
     /// brings up the links its stop took down.
     StartDevice { device: String },
@@ -2623,6 +2886,10 @@ impl Op {
             self,
             Op::AddDevice { .. }
                 | Op::StopDevice { .. }
+                | Op::PauseDevice { .. }
+                | Op::ResumeDevice { .. }
+                | Op::CrashDevice { .. }
+                | Op::Action { .. }
                 | Op::StartDevice { .. }
                 | Op::RemoveDevice { .. }
                 | Op::Wire { .. }
@@ -2645,6 +2912,14 @@ impl<R: Runtime + ?Sized> OpTarget for Network<'_, R> {
             DevicePhase::Running => Ok(id),
             _ => Err(OpError::NotRunning(name.to_owned())),
         }
+    }
+
+    fn phase(&self, name: &str) -> Option<DevicePhase> {
+        self.live_device(name).map(|d| self.devices[d.0].phase)
+    }
+
+    fn add_op(&mut self, op: Op, placement: Placement) -> Result<usize> {
+        Network::add_op(self, op, placement)
     }
 
     fn require_export(&self, device: DeviceId, export: &str) -> Result<()> {
@@ -2686,6 +2961,17 @@ pub enum Placement {
     StartOf(Nanos),
     /// At the end of instant `t`, after every event at `t`.
     EndOf(Nanos),
+}
+
+/// A control call cannot run in a paused device: refused, and the network goes on.
+fn refuse_paused(record: &DeviceRecord) -> Result<()> {
+    match record.phase {
+        DevicePhase::Paused => Err(Error::Refused(format!(
+            "`{}` is paused: it answers no control call until it resumes",
+            record.name
+        ))),
+        _ => Ok(()),
+    }
 }
 
 fn placement_is_timed(key: &EventKey) -> bool {
@@ -2735,3 +3021,7 @@ fn check_ports(device: &str, ports: Vec<DeclaredPort>) -> Result<Vec<PortInfo>> 
     }
     Ok(out)
 }
+
+#[cfg(test)]
+#[path = "network_tests.rs"]
+mod tests;

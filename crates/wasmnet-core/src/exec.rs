@@ -105,8 +105,15 @@ struct Slot {
     /// or outstanding.
     stopped: bool,
     /// A trap stops this device instead of failing the network (a device an in-world controller
-    /// created): the network is told ([`Flow::Crashed`]).
+    /// created, or one whose options say so): the network is told ([`Flow::Crashed`]).
     contain: bool,
+    /// Paused by an operator event: its store is kept but never polled; its timers and poll
+    /// deadline are held in `held` as they come due, frames for it are dropped at its ports.
+    paused: bool,
+    /// Its events that came due while it was paused, with the keys they were popped with.
+    held: Vec<(EventKey, Event)>,
+    /// Frames that reached its ports while it was paused (dropped there).
+    paused_drops: u64,
 }
 
 /// How a run returned to the network: done, stopped, or at an operator event that only the
@@ -262,6 +269,8 @@ pub(crate) struct Executor {
     crashed: std::collections::VecDeque<(usize, String)>,
     /// A wall clock (ns) for per-device cost reports; `None`: no wall times.
     wall: Option<fn() -> u64>,
+    /// How many actors are paused.
+    paused: usize,
 }
 
 impl Executor {
@@ -282,6 +291,7 @@ impl Executor {
             derived_pending: None,
             crashed: std::collections::VecDeque::new(),
             wall: None,
+            paused: 0,
         }
     }
 
@@ -422,6 +432,9 @@ impl Executor {
             polls_this_instant: 0,
             stopped: false,
             contain: false,
+            paused: false,
+            held: Vec::new(),
+            paused_drops: 0,
         });
     }
 
@@ -440,6 +453,9 @@ impl Executor {
             polls_this_instant: 0,
             stopped: false,
             contain: false,
+            paused: false,
+            held: Vec::new(),
+            paused_drops: 0,
         });
     }
 
@@ -514,6 +530,55 @@ impl Executor {
         slot.future = None;
         slot.stopped = true;
         slot.flag.take();
+        self.unpause(i);
+    }
+
+    /// Actor `i` is no longer paused: what it held is dropped (its store is gone).
+    fn unpause(&mut self, i: usize) {
+        let slot = &mut self.actors[i];
+        if std::mem::take(&mut slot.paused) {
+            self.paused -= 1;
+        }
+        slot.held.clear();
+        slot.paused_drops = 0;
+    }
+
+    /// Pauses actor `i`: its store is kept, it is not polled until
+    /// [`resume_actor`](Self::resume_actor), and what comes due for it meanwhile is held.
+    pub(crate) fn pause_actor(&mut self, i: usize) {
+        if !std::mem::replace(&mut self.actors[i].paused, true) {
+            self.paused += 1;
+        }
+    }
+
+    /// Resumes actor `i`: its held timers and poll deadline are queued again under the keys
+    /// they came due with (so they fire next, in their order, at the current instant), and it
+    /// is polled again. Returns how many were held and how many frames were dropped at its
+    /// ports meanwhile.
+    pub(crate) fn resume_actor(&mut self, i: usize) -> (usize, u64) {
+        self.at_boundary = false;
+        let slot = &mut self.actors[i];
+        if std::mem::take(&mut slot.paused) {
+            self.paused -= 1;
+        }
+        let held = std::mem::take(&mut slot.held);
+        let drops = std::mem::take(&mut slot.paused_drops);
+        let n = held.len();
+        for (key, event) in held {
+            self.clock.requeue(key, event);
+        }
+        (n, drops)
+    }
+
+    /// The actor whose number is `number`, if any.
+    fn by_number(&self, number: u32) -> Option<usize> {
+        let at = self
+            .order
+            .partition_point(|&j| self.actors[j].number < number);
+        self.order
+            .get(at)
+            .copied()
+            .filter(|&j| self.actors[j].number == number)
     }
 
     /// Gives slot `i` a new actor (a stopped device started again, with the same index).
@@ -538,6 +603,27 @@ impl Executor {
     /// Whether a trap of actor `i` stops only it instead of failing the network.
     pub(crate) fn set_contain(&mut self, i: usize, on: bool) {
         self.actors[i].contain = on;
+    }
+
+    /// The one rule for a fault of actor `i`, whatever raised it (its guest, its fuel or
+    /// memory, a host import, an operator event): a contained actor stops alone (`Ok(true)`:
+    /// the caller tells the network), any other fails the network with [`Error::Trap`].
+    pub(crate) fn fault(&mut self, i: usize, error: Fault) -> Result<bool, Error> {
+        let slot = &mut self.actors[i];
+        slot.future = None;
+        if slot.contain {
+            // A crash of this device alone: never polled again.
+            slot.stopped = true;
+            slot.flag.take();
+            self.unpause(i);
+            return Ok(true);
+        }
+        Err(Error::Trap {
+            device: slot.name.clone(),
+            at: self.clock.now(),
+            detail: error.detail,
+            message: error.message,
+        })
     }
 
     /// Contained traps not yet handed to the network (one from a control call's settle).
@@ -583,7 +669,8 @@ impl Executor {
             self.round += 1;
             for k in 0..self.order.len() {
                 let i = self.order[k];
-                if !self.actors[i].flag.take() || self.actors[i].stopped {
+                // A paused actor keeps its wake for when it resumes.
+                if self.actors[i].stopped || self.actors[i].paused || !self.actors[i].flag.take() {
                     continue;
                 }
                 polled_any = true;
@@ -616,7 +703,7 @@ impl Executor {
             // A quiet actor (no command, nothing in flight, no live guest task) has no wake to
             // miss: polling it would only cost time (most of a stepped device's polls).
             let slot = &self.actors[i];
-            if slot.stopped || (slot.inbox.is_empty() && slot.status.is_quiet()) {
+            if slot.stopped || slot.paused || (slot.inbox.is_empty() && slot.status.is_quiet()) {
                 continue;
             }
             self.poll_actor(i)?;
@@ -649,20 +736,12 @@ impl Executor {
             Poll::Ready(Ok(())) => Fault::new("device actor exited"),
             Poll::Ready(Err(e)) => e,
         };
-        slot.future = None;
-        if slot.contain {
-            // A crash of this device alone: never polled again; the network is told.
-            slot.stopped = true;
-            slot.flag.take();
-            self.crashed.push_back((i, error.message));
-            return Ok(());
+        let message = error.message.clone();
+        if self.fault(i, error)? {
+            // The network is told: it stops the device as crashed.
+            self.crashed.push_back((i, message));
         }
-        Err(Error::Trap {
-            device: slot.name.clone(),
-            at: self.clock.now(),
-            detail: error.detail,
-            message: error.message,
-        })
+        Ok(())
     }
 
     /// Phase 2: one event, at its instant.
@@ -671,6 +750,9 @@ impl Executor {
         // Records made while dispatching (the inbound pcap tap, a link transition) sort before
         // the device polls that follow (round 0).
         let operator = matches!(event, Event::Operator(_) | Event::Derived(_));
+        // Only while a device is paused can a timer or poll deadline be held (under its key).
+        let key_kept = (self.paused > 0 && matches!(event, Event::Timer(_) | Event::Poll(_)))
+            .then(|| key.clone());
         self.clock.set_ctx(Origin::Popped, Some(key), 0);
         self.round = 0;
         if operator {
@@ -685,14 +767,36 @@ impl Executor {
             }
         }
         match event {
-            Event::Timer(waker) => waker.wake(),
+            Event::Timer(waker) => {
+                // A paused device's timer (its key names the device whose poll set it) is held
+                // until it resumes.
+                let owner = key_kept
+                    .as_ref()
+                    .and_then(|k| self.by_number(k.levels[0].device))
+                    .filter(|&i| self.actors[i].paused);
+                match (owner, key_kept) {
+                    (Some(i), Some(key)) => self.actors[i].held.push((key, Event::Timer(waker))),
+                    _ => waker.wake(),
+                }
+            }
+            Event::Poll(device) if self.actors[device].paused => {
+                if let Some(key) = key_kept {
+                    self.actors[device].held.push((key, Event::Poll(device)));
+                }
+            }
             Event::Poll(device) => self.actors[device].inbox.push(Command::Poll),
             Event::Deliver(d) => {
                 if self.panel.arrive(&self.clock, at, &d) {
-                    self.actors[d.device].inbox.push(Command::Receive {
-                        port: d.port,
-                        frame: d.frame,
-                    });
+                    let slot = &mut self.actors[d.device];
+                    if slot.paused {
+                        // It reached the port; a sleeping device takes nothing in.
+                        slot.paused_drops += 1;
+                    } else {
+                        slot.inbox.push(Command::Receive {
+                            port: d.port,
+                            frame: d.frame,
+                        });
+                    }
                 }
             }
             Event::LinkState { link, up } => {
@@ -750,6 +854,14 @@ impl Executor {
                 port,
                 bytes,
             } => self.panel.transmit(&self.clock, device, port, bytes),
+            CoreOp::Control { device, .. } if self.actors[device].paused => {
+                self.ops[i].state = OpState::Failed {
+                    at,
+                    events,
+                    message: format!("`{}` is paused", self.actors[device].name),
+                };
+                return;
+            }
             CoreOp::Control { device, call } => {
                 // Served by the device's event loop in this event's rounds; the answer (the
                 // device's own refusal, if any) is kept for `op_states`.
@@ -784,7 +896,10 @@ impl Executor {
         let mut daemons = Vec::new();
         for slot in self.actors.iter().filter(|s| !s.stopped) {
             let s = slot.status.snapshot();
-            outstanding.extend(s.outstanding.into_iter().map(|c| (slot.name.clone(), c)));
+            // A paused device waits for its resume, not for a call: never a deadlock.
+            if !slot.paused {
+                outstanding.extend(s.outstanding.into_iter().map(|c| (slot.name.clone(), c)));
+            }
             daemons.extend(s.daemons.into_iter().map(|c| format!("{}: {c}", slot.name)));
             if s.alive {
                 parked.push(slot.name.clone());

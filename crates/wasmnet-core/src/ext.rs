@@ -18,6 +18,10 @@
 //!   operator event, [`Control`] ([`crate::Op::Control`], [`crate::Op::ControlNamed`]).
 //! * Ops of an extension ([`ExtensionOp`], [`crate::Op::Extension`]): applied by the network in
 //!   the op's own processing context through an [`OpContext`].
+//! * Embedder actions ([`Action`], [`crate::Network::register_action`], [`crate::Op::Action`]):
+//!   a closure of the embedder's, called through an [`OpContext`] when its op applies.
+//! * A device's life ([`NetworkExtension::device_life`]): pauses, stops, starts, crashes and
+//!   removals, heard right after the network journalled them.
 //!
 //! Embedder surface, unstable: everything in this module is public for embedders, and it may
 //! change between versions without notice.
@@ -172,6 +176,46 @@ impl DeviceExt {
     }
 }
 
+/// What happened to a device ([`NetworkExtension::device_life`]): one value per journal record
+/// the network makes about the device's life.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LifeEvent<'a> {
+    /// Paused (`device-paused`, [`crate::Op::PauseDevice`]): its store is kept and no longer
+    /// runs.
+    Paused,
+    /// Resumed (`device-resumed`, [`crate::Op::ResumeDevice`]).
+    Resumed,
+    /// Stopped (`device-stopped`): by an operator event, its controller, or with its owner. Its
+    /// store is gone; it may start again.
+    Stopped,
+    /// Started again after a stop or a crash (`device-started`), with a fresh store.
+    Started,
+    /// It crashed (`device-crashed`): a trap of its own, its fuel or memory, an extension's
+    /// import, or [`crate::Op::CrashDevice`]. Its store is gone; it may start again.
+    Crashed {
+        /// The one-line message journalled with it.
+        message: &'a str,
+    },
+    /// Removed (`device-removed`), for good: its name is free, and a later device of the same
+    /// name is a new device. A controller's recreation (a new spec) is a removal and a new
+    /// device.
+    Removed,
+}
+
+/// The device a [`NetworkExtension::device_life`] call is about.
+pub struct DeviceLife<'a> {
+    /// Its index in the network.
+    pub index: usize,
+    /// Its name in the network.
+    pub name: &'a str,
+    /// The instant it happened.
+    pub at: Nanos,
+    pub event: LifeEvent<'a>,
+    /// Its journal (records under its name), after the network's own record.
+    pub journal: &'a JournalEnd,
+}
+
 /// A network extension: network-wide state plus hooks the network calls at fixed points, in
 /// registration order. Reach it with [`crate::Network::extension`].
 pub trait NetworkExtension: Any + Send {
@@ -180,6 +224,17 @@ pub trait NetworkExtension: Any + Send {
     /// after it entered its setup slot, for an added or restarted one in the op's own context.
     fn device_setup(&mut self, setup: &DeviceSetup<'_>, ext: &mut DeviceExt) {
         let _ = (setup, ext);
+    }
+
+    /// A device paused, resumed, stopped, started again, crashed or was removed. Called right
+    /// after the network made the change and journalled its record, in the same processing
+    /// context, before anything else (a cascade's devices, the event's rounds): an extension
+    /// that journals here comes after the network's record. The device's store is already
+    /// dropped for [`LifeEvent::Stopped`], [`LifeEvent::Crashed`] and [`LifeEvent::Removed`]
+    /// (a backend's per-store state went with it); for [`LifeEvent::Started`] the new store
+    /// exists and has not run yet.
+    fn device_life(&mut self, life: &DeviceLife<'_>) {
+        let _ = life;
     }
 }
 
@@ -430,9 +485,27 @@ pub struct OpContext<'a> {
     pub(crate) network: &'a mut dyn OpTarget,
 }
 
+/// An embedder action being called ([`crate::Op::Action`], [`crate::Network::register_action`]).
+#[derive(Clone, Copy, Debug)]
+pub struct ActionCall<'a> {
+    /// The name it was registered under.
+    pub name: &'a str,
+    /// The device the op names (its `action` record is journalled on it).
+    pub device: &'a str,
+    /// The op's argument, as given.
+    pub argument: &'a str,
+}
+
+/// An embedder action ([`crate::Network::register_action`]): called when an [`crate::Op::Action`]
+/// naming it applies. An `Err` is the op's refusal ([`crate::OpState::Failed`]).
+pub type Action<'r> =
+    Box<dyn FnMut(&mut OpContext<'_>, &ActionCall<'_>) -> Result<(), OpError> + 'r>;
+
 /// The network's side of an [`OpContext`] (implemented by the network for every runtime).
 pub(crate) trait OpTarget {
     fn running(&self, name: &str) -> Result<DeviceId, OpError>;
+    fn phase(&self, name: &str) -> Option<crate::DevicePhase>;
+    fn add_op(&mut self, op: crate::Op, placement: crate::Placement) -> crate::Result<usize>;
     fn require_export(&self, device: DeviceId, export: &str) -> crate::Result<()>;
     fn device_name(&self, device: DeviceId) -> &str;
     fn journal_event(&self, device: &str, at: Nanos, kind: &str, fields: Vec<(&str, String)>);
@@ -450,6 +523,20 @@ impl OpContext<'_> {
     /// [`OpError::NotRunning`]).
     pub fn running(&self, name: &str) -> Result<DeviceId, OpError> {
         self.network.running(name)
+    }
+
+    /// The phase of the device called `name` that is not removed, if there is one.
+    pub fn phase(&self, name: &str) -> Option<crate::DevicePhase> {
+        self.network.phase(name)
+    }
+
+    /// Places another operator event, exactly as [`crate::Network::add_op`] does between runs
+    /// (the same refusals: a timed placement before the op's instant, an op a split network
+    /// does not take). One placed at the op's own instant whose key sorts before the next
+    /// queued event (`EndOf(now)` from an op at the start of the instant, say) applies right
+    /// after this op's rounds, before anything else still queued.
+    pub fn add_op(&mut self, op: crate::Op, placement: crate::Placement) -> crate::Result<usize> {
+        self.network.add_op(op, placement)
     }
 
     /// Refuses (as [`crate::Error::Refused`]) a device that does not report `export`.
