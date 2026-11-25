@@ -36,6 +36,10 @@ use crate::config::DeviceConfig;
 use crate::journal::{Journal, JournalEnd, JournalEntry, Record, Stream};
 use crate::network::DeviceOptions;
 
+mod calls;
+
+pub use calls::{Calls, require_grant, ungranted};
+
 /// Answers kept per caller for request-id retries.
 const ANSWERS_KEPT: usize = 256;
 

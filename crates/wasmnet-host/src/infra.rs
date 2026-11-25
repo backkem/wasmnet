@@ -1,11 +1,12 @@
-//! `wasmnet:infra` on the wasmtime backend: an in-world controller's calls, served from its
-//! [`wasmnet_core::InfraEnd`] (the sim core does the work, so every runtime answers the same).
-//! Every store links it; a device the network did not grant it
-//! ([`wasmnet_core::DeviceOptions::infra`]) gets `denied` for every call, and a component that
-//! imports it without the grant does not instantiate ([`require_grant`]). See
+//! `wasmnet:infra` on the wasmtime backend: an in-world controller's calls, served by the sim
+//! core's [`Calls`] from its [`wasmnet_core::InfraEnd`] (the core does the work and decides
+//! what a device without the grant gets, so every runtime answers the same). This file only
+//! converts between the WIT bindings and the core's types. Every store links it; a device the
+//! network did not grant it ([`wasmnet_core::DeviceOptions::infra`]) gets `denied`, and a
+//! component that imports it without the grant does not instantiate ([`require_grant`]). See
 //! `docs/design/topology-and-infra.md`.
 
-use wasmnet_core::infra::{ChangeKind, DeviceView, InfraError, Phase};
+use wasmnet_core::infra::{Calls, ChangeKind, DeviceView, InfraError, Phase};
 use wasmtime::component::{Accessor, Component, HasData, Linker};
 
 use crate::wasi::HostState;
@@ -63,10 +64,10 @@ fn error(e: InfraError) -> types::Error {
     }
 }
 
-fn ungranted() -> types::Error {
-    types::Error::Denied(
-        "this device is not granted wasmnet:infra (`DeviceOptions::infra`)".to_owned(),
-    )
+impl HostState {
+    fn calls(&self) -> Calls<'_> {
+        Calls::new(self.infra.as_ref())
+    }
 }
 
 impl types::Host for HostState {}
@@ -79,8 +80,10 @@ impl devices::Host for HostState {
         labels: Vec<(String, String)>,
         spec: Vec<u8>,
     ) -> Result<types::Applied, types::Error> {
-        let end = self.infra.as_ref().ok_or_else(ungranted)?;
-        let (d, changed) = end.apply(request_id, &name, labels, &spec).map_err(error)?;
+        let (d, changed) = self
+            .calls()
+            .apply(request_id, &name, labels, &spec)
+            .map_err(error)?;
         Ok(types::Applied {
             device: device(d),
             changed,
@@ -92,8 +95,10 @@ impl devices::Host for HostState {
         request_id: Option<String>,
         name: String,
     ) -> Result<types::Device, types::Error> {
-        let end = self.infra.as_ref().ok_or_else(ungranted)?;
-        end.start(request_id, &name).map(device).map_err(error)
+        self.calls()
+            .start(request_id, &name)
+            .map(device)
+            .map_err(error)
     }
 
     fn stop(
@@ -102,15 +107,14 @@ impl devices::Host for HostState {
         name: String,
         grace_ns: u64,
     ) -> Result<types::Device, types::Error> {
-        let end = self.infra.as_ref().ok_or_else(ungranted)?;
-        end.stop(request_id, &name, grace_ns)
+        self.calls()
+            .stop(request_id, &name, grace_ns)
             .map(device)
             .map_err(error)
     }
 
     fn remove(&mut self, request_id: Option<String>, name: String) -> Result<bool, types::Error> {
-        let end = self.infra.as_ref().ok_or_else(ungranted)?;
-        end.remove(request_id, &name).map_err(error)
+        self.calls().remove(request_id, &name).map_err(error)
     }
 
     fn control(
@@ -120,8 +124,8 @@ impl devices::Host for HostState {
         command: String,
         argument: String,
     ) -> Result<types::Device, types::Error> {
-        let end = self.infra.as_ref().ok_or_else(ungranted)?;
-        end.control(request_id, &name, &command, &argument)
+        self.calls()
+            .control(request_id, &name, &command, &argument)
             .map(device)
             .map_err(error)
     }
@@ -132,8 +136,8 @@ impl devices::Host for HostState {
         name: String,
         cable: Vec<u8>,
     ) -> Result<types::Device, types::Error> {
-        let end = self.infra.as_ref().ok_or_else(ungranted)?;
-        end.wire(request_id, &name, &cable)
+        self.calls()
+            .wire(request_id, &name, &cable)
             .map(device)
             .map_err(error)
     }
@@ -144,8 +148,8 @@ impl devices::Host for HostState {
         name: String,
         port: u32,
     ) -> Result<types::Device, types::Error> {
-        let end = self.infra.as_ref().ok_or_else(ungranted)?;
-        end.unwire(request_id, &name, port)
+        self.calls()
+            .unwire(request_id, &name, port)
             .map(device)
             .map_err(error)
     }
@@ -154,8 +158,8 @@ impl devices::Host for HostState {
         &mut self,
         request_id: String,
     ) -> Result<Option<types::CommandAnswer>, types::Error> {
-        let end = self.infra.as_ref().ok_or_else(ungranted)?;
-        Ok(end
+        Ok(self
+            .calls()
             .control_answer(&request_id)
             .map_err(error)?
             .map(|a| types::CommandAnswer {
@@ -167,18 +171,12 @@ impl devices::Host for HostState {
     }
 
     fn get(&mut self, name: String) -> Result<types::Device, types::Error> {
-        let end = self.infra.as_ref().ok_or_else(ungranted)?;
-        end.get(&name).map(device).map_err(error)
+        self.calls().get(&name).map(device).map_err(error)
     }
 
     fn list(&mut self, selector: Vec<(String, String)>) -> (u64, Vec<types::Device>) {
-        match &self.infra {
-            Some(end) => {
-                let (rv, items) = end.list(&selector);
-                (rv, items.into_iter().map(device).collect())
-            }
-            None => (0, Vec::new()),
-        }
+        let (rv, items) = self.calls().list(&selector);
+        (rv, items.into_iter().map(device).collect())
     }
 
     fn watch(
@@ -187,24 +185,19 @@ impl devices::Host for HostState {
         since: u64,
         max: u32,
     ) -> (u64, Vec<types::Change>) {
-        match &self.infra {
-            Some(end) => {
-                let (rv, changes) = end.watch(&selector, since, max);
-                let changes = changes
-                    .into_iter()
-                    .map(|c| types::Change {
-                        kind: match c.kind {
-                            ChangeKind::Added => types::ChangeKind::Added,
-                            ChangeKind::Modified => types::ChangeKind::Modified,
-                            ChangeKind::Deleted => types::ChangeKind::Deleted,
-                        },
-                        device: device(c.device),
-                    })
-                    .collect();
-                (rv, changes)
-            }
-            None => (since, Vec::new()),
-        }
+        let (rv, changes) = self.calls().watch(&selector, since, max);
+        let changes = changes
+            .into_iter()
+            .map(|c| types::Change {
+                kind: match c.kind {
+                    ChangeKind::Added => types::ChangeKind::Added,
+                    ChangeKind::Modified => types::ChangeKind::Modified,
+                    ChangeKind::Deleted => types::ChangeKind::Deleted,
+                },
+                device: device(c.device),
+            })
+            .collect();
+        (rv, changes)
     }
 
     fn logs(
@@ -214,10 +207,9 @@ impl devices::Host for HostState {
         since: u64,
         tail: u32,
     ) -> Result<Vec<types::LogLine>, types::Error> {
-        let end = self.infra.as_ref().ok_or_else(ungranted)?;
-        let stream = wasmnet_core::infra::parse_stream(&stream).map_err(error)?;
-        Ok(end
-            .logs(&name, stream, since, tail)
+        Ok(self
+            .calls()
+            .logs(&name, &stream, since, tail)
             .map_err(error)?
             .into_iter()
             .map(|l| types::LogLine {
@@ -231,21 +223,18 @@ impl devices::Host for HostState {
 
 impl components::Host for HostState {
     fn supply(&mut self, digest: Option<String>, bytes: Vec<u8>) -> Result<String, types::Error> {
-        let end = self.infra.as_ref().ok_or_else(ungranted)?;
-        end.supply(digest.as_deref(), &bytes).map_err(error)
+        self.calls()
+            .supply(digest.as_deref(), &bytes)
+            .map_err(error)
     }
 
     fn release(&mut self, digest: String) -> Result<bool, types::Error> {
-        let end = self.infra.as_ref().ok_or_else(ungranted)?;
-        end.release(&digest).map_err(error)
+        self.calls().release(&digest).map_err(error)
     }
 
     fn list(&mut self) -> Vec<components::Supplied> {
-        let Some(end) = &self.infra else {
-            return Vec::new();
-        };
-        end.supplied()
-            .unwrap_or_default()
+        self.calls()
+            .supplied()
             .into_iter()
             .map(|c| components::Supplied {
                 digest: c.digest,
@@ -267,10 +256,11 @@ impl<U> changes::HostWithStore<U> for Infra {
         since: u64,
         deadline: Option<u64>,
     ) -> Result<u64, types::Error> {
-        let end = store
-            .with(|mut view| view.get().infra.clone())
-            .ok_or_else(ungranted)?;
-        Ok(end.wait(selector, since, deadline).await)
+        let end = store.with(|mut view| view.get().infra.clone());
+        let wait = Calls::new(end.as_ref())
+            .wait(selector, since, deadline)
+            .map_err(error)?;
+        Ok(wait.await)
     }
 }
 
@@ -280,25 +270,17 @@ pub(crate) fn add_to_linker(l: &mut Linker<HostState>) -> wasmtime::Result<()> {
     changes::add_to_linker::<_, Infra>(l, |s| s)
 }
 
-/// Whether `component` imports `wasmnet:infra` (any interface, any version).
-pub(crate) fn imports_infra(component: &Component) -> bool {
-    component
-        .component_type()
-        .imports(component.engine())
-        .any(|(name, _)| name.starts_with("wasmnet:infra/"))
-}
-
-/// Refuses a component that imports `wasmnet:infra` for a device the network did not grant it:
-/// a clear error at instantiation, before the guest ever runs.
+/// Refuses a component that imports `wasmnet:infra` for a device the network did not grant it
+/// ([`wasmnet_core::infra::require_grant`], over the component's import names).
 pub(crate) fn require_grant(
     device: &str,
     component: &Component,
     granted: bool,
 ) -> Result<(), String> {
-    if granted || !imports_infra(component) {
-        return Ok(());
-    }
-    Err(format!(
-        "device `{device}` imports wasmnet:infra, but the network does not grant it (`DeviceOptions::infra`)"
-    ))
+    let ty = component.component_type();
+    wasmnet_core::infra::require_grant(
+        device,
+        ty.imports(component.engine()).map(|(name, _)| name),
+        granted,
+    )
 }
