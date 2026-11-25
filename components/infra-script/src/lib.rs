@@ -83,6 +83,11 @@ pub enum Verb {
     Unwire {
         port: u32,
     },
+    /// `events.read` of the device's events of `kinds` (none: every kind) after `since`.
+    Events {
+        kinds: Vec<String>,
+        since: u64,
+    },
 }
 
 impl Verb {
@@ -97,6 +102,7 @@ impl Verb {
             Verb::Answer => "answer",
             Verb::Wire { .. } => "wire",
             Verb::Unwire { .. } => "unwire",
+            Verb::Events { .. } => "events",
         }
     }
 }
@@ -182,7 +188,7 @@ fn hex(text: &str) -> Option<Vec<u8>> {
 /// Parses one step's value.
 pub fn parse_step(n: u32, text: &str) -> Result<Step, String> {
     let syntax = "`<at> [id=<id>] [when=<id>~|!<text>|when=<id>.<key>=<value>] \
-                  apply|control|start|stop|remove|logs|answer|wire|unwire <name> [<rest>]`";
+                  apply|control|start|stop|remove|logs|answer|wire|unwire|events <name> [<rest>]`";
     let text = text.trim();
     let (at, rest) = text.split_once(char::is_whitespace).ok_or(syntax)?;
     let at = parse_duration(at).ok_or_else(|| format!("`{at}` is not a duration"))?;
@@ -267,6 +273,23 @@ pub fn parse_step(n: u32, text: &str) -> Result<Step, String> {
             return Err("answer: takes only a request id".to_owned());
         }
         "answer" => Verb::Answer,
+        "events" => {
+            let mut words = rest.split_whitespace();
+            let kinds = match words.next() {
+                None | Some("-") => Vec::new(),
+                Some(k) => k.split(',').map(str::to_owned).collect(),
+            };
+            let since = match words.next() {
+                None => 0,
+                Some(s) => s
+                    .parse()
+                    .map_err(|_| format!("events: `{s}` is not a cursor"))?,
+            };
+            if words.next().is_some() {
+                return Err("events: `events <name> [<kinds>|-] [<since>]`".to_owned());
+            }
+            Verb::Events { kinds, since }
+        }
         "logs" => {
             let mut words = rest.split_whitespace();
             let stream = match words.next() {
@@ -300,6 +323,82 @@ pub fn parse_step(n: u32, text: &str) -> Result<Step, String> {
     })
 }
 
+/// A reaction to a device's events (`on.<n>`): a call made once for each event of `device`
+/// whose kind matches `kinds` (and whose field `field` has that value, if given).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Rule {
+    pub n: u32,
+    pub device: String,
+    /// Kind patterns: a kind, or a prefix and `*`.
+    pub kinds: Vec<String>,
+    pub field: Option<(String, String)>,
+    /// The call (its `at` is unused; its request id is a prefix, `-<seq>` added per event).
+    pub step: Step,
+}
+
+/// Whether `kind` matches one of `patterns` (a kind, or a prefix and `*`).
+pub fn kind_matches(patterns: &[String], kind: &str) -> bool {
+    patterns.is_empty()
+        || patterns.iter().any(|p| match p.strip_suffix('*') {
+            Some(prefix) => kind.starts_with(prefix),
+            None => kind == p,
+        })
+}
+
+impl Rule {
+    /// Whether an event of `kind` with `fields` sets it off.
+    pub fn matches(&self, kind: &str, fields: &[(String, String)]) -> bool {
+        kind_matches(&self.kinds, kind)
+            && self
+                .field
+                .as_ref()
+                .is_none_or(|(k, v)| fields.iter().any(|(fk, fv)| fk == k && fv == v))
+    }
+}
+
+/// Parses one rule's value: `<device> <kinds> [<field>=<value>] : <call>`, the call as a step
+/// without its time.
+pub fn parse_rule(n: u32, text: &str) -> Result<Rule, String> {
+    let syntax = "`<device> <kind>[,<kind>...] [<field>=<value>] : [id=<id>] [when=...] \
+                  <verb> <name> [<rest>]`";
+    let (head, call) = text.split_once(" : ").ok_or(syntax)?;
+    let mut words = head.split_whitespace();
+    let device = words.next().ok_or(syntax)?.to_owned();
+    let kinds: Vec<String> = words
+        .next()
+        .ok_or(syntax)?
+        .split(',')
+        .map(str::to_owned)
+        .collect();
+    if kinds.iter().any(|k| k.is_empty()) {
+        return Err(syntax.to_owned());
+    }
+    let field = match words.next() {
+        None => None,
+        Some(pair) => {
+            let (k, v) = pair.split_once('=').ok_or(syntax)?;
+            if k.is_empty() || v.is_empty() {
+                return Err(syntax.to_owned());
+            }
+            Some((k.to_owned(), v.to_owned()))
+        }
+    };
+    if words.next().is_some() {
+        return Err(syntax.to_owned());
+    }
+    let mut step = parse_step(n, &format!("0ms {}", call.trim()))?;
+    if step.request_id == format!("step-{n}") {
+        step.request_id = format!("on-{n}");
+    }
+    Ok(Rule {
+        n,
+        device,
+        kinds,
+        field,
+        step,
+    })
+}
+
 /// The script: every step, in the order they run, and how far it got.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Script {
@@ -307,6 +406,17 @@ pub struct Script {
     next: usize,
     /// Set by the `set` command, used as `{<variable>}` in `control` arguments.
     variables: std::collections::BTreeMap<String, String>,
+    /// The reactions to events, by rule number.
+    rules: Vec<Rule>,
+    /// How far the events of each followed device were read (the cursor).
+    cursors: std::collections::BTreeMap<String, u64>,
+}
+
+/// A key's number after `prefix`: `step.<n>` or `on.<n>`, without leading zeros.
+fn key_number(key: &str, prefix: &str) -> Option<u32> {
+    key.strip_prefix(prefix)
+        .filter(|n| !n.is_empty() && (n.len() == 1 || !n.starts_with('0')))
+        .and_then(|n| n.parse::<u32>().ok())
 }
 
 impl Script {
@@ -318,26 +428,81 @@ impl Script {
         V: Into<String>,
     {
         let mut steps = Vec::new();
+        let mut rules = Vec::new();
         for (key, value) in pairs {
             let (key, value): (String, String) = (key.into(), value.into());
-            let n = key
-                .strip_prefix("step.")
-                .filter(|n| !n.is_empty() && (n.len() == 1 || !n.starts_with('0')))
-                .and_then(|n| n.parse::<u32>().ok())
-                .ok_or_else(|| ConfigError::Unknown { key: key.clone() })?;
-            let step = parse_step(n, &value).map_err(|why| ConfigError::Invalid {
+            let invalid = |why| ConfigError::Invalid {
                 key: key.clone(),
                 value: value.clone(),
                 why,
-            })?;
-            steps.push(step);
+            };
+            if let Some(n) = key_number(&key, "step.") {
+                steps.push(parse_step(n, &value).map_err(invalid)?);
+            } else if let Some(n) = key_number(&key, "on.") {
+                rules.push(parse_rule(n, &value).map_err(invalid)?);
+            } else {
+                return Err(ConfigError::Unknown { key: key.clone() });
+            }
         }
         steps.sort_by_key(|s| (s.at, s.n));
+        rules.sort_by_key(|r| r.n);
         Ok(Self {
             steps,
             next: 0,
             variables: Default::default(),
+            rules,
+            cursors: Default::default(),
         })
+    }
+
+    /// The devices whose events the rules follow, in the order of their first rule, each with
+    /// the kinds its rules want (none: every kind) and the cursor read so far.
+    pub fn followed(&self) -> Vec<(String, Vec<String>, u64)> {
+        let mut out: Vec<(String, Vec<String>, u64)> = Vec::new();
+        for r in &self.rules {
+            match out.iter_mut().find(|(d, ..)| *d == r.device) {
+                Some((_, kinds, _)) => {
+                    if !kinds.is_empty() {
+                        for k in &r.kinds {
+                            if !kinds.contains(k) {
+                                kinds.push(k.clone());
+                            }
+                        }
+                    }
+                }
+                None => {
+                    let since = self.cursors.get(&r.device).copied().unwrap_or(0);
+                    out.push((r.device.clone(), r.kinds.clone(), since));
+                }
+            }
+        }
+        out
+    }
+
+    /// The events of `device` were read up to `next`.
+    pub fn advance(&mut self, device: &str, next: u64) {
+        let c = self.cursors.entry(device.to_owned()).or_insert(0);
+        *c = (*c).max(next);
+    }
+
+    /// The calls event `seq` of `device` (`kind`, `fields`) sets off, in rule order, each with
+    /// its request id made unique for the event (`<id>-<seq>`).
+    pub fn reactions(
+        &self,
+        device: &str,
+        seq: u64,
+        kind: &str,
+        fields: &[(String, String)],
+    ) -> Vec<Step> {
+        self.rules
+            .iter()
+            .filter(|r| r.device == device && r.matches(kind, fields))
+            .map(|r| {
+                let mut step = r.step.clone();
+                step.request_id = format!("{}-{seq}", step.request_id);
+                step
+            })
+            .collect()
     }
 
     /// The steps due at `now` that have not run yet, in order (they count as run).
@@ -609,6 +774,107 @@ mod variable_tests {
         assert_eq!(s.variables(), "peer 203.0.113.2:6081");
         for bad in ["peer", "Peer x", "peer a b", ""] {
             assert!(s.set(bad).is_err(), "{bad:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod rule_tests {
+    use super::*;
+
+    #[test]
+    fn rules_react_to_events_once_each_with_their_own_request_id() {
+        let mut s = Script::from_pairs([
+            ("step.0", "0ms apply r1 a0"),
+            (
+                "on.0",
+                "r1 tunnel-up tunnel=to-b : control r1 route-replace fd00:b::/64 tunnel to-b",
+            ),
+            (
+                "on.1",
+                "r1 tunnel-down,tunnel-failed : id=down control r1 routes",
+            ),
+            ("on.2", "sw mac-* : events sw"),
+        ])
+        .unwrap();
+        assert_eq!(
+            s.followed(),
+            [
+                (
+                    "r1".to_owned(),
+                    vec![
+                        "tunnel-up".to_owned(),
+                        "tunnel-down".into(),
+                        "tunnel-failed".into()
+                    ],
+                    0
+                ),
+                ("sw".to_owned(), vec!["mac-*".to_owned()], 0),
+            ]
+        );
+        let up = [("tunnel".to_owned(), "to-b".to_owned())];
+        let got = s.reactions("r1", 7, "tunnel-up", &up);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].request_id, "on-0-7");
+        assert_eq!(
+            got[0].verb,
+            Verb::Control {
+                command: "route-replace".into(),
+                argument: "fd00:b::/64 tunnel to-b".into()
+            }
+        );
+        let other = [("tunnel".to_owned(), "to-c".to_owned())];
+        assert!(s.reactions("r1", 8, "tunnel-up", &other).is_empty());
+        assert_eq!(
+            s.reactions("r1", 9, "tunnel-failed", &[])[0].request_id,
+            "down-9"
+        );
+        assert_eq!(s.reactions("sw", 1, "mac-learned", &[]).len(), 1);
+        assert!(s.reactions("sw", 2, "flood", &[]).is_empty());
+        s.advance("r1", 9);
+        s.advance("r1", 4);
+        assert_eq!(s.followed()[0].2, 9, "a cursor never goes back");
+        for bad in [
+            "r1 tunnel-up control r1 routes",
+            "r1 : control r1 routes",
+            "r1 tunnel-up tunnel : control r1 routes",
+            "r1 a,,b : control r1 routes",
+            "r1 tunnel-up : fly r1",
+        ] {
+            assert!(parse_rule(0, bad).is_err(), "{bad:?}");
+        }
+        assert!(matches!(
+            Script::from_pairs([("on.01", "r1 x : stop r1")]),
+            Err(ConfigError::Unknown { .. })
+        ));
+    }
+
+    #[test]
+    fn events_steps_take_kinds_and_a_cursor() {
+        let verb = |text| parse_step(0, text).map(|s| s.verb);
+        assert_eq!(
+            verb("1ms events r1"),
+            Ok(Verb::Events {
+                kinds: Vec::new(),
+                since: 0
+            })
+        );
+        assert_eq!(
+            verb("1ms events r1 tunnel-*,route-added 4"),
+            Ok(Verb::Events {
+                kinds: vec!["tunnel-*".into(), "route-added".into()],
+                since: 4
+            })
+        );
+        assert_eq!(
+            verb("1ms events r1 - 2"),
+            Ok(Verb::Events {
+                kinds: Vec::new(),
+                since: 2
+            })
+        );
+        for bad in ["1ms events r1 x y", "1ms events r1 x 1 2"] {
+            assert!(parse_step(0, bad).is_err(), "{bad:?}");
         }
     }
 }
