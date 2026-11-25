@@ -5,7 +5,9 @@ deterministic", not "finished".
 
 ## Set up
 
-Rust comes from `rust-toolchain.toml`. Three tools must be on `PATH`, at these versions:
+Rust comes from `rust-toolchain.toml`. Three tools must be on `PATH`, at these versions
+([tools.toml](tools.toml) is where they are pinned, for CI and for other tooling; `cargo xtask
+tools --check` compares it with what is installed):
 
 ```sh
 cargo install --locked wasmtime-cli@50.0.1 wasm-tools@1.261.0 wac-cli@0.12.0

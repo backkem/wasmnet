@@ -34,8 +34,9 @@ jobs:
       - run: rustup show
       - uses: Swatinem/rust-cache@v2
       - uses: cargo-bins/cargo-binstall@v1.27.0
+      # The pinned versions are in tools.toml; `cargo xtask tools` prints them as package@version.
       - name: Install wasm-tools and wac (pinned)
-        run: cargo binstall --no-confirm --locked wasm-tools@1.261.0 wac-cli@0.12.0
+        run: cargo binstall --no-confirm --locked $(cargo xtask tools wasm-tools wac-cli)
 
       - uses: actions/setup-node@v7
         with:

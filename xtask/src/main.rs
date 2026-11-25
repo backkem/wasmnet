@@ -11,6 +11,10 @@
 //! cargo xtask build --list every component and node by name, without building
 //! cargo xtask test-guest   run every component's own tests (and wasmnet-wire's) as
 //!                          wasm32-wasip2 binaries inside wasmtime
+//! cargo xtask tools [--check] [PACKAGE...]
+//!                          the pinned command-line tools (tools.toml), one <package>@<version>
+//!                          per line, as `cargo install --locked` takes them; --check compares
+//!                          them, and the Rust toolchain, with what is on PATH
 //! cargo xtask web [--no-build] [--test]
 //!                          the browser example in web/dist: `build`, the simulator for
 //!                          wasm32-unknown-unknown, then `npm ci` and `npm run build` in web/;
@@ -20,7 +24,7 @@
 //!
 //! Build outputs land in `target/wasm32-wasip2/release/` (or under `$CARGO_TARGET_DIR`).
 //! `build` needs `wac` and `wasm-tools` on `PATH`, `test-guest` needs `wasmtime`, `web` needs
-//! Node 24 and npm, and a Chromium for `--test` (the versions are in the workspace README). The
+//! Node 24 and npm, and a Chromium for `--test`. The tools' versions are in `tools.toml`; the
 //! components and nodes are listed in `components/README.md`.
 
 use std::collections::BTreeSet;
@@ -380,6 +384,116 @@ fn build(args: &BuildArgs) -> Result<()> {
     Ok(())
 }
 
+/// The pinned versions in `tools.toml`: the Rust toolchain, and the command-line tools by
+/// their crates.io package.
+struct Tools {
+    rust: String,
+    cargo_install: Vec<(String, String)>,
+}
+
+impl Tools {
+    /// The pinned version of the tool installed by `package`.
+    fn version(&self, package: &str) -> Option<&str> {
+        let (_, version) = self.cargo_install.iter().find(|(p, _)| p == package)?;
+        Some(version)
+    }
+}
+
+/// Reads `tools.toml`: `rust = "<version>"` first, then `<package> = "<version>"` lines under
+/// `[cargo-install]`.
+fn tools(text: &str) -> Result<Tools> {
+    let mut section = "";
+    let mut rust = None;
+    let mut cargo_install = Vec::new();
+    for line in text.lines() {
+        let line = line.split('#').next().unwrap_or_default().trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(name) = line.strip_prefix('[') {
+            section = name.trim_end_matches(']');
+            continue;
+        }
+        let (key, value) = line
+            .split_once('=')
+            .ok_or_else(|| format!("tools.toml: `{line}` is not `name = \"version\"`"))?;
+        let (key, value) = (key.trim(), value.trim().trim_matches('"').to_owned());
+        match (section, key) {
+            ("", "rust") => rust = Some(value),
+            ("cargo-install", package) => cargo_install.push((package.to_owned(), value)),
+            _ => return Err(format!("tools.toml: unknown key `{key}` in [{section}]").into()),
+        }
+    }
+    Ok(Tools {
+        rust: rust.ok_or("tools.toml: no `rust`")?,
+        cargo_install,
+    })
+}
+
+/// The version in a program's `--version` line, its second word (`wasmtime 50.0.1 (...)`), if
+/// the program is on `PATH`.
+fn reported_version(program: &str, dir: &Path) -> Option<String> {
+    let out = Command::new(program)
+        .current_dir(dir)
+        .arg("--version")
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    Some(text.split_whitespace().nth(1)?.to_owned())
+}
+
+/// `tools`: the pinned command-line tools as `<package>@<version>` lines (all of them, or the
+/// named packages); with `--check`, a comparison with what is installed instead.
+fn tools_command(args: &[String]) -> Result<()> {
+    let root = root();
+    let pins = tools(&fs::read_to_string(root.join("tools.toml"))?)?;
+    let check = args.iter().any(|a| a == "--check");
+    let wanted: Vec<&str> = args
+        .iter()
+        .map(String::as_str)
+        .filter(|a| *a != "--check")
+        .collect();
+    for w in &wanted {
+        if w.starts_with('-') {
+            return Err(format!("tools: unknown option {w}").into());
+        }
+        if pins.version(w).is_none() {
+            return Err(format!("tools: `{w}` is not in tools.toml").into());
+        }
+    }
+    let selected = pins
+        .cargo_install
+        .iter()
+        .filter(|(p, _)| wanted.is_empty() || wanted.contains(&p.as_str()));
+    if !check {
+        for (package, version) in selected {
+            println!("{package}@{version}");
+        }
+        return Ok(());
+    }
+    // The program a package installs: `wasmtime-cli` gives `wasmtime`, `wac-cli` gives `wac`.
+    let mut programs = vec![("rustc", pins.rust.as_str())];
+    programs.extend(selected.map(|(p, v)| (p.trim_end_matches("-cli"), v.as_str())));
+    let mut wrong = 0;
+    for (program, version) in programs {
+        match reported_version(program, &root) {
+            Some(found) if found == version => println!("  ok       {program} {version}"),
+            Some(found) => {
+                println!("  WRONG    {program} {found}: tools.toml pins {version}");
+                wrong += 1;
+            }
+            None => {
+                println!("  MISSING  {program}: tools.toml pins {version}");
+                wrong += 1;
+            }
+        }
+    }
+    if wrong > 0 {
+        return Err(format!("{wrong} tool(s) not at the pinned version").into());
+    }
+    Ok(())
+}
+
 /// `npm` (`npm.cmd` on Windows, where Command does not search for `.cmd` files).
 fn npm() -> Command {
     Command::new(if cfg!(windows) { "npm.cmd" } else { "npm" })
@@ -438,13 +552,15 @@ fn web(args: &[String]) -> Result<()> {
 }
 
 const USAGE: &str = "usage: cargo xtask build [--only NAME[,NAME...]] [--out-dir DIR] | \
-cargo xtask build --list | cargo xtask test-guest | cargo xtask web [--no-build] [--test]";
+cargo xtask build --list | cargo xtask test-guest | cargo xtask tools [--check] [PACKAGE...] | \
+cargo xtask web [--no-build] [--test]";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
         Some("build") => build_args(&args[1..]).and_then(|args| build(&args)),
         Some("test-guest") if args.len() == 1 => test_guest(),
+        Some("tools") => tools_command(&args[1..]),
         Some("web") => web(&args[1..]),
         _ => Err(USAGE.into()),
     };
@@ -525,6 +641,135 @@ mod tests {
 
         let unknown = select(&crates, &nodes, &strings(&["node-nowhere"]));
         assert!(unknown.is_err_and(|e| e.to_string().contains("node-nowhere")));
+    }
+
+    #[test]
+    fn the_tools_file_is_read() {
+        let pins = tools(
+            "# a comment\nrust = \"1.2.3\"\n\n[cargo-install]\nwasm-tools = \"4.5.6\" # why\n",
+        )
+        .unwrap();
+        assert_eq!(pins.rust, "1.2.3");
+        assert_eq!(pins.version("wasm-tools"), Some("4.5.6"));
+        assert_eq!(pins.version("wac-cli"), None);
+        assert!(
+            tools("[cargo-install]\nwac-cli = \"1\"\n").is_err(),
+            "no rust"
+        );
+        assert!(
+            tools("rust = \"1\"\nnode = \"24\"\n").is_err(),
+            "unknown key"
+        );
+    }
+
+    /// The versions written after `<package>@` in `text`.
+    fn mentions(text: &str, package: &str) -> Vec<String> {
+        let marker = format!("{package}@");
+        text.match_indices(&marker)
+            .map(|(at, _)| {
+                text[at + marker.len()..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit() || *c == '.')
+                    .collect::<String>()
+                    .trim_end_matches('.')
+                    .to_owned()
+            })
+            .filter(|version| !version.is_empty())
+            .collect()
+    }
+
+    /// Every Markdown and workflow file of the repository, outside build output and vendored
+    /// trees.
+    fn prose(dir: &Path, found: &mut Vec<PathBuf>) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default();
+            if path.is_dir() {
+                if !matches!(
+                    name,
+                    "target" | "node_modules" | "third_party" | ".git" | "dist"
+                ) {
+                    prose(&path, found);
+                }
+            } else if name.ends_with(".md") || name.ends_with(".yml") {
+                found.push(path);
+            }
+        }
+    }
+
+    /// `tools.toml` is where the versions are: the toolchain file, the manifests, the install
+    /// lines in the prose and the workflows agree with it.
+    #[test]
+    fn the_tool_versions_are_the_same_everywhere() {
+        let root = root();
+        let read = |path: &str| fs::read_to_string(root.join(path)).unwrap();
+        let pins = tools(&read("tools.toml")).unwrap();
+        let wasmtime = pins
+            .version("wasmtime-cli")
+            .expect("wasmtime-cli is pinned");
+
+        let toolchain = read("rust-toolchain.toml");
+        assert!(
+            toolchain.contains(&format!("channel = \"{}\"", pins.rust)),
+            "rust-toolchain.toml pins Rust {}",
+            pins.rust
+        );
+        // The wasmtime that runs the component tests is the wasmtime the host embeds.
+        let manifest = read("Cargo.toml");
+        for krate in ["wasmtime", "wasmtime-wasi"] {
+            assert!(
+                manifest.contains(&format!("{krate} = {{ version = \"={wasmtime}\"")),
+                "Cargo.toml pins {krate} {wasmtime}"
+            );
+        }
+
+        // Wherever a file writes `<package>@<version>`, it is the pinned version.
+        let mut files = Vec::new();
+        prose(&root, &mut files);
+        for file in &files {
+            let text = fs::read_to_string(file).unwrap();
+            for (package, version) in &pins.cargo_install {
+                for mention in mentions(&text, package) {
+                    assert_eq!(
+                        &mention,
+                        version,
+                        "{}: {package}@{mention}, tools.toml pins {version}",
+                        file.display()
+                    );
+                }
+            }
+        }
+        // The install line is in both places a newcomer reads, and the README's status line
+        // names the same versions.
+        for file in ["README.md", "CONTRIBUTING.md"] {
+            let text = read(file);
+            for (package, _) in &pins.cargo_install {
+                assert!(
+                    !mentions(&text, package).is_empty(),
+                    "{file} installs {package}"
+                );
+            }
+        }
+        let status = format!("Rust {} and wasmtime {wasmtime}", pins.rust);
+        let readme: Vec<String> = read("README.md")
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect();
+        assert!(readme.join(" ").contains(&status), "README.md: {status}");
+        // The workflows install what `cargo xtask tools` prints, not versions of their own.
+        for file in files
+            .iter()
+            .filter(|f| f.extension().is_some_and(|x| x == "yml"))
+        {
+            let text = fs::read_to_string(file).unwrap();
+            assert!(text.contains("cargo xtask tools"), "{}", file.display());
+            for (package, _) in &pins.cargo_install {
+                assert!(mentions(&text, package).is_empty(), "{}", file.display());
+            }
+        }
     }
 
     /// The cells of the Markdown table rows in `text` whose first cell is a name in backticks.

@@ -1,0 +1,17 @@
+# The tool versions this repository builds and tests with, in one place.
+#
+# `cargo xtask tools` prints the command-line tools as `<package>@<version>` (what
+# `cargo install --locked` and `cargo binstall` take), and `cargo xtask tools --check` compares
+# them with what is on PATH. CI installs from this file, and a test (`cargo test -p xtask`)
+# keeps the README, CONTRIBUTING.md, the workflows and the manifests in step with it. Another
+# repository's tooling can read it too: plain `name = "version"` lines.
+
+# The Rust toolchain: the channel rust-toolchain.toml pins.
+rust = "1.98.1"
+
+# Command-line tools on PATH, by crates.io package: wasmtime runs the component tests,
+# wasm-tools validates every component, wac composes the nodes.
+[cargo-install]
+wasmtime-cli = "50.0.1"
+wasm-tools = "1.261.0"
+wac-cli = "0.12.0"

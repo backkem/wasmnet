@@ -97,7 +97,7 @@ cargo xtask web --test     # the browser page, in headless Chromium (needs Node 
 
 Experimental, version 0.0.0: the Rust API and the WIT still move. A browser run is live and
 repeats itself, but is not byte-identical to a native one. Built on Rust 1.98.1 and wasmtime
-50.0.1, both pinned.
+50.0.1, both pinned ([tools.toml](tools.toml) has every tool version in one place).
 
 ## License
 
