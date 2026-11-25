@@ -87,7 +87,7 @@ from outside the core, so a lost constructor fails the tests.
     `mdns::Resolved::new(name, instance, host, port)`.
 - **Structs an embedder reads** (results, records, statistics and costs: `LinkStats`,
   `LinkInfo`, `DeviceCost`, `FrameRecord`, `Transmit`, `DeviceView`, `pcap::Capture`,
-  `CommandOutput`, ...) are `#[non_exhaustive]` too: read their fields, and destructure them
+  `CommandOutput`, `DeviceEntropy`, ...) are `#[non_exhaustive]` too: read their fields, and destructure them
   with `..`.
 - **Enums that may grow** (outcomes, events, phases, reasons, errors: `Outcome`,
   `DevicePhase`, `Cascade`, `FrameFate`, `FrameAction`, `OpState`, `Refusal`, `dns::RData`,
@@ -106,8 +106,9 @@ from outside the core, so a lost constructor fails the tests.
   - what mirrors a versioned format or WIT record: `PortInfo` and `DeclaredPort` (the WIT
     `port-info`), the causal key (`EventKey`, `KeyLevel`, `Ctx`, `Tag`, `Origin`), the site-sync
     messages (`sites::Msg`, `sites::Sync`, `RemoteFrame`), `infra::{Phase, ChangeKind,
-    InfraError}` (the `wasmnet:infra` enums), `journal::{Level, Stream}`, and the DHCP and DNS
-    messages (`dhcp::Message`, `dns::{Message, Question, Record}`);
+    InfraError}` (the `wasmnet:infra` enums), `journal::{Level, Stream}`, the DHCP and DNS
+    messages (`dhcp::Message`, `dns::{Message, Question, Record}`), and the browser boundary's
+    `wasmnet_web::codec::Value` and `wasmnet_web::infra::Reply`;
   - what a caller must handle in full, so that a new case is a compile error where it must be
     handled: a backend's `Command`, the stepping results `Step` and `sites::Step`, and
     `LinkKind` (Ethernet or a registered cable kind);

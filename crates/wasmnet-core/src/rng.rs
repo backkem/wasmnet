@@ -28,6 +28,7 @@ pub fn derive_seed(sim_seed: u64, component: &str, stream: &str) -> u64 {
 /// first two values of `insecure-seed`. One derivation for every backend, so a device draws the
 /// same numbers from the same seed wherever it runs.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct DeviceEntropy {
     /// `wasi:random/random`.
     pub secure: SimRng,
