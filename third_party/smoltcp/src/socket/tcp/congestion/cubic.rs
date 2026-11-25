@@ -179,6 +179,19 @@ impl Controller for Cubic {
         }
     }
 
+    fn on_partial_ack(&mut self, _now: Instant, len: usize) {
+        // RFC 6582 3.2 (5), as in Reno: deflate by the new data acknowledged, add back one
+        // segment for the retransmission.
+        if self.in_fast_recovery {
+            self.cwnd = self
+                .cwnd
+                .saturating_sub(len)
+                .saturating_add(self.mss)
+                .min(self.rwnd)
+                .max(self.mss);
+        }
+    }
+
     fn post_transmit(&mut self, now: Instant, _len: usize) {
         self.absorb_idle(now);
     }

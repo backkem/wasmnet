@@ -29,6 +29,11 @@ pub(super) trait Controller {
     /// Fired after an inferred loss via three duplicate acks.
     fn on_loss(&mut self, now: Instant, in_flight: usize) {}
 
+    /// Fired, instead of `on_ack`, on an ACK of new data during fast recovery that does not
+    /// yet acknowledge everything sent before the loss was detected (a partial ACK, RFC 6582).
+    /// The socket retransmits the next unacknowledged segment and stays in fast recovery.
+    fn on_partial_ack(&mut self, now: Instant, len: usize) {}
+
     fn pre_transmit(&mut self, now: Instant) {}
 
     fn post_transmit(&mut self, now: Instant, len: usize) {}

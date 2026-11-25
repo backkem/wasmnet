@@ -1,6 +1,6 @@
 # smoltcp: issues found while building wasmnet
 
-Pinned version: **smoltcp =0.14.0** (`Medium::Ethernet`, features as in `components/netstack/Cargo.toml`), **vendored with two patches** (`third_party/smoltcp`, `[patch.crates-io]`; #2 and #28 below). This is a running list of upstream bugs, spec deviations and API gaps that we hit, with the part of wasmnet where each was found and how we work around it today. Keep it current. When something gets filed upstream, add the link. When a fix lands, note the version and remove our workaround.
+Pinned version: **smoltcp =0.14.0** (`Medium::Ethernet`, features as in `components/netstack/Cargo.toml`), **vendored with three patches** (`third_party/smoltcp`, `[patch.crates-io]`; #2, #28 and #31 below). This is a running list of upstream bugs, spec deviations and API gaps that we hit, with the part of wasmnet where each was found and how we work around it today. Keep it current. When something gets filed upstream, add the link. When a fix lands, note the version and remove our workaround.
 
 These are our own notes from building one stack on smoltcp. Unless the last column says so, an
 entry has not been reported upstream yet, and some may turn out to be our misreading: check
@@ -38,10 +38,17 @@ Legend: **bug**: violates an RFC or is clearly wrong. **gap**: missing behaviour
 | 26 | gap | **No multicast loopback:** a datagram sent to a group the interface joined is never delivered to the node's own sockets (POSIX `IP_MULTICAST_LOOP` is on by default). | multicast and mDNS | The netstack pushes a copy of such a datagram back into its receive queue when the sending socket keeps `multicast-loopback` on. | not filed |
 | 27 | gap | **A UDP datagram is delivered to one socket only**, the first that accepts it, even for multicast (Linux delivers a group datagram to every socket bound to the port with `SO_REUSEADDR`). | multicast and mDNS | None needed yet: one mDNS responder per node; the resolver's one-shot queries use their own ephemeral ports. | not filed |
 | 28 | gap | **No way to save and restore an interface.** The random generator, the neighbor cache, the multicast groups and their report timers are private, and a socket cannot be put into a given slot of a `SocketSet` (slot order decides the order of frames). A node restored from a snapshot needs all of them. | node snapshots | **Our second vendored patch** (`snapshot` feature, `smoltcp-0002-snapshot-state.patch`): `Interface::snapshot_state`/`restore_state` (an `InterfaceState` of plain values, in the interface's own order), `SocketHandle::index`, `SocketSet::add_at`, and one round-trip test. Additive, behind a feature: nothing changes without it. | not proposed (wasmnet-specific shape; an upstream "interface state" API would be a design discussion) |
+| 29 | bug | **`socket-tcp-cubic` does not build without `std`.** `congestion/cubic.rs` calls `f64::powi` and `f64::mul_add`, which `core` does not have, so a `no_std` build with the feature fails (`E0599`). | TCP congestion control | The netstack enables only `socket-tcp-reno`; `tcp.congestion` offers `reno` and `none`. A fix would use `libm` or integer arithmetic (and `cube_root` already avoids `cbrt`). | not filed |
+| 30 | quirk | **The initial congestion window is 2048 bytes whatever the MSS** (`2 * DEFAULT_MSS` with a default MSS of 1024; `set_mss` changes the increments, not the window). At a 1500-byte MTU that is one full segment and 588 bytes, below RFC 5681's two full segments and far below RFC 6928's ten, and the receiver holds its ACK for its delayed-ACK time (10 ms) because less than two full segments arrived. | TCP congestion control, bulk transfers | None: it costs one delayed ACK at the start of a transfer. | not filed |
+| 31 | gap | **Fast recovery has no partial-ACK handling (NewReno, RFC 6582).** Reno leaves fast recovery on the first ACK of new data, so a second loss in the same window waits for three more duplicate ACKs, which seldom come, and then for a retransmission timeout (at least 1 s). A queue overflow drops several frames at once, so this is the common case. | TCP congestion control over a small transmit queue | **Fixed in our vendored smoltcp** (`smoltcp-0003-newreno-partial-acks.patch`, [below](#upstream-ready-patch-newreno-partial-acks-31)). | patch ready, not filed |
+| 32 | bug | **A FIN is accepted on a segment cut at the receive window's right edge.** `process` trims a segment to the window but takes its FIN whenever the segment starts at or before `RCV.NXT` (`control == Fin && window_start < segment_start` is the only check), so the FIN takes the sequence number of the first byte that was cut: the stream ends early with `CLOSE-WAIT`, and the ACK of the FIN acknowledges the first cut byte to the sender as if it had arrived. RFC 9293 §3.10.7.4 drops a FIN that lies beyond the window. A sender reaches past the window with a fast retransmission, which sends a full segment from `SND.UNA` without looking at the window (also a bug). | TCP congestion-control tests, a receive buffer exactly the size of the transfer and an app that reads only at the end: 1 or 2 bytes missing before EOF | None yet; apps that keep reading never meet it. The fix is to ignore the FIN when the accepted payload ends before the segment does, and to cap fast retransmissions at the window. | not filed |
+| 33 | gap | **No SACK-based recovery, Limited Transmit (RFC 3042), early retransmit (RFC 5827) or tail-loss probe, and a minimum RTO of 1 s** (`RTTE_MIN_RTO`, RFC 6298's SHOULD; Linux uses 200 ms). A loss that three duplicate ACKs do not reveal costs at least 1 s. smoltcp sends SACK blocks as a receiver but ignores the peer's. | TCP congestion control, lossy links | None; the costs are in `docs/design/netstack.md`. | not filed |
 
 
 ## Plan
 - ~~Fix #2~~: done (vendored patch). Open the upstream PR below, and drop `third_party/smoltcp` once a release has it.
+- ~~Fix #31~~: done (vendored patch, NewReno). Open the upstream PR below.
+- Fix #32 (a FIN past the window, and fast retransmissions past the window) with a vendored patch, or upstream first.
 - ~~Fix #7~~: done in the netstack (family demultiplexing). An upstream family filter would let us delete `UdpSockets::demux` and the TCP stray hand-off.
 - File upstream issues for #1, #3, #4, #5, #7, #8, #9, #18, #20, #21, #24, #26 and #27, with minimal repros. Our deterministic simulations make good reproducers.
 
@@ -93,3 +100,43 @@ The diff is [`smoltcp-0001-neighbor-rate-limit-per-address.patch`](smoltcp-0001-
 `two_neighbors_resolve_at_the_same_instant` (two ARP requests at t=0, both resolved at 200 µs),
 and the timelines of a ping test (three resolutions within 2 ms) and a traceroute test (the IPv6
 gateway resolved 6 ms after the IPv4 one).
+
+## Upstream-ready patch: NewReno partial ACKs (#31)
+
+Ready to send as a PR against smoltcp `main` (written and tested against 0.14.0; not opened
+yet). The diff is [`smoltcp-0003-newreno-partial-acks.patch`](smoltcp-0003-newreno-partial-acks.patch)
+(4 files, +269 / -8; applies with `git apply` to the 0.14.0 crate): exactly the change in
+`third_party/smoltcp`.
+
+**Title:** tcp: retransmit on partial ACKs during fast recovery (NewReno, RFC 6582)
+
+**Description:**
+
+> Fast recovery ends on the first ACK of new data (`Reno::on_ack`, `Cubic::on_ack`). When
+> several segments of one window were lost, as when a router queue overflows, that ACK is a
+> partial ACK: it points at the next hole. The socket then needs three more duplicate ACKs to
+> retransmit it; they only come if enough new data follows, so the usual outcome is a
+> retransmission timeout, at least 1 s, and a go-back-N resend in slow start.
+>
+> This change keeps fast recovery until everything sent before the loss was detected is
+> acknowledged (RFC 6582's `recover`, the new `Socket::fast_recovery_until`). A partial ACK
+> retransmits the segment it points at right away and calls the controller's new
+> `on_partial_ack` instead of `on_ack`; Reno and Cubic deflate the window by the newly
+> acknowledged data and add back one segment (RFC 6582 §3.2 step 5). Duplicate ACKs during
+> recovery only inflate the window, as before, and no longer start a second fast retransmit.
+> A retransmission timeout ends recovery. With `CongestionControl::None` nothing changes: there
+> is no fast recovery, and each loss still waits for its own three duplicate ACKs.
+>
+> Tests: `test_fast_recovery_retransmits_on_partial_ack` (two holes in one window, the second
+> retransmitted on the partial ACK, a fourth duplicate ACK sends nothing, the full ACK ends
+> recovery), `test_fast_recovery_ends_on_rto` and `test_no_fast_recovery_without_congestion_control`
+> in `socket/tcp.rs`, and `partial_acks_deflate_and_keep_fast_recovery` in `congestion/reno.rs`.
+> `cargo test --lib` passes with the default features (677 tests), with
+> `--features socket-tcp-reno,socket-tcp-cubic` (703), and with
+> `std,alloc,medium-ethernet,proto-ipv4,proto-ipv6,multicast,socket-tcp,socket-tcp-reno,socket-tcp-cubic,socket-udp,socket-icmp,socket-dhcpv4,auto-icmp-echo-reply` (318).
+
+**Found and verified in wasmnet:** the netstack's
+`reno_repairs_two_losses_in_one_window_without_a_timeout` (two holes in the last window: the
+second goes 200 µs after the first instead of after 1 s), and a 1 MB fetch through a 4-frame
+transmit queue at 10 Mbit/s (`crates/wasmnet-host/tests/congestion.rs`): 2.85 s with Reno
+alone, 1.85 s with this patch.

@@ -73,6 +73,19 @@ impl Controller for Reno {
         }
     }
 
+    fn on_partial_ack(&mut self, _now: Instant, len: usize) {
+        // RFC 6582 3.2 (5): deflate by the amount of new data acknowledged, then add back one
+        // segment for the retransmission the partial ACK triggers.
+        if self.in_fast_recovery {
+            self.cwnd = self
+                .cwnd
+                .saturating_sub(len)
+                .saturating_add(self.mss)
+                .min(self.rwnd)
+                .max(self.mss);
+        }
+    }
+
     fn on_loss(&mut self, _now: Instant, in_flight: usize) {
         // Only cut window size on first entrance to fast recovery.
         if !self.in_fast_recovery {
@@ -457,5 +470,27 @@ mod test {
         reno.set_remote_window(64 * 1024 * 1024);
 
         println!("{reno:?}");
+    }
+
+    #[test]
+    fn partial_acks_deflate_and_keep_fast_recovery() {
+        let mut reno = Reno::new();
+        reno.set_mss(MSS);
+        reno.cwnd = MSS * 32;
+        reno.on_loss(Instant::from_millis(0), MSS * 32);
+        assert_eq!(reno.cwnd, MSS * 16 + 3 * MSS);
+
+        // A partial ACK of 4 segments: the window shrinks by them and grows by one segment
+        // for the retransmission; fast recovery goes on.
+        reno.on_partial_ack(Instant::from_millis(1), 4 * MSS);
+        assert_eq!(reno.cwnd, MSS * 16);
+        assert!(reno.in_fast_recovery);
+
+        // Outside fast recovery a partial ACK changes nothing.
+        ack(&mut reno, MSS, Instant::from_millis(2));
+        assert_eq!(reno.cwnd, reno.ssthresh);
+        let cwnd = reno.cwnd;
+        reno.on_partial_ack(Instant::from_millis(3), 4 * MSS);
+        assert_eq!(reno.cwnd, cwnd);
     }
 }
