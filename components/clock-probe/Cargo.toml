@@ -33,5 +33,12 @@ crate-type = ["cdylib"]
 name = "ext-probe"
 path = "examples/ext_probe.rs"
 
+# `examples/disk_device.rs`: a stepped device (no ports) that imports a test-only disk, for the
+# host's fault and extension tests.
+[[example]]
+name = "disk-device"
+path = "examples/disk_device.rs"
+crate-type = ["cdylib"]
+
 [lints]
 workspace = true
