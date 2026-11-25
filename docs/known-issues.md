@@ -59,8 +59,9 @@ here so that nobody has to find these the hard way. Each entry names where the c
   compiled components live in memory for the run, bounded per controller by its
   `SupplyLimits`, not across controllers. A component compiled in another process is shared
   only through a compile cache directory, which must be trusted as before.
-- **A controller has no limits.** Nothing bounds how many devices a controller creates (beyond
-  its 2^20 device numbers per run) or what they allocate.
+- **A controller's limits are opt-in.** Without `DeviceOptions::infra_max_devices` nothing bounds
+  how many devices a controller creates (beyond its 2^20 device numbers per run), and without a
+  `memory` limit nothing bounds what they allocate.
 - **Split networks keep changes on one site.** A controller changes only devices on its own
   site; a creation cabled to another site's device fails the split run (`Error::Refused`), and
   WAN links cannot be created while a network runs. Operator events there are limited to
