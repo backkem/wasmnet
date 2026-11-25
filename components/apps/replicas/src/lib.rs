@@ -25,7 +25,10 @@
 //! | `wake` | `true`: also reconcile as soon as a device it sees changes (`wasmnet:infra/changes.wait`: a crash or an exit is handled at once, not at the next `period`) | `false` |
 //! | `start` | virtual time before the first reconcile | `0` |
 //! | `grace` | a removed instance keeps running this long first (`stop` with grace) | `0` |
-//! | `template.component` | the instances' catalog name (`node:http-server`) | required |
+//! | `template.component` | the instances' catalog name (`node:http-server`) | required, unless `template.fetch` |
+//! | `template.fetch` | `http://<ipv4>[:port]/<path>`: fetch the instances' component from a store node over HTTP (one `GET` at the first reconcile, again at each one until it works), supply it (`wasmnet:infra/components`, which the node must be granted) and make the instances from its digest | |
+//! | `template.digest` | with `template.fetch`: the digest the fetched component must have, `sha256:<64 hex>` (otherwise the supply is refused and nothing runs) | any |
+//! | `template.fetch-max` | with `template.fetch`: the largest component it accepts, bytes | `16777216` |
 //! | `template.stdio` | `journal` or `capture` (anything else is a config error) | `capture` |
 //! | `template.fuel_per_instant` | the instances' fuel per virtual instant (`50M`, `4G`) | the network's |
 //! | `template.config.<key>` | the instances' config; values may use `{n}`, `{n+K}`, `{n:02x}`, `{name}`, `{prefix}` | |
@@ -39,8 +42,9 @@
 //!
 //! # Journal
 //!
-//! `replicas-desired {replicas, from}` (from `config` or `stdin`), `replicas-observed {name, change,
-//! phase}` for each watch event, `replicas-registered {name, backend, status}`,
+//! `replicas-desired {replicas, from}` (from `config` or `stdin`), `replicas-supplied {digest,
+//! size}` once a fetched component is supplied, `replicas-observed {name, change, phase}` for
+//! each watch event, `replicas-registered {name, backend, status}`,
 //! `replicas-deregistered {name, status}`, `replicas-error {what, error}`; the `infra-*` events of
 //! its calls come from the host.
 
@@ -104,6 +108,72 @@ pub struct Lb {
     pub half_close: bool,
 }
 
+/// Where the instances' component comes from when it is fetched (`template.fetch`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Fetch {
+    pub addr: std::net::SocketAddrV4,
+    /// The request target, `/store/web.wasm`.
+    pub path: String,
+    /// The digest the component must have (`template.digest`).
+    pub digest: Option<String>,
+    /// The largest component it accepts, bytes (`template.fetch-max`).
+    pub max: u64,
+}
+
+impl Fetch {
+    /// The `GET` request; the server closes the connection after its response.
+    pub fn request(&self) -> Vec<u8> {
+        format!(
+            "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: wasmnet-replicas\r\nConnection: close\r\n\r\n",
+            self.path, self.addr
+        )
+        .into_bytes()
+    }
+}
+
+/// `http://<ipv4>[:port]/<path>`: the store's address (port 80 by default) and the target.
+pub fn parse_url(url: &str) -> Option<(std::net::SocketAddrV4, String)> {
+    let rest = url.trim().strip_prefix("http://")?;
+    let (authority, path) = rest.split_at(rest.find('/')?);
+    let addr = match authority.parse() {
+        Ok(addr) => addr,
+        Err(_) => std::net::SocketAddrV4::new(authority.parse().ok()?, 80),
+    };
+    (!path.contains([' ', '\r', '\n'])).then(|| (addr, path.to_owned()))
+}
+
+/// The body of a whole HTTP/1.1 response that must be `200`: everything after its head, which
+/// must be as long as its `Content-Length` says (when it says one). A chunked body is refused.
+pub fn response_body(response: &[u8]) -> Result<&[u8], String> {
+    let end = response
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .ok_or("no complete HTTP response head")?;
+    let head =
+        std::str::from_utf8(&response[..end]).map_err(|_| "a response head that is not text")?;
+    let body = &response[end + 4..];
+    let status = status_of(response).ok_or("no HTTP status line")?;
+    if status != 200 {
+        return Err(format!("status {status}"));
+    }
+    for line in head.lines().skip(1) {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let (name, value) = (name.trim().to_ascii_lowercase(), value.trim());
+        if name == "transfer-encoding" && !value.eq_ignore_ascii_case("identity") {
+            return Err(format!("transfer-encoding `{value}` is not supported"));
+        }
+        if name == "content-length" {
+            let n: usize = value.parse().map_err(|_| "a malformed content-length")?;
+            if n != body.len() {
+                return Err(format!("{} body bytes of {n}", body.len()));
+            }
+        }
+    }
+    Ok(body)
+}
+
 /// The parsed config.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Config {
@@ -123,6 +193,9 @@ pub struct Config {
     pub config: BTreeMap<String, String>,
     pub wire: Vec<Cable>,
     pub lb: Option<Lb>,
+    /// The instances' component is fetched and supplied (`template.fetch`): `component` is
+    /// empty until then, and then the digest reference the host answered.
+    pub fetch: Option<Fetch>,
 }
 
 fn invalid(key: &str, value: &str, expected: &'static str) -> ConfigError {
@@ -164,6 +237,7 @@ impl Config {
             config: BTreeMap::new(),
             wire: Vec::new(),
             lb: None,
+            fetch: None,
         };
         let mut wire: BTreeMap<u32, Cable> = BTreeMap::new();
         let (mut lb, mut backend) = (None, None);
@@ -173,6 +247,7 @@ impl Config {
         let mut deregister = request("deregister", "DELETE /backends/{name}")?;
         let mut register_body = "{backend}".to_owned();
         let mut half_close = false;
+        let (mut fetch, mut digest, mut fetch_max) = (None, None, 16u64 << 20);
         let dur =
             |k: &str, v: &str| parse_duration(v.trim()).ok_or_else(|| invalid(k, v, "a duration"));
         for (k, v) in pairs {
@@ -226,6 +301,25 @@ impl Config {
                 "start" => c.start_ns = dur(&k, &v)?,
                 "grace" => c.grace_ns = dur(&k, &v)?,
                 "template.component" => c.component = v.trim().to_owned(),
+                "template.fetch" => {
+                    let url = parse_url(&v)
+                        .ok_or_else(|| invalid(&k, &v, "http://<ipv4>[:port]/<path>"))?;
+                    fetch = Some(url);
+                }
+                "template.digest" => {
+                    let hex = v.trim().strip_prefix("sha256:").unwrap_or("");
+                    let lower_hex = hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+                    if hex.len() != 64 || !lower_hex {
+                        return Err(invalid(&k, &v, "sha256: and 64 lowercase hex digits"));
+                    }
+                    digest = Some(v.trim().to_owned());
+                }
+                "template.fetch-max" => {
+                    fetch_max = v
+                        .trim()
+                        .parse()
+                        .map_err(|_| invalid(&k, &v, "a size in bytes"))?
+                }
                 "template.stdio" => match v.trim() {
                     s @ ("journal" | "capture") => c.stdio = Some(s.to_owned()),
                     _ => return Err(invalid(&k, &v, "journal or capture")),
@@ -251,11 +345,36 @@ impl Config {
                 _ => return Err(ConfigError::Unknown { key: k }),
             }
         }
-        if c.component.is_empty() {
-            return Err(ConfigError::Missing {
-                key: "template.component".to_owned(),
-                expected: "the instances' catalog name",
-            });
+        c.fetch = match fetch {
+            Some((addr, path)) => Some(Fetch {
+                addr,
+                path,
+                digest,
+                max: fetch_max,
+            }),
+            None if digest.is_some() => {
+                return Err(ConfigError::Missing {
+                    key: "template.fetch".to_owned(),
+                    expected: "where to fetch the component `template.digest` names",
+                });
+            }
+            None => None,
+        };
+        match (c.component.is_empty(), c.fetch.is_some()) {
+            (true, false) => {
+                return Err(ConfigError::Missing {
+                    key: "template.component".to_owned(),
+                    expected: "the instances' catalog name, or `template.fetch`",
+                });
+            }
+            (false, true) => {
+                return Err(invalid(
+                    "template.fetch",
+                    &c.component,
+                    "either `template.component` or `template.fetch`, not both",
+                ));
+            }
+            _ => {}
         }
         if c.replicas > c.max {
             return Err(invalid(
@@ -645,5 +764,60 @@ mod tests {
                 Action::Register("web-1".into(), 1),
             ]
         );
+    }
+
+    #[test]
+    fn a_fetched_component() {
+        let digest = format!("sha256:{}", "ab".repeat(32));
+        let without_component = |extra: &[(&str, &str)]| -> Vec<(String, String)> {
+            pairs(extra)
+                .into_iter()
+                .filter(|(k, _)| k != "template.component")
+                .collect()
+        };
+        let fetched = |extra: &[(&str, &str)]| {
+            let mut p = without_component(extra);
+            p.push((
+                "template.fetch".into(),
+                "http://10.0.0.9:8080/store/web.wasm".into(),
+            ));
+            Config::from_pairs(p)
+        };
+        let c = fetched(&[("template.digest", &digest)]).expect("valid");
+        let f = c.fetch.clone().expect("fetch");
+        assert_eq!(f.addr, "10.0.0.9:8080".parse().unwrap());
+        assert_eq!(f.path, "/store/web.wasm");
+        assert_eq!(f.digest.as_deref(), Some(digest.as_str()));
+        assert_eq!(f.max, 16 << 20);
+        assert!(c.component.is_empty());
+        let request = String::from_utf8(f.request()).unwrap();
+        assert!(request.starts_with("GET /store/web.wasm HTTP/1.1\r\nHost: 10.0.0.9:8080\r\n"));
+        assert!(request.ends_with("\r\n\r\n"));
+        assert_eq!(
+            parse_url("http://10.0.0.9/w").unwrap().0,
+            "10.0.0.9:80".parse().unwrap()
+        );
+        for bad in [
+            "https://10.0.0.9/w",
+            "http://store/w",
+            "http://10.0.0.9",
+            "http://10.0.0.9/a b",
+        ] {
+            assert_eq!(parse_url(bad), None, "{bad}");
+        }
+        // Both, neither, a digest without a fetch, a malformed digest: config errors.
+        assert!(Config::from_pairs(pairs(&[("template.fetch", "http://10.0.0.9/w")])).is_err());
+        assert!(Config::from_pairs(without_component(&[])).is_err());
+        assert!(Config::from_pairs(pairs(&[("template.digest", &digest)])).is_err());
+        assert!(fetched(&[("template.digest", "sha256:AB")]).is_err());
+        // The response: 200 with all of its body, else refused.
+        let ok = b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\n\x00a\xff";
+        assert_eq!(response_body(ok).unwrap(), b"\x00a\xff");
+        let short = b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nabc";
+        assert!(response_body(short).is_err());
+        assert!(response_body(b"HTTP/1.1 404 Not Found\r\n\r\n").is_err());
+        let chunked = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc";
+        assert!(response_body(chunked).is_err());
+        assert!(response_body(b"HTTP/1.1 200 OK\r\n").is_err());
     }
 }

@@ -14,7 +14,9 @@ use wasip3::clocks::monotonic_clock;
 use wasip3::sockets::types::{IpAddressFamily, IpSocketAddress, Ipv4SocketAddress, TcpSocket};
 use wit_bindgen::StreamResult;
 
-use crate::{APP, Action, Config, Seen, parse_line, plan, status_of, take_lines};
+use crate::{
+    APP, Action, Config, Fetch, Seen, parse_line, plan, response_body, status_of, take_lines,
+};
 
 wit_bindgen::generate!({
     inline: "
@@ -23,6 +25,7 @@ wit_bindgen::generate!({
             include wasmnet:app/app@0.1.0;
             import wasmnet:infra/devices@0.1.2;
             import wasmnet:infra/changes@0.1.2;
+            import wasmnet:infra/components@0.1.2;
         }
     ",
     path: [
@@ -48,7 +51,7 @@ wit_bindgen::generate!({
 
 use wasi::config::store;
 use wasmnet::infra::types::{ChangeKind, Phase};
-use wasmnet::infra::{changes, devices};
+use wasmnet::infra::{changes, components, devices};
 use wasmnet::link::log::{self, Level};
 
 fn event(kind: &str, fields: &[(&str, String)]) {
@@ -145,6 +148,56 @@ async fn admin(addr: SocketAddrV4, request: Vec<u8>, half_close: bool) -> Result
     let _ = rx_done.await;
     drop(socket);
     status_of(&response).ok_or_else(|| "no HTTP response".to_owned())
+}
+
+/// Fetches the instances' component from its store over TCP (one `GET`, the whole response
+/// read until the server closes), and supplies it to the host: its digest reference.
+async fn fetch_component(f: &Fetch) -> Result<String, String> {
+    let socket = TcpSocket::create(IpAddressFamily::Ipv4).map_err(|e| format!("create: {e:?}"))?;
+    let [a, b, c, d] = f.addr.ip().octets();
+    socket
+        .connect(IpSocketAddress::Ipv4(Ipv4SocketAddress {
+            port: f.addr.port(),
+            address: (a, b, c, d),
+        }))
+        .await
+        .map_err(|e| format!("connect {}: {e:?}", f.addr))?;
+    let (mut rx, rx_done) = socket.receive();
+    let (mut tx, tx_reader) = wasip3::wit_stream::new::<u8>();
+    let send_done = socket.send(tx_reader);
+    if !tx.write_all(f.request()).await.is_empty() {
+        return Err("closed before the request was sent".to_owned());
+    }
+    // Room for the head besides the largest body it accepts.
+    let limit = usize::try_from(f.max)
+        .unwrap_or(usize::MAX)
+        .saturating_add(16 << 10);
+    let mut response = Vec::new();
+    let too_large = loop {
+        let (status, chunk) = rx.read(Vec::with_capacity(64 << 10)).await;
+        response.extend_from_slice(&chunk);
+        if response.len() > limit {
+            break true;
+        }
+        if !matches!(status, StreamResult::Complete(_)) {
+            break false;
+        }
+    };
+    drop(tx);
+    drop(rx);
+    let _ = send_done.await;
+    let _ = rx_done.await;
+    drop(socket);
+    if too_large {
+        return Err(format!("the component is larger than {} bytes", f.max));
+    }
+    let body = response_body(&response)?;
+    let digest = components::supply(f.digest.as_deref(), body).map_err(|e| format!("{e:?}"))?;
+    event(
+        "replicas-supplied",
+        &[("digest", digest.clone()), ("size", body.len().to_string())],
+    );
+    Ok(digest)
 }
 
 /// What the world has of our instances, by name.
@@ -246,7 +299,7 @@ async fn controller() -> Result<(), String> {
         .into_iter()
         .filter_map(|(k, v)| k.strip_prefix(&prefix).map(|k| (k.to_owned(), v)))
         .collect();
-    let c = Config::from_pairs(pairs).map_err(|e| e.to_string())?;
+    let mut c = Config::from_pairs(pairs).map_err(|e| e.to_string())?;
     let desired = Rc::new(Cell::new(c.replicas));
     event(
         "replicas-desired",
@@ -281,7 +334,18 @@ async fn controller() -> Result<(), String> {
                 ],
             );
         }
-        step(&c, desired.get(), &mut registered).await;
+        // A fetched component first: nothing is applied before the host has it.
+        if c.component.is_empty()
+            && let Some(f) = &c.fetch
+        {
+            match fetch_component(f).await {
+                Ok(digest) => c.component = digest,
+                Err(e) => error("fetch", e),
+            }
+        }
+        if !c.component.is_empty() {
+            step(&c, desired.get(), &mut registered).await;
+        }
         if c.wake {
             // Until a device it sees changes (its own requests applying included), or `period`.
             let deadline = monotonic_clock::now().saturating_add(c.period_ns);

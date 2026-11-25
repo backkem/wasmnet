@@ -16,6 +16,7 @@
 //! | `big-max` | the largest `/big?n=` body, bytes | `16777216` |
 //! | `route.<name>.path` | a route's path, `/` or `/about` (required per route) | |
 //! | `route.<name>.body` | its body text; `{args}` is replaced by the node's arguments after `argv[0]` (one space between them) and `{env:NAME}` by its environment variable `NAME` (empty if unset), both from `wasi:cli/environment` | `""` |
+//! | `route.<name>.body-base64` | its body as standard base64 (with `=` padding), for a binary body such as a component a store node serves; never templated; replaces `body` | |
 //! | `route.<name>.type` | its `Content-Type` | `text/plain` |
 //! | `route.<name>.sse-events` | (embedder surface, unstable) makes the route an event stream (`text/event-stream`): events `1..=N`, see [`Sse`]; `GET` only | |
 //! | `route.<name>.sse-interval-ms` | the virtual time between two events, `0..=60000` | `1000` |
@@ -115,6 +116,8 @@ pub struct Route {
     pub body: Vec<u8>,
     pub content_type: String,
     pub sse: Option<Sse>,
+    /// The body came from `body-base64`: bytes, never templated.
+    pub raw: bool,
 }
 
 /// The parsed config.
@@ -146,6 +149,38 @@ fn ranged(v: &str, lo: u64, hi: u64) -> Option<u64> {
         .parse::<u64>()
         .ok()
         .filter(|n| (lo..=hi).contains(n))
+}
+
+/// Standard base64 (RFC 4648, `+` and `/`, `=` padding to a multiple of four), decoded.
+pub fn base64(text: &str) -> Option<Vec<u8>> {
+    let text = text.as_bytes();
+    if !text.len().is_multiple_of(4) {
+        return None;
+    }
+    let value = |c: u8| match c {
+        b'A'..=b'Z' => Some(c - b'A'),
+        b'a'..=b'z' => Some(c - b'a' + 26),
+        b'0'..=b'9' => Some(c - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    };
+    let mut out = Vec::with_capacity(text.len() / 4 * 3);
+    let quads = text.len() / 4;
+    for (n, quad) in text.chunks(4).enumerate() {
+        let pad = quad.iter().rev().take_while(|&&c| c == b'=').count();
+        if pad > 2 || (pad > 0 && n + 1 != quads) {
+            return None;
+        }
+        let mut acc = 0u32;
+        for &c in &quad[..4 - pad] {
+            acc = acc << 6 | u32::from(value(c)?);
+        }
+        acc <<= 6 * pad as u32;
+        let bytes = acc.to_be_bytes();
+        out.extend_from_slice(&bytes[1..4 - pad]);
+    }
+    Some(out)
 }
 
 /// An instance name or version: letters, digits, `-`, `.` and `_`, 1 to 32 characters (it goes
@@ -201,8 +236,15 @@ impl Config {
             ready_after_ns: 0,
         };
         let mut ready_after = None;
-        // name -> (path, body, type, sse-events, sse-interval-ms)
-        type Draft = (Option<String>, String, String, Option<u64>, Option<u64>);
+        // name -> (path, body, type, sse-events, sse-interval-ms, body-base64)
+        type Draft = (
+            Option<String>,
+            String,
+            String,
+            Option<u64>,
+            Option<u64>,
+            Option<Vec<u8>>,
+        );
         let mut routes: std::collections::BTreeMap<String, Draft> =
             std::collections::BTreeMap::new();
         for (key, value) in pairs {
@@ -215,15 +257,25 @@ impl Config {
                 let (name, field) = rest
                     .rsplit_once('.')
                     .ok_or(ConfigError::Unknown { key: key.clone() })?;
-                let route = routes
-                    .entry(name.to_owned())
-                    .or_insert_with(|| (None, String::new(), "text/plain".to_owned(), None, None));
+                let route = routes.entry(name.to_owned()).or_insert_with(|| {
+                    (
+                        None,
+                        String::new(),
+                        "text/plain".to_owned(),
+                        None,
+                        None,
+                        None,
+                    )
+                });
                 match field {
                     "path" if value.starts_with('/') && !value.contains([' ', '?']) => {
                         route.0 = Some(value.clone())
                     }
                     "path" => return Err(invalid("a path starting with / (no query)")),
                     "body" => route.1 = value.clone(),
+                    "body-base64" => {
+                        route.5 = Some(base64(&value).ok_or_else(|| invalid("standard base64"))?)
+                    }
                     "type" if !value.trim().is_empty() => route.2 = value.trim().to_owned(),
                     "type" => return Err(invalid("a content type")),
                     "sse-events" => {
@@ -289,7 +341,7 @@ impl Config {
                 _ => return Err(ConfigError::Unknown { key }),
             }
         }
-        for (name, (path, body, content_type, events, interval)) in routes {
+        for (name, (path, body, content_type, events, interval, raw)) in routes {
             let path = path.ok_or_else(|| ConfigError::Missing {
                 key: format!("route.{name}.path"),
                 expected: "a path starting with /",
@@ -309,7 +361,8 @@ impl Config {
             };
             c.routes.push(Route {
                 path,
-                body: body.into_bytes(),
+                raw: raw.is_some(),
+                body: raw.unwrap_or_else(|| body.into_bytes()),
                 content_type,
                 sse,
             });
@@ -326,6 +379,7 @@ impl Config {
                 body: body.into_bytes(),
                 content_type: "text/plain".to_owned(),
                 sse: None,
+                raw: false,
             });
         }
         if c.instance.is_some() || c.version.is_some() {
@@ -333,7 +387,7 @@ impl Config {
                 c.instance.clone().unwrap_or_default(),
                 c.version.clone().unwrap_or_default(),
             );
-            for r in &mut c.routes {
+            for r in c.routes.iter_mut().filter(|r| !r.raw) {
                 let text = String::from_utf8_lossy(&r.body)
                     .replace("{instance}", &i)
                     .replace("{version}", &v);
@@ -349,7 +403,7 @@ impl Config {
 
     /// Whether a route body names the node's arguments or environment (`{args}`, `{env:NAME}`).
     pub fn wants_environment(&self) -> bool {
-        self.routes.iter().any(|r| {
+        self.routes.iter().filter(|r| !r.raw).any(|r| {
             let b = String::from_utf8_lossy(&r.body);
             b.contains("{args}") || b.contains("{env:")
         })
@@ -360,7 +414,7 @@ impl Config {
     /// (empty if it has none). What is put in is not looked at again.
     pub fn with_environment(&mut self, args: &[String], env: &[(String, String)]) {
         let joined = args.join(" ");
-        for r in &mut self.routes {
+        for r in self.routes.iter_mut().filter(|r| !r.raw) {
             let text = String::from_utf8_lossy(&r.body).into_owned();
             let mut out = String::with_capacity(text.len());
             let mut rest = text.as_str();
@@ -731,6 +785,33 @@ mod tests {
             last_event_id: None,
             head_len: 0,
         }
+    }
+
+    #[test]
+    fn base64_bodies_are_bytes_never_templated() {
+        assert_eq!(base64("").unwrap(), b"");
+        assert_eq!(base64("Zg==").unwrap(), b"f");
+        assert_eq!(base64("Zm8=").unwrap(), b"fo");
+        assert_eq!(base64("Zm9v").unwrap(), b"foo");
+        assert_eq!(base64("AP8A/w==").unwrap(), [0, 255, 0, 255]);
+        for bad in ["Zg", "Zg=a", "Z===", "Zg==Zg==", "Zm9v!A==", "Zm 9v"] {
+            assert_eq!(base64(bad), None, "{bad}");
+        }
+        let c = Config::from_pairs(vec![
+            ("instance".to_owned(), "a".to_owned()),
+            ("route.w.path".to_owned(), "/w".to_owned()),
+            // `{instance}` in bytes: not replaced.
+            (
+                "route.w.body-base64".to_owned(),
+                "e2luc3RhbmNlfQD/".to_owned(),
+            ),
+            ("route.w.type".to_owned(), "application/wasm".to_owned()),
+        ])
+        .unwrap();
+        assert_eq!(c.routes[0].body, b"{instance}\x00\xff");
+        assert!(c.routes[0].raw);
+        let bad = vec![("route.w.body-base64".to_owned(), "!".to_owned())];
+        assert!(Config::from_pairs(bad).is_err());
     }
 
     #[test]
