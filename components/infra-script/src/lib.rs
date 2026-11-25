@@ -1,5 +1,6 @@
 //! infra-script: a test fixture, not a product device. A controller with a script: a stepped
-//! device with no ports that makes `wasmnet:infra/devices` calls at set virtual times, so a test
+//! device with no ports that makes `wasmnet:infra/devices` calls at set virtual times and in
+//! answer to the events of the devices it created (`wasmnet:infra/events`), so a test
 //! can drive the infra API from inside the network without writing a controller.
 //!
 //! Config (`wasi:config/store`): one key per step, `step.<n>`, whose value is
@@ -17,8 +18,10 @@
 //!   `start <name>`, `stop <name>` (no grace period), `remove <name>`, or
 //!   `wire <name> <cable>` (the cable's CBOR as hex), `unwire <name> <port>`,
 //!   `logs <name> [stdout|stderr] [<tail>]` (the device's journalled output lines, default
-//!   `stderr` and every line), or `answer <request-id>` (the answer to the command sent with
-//!   that request id: `devices.control-answer`).
+//!   `stderr` and every line), `answer <request-id>` (the answer to the command sent with
+//!   that request id: `devices.control-answer`), or `events <name> [<kinds>|-] [<since>]` (the
+//!   device's events of those comma-separated kind patterns, `-` or none: every kind, after
+//!   that cursor: `events.read`).
 //! * `when=<request-id>~<text>` or `when=<request-id>!<text>` (after `id=`, if any): the step
 //!   runs only if the answer to the command sent with that request id has come, is `ok`, and
 //!   contains (`~`) or does not contain (`!`) `<text>` (no spaces); otherwise its result is
@@ -29,6 +32,22 @@
 //! * `{<variable>}` in a `control` step's argument is replaced, when the step runs, by the value
 //!   the variable was given through the fixture's own command `set` (below); a variable not set
 //!   yet makes the step's result `unset <variable>`, and nothing is sent.
+//!
+//! Rules, one key each, `on.<n>`, make a call in answer to a device's events instead of at a
+//! time:
+//!
+//! ```text
+//! <device> <kind>[,<kind>...] [<field>=<value>] : [id=<request-id>] [when=...] <verb> <name> [<rest>]
+//! ```
+//!
+//! For every event of `<device>` (one this controller created) whose kind matches a pattern (a
+//! kind, or a prefix and `*`) and, if given, whose field `<field>` is `<value>`, the call after
+//! ` : ` (a step without its time) is made once, in the poll the event causes. Its request id
+//! is `<request-id>-<seq>` (default `on-<n>-<seq>`), so each event's call is new. After every
+//! poll the fixture reads the new events of the devices its rules follow (`events.read`, from
+//! its own cursor per device) and arms `events.arm` on them, so the next matching event polls it
+//! again at that instant: no step polls. A device it cannot read yet (not created) is left out
+//! until a later poll.
 //!
 //! The fixture takes commands (`wasmnet:control/commands`), which is how an embedder hands it
 //! what it learnt elsewhere (from another controller, for instance): `set <variable> <value>`
@@ -43,6 +62,10 @@
 //! `logs` step adds `lines` (how many) and `text` (the lines, joined with ` | `); an `answer`
 //! step adds `at` and `text` (the answer's lines, joined with ` | `), and its `result` is `ok`,
 //! `err` (the device refused), `pending` or the error.
+//! An `events` step adds `count`, `seqs` and `kinds` (comma-separated), `next` and `missed`. A
+//! rule's call is journalled like a step, with `step` `on.<n>` and `device`, `seq` and `event`
+//! (the kind) added; a gap in what a rule follows is journalled as `infra-script-missed {device,
+//! missed}`.
 //! Unknown keys and malformed steps are configuration errors (the glue logs and traps).
 //!
 //! This file is pure logic with no bindings, unit-tested inside wasmtime. The wit-bindgen glue

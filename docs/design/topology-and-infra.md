@@ -145,7 +145,9 @@ stop and a start at one instant.
 manage sibling devices: `apply`, `start`, `stop` (with a grace
 period), `remove`, `control` (a command into a running device, [below](#commands-into-a-running-device)),
 `get`, `list` (by label selector), `watch` (a change feed polled from a
-resource version) and `logs`, plus `changes.wait`, which waits for a change. Every `devices`
+resource version) and `logs`, plus `changes.wait`, which waits for a change, and the events of
+the devices it created (`events.read`, waited on with `changes.wait-any` or `events.arm`,
+[below](#events-of-the-devices-a-controller-created)). Every `devices`
 function is sync and never yields; a controller polls a watch on its own period, or waits on
 `changes.wait` ([below](#a-change-feed-that-wakes-a-controller)). Specs are deterministic
 CBOR: the device's component, config and options (its output journalled, its arguments and
@@ -375,8 +377,102 @@ operator event, a device's app exit, which the table folds in as it is journalle
 executor polls the controller in that event's next round. So the wake is at the same position
 in every run, and the same in a split network, where everything in a controller's view
 changes on its own site ([sites.md](sites.md)). The deadline is an ordinary timer, cancelled
-when the call returns early or is dropped. A stepped controller cannot await: it keeps polling
-`watch` from its `poll`.
+when the call returns early or is dropped. A stepped controller cannot await: it arms the same
+wait with `events.arm` (below), or keeps polling `watch` from its `poll`.
+
+### Events of the devices a controller created
+
+A controller often needs to know what happened inside a device, not only in the table: a
+router's tunnel came up or went down, a server answered. Devices already say so in the journal
+(`wasmnet:link/log.event`: `tunnel-up {tunnel, peer}`), but only the embedder reads the journal.
+`wasmnet:infra/events` (package 0.1.2) gives a controller those events of the devices it
+created, and a wait that ends on them, so it need not send a device a command on a period to
+learn its state ([wit/infra/infra.wit](../../wit/infra/infra.wit) has the calls' exact
+contracts). Tested end to end in
+[crates/wasmnet-host/tests/tunnel.rs](../../crates/wasmnet-host/tests/tunnel.rs) (a controller
+follows its router's tunnel through a cut and a heal) and
+[crates/wasmnet-host/tests/infra_sites.rs](../../crates/wasmnet-host/tests/infra_sites.rs)
+(split over sites); the ring, the cursor and the waits in the core's unit tests.
+
+**What is kept.** Every event a device journals through `log.event` while it is a device a
+controller created (in the table with an owner, from the moment `apply` asked for it, so also
+while it is instantiated), in a ring per device: the last 256 (`infra::EVENTS_KEPT`), at most
+256 KiB together (`EVENT_BYTES_KEPT`; an event counts its kind, field names and values and 32
+bytes), the newest always kept; fields are capped at 16 KiB by the journal already. The records
+the network makes about a device (`device-added`, `link-added`, `app-exit`, ...) are not among
+them: the table shows those. The events are kept whether or not the journal itself is full, and
+the journal keeps them as before: a network whose controllers never call `events` journals and
+runs exactly as it did, and one without controllers keeps nothing. The ring goes when the device
+leaves the table (removed); a stop, a crash, a start and a recreation keep it.
+
+**The cursor.** Every kept event gets a number, `seq`: 1 for the first event of a device name,
+one more for each next, never reused while the network runs (a name removed and created again
+goes on from its last number). `events.read(name, kinds, since, max)` answers the events after
+`since` whose kind matches the filter, oldest first, the cursor to read from next (`next`: every
+event up to it was looked at, those the filter left out included) and `missed`: how many events
+after `since` the ring dropped before they were read. Numbers, not times, because several events
+come at one instant (three routes added by one command burst, a tunnel's `tunnel-up` and the
+router's `route-added` it causes): a time cursor would read them twice or skip some. A gap is
+reported, never skipped: a controller that missed events reads the device's state another way
+(the router's `tunnels` command) and goes on from `next`. `missed` counts dropped events of any
+kind, since the ring keeps every kind; a reader that wants few kinds from a chatty device reads
+often enough, or accepts a resync now and then.
+
+**Filters.** A list of kind patterns: a kind (`tunnel-up`) or a prefix and `*` (`tunnel-*`); at
+most 16 (`MAX_KINDS`), each 1 to 128 bytes without spaces; none is every kind. A wait wakes only
+on what its filter wants, so a router's `route-lookup` traces do not wake a controller that
+follows `tunnel-*`.
+
+**Whose events: the devices the caller created.** The same rule as `logs`, for the same reason:
+`not-found` for a device not in the caller's view (another controller's), `denied` for the
+network's own devices and the caller itself. A controller *sees* the network's own devices in
+the table, but their events, like their output lines, are journalled on their own site when the
+network is split ([sites.md](sites.md)), so reading them would answer differently split and
+unsplit; the devices a controller created are always on its site. Reading events gives no
+authority a controller lacks already: it reads what devices it created and may command
+(`devices.control`) chose to journal. An embedder that wants a controller to follow one of its
+own devices lets the controller create it (the tunnel test's controllers create their box
+routers) or relays what it needs through a command of the controller's own
+([known-issues.md](../known-issues.md)).
+
+**Waiting: one call for the table and events.** A controller has one loop: it reconciles, then
+sleeps until something it cares about changed. So one wait covers both:
+`changes.wait-any(table, follows, deadline)` returns at once if something is ready, and
+otherwise waits until a change of the caller's view after `table.since` matching
+`table.selector` (if `table` is given), an event a follow waits for (`follow = {name, kinds,
+since}`, at most 64), a gap after a follow's cursor, or a followed device leaving the table, or
+until `deadline`. It answers what is ready (`ready {rv, changed, devices}`: the view's latest
+version, whether the table changed, which followed devices to read); the controller then reads
+with `devices.watch` and `events.read`. Two separate waits would make an async controller race
+two futures, and a stepped controller could arm only one. `changes.wait` stays as it was.
+
+`wait-any` lives in `changes` and the rest in `events`, so `events` is all sync: an async
+function in an interface makes every importer of it need async support, and a stepped
+controller cannot await. A stepped controller (no async tasks, only `poll`) arms the same wait
+with `events.arm(table, follows)`: if something is ready it says what and arms nothing;
+otherwise the first event, change or departure that would end the wait queues one more `poll`
+of the controller at that instant, in that processing context (`VirtualClock::wake_poll`). That
+poll is a queue entry of its own, beside the controller's poll deadline, so a deadline the
+controller returns does not replace it, and a wake that comes while the controller runs is not
+lost. An armed wait fires once (the controller reads and arms again), one per controller (a new
+`arm` replaces it; one with nothing to follow disarms), and a stop, a crash or a new instance of
+the controller disarms it.
+
+**The wake is deterministic.** An event is kept, and wakes what waits for it, inside the
+journalling device's own `log.event` call, in its processing context; a change wakes in the
+context it is made in, as for `changes.wait`. The woken task runs in that event's next round,
+and an armed controller's extra poll is keyed by that context. Neither depends on wall time or
+on the order the host happens to do things in, so every replay puts the controller's reaction at
+the same position, and a split network puts it at the same position as the unsplit one: the
+controller and the devices it created share a site. Nothing polls in the host: a wait costs
+nothing until what it waits for happens.
+
+**A backend.** The core does all of it: the rings (fed by `JournalEnd::event`, which both
+backends call for `log.event`), the cursor, the filters, the view rule, the waits and the extra
+poll. A backend maps `events.read`, `events.arm` and `changes.wait-any` to `infra::Calls`
+(`read_events`, `arm`, `wait_any`) and, for `wait-any`, awaits the returned future on the
+device's behalf as it does for `changes.wait`. The browser backend serves `read` and `arm`, not
+`wait-any` yet ([browser.md](browser.md)).
 
 **Split networks.** A controller works in a split (multi-site) network on its own site: its
 devices and their cables stay there. A creation cabled to a device of another site fails the
@@ -492,18 +588,21 @@ tunnel once its `tunnels` answer says `state up`. The fixture also takes command
 filled in when the step runs, which is how a test hands one controller what another learnt.
 
 The package went from `wasmnet:infra@0.1.0` to `0.1.1` (`devices.control`) and to `0.1.2`
-(`changes.wait`, `devices.control-answer`, `devices.wire`, `devices.unwire`, the spec keys `args`,
-`env` and `memory`, the cable key `impair`): additions, so a component built against an earlier `0.1` still links (wasmtime matches `0.1.x` imports
+(`changes.wait`, `changes.wait-any`, `devices.control-answer`, `devices.wire`, `devices.unwire`,
+`events`, the spec keys `args`, `env` and `memory`, the cable key `impair`): additions, so a component built against an earlier `0.1` still links (wasmtime matches `0.1.x` imports
 semver-compatibly).
 
 The `infra-script` test fixture ([components/infra-script](../../components/infra-script)) is
 a controller with a script: a stepped device with no ports that makes `apply`, `control`,
-`start`, `stop`, `remove` and `logs` calls at set virtual times, which
+`start`, `stop`, `remove`, `logs` and `events` calls at set virtual times, and calls in answer to
+the events of the devices it created (rules, `on.<n>`, which it follows with `events.arm`), which
 [crates/wasmnet-host/tests/routes.rs](../../crates/wasmnet-host/tests/routes.rs) uses to change
 the routes of a router it created while traffic crosses it, and
 [crates/wasmnet-host/tests/infra_verbs.rs](../../crates/wasmnet-host/tests/infra_verbs.rs) to
 create devices with arguments and environment, read a failed device's output and stop its
-devices with it.
+devices with it, and
+[crates/wasmnet-host/tests/tunnel.rs](../../crates/wasmnet-host/tests/tunnel.rs) to route over a
+tunnel when its router says `tunnel-up` and take the route away on `tunnel-down`.
 
 **Not covered yet.** Commands to a device of another site (a controller's own devices are on its
 site; a timed `Op::Control` is applied by the device's site, [sites.md](sites.md)). In-place

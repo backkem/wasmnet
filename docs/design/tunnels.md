@@ -170,6 +170,26 @@ up`. What carries one controller's endpoint to the other is the embedder's busin
 test the harness reads it from one controller's journal and sets it on the other with a
 command, where a real embedder would use its own replicated state or a message over the network.
 
+**Following a tunnel's state without polling.** The router journals `tunnel-reflexive
+{tunnel, endpoint, from}`, `tunnel-up {tunnel, peer, after-ns}`, `tunnel-roamed {tunnel, from,
+to}`, `tunnel-down {tunnel, peer, silent-ns}` and `tunnel-failed {tunnel, rounds, candidates}`
+as they happen (a controller could take its reflexive endpoint from `tunnel-reflexive` too).
+A controller that created the router reads them with `wasmnet:infra/events.read` and waits
+for them with `changes.wait-any` (an async controller) or `events.arm` (a stepped one), filtered to
+`tunnel-*` so the router's other events (`route-lookup`, `route-added`) do not wake it
+([topology-and-infra.md](topology-and-infra.md#events-of-the-devices-a-controller-created)).
+It wakes in the instant the router changed state, at the same position on every replay, and
+reacts there: `tunnel-up` with a route over the tunnel, `tunnel-down` or `tunnel-failed` with a
+route over a relay or none (`routes-replace` with the whole static table, so the reaction is the
+same whatever came before). A reader that fell behind (`missed` not 0: the router's events
+overflowed the ring) asks `tunnels` once and goes on from there. The core keeps a router's events
+for a controller only if that controller created it; a router the embedder built is followed by
+the embedder, from the journal. `crates/wasmnet-host/tests/tunnel.rs`
+(`controllers_follow_the_tunnel_s_events_through_a_cut_and_heal`) has two such controllers:
+home B's Internet cable is cut from 3 s to 7 s, each tunnel goes down and comes back, and each
+controller adds the route at each `tunnel-up` and removes it at the `tunnel-down`, in those
+instants, with one `tunnels` command in the whole run (for the reflexive endpoint).
+
 **A relay** is a router with one tunnel per relayed peer and a route per relayed prefix over
 each. Its tunnels need no candidates: each learns its peer from the peer's first check. A box
 that cannot punch through to another (both behind symmetric NATs) adds a tunnel to the relay

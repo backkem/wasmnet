@@ -10,9 +10,10 @@
 /// transmitted with zero latency; a graceful stop at `now + grace`). The change applies when the
 /// world reaches that event, before anything it causes, so it is deterministic, recomputed on
 /// replay (never recorded as an operator input), and a debugger can stop the world between the
-/// request and its effect. Reads (`get`, `list`, `watch`, `logs`) are answered from the
-/// world as it is at the call. `changes.wait` is the one function that does not return at
-/// once: it waits, on virtual time, for a change in the caller's view.
+/// request and its effect. Reads (`get`, `list`, `watch`, `logs`, `events.read`) are answered
+/// from the world as it is at the call. `changes.wait` and `changes.wait-any` are the functions
+/// that do not return at once: they wait, on virtual time, for a change in the caller's view
+/// (`wait-any` also for an event of a device it created).
 ///
 /// **No new authority.** The host serves this interface only to devices whose
 /// `DeviceOptions::infra` is set, and refuses to instantiate any other component that imports

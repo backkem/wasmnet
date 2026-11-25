@@ -43,6 +43,15 @@ here so that nobody has to find these the hard way. Each entry names where the c
   the devices it created, and a paused device is `running` in the device table: a `paused`
   phase and the verbs need a new package version. A controller cannot crash a device either
   (an operator event can).
+- **A controller reads the events only of the devices it created.** `wasmnet:infra/events`
+  refuses the network's own devices (`denied`), which a controller sees in the table: their
+  events may be journalled on another site of a split network. A controller that must follow
+  one of them needs the embedder to relay it (a command of the controller's own), or creates
+  the device itself. Each device a controller created keeps up to 256 events (256 KiB) for it
+  whether or not anyone reads them; `missed` counts the dropped events of every kind, not only
+  those a reader's filter wants, so a reader of a few kinds from a chatty device may resync
+  more often than it needs to. Log lines (`log.log`) and the network's own records about a
+  device are not served as events ([design/topology-and-infra.md](design/topology-and-infra.md#events-of-the-devices-a-controller-created)).
 - **A paused device holds only what its own polls set.** Its timers are recognised by the
   device that set them; a timer it set while being instantiated by an operator event is not
   held, and completes at the resume's rounds instead of in its order. Its overdue work all runs
@@ -60,8 +69,10 @@ here so that nobody has to find these the hard way. Each entry names where the c
   stdin (`Op::Stdin` is dropped), fuel metering (`fuel_per_instant` is ignored; the guard is
   `Guard::max_polls_per_instant`), memory, the refusal of a component that imports
   `wasmnet:infra` without the grant at instantiation (it instantiates and every call is
-  `denied`), host extensions' imports, and sites. Its `wasmnet:infra/changes.wait` and a
-  controller that is an async app (the `replicas` node) are untested in a real browser.
+  `denied`), host extensions' imports, sites, and `wasmnet:infra/changes.wait-any` (the page links only
+  `changes.wait`, whose answer it passes as a number; a component that imports `wait-any` does
+  not instantiate there). Its `wasmnet:infra/changes.wait`, `events.read` and `events.arm` and
+  a controller that is an async app (the `replicas` node) are untested in a real browser.
 - **Supplied components are native only, and kept in memory.** The browser backend compiles
   nothing while a network runs (`Runtime::compile_supplied` keeps its default refusal), so a
   creation from a digest fails there (`failed`). On wasmtime a controller's store and the

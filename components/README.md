@@ -55,7 +55,7 @@ An app never runs alone: a composition plugs it into a netstack
 |---|---|---|---|
 | `blaster` | `wasmnet-blaster` | `blaster.wasm` | Emits a train of raw Ethernet probe frames. |
 | `clock-probe` | `wasmnet-clock-probe` | `clock-probe.wasm` | A command that samples every source of time and entropy it can reach. |
-| `infra-script` | `wasmnet-infra-script` | `infra-script.wasm` | A device with no ports that makes scripted `wasmnet:infra` calls at set times; its commands set variables its calls use. |
+| `infra-script` | `wasmnet-infra-script` | `infra-script.wasm` | A device with no ports that makes scripted `wasmnet:infra` calls at set times and in answer to the events of devices it created; its commands set variables its calls use. |
 | `reflector` | `wasmnet-reflector` | `reflector.wasm` | Echoes frames back out of the port they came in on. |
 | `udp-punch` | `wasmnet-udp-punch` | `udp-punch.wasm` | An app (in `components/apps`): UDP hole punching between two peers through a rendezvous server, for the NAT tests. |
 

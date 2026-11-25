@@ -130,7 +130,7 @@ call to the core. What the core decides for both:
 | a device's entropy streams and insecure seed (`DeviceEntropy`) | both backends' `wasi:random` |
 | a device's `argv` (`argv`): its name, then `DeviceOptions::args` | both backends' `wasi:cli/environment` |
 | an app's end in the journal (`JournalEnd::app_exit`) | both actors |
-| `wasmnet:infra`: every call, the answers to a device without the grant, the stream names of `logs`, the refusal of an ungranted importer (`infra::Calls`, `infra::require_grant`) | the host's bindings; the browser's `wn_infra` |
+| `wasmnet:infra`: every call, the answers to a device without the grant, the stream names of `logs`, the refusal of an ungranted importer (`infra::Calls`, `infra::require_grant`); the events kept of the devices controllers created, and the wake of an armed wait (`events.arm`: one more `poll` of the controller, queued by the core) | the host's bindings; the browser's `wn_infra` |
 | commands and their answers, a controller's `control-answer` (`commands`, `CommandCall::finish`) | both actors |
 | reconfiguration, and which config `wasi:config/store` serves after it (`ReconfigureCall::finish_serving`) | both actors |
 | validation, ordering, operator events, the device table, limits, digests, admission, the journal, captures | the network itself |
@@ -159,14 +159,17 @@ What each backend still does itself, module by module:
 What the browser backend does not do yet: create a device while the network runs (the page
 instantiates asynchronously, see above), stdin, fuel, memory (measured or bounded), supplied
 components, the refusal of an ungranted `wasmnet:infra` importer at instantiation (the page does
-not see a component's imports; every call is `denied` instead), host extensions and sites
+not see a component's imports; every call is `denied` instead), `changes.wait-any` (the page
+links only `changes.wait`, whose answer is a number: a component that imports `wait-any` does
+not instantiate there; `events.read` and `events.arm` are served), host extensions and sites
 ([known-issues.md](../known-issues.md)).
 
 **One set of scenarios for both.** `crates/wasmnet-web/tests/parity.rs` runs the same
 scenarios on the wasmtime backend and on the browser backend's Rust half, and requires the
 same answers and the same journalled events: device commands between runs and as operator
 events, a controller that creates devices, commands them, reads the answers and reconfigures a
-switch in place, and a device's arguments and environment. On the browser side wasmtime stands
+switch in place, a controller that follows the events of a router it created (`events.read`,
+`events.arm`), and a device's arguments and environment. On the browser side wasmtime stands
 in for the page: it runs the components and serves their imports through the registry and the
 boundary's encoding, as `network.ts` does, so every line of Rust a browser runs is exercised.
 The page's own test (`web/test`) then has to prove only the TypeScript: it runs a command, an

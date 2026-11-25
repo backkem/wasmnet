@@ -22,7 +22,9 @@ operator event, though that test exercises it too. So are a device's arguments a
 environment (`DeviceOptions::args` and `env`, the spec keys `args` and `env`), a controller's
 `logs` of its own devices, `devices.control-answer`, `DeviceOptions::infra_cascade` and
 `wasmnet:infra/changes.wait`
-(`crates/wasmnet-host/tests/infra_verbs.rs`), and `devices.wire` and `devices.unwire`, cable
+(`crates/wasmnet-host/tests/infra_verbs.rs`), the events of the devices a controller created:
+`wasmnet:infra/events`, `changes.wait-any` and the core's `infra::{DeviceEvent, EventPage,
+Follow, TableSince, Ready}` (`crates/wasmnet-host/tests/tunnel.rs`), and `devices.wire` and `devices.unwire`, cable
 impairments (also on `Op::Wire` and `Cable`), the `wasmnet:reconfigure` export and the switch's
 answer to it, `DeviceOptions::infra_max_devices` and `memory`, and `DeviceCost::memory` and
 `peak_memory` (`crates/wasmnet-host/tests/infra_limits.rs`). So are components a controller
@@ -83,7 +85,8 @@ from outside the core, so a lost constructor fails the tests.
   - `Cable::new(port, to_device, to_port).latency(ns)`, `SeriesOptions::new(width, keep)`,
     `SimConfig::seeded(seed).wall_epoch(epoch)`, `Fault::new(message)`,
     `DeviceInstance::new(ports, actor).apps(apps)`, `JournalEntry::new(at, device, record)`,
-    `DeviceCommand::new(command, argument)` and, in `wasmnet-app-kit`,
+    `DeviceCommand::new(command, argument)`, `infra::Follow::new(name, kinds, since)`,
+    `infra::TableSince::new(selector, since)` and, in `wasmnet-app-kit`,
     `mdns::Resolved::new(name, instance, host, port)`.
 - **Structs an embedder reads** (results, records, statistics and costs: `LinkStats`,
   `LinkInfo`, `DeviceCost`, `FrameRecord`, `Transmit`, `DeviceView`, `pcap::Capture`,
