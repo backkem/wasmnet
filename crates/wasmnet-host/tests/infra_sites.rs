@@ -29,10 +29,10 @@ use support::{built, config, events, field, transcript};
 use wasmnet_det_cbor::Value;
 use wasmnet_host::sim::infra::{Change, DeviceView};
 use wasmnet_host::sim::sites::{self, Msg, SiteRecords, SiteSync, Step};
-use wasmnet_host::sim::{CREATOR_RANGE, DeviceCommand, Op, OpState, Placement};
+use wasmnet_host::sim::{CREATOR_RANGE, DeviceCommand, Op, OpState, Placement, SupplyLimits};
 use wasmnet_host::{
-    DeviceConfig, DeviceId, DeviceOptions, FrameRecord, JournalEntry, LinkTransition, Nanos,
-    Network, sim,
+    DeviceConfig, DeviceId, DeviceOptions, FrameRecord, ImportPolicy, JournalEntry, LinkTransition,
+    Nanos, Network, sim,
 };
 
 const US: Nanos = 1_000;
@@ -368,6 +368,86 @@ fn waking_controller() -> Plan {
     }
 }
 
+/// A `replicas` controller on site 0 that fetches its instances' component from `store` on site
+/// 1 across the WAN link (`template.fetch`), supplies its bytes and keeps two `web-<n>` made
+/// from its digest on its own site; `client` on site 1 fetches from both across the WAN link.
+fn supplying_controller() -> Plan {
+    let web = std::fs::read(built().path("node-http-server")).expect("a built node");
+    let mut store = config(&[("mac", "02:00:00:00:02:09"), ("ipv4", "10.0.0.9/24")]);
+    store.insert(
+        "app.http-server.route.web.path".to_owned(),
+        "/web.wasm".to_owned(),
+    );
+    store.insert(
+        "app.http-server.route.web.body-base64".to_owned(),
+        support::base64(&web),
+    );
+    Plan {
+        devices: vec![
+            switch("sw-a", "6", 0),
+            Dev {
+                name: "ctl",
+                file: "node-replicas",
+                component: "node:replicas",
+                config: config(&[
+                    ("mac", "02:00:00:00:01:05"),
+                    ("ipv4", "10.0.0.5/24"),
+                    ("app.replicas.replicas", "2"),
+                    ("app.replicas.period", "200ms"),
+                    ("app.replicas.template.fetch", "http://10.0.0.9/web.wasm"),
+                    (
+                        "app.replicas.template.digest",
+                        &format!("sha256:{}", sha(&web)),
+                    ),
+                    ("app.replicas.template.config.mac", "02:00:00:00:01:{n+10}"),
+                    ("app.replicas.template.config.ipv4", "10.0.0.{n+10}/24"),
+                    ("app.replicas.template.wire.0.port", "0"),
+                    ("app.replicas.template.wire.0.to", "sw-a"),
+                ]),
+                options: DeviceOptions {
+                    infra_supply: Some(SupplyLimits::default()),
+                    ..infra(None)
+                },
+                site: 0,
+            },
+            switch("sw-b", "4", 1),
+            Dev {
+                name: "store",
+                file: "node-http-server",
+                component: "node:http-server",
+                config: store,
+                // Decoding the base64 body costs more than an instant's default fuel.
+                options: DeviceOptions {
+                    fuel_per_instant: Some(4_000_000_000),
+                    ..DeviceOptions::default()
+                },
+                site: 1,
+            },
+            Dev {
+                name: "client",
+                file: "node-http-get",
+                component: "node:http-get",
+                config: config(&[
+                    ("mac", "02:00:00:00:02:03"),
+                    ("ipv4", "10.0.0.3/24"),
+                    ("app.http-get.urls", "http://10.0.0.11/,http://10.0.0.12/"),
+                    ("app.http-get.start", "1s"),
+                ]),
+                options: DeviceOptions::default(),
+                site: 1,
+            },
+        ],
+        links: vec![
+            ((0, 0), (2, 0), WAN),
+            ((1, 0), (0, 1), 100 * US),
+            ((3, 0), (2, 1), 100 * US),
+            ((4, 0), (2, 2), 100 * US),
+        ],
+        ops: Vec::new(),
+        deadline: 1_500 * MS,
+    }
+}
+
 // ---- running a plan ----
 
 /// The devices of `plan` as site `site` builds them (`None`: the unsplit network): its own,
@@ -389,6 +469,8 @@ fn build(plan: &Plan, seed: u64, site: Option<usize>) -> (Network<'static>, Vec<
             .map(String::from)
             .to_vec(),
     );
+    // Only `supplying_controller`'s `ctl` is granted to supply components.
+    network.set_supply_admission(ImportPolicy::devices().admission());
     let mut ids = Vec::new();
     for d in &plan.devices {
         let id = if site.is_none_or(|s| s == d.site) {
@@ -978,6 +1060,27 @@ fn a_waking_controller_matches_the_unsplit_run() {
             "seed {seed}: the split rerun is byte-identical"
         );
     }
+}
+
+/// A controller that fetches a component from another site, supplies it and runs devices made
+/// from its digest on its own site: the split run merges into the unsplit one, its journal of
+/// digests and sizes and its view of the table included.
+#[test]
+fn a_supplying_controller_matches_the_unsplit_run() {
+    let plan = supplying_controller();
+    let seed = 42;
+    let whole = run_whole(&plan, seed);
+    let log = transcript(&whole.journal);
+    assert_eq!(
+        events(&whole.journal, "ctl", "infra-supply").len(),
+        1,
+        "{log}"
+    );
+    let done = events(&whole.journal, "client", "http-get-done");
+    assert_eq!(done.len(), 2, "{log}");
+    assert!(done.iter().all(|d| field(d, "status") == "200"), "{log}");
+    let split = run_split(&plan, seed).unwrap_or_else(|e| panic!("{e:?}"));
+    assert_same(&whole, &split, "supplied");
 }
 
 /// `devices.wire` follows the rule of a creation's cables: a far end on another site fails the
