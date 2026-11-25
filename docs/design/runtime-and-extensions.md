@@ -117,6 +117,10 @@ deliveries are queued `latency` later. A cable never crosses sites ([sites.md](s
 that `may_reschedule` is followed by a `poll` at the same instant. A call no handler serves is
 answered by `unsupported`. An operator event carries a `ControlRequest` (wrapped in `Control`)
 that makes a fresh call each time it applies; the device's refusal becomes the op's state.
+One kind of control call is built in: device commands (`wasmnet_core::commands`), for the
+`wasmnet:control/commands` export, which `wasmnet-host` serves itself (before any extension's
+handler) and the browser backend does not serve
+([topology-and-infra.md](topology-and-infra.md#commands-into-a-running-device)).
 
 **Extension ops** apply like topology changes. `ExtOp::apply` gets an `OpContext`: the op's
 instant, `running(name)`, `require_export`, `journal_event`, `control` (answered in the op's
@@ -139,7 +143,9 @@ type private.
 **What is implemented here.** `Runtime` has two implementations, `Host` (wasmtime) and
 `wasmnet-web`'s `JsRuntime` (a browser). `HostExtension` has one,
 a test (`Probe` in [crates/wasmnet-host/tests/extension.rs](../../crates/wasmnet-host/tests/extension.rs))
-that implements `name`, `add_to_linker` and `init_store`. `NetworkExtension`, `CableModel`,
-`ControlCall`, `ControlRequest`, `ControlAnswer`, `ExtOp` and `ControlHandler` have no
-implementation in this repository. An embedder grants a capability its extension serves
+that implements `name`, `add_to_linker` and `init_store`. `ControlCall`, `ControlRequest`,
+`ControlAnswer` and `ControlHandler` have one each, device commands (`CommandCall`,
+`DeviceCommand`, `CommandAnswer`, and the host's handler in
+[crates/wasmnet-host/src/control.rs](../../crates/wasmnet-host/src/control.rs)).
+`NetworkExtension`, `CableModel` and `ExtOp` have no implementation in this repository. An embedder grants a capability its extension serves
 through `DeviceOptions::ext` (a typed value its extension reads in `device_setup`).

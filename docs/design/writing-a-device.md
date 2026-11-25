@@ -15,7 +15,7 @@ anything that came off the wire. This note uses the learning switch
 | world | exports | keeps time through | examples |
 |---|---|---|---|
 | `wasmnet:link/stepped-device` | `device` | the `now` argument; `poll` returns the next deadline | `switch`, `wan-port`, `reflector` |
-| `wasmnet:router/router` | `device`, `counters` | as above | `router` |
+| `wasmnet:router/router` | `device`, `counters`, `wasmnet:control/commands` | as above | `router` |
 | `wasmnet:link/async-device` | `device`, `lifecycle` | virtual `wasi:clocks` waits in its own tasks | `reflector --features async-device` |
 | `wasmnet:link/counted-async-device` | `device`, `lifecycle`, `counters` | as above | `netstack` (every node) |
 
@@ -76,6 +76,16 @@ runs, as a control call into the live device at its current instant. It must not
 or wake a task. The router exports it through its own world,
 [wit/router/router.wit](../../wit/router/router.wit); the switch keeps per-port counters
 internally but does not export them.
+
+A device whose state an operator or a controller should change while it runs (the router's
+routes) exports `wasmnet:control/commands` ([wit/control/control.wit](../../wit/control/control.wit)):
+`invoke(now, command, argument) -> result<string, string>`. Commands are text, parsed in
+`lib.rs` like the configuration (the router's `Router::command` reuses its route parser), and
+a malformed one is an `err`, never a trap. Unlike `counters`, a command may change the device,
+transmit and log, and a `poll(now)` follows it. Include the interface in the device's world
+(`export wasmnet:control/commands@0.1.0;`) and the host reports it on its own: nothing else to
+register. How commands reach a device is in
+[topology-and-infra.md](topology-and-infra.md#commands-into-a-running-device).
 
 ## Logic in `lib.rs`, glue in `component.rs`
 

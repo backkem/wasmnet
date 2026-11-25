@@ -8,7 +8,11 @@ tiers.
 What the examples and tests here exercise: building and running a network, its records and
 captures, the components and the apps. Link impairments set when a link is built
 (`Impairments`, `LinkMut::impair`, `LinkMut::impair_from`) and their counters in `LinkStats`
-are part of it ([design/links.md](design/links.md)).
+are part of it ([design/links.md](design/links.md)). So are device commands: the
+`wasmnet:control/commands` export, the router's commands, `Network::command` and
+`wasmnet:infra/devices.control` (`crates/wasmnet-host/tests/routes.rs`). Sending them as
+operator events (`Op::Control` with a `DeviceCommand`) is embedder surface like every
+operator event, though that test exercises it too.
 
 ## Embedder surface, unstable
 
@@ -30,5 +34,5 @@ versions without notice. Rustdoc and the design notes mark it **embedder surface
 
 Other parts of the tree, for reference: `crates/wasmnet-wire` (`no_std` wire helpers: MAC
 addresses, Ethernet, pcap-ng, DHCP and DNS codecs), `crates/wasmnet-app-kit` (what an app needs: its
-bindings, and what the apps here share), and three test fixtures among the components
-(`blaster`, `reflector`, `clock-probe`).
+bindings, and what the apps here share), and four test fixtures among the components
+(`blaster`, `reflector`, `clock-probe`, `infra-script`).

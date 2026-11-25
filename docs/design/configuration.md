@@ -233,6 +233,14 @@ Examples: `10.0.3.0/24 via 10.0.2.2`, `default via 10.0.2.2`, `fd00:3::/64 via f
 
 Besides the errors above, the component traps if `get-all` itself fails.
 
+**Changing routes while it runs.** The config is read once, but the static routes can change
+later through the router's commands (`wasmnet:control/commands`): `route-add <route>`,
+`route-replace <route>`, `route-remove <prefix or route>` and `routes`, with routes in the
+syntax above. An embedder sends them with `Network::command` or as operator events, a controller
+with `wasmnet:infra/devices.control`; nothing else about the router (ports, neighbours, links,
+counters) changes. Their semantics are in [wit/router/router.wit](../../wit/router/router.wit)
+and [topology-and-infra.md](topology-and-infra.md#commands-into-a-running-device).
+
 ### WAN port
 
 An L2 WAN port that bridges two segments over a WAN link with VXLAN-style encapsulation (RFC

@@ -31,8 +31,16 @@ here so that nobody has to find these the hard way. Each entry names where the c
 - **Few tests here.** Operator events, stoppable runs, frame rules, transmit hooks, cable
   models, network extensions, control calls and the merging of two sites' recordings are used
   and tested by an embedder outside this repository. In this repository only the site-sync
-  decoder has tests of its own. Treat that surface as unstable
+  decoder has tests of its own, and operator events and control calls only as far as device
+  commands use them (`crates/wasmnet-host/tests/routes.rs`). Treat that surface as unstable
   ([stability.md](stability.md)).
+- **Device commands are native only.** The browser backend (`wasmnet-web`) reports no
+  optional exports, so it does not serve `wasmnet:control/commands`: an `Op::Control` with a
+  `DeviceCommand` is refused when added, and a controller's `devices.control` is refused when it
+  applies (`infra-failed`).
+- **Commands do not cross sites.** In a split network an operator event or a `devices.control`
+  is refused, like every operator event and infra mutation; `Network::command` reaches only
+  the devices of its own site.
 - **`Network` is large.** About ninety methods on one type; the core and the embedder surface
   are told apart only by their doc comments.
 - **The browser binding reports errors as strings** (`wasmnet_web::Network::link`, the
