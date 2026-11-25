@@ -1116,3 +1116,75 @@ fn a_wire_to_another_site_fails_the_split_run_deterministically() {
     );
     assert_eq!(failure(), (site, at, message));
 }
+
+/// When each `kind` event of `device` was journalled.
+fn times(journal: &[JournalEntry], device: &str, kind: &str) -> Vec<Nanos> {
+    journal
+        .iter()
+        .filter(|e| e.device == device)
+        .filter(|e| matches!(&e.record, wasmnet_host::Record::Event { kind: k, .. } if k == kind))
+        .map(|e| e.at)
+        .collect()
+}
+
+/// The one-controller network, with `ctl` following the events of the router it created
+/// (`wasmnet:infra/events`, armed by the `infra-script` fixture): every `route-lookup` of `r1`,
+/// which the client's traffic from site 1 sets off, makes it send `r1` a `routes` command.
+fn following_controller() -> Plan {
+    let mut plan = one_controller("r1:1");
+    let ctl = plan
+        .devices
+        .iter_mut()
+        .find(|d| d.name == "ctl")
+        .expect("ctl");
+    ctl.config.insert(
+        "on.0".to_owned(),
+        "r1 route-lookup : control r1 routes".to_owned(),
+    );
+    plan
+}
+
+/// A controller woken by the events of a device it created, which traffic from the other site
+/// causes: it reacts in the instant of each event, and the split run merges into the unsplit
+/// one (the controller's journal, its commands and their answers, and its view included).
+#[test]
+fn a_controller_following_events_matches_the_unsplit_run() {
+    let plan = following_controller();
+    for seed in [42, 7] {
+        let whole = run_whole(&plan, seed);
+        let log = transcript(&whole.journal);
+        let lookups = times(&whole.journal, "r1", "route-lookup");
+        assert!(!lookups.is_empty(), "seed {seed}:\n{log}");
+        let reactions: Vec<Nanos> = whole
+            .journal
+            .iter()
+            .filter(|e| e.device == "ctl")
+            .filter(|e| {
+                matches!(&e.record, wasmnet_host::Record::Event { kind, fields }
+                if kind == "infra-script"
+                    && fields.iter().any(|(k, v)| k == "step" && v == "on.0"))
+            })
+            .map(|e| e.at)
+            .collect();
+        assert_eq!(
+            reactions, lookups,
+            "seed {seed}: one reaction per event, at its instant"
+        );
+        let results: Vec<String> = events(&whole.journal, "ctl", "infra-script")
+            .iter()
+            .filter(|f| field(f, "step") == "on.0")
+            .map(|f| field(f, "result").to_owned())
+            .collect();
+        assert!(
+            results.iter().all(|r| r == "ok"),
+            "seed {seed}: {results:?}"
+        );
+        let split = run_split(&plan, seed).unwrap_or_else(|e| panic!("seed {seed}: {e:?}"));
+        assert_same(&whole, &split, &format!("seed {seed}"));
+        let again = run_split(&plan, seed).unwrap_or_else(|e| panic!("seed {seed}: {e:?}"));
+        assert_eq!(
+            split, again,
+            "seed {seed}: the split rerun is byte-identical"
+        );
+    }
+}

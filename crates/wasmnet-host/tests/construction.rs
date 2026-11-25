@@ -5,6 +5,7 @@
 
 use std::time::Duration;
 
+use wasmnet_host::sim::infra::{Follow, TableSince};
 use wasmnet_host::sim::{
     Cable, CaptureOptions, Control, DeclaredPort, DeviceCommand, DeviceCost, DeviceInstance,
     ExtOptions, Fault, Impairments, LinkKind, Op, SeriesOptions, SupplyLimits,
@@ -77,6 +78,9 @@ fn every_listed_type_has_a_constructor_outside_its_crate() {
         Outcome::quiescent(1, Vec::new(), Vec::new()),
         Outcome::deadline(2, 3),
     ];
+    let follow = Follow::new("r1", vec!["tunnel-*".to_owned()], 7);
+    let table = TableSince::new(vec![("app".to_owned(), "web".to_owned())], 3);
+    assert_eq!((follow.since, table.since), (7, 3));
     let call = || -> Control { DeviceCommand::new("routes", "").into_control() };
     let (link, device) = (LinkId::from_index(0), DeviceId::from_index(0));
     let ops = [

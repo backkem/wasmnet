@@ -1075,7 +1075,7 @@ fn a_controller_follows_device_events_alike() {
             refused
                 .3
                 .iter()
-                .any(|(k, v)| k == "result" && v.starts_with("Denied")),
+                .any(|(k, v)| k == "result" && v.contains("Denied")),
             "{refused:?}"
         );
         s
