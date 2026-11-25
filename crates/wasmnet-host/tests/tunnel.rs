@@ -71,7 +71,18 @@ struct Setup {
     /// Home B's Internet cable is down over this interval.
     cut: Option<(u64, u64)>,
     end: u64,
+    /// The direct tunnel's key at box A and at box B; with keys, the relay's tunnels are keyed
+    /// too ([`RELAY_A`], [`RELAY_B`]).
+    keys: Option<[&'static str; 2]>,
+    /// Frames an attacker on the Internet switch sends (from the relay's cable), at instants.
+    inject: Vec<(u64, Vec<u8>)>,
 }
+
+/// Tunnel keys: the direct tunnel's, another, and the relay's two pairs.
+const KEY: &str = "5a17b0c3e8d24f6197a2c4e6f8091b3d5f7193b5d7f9e2c4a6b8d0f1e3c5a7b9";
+const KEY2: &str = "0d1c2b3a49586776859a4b3c2d1e0f1f2e3d4c5b6a79887766554433221100ff";
+const RELAY_A: &str = "a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0";
+const RELAY_B: &str = "b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0";
 
 impl Setup {
     fn new(a: Nat, b: Nat) -> Setup {
@@ -87,6 +98,22 @@ impl Setup {
             relay: false,
             cut: None,
             end: 4 * S,
+            keys: None,
+            inject: Vec::new(),
+        }
+    }
+
+    /// The same with the direct tunnel keyed with `KEY` at both ends.
+    fn keyed(mut self) -> Setup {
+        self.keys = Some([KEY, KEY]);
+        self
+    }
+
+    /// ` key <k>` for box `i`'s direct tunnel, or nothing (no keys, or an empty one).
+    fn key(&self, i: usize) -> String {
+        match self.keys {
+            Some(k) if !k[i].is_empty() => format!(" key {}", k[i]),
+            _ => String::new(),
         }
     }
 }
@@ -101,6 +128,8 @@ struct Run {
     /// `tunnels` of box-a, box-b and the relay at the end.
     listings: BTreeMap<String, String>,
     counters: BTreeMap<String, BTreeMap<String, u64>>,
+    /// What each device cost (fuel), by name.
+    costs: BTreeMap<String, wasmnet_host::sim::DeviceCost>,
 }
 
 impl Run {
@@ -247,8 +276,10 @@ fn run(seed: u64, s: &Setup) -> Run {
     for (i, (me, other)) in [("a", "b"), ("b", "a")].into_iter().enumerate() {
         let spec = format!(
             "to-{other} id 7 local fd00:ff::{me}/128 reflector 203.0.113.50:3478 \
-             keepalive {} dead {}",
-            s.keepalive, s.dead
+             keepalive {} dead {}{}",
+            s.keepalive,
+            s.dead,
+            s.key(i)
         );
         assert_eq!(
             command(&mut network, boxes[i], "tunnel-add", &spec),
@@ -260,8 +291,13 @@ fn run(seed: u64, s: &Setup) -> Run {
             "added"
         );
         if s.relay {
+            // A keyed relay tunnel listens on 4500, a keyless one on Geneve's 6081.
+            let (port, key) = match s.keys {
+                Some(_) => (4500, format!(" key {}", [RELAY_A, RELAY_B][i])),
+                None => (6081, String::new()),
+            };
             let spec = format!(
-                "relay id {} local fd00:ff::{me}:1/128 peer 203.0.113.50:6081 keepalive {} dead {}",
+                "relay id {} local fd00:ff::{me}:1/128 peer 203.0.113.50:{port} keepalive {} dead {}{key}",
                 8 + i,
                 s.keepalive,
                 s.dead
@@ -274,9 +310,10 @@ fn run(seed: u64, s: &Setup) -> Run {
     }
     if s.relay {
         // The relay's ends: no candidates; each learns its peer from the first check.
-        for (name, id, sub) in [("to-a", 8, "a"), ("to-b", 9, "b")] {
+        for (name, id, sub, key) in [("to-a", 8, "a", RELAY_A), ("to-b", 9, "b", RELAY_B)] {
+            let key = s.keys.map_or_else(String::new, |_| format!(" key {key}"));
             let spec = format!(
-                "{name} id {id} local fd00:ff::50:{id}/128 keepalive {} dead {}",
+                "{name} id {id} local fd00:ff::50:{id}/128 keepalive {} dead {}{key}",
                 s.keepalive, s.dead
             );
             command(&mut network, relay, "tunnel-add", &spec);
@@ -287,6 +324,14 @@ fn run(seed: u64, s: &Setup) -> Run {
                 &format!("fd00:{sub}::/64 tunnel {name}"),
             );
         }
+    }
+    for (at, frame) in &s.inject {
+        network
+            .add_op(
+                sim::Op::inject(relay.port(0), frame.clone()),
+                sim::Placement::StartOf(*at),
+            )
+            .unwrap();
     }
     // At 50 ms each controller has its tunnel's reflexive endpoint and hands it to the other.
     network.run_until(50 * MS).unwrap();
@@ -347,6 +392,7 @@ fn run(seed: u64, s: &Setup) -> Run {
         wan_links,
         listings,
         counters,
+        costs: network.costs().into_iter().collect(),
     }
 }
 
@@ -358,6 +404,10 @@ struct Wan {
     stun_requests: usize,
     stun_responses: usize,
     geneve: usize,
+    /// ESP packets (RFC 4303 in UDP, RFC 3948): a keyed tunnel's data.
+    esp: usize,
+    /// STUN messages that carry MESSAGE-INTEGRITY-SHA256 (0x001C).
+    signed: usize,
     /// Distinct outer UDP endpoints seen (address and port).
     endpoints: std::collections::BTreeSet<String>,
 }
@@ -392,6 +442,29 @@ fn decode_wan(run: &Run) -> Wan {
                 0x0101 => w.stun_responses += 1,
                 t => panic!("STUN type {t:#06x}"),
             }
+            let mut at = 20;
+            while at + 4 <= d.len() {
+                let t = u16::from_be_bytes([d[at], d[at + 1]]);
+                let l = usize::from(u16::from_be_bytes([d[at + 2], d[at + 3]]));
+                if t == 0x001c {
+                    w.signed += 1;
+                }
+                at += 4 + l.next_multiple_of(4);
+            }
+        } else if d[0] & 0x80 != 0 {
+            // ESP: SPI (top bit set), sequence number, IV, then ciphertext and a 16-byte tag; the
+            // encrypted part is a multiple of 4 bytes.
+            assert!(
+                d.len() >= 36 && (d.len() - 32).is_multiple_of(4),
+                "an ESP length"
+            );
+            assert_eq!(
+                d[8..12],
+                [0; 4],
+                "the IV is the zero-extended sequence number"
+            );
+            assert_eq!(d[12..16], d[4..8]);
+            w.esp += 1;
         } else {
             assert_eq!(d[0], 0, "Geneve version 0, no options");
             assert_eq!(d[1], 0, "no O or C bit");
@@ -879,11 +952,16 @@ fn numbered(steps: Vec<String>) -> Vec<(String, String)> {
 /// 1 s, `dead` 3.5 s), read its reflexive endpoint (`tunnels`, once) and give the tunnel the
 /// peer's endpoint once the embedder has set it (`{peer}`).
 fn signaling_steps(me: &str, other: &str) -> Vec<String> {
+    keyed_signaling_steps(me, other, "")
+}
+
+/// [`signaling_steps`] with `more` after the tunnel's settings (` key <hex>`).
+fn keyed_signaling_steps(me: &str, other: &str, more: &str) -> Vec<String> {
     vec![
         format!("0ms apply box-{me} {}", hex(&box_spec(me))),
         format!(
             "10ms id=add control box-{me} tunnel-add to-{other} id 7 local fd00:ff::{me}/128 \
-             reflector 203.0.113.50:3478 keepalive 1s dead 3500ms"
+             reflector 203.0.113.50:3478 keepalive 1s dead 3500ms{more}"
         ),
         format!("40ms id=reflexive control box-{me} tunnels"),
         "41ms answer reflexive".to_owned(),
@@ -931,8 +1009,9 @@ struct Controlled {
     script: fn(&str, &str) -> Vec<(String, String)>,
     /// Home B's Internet cable is down over this interval.
     cut: Option<(u64, u64)>,
-    /// When `node-a` fetches.
+    /// When `node-a` fetches, and (interval, count) to fetch again.
     fetch_at: &'static str,
+    repeat: Option<(&'static str, &'static str)>,
     end: u64,
 }
 
@@ -941,6 +1020,7 @@ const POLLING: Controlled = Controlled {
     script: controller_steps,
     cut: None,
     fetch_at: "2s",
+    repeat: None,
     end: 4 * S,
 };
 
@@ -1002,6 +1082,10 @@ fn controlled_run(seed: u64, plan: &Controlled) -> Run {
         let component = if me == "a" {
             node.push(("app.http-get.url", "http://[fd00:b::10]/big?n=20000"));
             node.push(("app.http-get.start", plan.fetch_at));
+            if let Some((interval, n)) = plan.repeat {
+                node.push(("app.http-get.interval", interval));
+                node.push(("app.http-get.repeat", n));
+            }
             "node-http-get"
         } else {
             node.push(("app.http-server.listen", "[::]:80"));
@@ -1059,6 +1143,7 @@ fn controlled_run(seed: u64, plan: &Controlled) -> Run {
         wan_links,
         listings,
         counters,
+        costs: network.costs().into_iter().collect(),
     }
 }
 
@@ -1132,6 +1217,7 @@ fn controllers_follow_the_tunnel_s_events_through_a_cut_and_heal() {
         script: event_steps,
         cut: Some((3 * S, 7 * S)),
         fetch_at: "9s",
+        repeat: None,
         end: 11 * S,
     };
     for seed in [1, 2] {
@@ -1233,4 +1319,357 @@ fn a_keyless_tunnel_s_captures_are_unchanged() {
         assert!(r.fetched());
         assert_eq!(capture_digest(&r), want, "seed={seed}");
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Keyed tunnels: ESP in UDP, signed checks
+
+/// The reasons box `d`'s tunnel journalled for refusing something (`tunnel-auth-failed`).
+fn refusals(r: &Run, d: &str) -> Vec<String> {
+    events(&r.journal, d, "tunnel-auth-failed")
+        .iter()
+        .map(|f| field(f, "reason").to_owned())
+        .collect()
+}
+
+/// When each `kind` event of device `d` was journalled.
+fn instants(r: &Run, d: &str, kind: &str) -> Vec<u64> {
+    r.journal
+        .iter()
+        .filter(|e| e.device == d)
+        .filter(|e| matches!(&e.record, wasmnet_host::Record::Event { kind: k, .. } if k == kind))
+        .map(|e| e.at)
+        .collect()
+}
+
+#[test]
+fn http_across_a_keyed_tunnel_punched_through_two_nats() {
+    each_seed(
+        &Setup::new(nat(EI, APD), nat(EI, APD)).keyed(),
+        |r, label| {
+            let log = transcript(&r.journal);
+            assert!(r.fetched(), "{label}\n{log}");
+            for (d, t, peer) in [
+                ("box-a", "to-b", "203.0.113.2:4500"),
+                ("box-b", "to-a", "203.0.113.1:4500"),
+            ] {
+                let up = events(&r.journal, d, "tunnel-up");
+                assert_eq!(up.len(), 1, "{label} {d}\n{log}");
+                assert_eq!(field(&up[0], "peer"), peer, "{label}");
+                assert_eq!(
+                    r.counter(d, &format!("tunnel-{t}-auth-failed")),
+                    0,
+                    "{label}"
+                );
+                assert!(refusals(r, d).is_empty(), "{label} {d}");
+            }
+            // Between the homes: ESP and signed STUN, never Geneve.
+            let w = decode_wan(r);
+            assert_eq!(w.geneve, 0, "{label}: no cleartext");
+            assert!(w.esp > 20, "{label}: {w:?}");
+            assert!(w.signed > 2, "{label}: {w:?}");
+            let want = ["203.0.113.1:4500", "203.0.113.2:4500", "203.0.113.50:3478"];
+            assert_eq!(
+                w.endpoints.iter().map(String::as_str).collect::<Vec<_>>(),
+                want
+            );
+            // The default keyed MTU (1438) is what the MSS clamp follows.
+            assert!(r.counter("box-a", "tunnel-to-b-mss-clamped") >= 1);
+            let a = &r.listings["box-a"];
+            assert!(a.contains("udp 4500") && a.contains(" key "), "{a}");
+            assert!(!a.contains(&KEY[..16]), "a listing never shows the key");
+        },
+    );
+}
+
+#[test]
+fn a_wrong_key_or_a_keyless_end_never_comes_up_and_says_why() {
+    for (keys, a_says, b_says) in [
+        ([KEY, KEY2], "integrity", "integrity"),
+        ([KEY, ""], "unsigned", "keyed-peer"),
+    ] {
+        let mut s = Setup::new(nat(EI, APD), nat(EI, APD));
+        s.keys = Some(keys);
+        each_seed(&s, |r, label| {
+            let log = transcript(&r.journal);
+            assert!(!r.fetched(), "{label}");
+            for d in ["box-a", "box-b"] {
+                assert_eq!(r.count(d, "tunnel-up"), 0, "{label} {d}\n{log}");
+            }
+            assert!(
+                refusals(r, "box-a").contains(&a_says.to_owned()),
+                "{label}\n{log}"
+            );
+            assert!(
+                refusals(r, "box-b").contains(&b_says.to_owned()),
+                "{label}\n{log}"
+            );
+            assert!(r.counter("box-b", "tunnel-to-a-auth-failed") > 0);
+        });
+    }
+}
+
+#[test]
+fn symmetric_nats_fail_and_a_keyed_relay_carries_the_fetch() {
+    let mut s = Setup::new(nat(APD, APD), nat(APD, APD)).keyed();
+    s.fetch_at = "6s";
+    s.end = 8 * S;
+    s.relay = true;
+    each_seed(&s, |r, label| {
+        let log = transcript(&r.journal);
+        assert!(r.fetched(), "{label}\n{log}");
+        assert_eq!(r.count("box-a", "tunnel-failed"), 1, "{label}");
+        for t in ["to-a", "to-b"] {
+            assert!(r.counter("relay", &format!("tunnel-{t}-forwarded-out")) > 5);
+            assert_eq!(value(line(&r.listings["relay"], t), "state"), "up");
+            assert_eq!(r.counter("relay", &format!("tunnel-{t}-auth-failed")), 0);
+        }
+        let w = decode_wan(r);
+        assert_eq!(w.geneve, 0, "{label}");
+        assert!(w.esp > 20, "{label}: {w:?}");
+    });
+}
+
+/// `frame` (Ethernet, IPv4, UDP) as the attacker sends it: from its own MAC, and from
+/// `from` (address and port) if given, with the IPv4 header checksum recomputed and the UDP
+/// checksum left out (0, allowed over IPv4).
+fn forged(frame: &[u8], from: Option<([u8; 4], u16)>) -> Vec<u8> {
+    let mut f = frame.to_vec();
+    f[6..12].copy_from_slice(&[0x02, 0, 0, 0, 0x66, 0]);
+    let ihl = usize::from(f[14] & 0x0f) * 4;
+    if let Some((ip, port)) = from {
+        f[26..30].copy_from_slice(&ip);
+        f[14 + ihl..16 + ihl].copy_from_slice(&port.to_be_bytes());
+    }
+    f[14 + ihl + 6..14 + ihl + 8].copy_from_slice(&[0, 0]);
+    f[24..26].copy_from_slice(&[0, 0]);
+    let mut sum: u32 = f[14..14 + ihl]
+        .chunks(2)
+        .map(|w| u32::from(u16::from_be_bytes([w[0], w[1]])))
+        .sum();
+    while sum > 0xffff {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    f[24..26].copy_from_slice(&(!(sum as u16)).to_be_bytes());
+    f
+}
+
+/// Where the UDP payload of an Ethernet/IPv4/UDP frame starts.
+fn udp_start(f: &[u8]) -> usize {
+    14 + usize::from(f[14] & 0x0f) * 4 + 8
+}
+
+/// A Binding request with `USERNAME` 7 and nothing else, in place of `check`'s payload.
+fn unsigned_check(check: &[u8]) -> Vec<u8> {
+    let start = udp_start(check);
+    let mut f = check[..start].to_vec();
+    let mut stun = check[start..start + 20].to_vec();
+    stun[2..4].copy_from_slice(&8u16.to_be_bytes());
+    stun.extend_from_slice(&[0, 6, 0, 1, b'7', 0, 0, 0]);
+    f.extend_from_slice(&stun);
+    let ip_len = (f.len() - 14) as u16;
+    f[16..18].copy_from_slice(&ip_len.to_be_bytes());
+    let udp_len = (8 + stun.len()) as u16;
+    f[start - 4..start - 2].copy_from_slice(&udp_len.to_be_bytes());
+    f
+}
+
+#[test]
+fn an_attacker_cannot_inject_roam_or_bring_up_a_keyed_tunnel() {
+    // Endpoint-independent NATs, so what the attacker sends from its own address reaches box
+    // B. Node A fetches at 2 s and again at 4 s; at 3 s the attacker, on the Internet switch,
+    // replays one of box A's ESP packets as it was and from its own address, replays one of A's
+    // signed checks from its own address, sends a check without a key and one whose integrity
+    // does not check (a captured check with one byte of its transaction id changed).
+    let mut base = Setup::new(nat(EI, EI), nat(EI, EI)).keyed();
+    base.urls = "http://[fd00:b::10]/big?n=20000,http://[fd00:b::10]/big?n=20000";
+    base.interval = "2s";
+    base.end = 6 * S;
+    const EVIL: ([u8; 4], u16) = ([203, 0, 113, 66], 4500);
+    for seed in [1, 2] {
+        let label = format!("seed={seed}");
+        let first = run(seed, &base);
+        let from_a = |f: &&FrameRecord| {
+            f.link == first.wan_links[0]
+                && f.sent_at < 3 * S
+                && f.bytes.len() > 42
+                && f.bytes[12..14] == [0x08, 0x00]
+                && f.bytes[23] == 17
+                && f.bytes[26..30] == [203, 0, 113, 1]
+                && f.bytes[30..34] == [203, 0, 113, 2]
+        };
+        let esp = first
+            .frames
+            .iter()
+            .filter(from_a)
+            .find(|f| f.bytes[udp_start(&f.bytes)] & 0x80 != 0)
+            .expect("an ESP packet from A")
+            .bytes
+            .clone();
+        let check = first
+            .frames
+            .iter()
+            .filter(from_a)
+            .find(|f| f.bytes[udp_start(&f.bytes)..][..2] == [0x00, 0x01])
+            .expect("a check from A")
+            .bytes
+            .clone();
+        let mut bad_integrity = forged(&check, Some(EVIL));
+        let tx = udp_start(&bad_integrity) + 12;
+        bad_integrity[tx] ^= 0xff;
+        let mut s = base.clone();
+        s.inject = vec![
+            (3 * S, forged(&esp, None)),
+            (3 * S + MS, forged(&esp, Some(EVIL))),
+            (3 * S + 2 * MS, forged(&check, Some(EVIL))),
+            (3 * S + 3 * MS, forged(&unsigned_check(&check), Some(EVIL))),
+            (3 * S + 4 * MS, bad_integrity),
+        ];
+        let r = run(seed, &s);
+        let log = transcript(&r.journal);
+        let done = events(&r.journal, "node-a", "http-get-done");
+        assert_eq!(done.len(), 2, "{label}: both fetches\n{log}");
+        assert!(done.iter().all(|f| field(f, "status") == "200"));
+        for d in ["box-a", "box-b"] {
+            assert_eq!(r.count(d, "tunnel-up"), 1, "{label} {d}");
+            assert_eq!(r.count(d, "tunnel-roamed"), 0, "{label} {d}\n{log}");
+            assert_eq!(r.count(d, "tunnel-down"), 0, "{label} {d}");
+        }
+        let said = refusals(&r, "box-b");
+        for reason in ["replayed", "unsigned", "integrity"] {
+            assert!(
+                said.contains(&reason.to_owned()),
+                "{label}: {said:?}\n{log}"
+            );
+        }
+        assert!(r.counter("box-b", "tunnel-to-a-replayed") >= 3, "{label}");
+        let peer = value(line(&r.listings["box-b"], "to-a"), "peer");
+        assert_eq!(peer, "203.0.113.1:4500", "{label}: the peer never moved");
+        // Box B answered nothing to the attacker.
+        let to_evil = r
+            .frames
+            .iter()
+            .filter(|f| f.bytes.len() > 34 && f.bytes[12..14] == [0x08, 0x00])
+            .filter(|f| f.bytes[30..34] == [203, 0, 113, 66])
+            .count();
+        assert_eq!(to_evil, 0, "{label}");
+        r.same_as(&run(seed, &s), &label);
+    }
+}
+
+/// The controllers of keyed boxes: as [`event_steps`] for `tunnel-up`, with the key in
+/// `tunnel-add`, and a new key at 3 s. Box A's controller replaces its key on a timer; box B's
+/// controller replaces it when its box first refuses a check under a key it does not have
+/// (`tunnel-auth-failed`), which is how it learns that its peer moved on. Both set the new key
+/// through `devices.control` (`tunnel-key`).
+fn rekeying_steps(me: &str, other: &str) -> Vec<(String, String)> {
+    let mut steps = keyed_signaling_steps(me, other, &format!(" key {KEY}"));
+    if me == "a" {
+        steps.push(format!("3s id=rekey control box-a tunnel-key to-b {KEY2}"));
+    }
+    let mut config = numbered(steps);
+    config.push((
+        "on.0".to_owned(),
+        format!(
+            "box-{me} tunnel-up tunnel=to-{other} : control box-{me} routes-replace \
+             default via 192.168.1.1, fd00:{other}::/64 tunnel to-{other}"
+        ),
+    ));
+    if me == "b" {
+        config.push((
+            "on.1".to_owned(),
+            format!("box-b tunnel-auth-failed tunnel=to-a : control box-b tunnel-key to-a {KEY2}"),
+        ));
+    }
+    config
+}
+
+#[test]
+fn controllers_replace_a_live_tunnel_s_key_without_taking_it_down() {
+    // Node A fetches every 500 ms from 2 s to 4.5 s, across the replacement at 3 s.
+    let plan = Controlled {
+        script: rekeying_steps,
+        cut: None,
+        fetch_at: "2s",
+        repeat: Some(("500ms", "6")),
+        end: 6 * S,
+    };
+    for seed in [1, 2] {
+        let label = format!("seed={seed}");
+        let r = controlled_run(seed, &plan);
+        let log = transcript(&r.journal);
+        let done = events(&r.journal, "node-a", "http-get-done");
+        assert_eq!(done.len(), 6, "{label}\n{log}");
+        assert!(done.iter().all(|f| field(f, "status") == "200"), "{label}");
+        for d in ["box-a", "box-b"] {
+            assert_eq!(r.count(d, "tunnel-up"), 1, "{label} {d}");
+            assert_eq!(r.count(d, "tunnel-down"), 0, "{label} {d}\n{log}");
+            assert_eq!(r.count(d, "tunnel-key-replaced"), 1, "{label} {d}\n{log}");
+            assert_eq!(r.count(d, "tunnel-key-confirmed"), 1, "{label} {d}\n{log}");
+            assert!(!r.listings[d].contains(&KEY2[..16]), "{d}");
+        }
+        // Box A changed its key at 3 s; box B refused A's first check under the new key, and
+        // its controller replaced B's key in that same instant.
+        assert_eq!(
+            instants(&r, "box-a", "tunnel-key-replaced"),
+            [3 * S],
+            "{label}"
+        );
+        let refused = instants(&r, "box-b", "tunnel-auth-failed");
+        assert_eq!(refused.len(), 1, "{label}\n{log}");
+        assert_eq!(
+            instants(&r, "box-b", "tunnel-key-replaced"),
+            refused,
+            "{label}"
+        );
+        assert_eq!(refusals(&r, "box-b"), ["integrity"], "{label}");
+        let rule: Vec<_> = events(&r.journal, "ctl-b", "infra-script")
+            .into_iter()
+            .filter(|f| field(f, "step") == "on.1")
+            .collect();
+        assert_eq!(rule.len(), 1, "{label}");
+        assert_eq!(field(&rule[0], "result"), "ok");
+        decode_wan(&r);
+        r.same_as(&controlled_run(seed, &plan), &label);
+    }
+}
+
+#[test]
+fn what_the_cryptography_costs() {
+    // One 1 MB fetch through box B, keyless and keyed: its fuel, per tunnel packet, and the
+    // most it used in one instant (a device's default budget is 50 M per instant).
+    let mut plain = Setup::new(nat(EI, APD), nat(EI, APD));
+    plain.urls = "http://[fd00:b::10]/big?n=1000000";
+    plain.end = 6 * S;
+    let keyed = plain.clone().keyed();
+    let mut rows = Vec::new();
+    let mut per = Vec::new();
+    for (name, s) in [("keyless", &plain), ("keyed", &keyed)] {
+        let r = run(1, s);
+        let done = events(&r.journal, "node-a", "http-get-done");
+        assert_eq!(field(&done[0], "body-bytes"), "1000000", "{name}");
+        let c = &r.costs["box-b"];
+        let packets = r.counter("box-b", "tunnel-to-a-tx-packets")
+            + r.counter("box-b", "tunnel-to-a-rx-packets");
+        let checks = r.counter("box-b", "tunnel-to-a-checks-sent")
+            + r.counter("box-b", "tunnel-to-a-requests-received");
+        per.push((c.fuel, packets));
+        rows.push(format!(
+            "{name}: box-b fuel {} for {packets} tunnel packets and {checks} checks; \
+             peak {} in one instant",
+            c.fuel, c.peak_fuel
+        ));
+        assert!(
+            c.peak_fuel < 50_000_000,
+            "{name}: within the default budget"
+        );
+    }
+    let ((f0, p0), (f1, p1)) = (per[0], per[1]);
+    rows.push(format!(
+        "box-b fuel per tunnel packet: keyless {}, keyed {}",
+        f0 / p0.max(1),
+        f1 / p1.max(1)
+    ));
+    println!("{}", rows.join("\n"));
+    assert!(f1 > f0, "encryption costs something");
 }
