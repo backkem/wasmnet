@@ -8,8 +8,8 @@
 //! [`Network::finish`] reads the outcome at the end.
 
 use wasmnet_core::{
-    DeviceConfig, DeviceId, DeviceOptions, FrameRecord, Guard, Impairments, JournalEntry, LinkId,
-    Nanos, Outcome, PortRef, SimConfig, Stats,
+    DeviceCommand, DeviceConfig, DeviceId, DeviceOptions, FrameRecord, Guard, Impairments,
+    JournalEntry, LinkId, Nanos, Op, Outcome, Placement, PortRef, SimConfig, Stats,
 };
 
 use crate::host::JsHost;
@@ -45,8 +45,11 @@ impl<H: JsHost + Clone + Unpin + 'static> Network<H> {
         // A busy guest that never lets the network move would otherwise spin forever; jco
         // needs more polls per instant than wasmtime, as its work arrives in small pieces.
         let guard = Guard::default().max_polls_per_instant(100_000);
-        let sim = wasmnet_core::Network::with_config(runtime, SimConfig::seeded(seed), guard);
+        let mut sim = wasmnet_core::Network::with_config(runtime, SimConfig::seeded(seed), guard);
         runtime.registry().set_clock(sim.clock().clone());
+        // A component's key is its catalog name: devices created while the network runs (an
+        // operator event, a controller's `apply`) are instantiated by JavaScript from it.
+        sim.set_component_resolver(Box::new(|name, instantiate| instantiate(name)));
         Self {
             runtime,
             sim: Some(sim),
@@ -59,13 +62,18 @@ impl<H: JsHost + Clone + Unpin + 'static> Network<H> {
         self.sim.as_ref().expect("present until dropped")
     }
 
-    fn sim_mut(&mut self) -> &mut wasmnet_core::Network<'static, JsRuntime<H>> {
-        self.sim.as_mut().expect("present until dropped")
-    }
-
     /// The simulator underneath, for anything this API does not wrap.
     pub fn sim(&self) -> &wasmnet_core::Network<'static, JsRuntime<H>> {
         self.sim_ref()
+    }
+
+    /// The simulator underneath, mutably: operator events
+    /// ([`wasmnet_core::Network::add_op`]), the controllers' catalog, the component resolver
+    /// (by default a catalog name is the component's key). Run it only through
+    /// [`step`](Self::step) and [`finish`](Self::finish): the JavaScript event loop must
+    /// settle between rounds.
+    pub fn sim_mut(&mut self) -> &mut wasmnet_core::Network<'static, JsRuntime<H>> {
+        self.sim.as_mut().expect("present until dropped")
     }
 
     /// The registry the device-side exports serve from.
@@ -276,6 +284,49 @@ impl<H: JsHost + Clone + Unpin + 'static> Network<H> {
                 Err(message)
             }
         }
+    }
+
+    /// Runs `command` with `argument` in the device's `wasmnet:control/commands` export
+    /// ([`wasmnet_core::Network::command`]): `Ok(None)` if it takes no commands, else its answer
+    /// (`ok` text or its refusal). At the current instant, between steps. A trap here fails the
+    /// network; a call the network refuses (a paused device) does not.
+    pub fn command(
+        &mut self,
+        device: DeviceId,
+        command: &str,
+        argument: &str,
+    ) -> Result<Option<Result<String, String>>, String> {
+        if let Some((_, message)) = &self.failure {
+            return Err(message.clone());
+        }
+        let sim = self.sim_mut();
+        match sim.command(device, command, argument) {
+            Ok(answer) => Ok(answer),
+            Err(e @ (wasmnet_core::Error::Trap { .. } | wasmnet_core::Error::Halted)) => {
+                let at = sim.now();
+                let message = e.to_string();
+                self.failure = Some((at, message.clone()));
+                Err(message)
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    /// Sends `command` with `argument` to the device at the start of instant `at`, as an
+    /// operator event ([`Op::Control`]); answers the op's index, whose state
+    /// ([`wasmnet_core::Network::op_states`]) shows a refusal. Refused here if the device takes
+    /// no commands.
+    pub fn schedule_command(
+        &mut self,
+        device: DeviceId,
+        at: Nanos,
+        command: &str,
+        argument: &str,
+    ) -> Result<usize, String> {
+        let op = Op::control(device, DeviceCommand::new(command, argument).into_control());
+        self.sim_mut()
+            .add_op(op, Placement::StartOf(at))
+            .map_err(|e| e.to_string())
     }
 
     /// Executor counters.

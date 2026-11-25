@@ -1783,9 +1783,13 @@ dependencies = [
 name = "wasmnet-web"
 version = "0.0.0"
 dependencies = [
+ "etherparse",
  "thiserror",
  "wasmnet-core",
+ "wasmnet-det-cbor",
+ "wasmnet-host",
  "wasmnet-wire",
+ "wasmtime-wasi",
 ]
 
 [[package]]

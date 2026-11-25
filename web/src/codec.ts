@@ -140,11 +140,15 @@ export function decodePlan(bytes: Uint8Array): { name: string; component: string
 }
 
 /** What `js_instantiate` answers: the ports, which optional exports exist, the apps in start order. */
-export function encodeInstance(ports: readonly PortInfo[], flags: { counters: boolean; lifecycle: boolean }, apps: readonly string[]): Uint8Array {
+export function encodeInstance(
+  ports: readonly PortInfo[],
+  flags: { counters: boolean; lifecycle: boolean; commands: boolean; reconfigure: boolean },
+  apps: readonly string[],
+): Uint8Array {
   const w = new Writer().u32(ports.length);
   for (const p of ports) w.u32(p.id).str(p.name).raw(p.mac ?? new Uint8Array()).u32(p.mtu);
   return w
-    .u32((flags.counters ? 1 : 0) | (flags.lifecycle ? 2 : 0))
+    .u32((flags.counters ? 1 : 0) | (flags.lifecycle ? 2 : 0) | (flags.commands ? 4 : 0) | (flags.reconfigure ? 8 : 0))
     .strs(apps)
     .finish();
 }
@@ -170,6 +174,10 @@ export function encodeEvent(kind: string, fields: readonly (readonly [string, st
 
 export function encodeConfig(config: readonly (readonly [string, string])[]): Uint8Array {
   return new Writer().pairs(config).finish();
+}
+
+export function decodeStrs(bytes: Uint8Array): string[] {
+  return whole(bytes, (r) => r.strs());
 }
 
 export function decodeConfig(bytes: Uint8Array): [string, string][] {
@@ -227,5 +235,161 @@ export function decodeOutcome(bytes: Uint8Array): Outcome {
     if (kind === 1) return { kind: 'deadline', at: r.u64(), pending: r.u64() };
     if (kind === 2) return { kind: 'failed', at: r.u64(), message: r.str() };
     throw new Error(`malformed outcome: kind ${kind}`);
+  });
+}
+
+// ---- device options, commands, reconfiguration ------------------------------------------------
+
+/** A device's options (`DeviceOptions`): what `Network.device` takes besides its config. */
+export interface DeviceOptions {
+  /** Journal its stdout and stderr lines. */
+  journalStdio?: boolean;
+  /** Its arguments after `argv[0]` (its name), for `wasi:cli/environment`. */
+  args?: readonly string[];
+  /** Its environment variables, in order. */
+  env?: readonly (readonly [string, string])[] | Record<string, string>;
+  /** It may use `wasmnet:infra` (an in-world controller). */
+  infra?: boolean;
+  /** With `infra`: the prefix of the names it may create. */
+  infraPrefix?: string;
+  /** With `infra`: what becomes of its devices when it stops or is removed. */
+  infraCascade?: 'keep' | 'stop' | 'remove';
+  /** With `infra`: the most devices it may have at once. */
+  infraMaxDevices?: number;
+  /** A fault of this device crashes it alone, not the network. */
+  crashAlone?: boolean;
+}
+
+const CASCADES = ['keep', 'stop', 'remove'] as const;
+
+function optU64(w: Writer, v: bigint | number | undefined): void {
+  if (v === undefined) w.u8(0);
+  else w.u8(1).u64(BigInt(v));
+}
+
+/** The `options` message (into `wn_add_device`). Memory and fuel are not set from here. */
+export function encodeOptions(o: DeviceOptions): Uint8Array {
+  const flags = (o.journalStdio ? 1 : 0) | (o.infra ? 2 : 0) | (o.crashAlone ? 4 : 0);
+  const env = Array.isArray(o.env) ? o.env : Object.entries(o.env ?? {});
+  const w = new Writer()
+    .u32(flags)
+    .strs(o.args ?? [])
+    .pairs(env as readonly (readonly [string, string])[])
+    .str(o.infraPrefix ?? '')
+    .u8(CASCADES.indexOf(o.infraCascade ?? 'keep'));
+  optU64(w, o.infraMaxDevices);
+  optU64(w, undefined); // memory
+  optU64(w, undefined); // fuel per instant
+  return w.finish();
+}
+
+/** A command's answer: `ok` text or the device's refusal. */
+export type CommandAnswer = { ok: string } | { err: string };
+
+export function encodeCommandAnswer(a: CommandAnswer): Uint8Array {
+  return 'ok' in a ? new Writer().u8(0).str(a.ok).finish() : new Writer().u8(1).str(a.err).finish();
+}
+
+export function decodeCommandAnswer(bytes: Uint8Array): CommandAnswer {
+  return whole(bytes, (r) => (r.u8() === 0 ? { ok: r.str() } : { err: r.str() }));
+}
+
+/** A reconfiguration's answer: 0 ok, 1 `restart(m)`, 2 `invalid(m)`. */
+export function encodeReconfigured(kind: 0 | 1 | 2, message = ''): Uint8Array {
+  return new Writer().u8(kind).str(message).finish();
+}
+
+// ---- values: wasmnet:infra calls --------------------------------------------------------------
+//
+// Generic in both directions, so this side knows no function of the interface: arguments as jco
+// handed them to the import, answers in the shape jco expects (crates/wasmnet-web/src/codec.rs,
+// `Value`, decides the shapes; crates/wasmnet-web/src/infra.rs serves the calls).
+
+const camel = (s: string) => s.replace(/-([a-z0-9])/g, (_, c: string) => c.toUpperCase());
+
+/** Writes a value jco handed over: an option's value bare, `undefined` for none. */
+export function writeValue(w: Writer, v: unknown): void {
+  if (v === undefined || v === null) w.u8(0);
+  else if (typeof v === 'boolean') w.u8(2).u8(v ? 1 : 0);
+  else if (typeof v === 'number') w.u8(3).u32(v);
+  else if (typeof v === 'bigint') w.u8(4).u64(v);
+  else if (typeof v === 'string') w.u8(5).str(v);
+  else if (v instanceof Uint8Array) w.u8(6).raw(v);
+  else if (Array.isArray(v)) {
+    w.u8(7).u32(v.length);
+    for (const x of v) writeValue(w, x);
+  } else if (typeof v === 'object' && 'tag' in v) {
+    const { tag, val } = v as { tag: string; val?: unknown };
+    w.u8(10).str(tag);
+    if (val === undefined) w.u8(0);
+    else writeValue(w.u8(1), val);
+  } else if (typeof v === 'object') {
+    const entries = Object.entries(v);
+    w.u8(9).u32(entries.length);
+    for (const [k, x] of entries) writeValue(w.str(k.replace(/[A-Z]/g, (c) => `-${c.toLowerCase()}`)), x);
+  } else throw new Error(`a value of type ${typeof v} cannot cross`);
+}
+
+/** Reads a value in the shape jco expects back. */
+export function readValue(r: Reader): unknown {
+  const kind = r.u8();
+  switch (kind) {
+    case 0:
+      return undefined;
+    case 1:
+      return readValue(r);
+    case 2:
+      return r.u8() !== 0;
+    case 3:
+      return r.u32();
+    case 4:
+      return r.u64();
+    case 5:
+      return r.str();
+    case 6:
+      return r.raw().slice();
+    case 7:
+    case 8: {
+      const n = r.u32();
+      const out: unknown[] = [];
+      for (let i = 0; i < n; i++) out.push(readValue(r));
+      return out;
+    }
+    case 9: {
+      const n = r.u32();
+      const out: Record<string, unknown> = {};
+      for (let i = 0; i < n; i++) {
+        const k = r.str();
+        out[camel(k)] = readValue(r);
+      }
+      return out;
+    }
+    case 10: {
+      const tag = r.str();
+      return r.u8() === 0 ? { tag } : { tag, val: readValue(r) };
+    }
+    case 11:
+      return r.str();
+    default:
+      throw new Error(`malformed value: kind ${kind}`);
+  }
+}
+
+/** The `infra call` message: the function (`devices.apply`) and the arguments jco passed. */
+export function encodeInfraCall(fn: string, args: readonly unknown[]): Uint8Array {
+  const w = new Writer().str(fn).u32(args.length);
+  for (const a of args) writeValue(w, a);
+  return w.finish();
+}
+
+/** The `infra reply` message: the value, the error to throw, or a failure of the call. */
+export type InfraReply = { value: unknown } | { error: unknown } | { failed: string };
+
+export function decodeInfraReply(bytes: Uint8Array): InfraReply {
+  return whole(bytes, (r): InfraReply => {
+    const kind = r.u8();
+    if (kind === 0) return { value: readValue(r) };
+    if (kind === 1) return { error: readValue(r) };
+    return { failed: r.str() };
   });
 }

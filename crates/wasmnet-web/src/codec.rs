@@ -24,10 +24,25 @@
 //! plan       (to js_instantiate)    str name, str component, pairs config
 //! instance   (from js_instantiate)  list<port>, u32 flags, list<str> apps
 //!            port = u32 id, str name, bytes mac (empty: none, else 6 bytes), u32 mtu
-//!            flags: bit 0 exports wasmnet:link/counters, bit 1 exports wasmnet:link/lifecycle
+//!            flags: bit 0 exports wasmnet:link/counters, bit 1 wasmnet:link/lifecycle,
+//!                   bit 2 wasmnet:control/commands, bit 3 wasmnet:reconfigure/reconfigure
 //! counters   (from js_counters, out of wn_counters)   list<(str name, u64 value)>
 //! event      (into wn_event)        str kind, pairs fields
-//! config     (into wn_add_device, out of wn_config_all)   pairs
+//! config     (into wn_add_device and js_reconfigure, out of wn_config_all)   pairs
+//! options    (into wn_add_device)   u32 flags (bit 0 journal stdio, 1 infra, 2 crash alone),
+//!            list<str> args, pairs env, str infra prefix (empty: none), u8 cascade (0 keep,
+//!            1 stop, 2 remove), opt infra max devices, opt memory, opt fuel per instant
+//!            (opt = u8 0, or u8 1 then u64)
+//! strs       (out of wn_args)       list<str>: argv, the device's name first
+//! pairs      (out of wn_env)        pairs, in order
+//! command    (from js_invoke, out of wn_command)   u8 0 ok, 1 refused; str text
+//! reconfigured (from js_reconfigure)  u8 0 ok, 1 restart, 2 invalid; str message (empty for ok)
+//! infra call (into wn_infra, wn_infra_wait)   str function (`devices.apply`), list<value> args
+//! infra reply (out of wn_infra, wn_infra_wait)  u8 0 value, then value; 1 error, then value
+//!            (thrown in JavaScript); 2 failed (a malformed call), then str message
+//! value      u8 kind, then by kind: 0 none, 1 some + value, 2 bool (u8), 3 u32, 4 u64, 5 str,
+//!            6 bytes, 7 list<value>, 8 tuple (list<value>), 9 record (list<(str field,
+//!            value)>, WIT names), 10 variant (str case, u8 0 or 1 + value), 11 enum (str)
 //! journal    (out of wn_journal)    list<row>
 //!            row = u64 at (ns), str device, u8 record, then by record:
 //!              0 log:    u8 level (0 trace, 1 debug, 2 info, 3 warn, 4 error), str message
@@ -40,9 +55,13 @@
 //!              2 failed:    u64 at, str message
 //! ```
 
-use wasmnet_core::{DeclaredPort, DeviceConfig, JournalEntry, Level, Outcome, Record, Stream};
+use wasmnet_core::{
+    Cascade, DeclaredPort, DeviceConfig, DeviceOptions, JournalEntry, Level, Outcome, Record,
+    Refusal, Stream,
+};
 
 use crate::host::Instance;
+use crate::infra::Reply;
 use crate::network::RunOutcome;
 
 /// Why bytes from the other side could not be read.
@@ -236,6 +255,8 @@ pub fn decode_plan(bytes: &[u8]) -> Result<(String, String, DeviceConfig), Decod
 
 const FLAG_COUNTERS: u32 = 1;
 const FLAG_LIFECYCLE: u32 = 2;
+const FLAG_COMMANDS: u32 = 4;
+const FLAG_RECONFIGURE: u32 = 8;
 
 /// The `instance` message: JavaScript's answer to `js_instantiate`.
 pub fn encode_instance(instance: &Instance) -> Vec<u8> {
@@ -248,7 +269,9 @@ pub fn encode_instance(instance: &Instance) -> Vec<u8> {
             .u32(p.mtu);
     }
     let flags = u32::from(instance.counters) * FLAG_COUNTERS
-        + u32::from(instance.lifecycle) * FLAG_LIFECYCLE;
+        + u32::from(instance.lifecycle) * FLAG_LIFECYCLE
+        + u32::from(instance.commands) * FLAG_COMMANDS
+        + u32::from(instance.reconfigure) * FLAG_RECONFIGURE;
     w.u32(flags).strs(&instance.apps).finish()
 }
 
@@ -277,6 +300,8 @@ pub fn decode_instance(bytes: &[u8]) -> Result<Instance, DecodeError> {
             apps,
             counters: flags & FLAG_COUNTERS != 0,
             lifecycle: flags & FLAG_LIFECYCLE != 0,
+            commands: flags & FLAG_COMMANDS != 0,
+            reconfigure: flags & FLAG_RECONFIGURE != 0,
         })
     })
 }
@@ -322,6 +347,23 @@ pub fn encode_config(config: &DeviceConfig) -> Vec<u8> {
 /// Reads a `config` message. A key given twice keeps its last value.
 pub fn decode_config(bytes: &[u8]) -> Result<DeviceConfig, DecodeError> {
     whole(bytes, |r| Ok(r.pairs()?.into_iter().collect()))
+}
+
+/// The `list<str>` message (out of `wn_args`): a device's `argv`.
+pub fn encode_strs<S: AsRef<str>>(items: &[S]) -> Vec<u8> {
+    Writer::new().strs(items).finish()
+}
+
+/// Reads a `list<str>` message.
+pub fn decode_strs(bytes: &[u8]) -> Result<Vec<String>, DecodeError> {
+    whole(bytes, |r| r.strs())
+}
+
+/// The `pairs` message in the given order (out of `wn_env`): a device's environment.
+pub fn encode_pairs(pairs: &[(String, String)]) -> Vec<u8> {
+    Writer::new()
+        .pairs(pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .finish()
 }
 
 // ---- journal -------------------------------------------------------------------------------
@@ -486,6 +528,370 @@ pub fn decode_outcome(bytes: &[u8]) -> Result<RunOutcome, DecodeError> {
     })
 }
 
+// ---- options -------------------------------------------------------------------------------
+
+const OPT_JOURNAL_STDIO: u32 = 1;
+const OPT_INFRA: u32 = 2;
+const OPT_CRASH_ALONE: u32 = 4;
+
+fn opt_u64(w: &mut Writer, v: Option<u64>) {
+    match v {
+        Some(v) => w.u8(1).u64(v),
+        None => w.u8(0),
+    };
+}
+
+fn read_opt_u64(r: &mut Reader<'_>) -> Result<Option<u64>, DecodeError> {
+    let at = r.at;
+    match r.u8()? {
+        0 => Ok(None),
+        1 => Ok(Some(r.u64()?)),
+        _ => Err(DecodeError { at, what: "option" }),
+    }
+}
+
+/// The `options` message: the [`DeviceOptions`] this boundary carries (everything but the
+/// supply limits and extension options).
+pub fn encode_options(options: &DeviceOptions) -> Vec<u8> {
+    let mut w = Writer::new();
+    let flags = u32::from(options.journal_stdio) * OPT_JOURNAL_STDIO
+        + u32::from(options.infra) * OPT_INFRA
+        + u32::from(options.crash_alone) * OPT_CRASH_ALONE;
+    w.u32(flags)
+        .strs(&options.args)
+        .pairs(options.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .str(options.infra_prefix.as_deref().unwrap_or_default())
+        .u8(match options.infra_cascade {
+            Cascade::Keep => 0,
+            Cascade::Stop => 1,
+            Cascade::Remove => 2,
+            // A cascade newer than this encoding: the reader refuses it.
+            _ => u8::MAX,
+        });
+    opt_u64(&mut w, options.infra_max_devices.map(u64::from));
+    opt_u64(&mut w, options.memory);
+    opt_u64(&mut w, options.fuel_per_instant);
+    w.finish()
+}
+
+/// Reads an `options` message (unknown flag bits are ignored; an empty prefix is none).
+// Field by field rather than a struct literal: the options struct may grow fields this crate
+// does not set.
+#[allow(clippy::field_reassign_with_default)]
+pub fn decode_options(bytes: &[u8]) -> Result<DeviceOptions, DecodeError> {
+    whole(bytes, |r| {
+        let flags = r.u32()?;
+        let args = r.strs()?;
+        let env = r.pairs()?;
+        let prefix = r.str()?;
+        let at = r.at;
+        let cascade = match r.u8()? {
+            0 => Cascade::Keep,
+            1 => Cascade::Stop,
+            2 => Cascade::Remove,
+            _ => {
+                return Err(DecodeError {
+                    at,
+                    what: "cascade",
+                });
+            }
+        };
+        let at = r.at;
+        let max = read_opt_u64(r)?
+            .map(|n| u32::try_from(n).map_err(|_| DecodeError { at, what: "u32" }))
+            .transpose()?;
+        let memory = read_opt_u64(r)?;
+        let fuel = read_opt_u64(r)?;
+        let mut o = DeviceOptions::default();
+        o.journal_stdio = flags & OPT_JOURNAL_STDIO != 0;
+        o.infra = flags & OPT_INFRA != 0;
+        o.crash_alone = flags & OPT_CRASH_ALONE != 0;
+        o.args = args;
+        o.env = env;
+        o.infra_prefix = (!prefix.is_empty()).then_some(prefix);
+        o.infra_cascade = cascade;
+        o.infra_max_devices = max;
+        o.memory = memory;
+        o.fuel_per_instant = fuel;
+        Ok(o)
+    })
+}
+
+// ---- device commands and reconfiguration ---------------------------------------------------
+
+/// The `command` message (into `js_invoke`, out of `wn_command`): the device's answer.
+pub fn encode_command_answer(answer: &Result<String, String>) -> Vec<u8> {
+    match answer {
+        Ok(text) => Writer::new().u8(0).str(text).finish(),
+        Err(text) => Writer::new().u8(1).str(text).finish(),
+    }
+}
+
+/// Reads a `command` message.
+pub fn decode_command_answer(bytes: &[u8]) -> Result<Result<String, String>, DecodeError> {
+    whole(bytes, |r| {
+        let at = r.at;
+        match r.u8()? {
+            0 => Ok(Ok(r.str()?)),
+            1 => Ok(Err(r.str()?)),
+            _ => Err(DecodeError { at, what: "answer" }),
+        }
+    })
+}
+
+/// The `reconfigured` message (from `js_reconfigure`): the device's answer.
+pub fn encode_reconfigured(answer: &Result<(), Refusal>) -> Vec<u8> {
+    match answer {
+        Ok(()) => Writer::new().u8(0).str("").finish(),
+        Err(Refusal::Restart(m)) => Writer::new().u8(1).str(m).finish(),
+        Err(Refusal::Invalid(m)) => Writer::new().u8(2).str(m).finish(),
+        // A refusal newer than this encoding: the reader refuses it.
+        Err(other) => Writer::new()
+            .u8(u8::MAX)
+            .str(&format!("{other:?}"))
+            .finish(),
+    }
+}
+
+/// Reads a `reconfigured` message.
+pub fn decode_reconfigured(bytes: &[u8]) -> Result<Result<(), Refusal>, DecodeError> {
+    whole(bytes, |r| {
+        let at = r.at;
+        let kind = r.u8()?;
+        let text = r.str()?;
+        match kind {
+            0 => Ok(Ok(())),
+            1 => Ok(Err(Refusal::Restart(text))),
+            2 => Ok(Err(Refusal::Invalid(text))),
+            _ => Err(DecodeError {
+                at,
+                what: "refusal",
+            }),
+        }
+    })
+}
+
+// ---- values: wasmnet:infra calls -------------------------------------------------------------
+
+/// A WIT value as `wasmnet:infra` calls carry it across the boundary, close to jco's own
+/// shapes, so the JavaScript side converts generically and knows nothing of the interface:
+/// JavaScript sends a call's arguments the way jco handed them to the import, and gets the
+/// answer in the shape jco expects back.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Value {
+    /// `option::none` (JavaScript: `undefined`).
+    None,
+    /// `option::some` (JavaScript: the value itself). JavaScript sends a present option as
+    /// the bare value.
+    Some(Box<Value>),
+    Bool(bool),
+    /// Integers up to 32 bits (JavaScript: a number).
+    U32(u32),
+    /// 64-bit integers (JavaScript: a bigint).
+    U64(u64),
+    Str(String),
+    /// `list<u8>` (JavaScript: a `Uint8Array`).
+    Bytes(Vec<u8>),
+    List(Vec<Value>),
+    /// JavaScript: an array, like a list.
+    Tuple(Vec<Value>),
+    /// Fields by their WIT (kebab-case) names; JavaScript camel-cases them.
+    Record(Vec<(String, Value)>),
+    /// A variant case or a `result` (`ok`/`err`); JavaScript: `{ tag, val }`.
+    Variant(String, Option<Box<Value>>),
+    /// JavaScript: the case's name.
+    Enum(String),
+}
+
+impl Value {
+    pub fn str(s: impl Into<String>) -> Self {
+        Value::Str(s.into())
+    }
+
+    /// `option<T>`.
+    pub fn option(v: Option<Value>) -> Self {
+        v.map_or(Value::None, |v| Value::Some(Box::new(v)))
+    }
+
+    /// A variant case with a payload.
+    pub fn case(tag: &str, payload: Value) -> Self {
+        Value::Variant(tag.to_owned(), Some(Box::new(payload)))
+    }
+
+    /// A record from `(field, value)` pairs.
+    pub fn record(fields: Vec<(&str, Value)>) -> Self {
+        Value::Record(fields.into_iter().map(|(k, v)| (k.to_owned(), v)).collect())
+    }
+}
+
+/// How deep values nest at most (the interface's deepest is 5); deeper input is malformed.
+const MAX_DEPTH: usize = 32;
+
+impl Writer {
+    /// A `value`.
+    pub fn value(&mut self, v: &Value) -> &mut Self {
+        match v {
+            Value::None => self.u8(0),
+            Value::Some(v) => self.u8(1).value(v),
+            Value::Bool(b) => self.u8(2).u8(u8::from(*b)),
+            Value::U32(n) => self.u8(3).u32(*n),
+            Value::U64(n) => self.u8(4).u64(*n),
+            Value::Str(s) => self.u8(5).str(s),
+            Value::Bytes(b) => self.u8(6).bytes(b),
+            Value::List(items) | Value::Tuple(items) => {
+                self.u8(if matches!(v, Value::List(_)) { 7 } else { 8 });
+                self.len(items.len());
+                for i in items {
+                    self.value(i);
+                }
+                self
+            }
+            Value::Record(fields) => {
+                self.u8(9).len(fields.len());
+                for (k, v) in fields {
+                    self.str(k).value(v);
+                }
+                self
+            }
+            Value::Variant(tag, payload) => {
+                self.u8(10).str(tag);
+                match payload {
+                    Some(p) => self.u8(1).value(p),
+                    None => self.u8(0),
+                }
+            }
+            Value::Enum(name) => self.u8(11).str(name),
+        }
+    }
+}
+
+impl Reader<'_> {
+    /// A `value`.
+    pub fn value(&mut self) -> Result<Value, DecodeError> {
+        self.value_at(0)
+    }
+
+    fn value_at(&mut self, depth: usize) -> Result<Value, DecodeError> {
+        let at = self.at;
+        if depth > MAX_DEPTH {
+            return Err(DecodeError {
+                at,
+                what: "value (nested too deep)",
+            });
+        }
+        let d = depth + 1;
+        Ok(match self.u8()? {
+            0 => Value::None,
+            1 => Value::Some(Box::new(self.value_at(d)?)),
+            2 => match self.u8()? {
+                0 => Value::Bool(false),
+                1 => Value::Bool(true),
+                _ => {
+                    return Err(DecodeError {
+                        at: at + 1,
+                        what: "bool",
+                    });
+                }
+            },
+            3 => Value::U32(self.u32()?),
+            4 => Value::U64(self.u64()?),
+            5 => Value::Str(self.str()?),
+            6 => Value::Bytes(self.bytes()?.to_vec()),
+            kind @ (7 | 8) => {
+                let n = self.u32()?;
+                let items = (0..n)
+                    .map(|_| self.value_at(d))
+                    .collect::<Result<Vec<_>, _>>()?;
+                if kind == 7 {
+                    Value::List(items)
+                } else {
+                    Value::Tuple(items)
+                }
+            }
+            9 => {
+                let n = self.u32()?;
+                Value::Record(
+                    (0..n)
+                        .map(|_| Ok((self.str()?, self.value_at(d)?)))
+                        .collect::<Result<Vec<_>, DecodeError>>()?,
+                )
+            }
+            10 => {
+                let tag = self.str()?;
+                let p = self.at;
+                let payload = match self.u8()? {
+                    0 => None,
+                    1 => Some(Box::new(self.value_at(d)?)),
+                    _ => {
+                        return Err(DecodeError {
+                            at: p,
+                            what: "payload",
+                        });
+                    }
+                };
+                Value::Variant(tag, payload)
+            }
+            11 => Value::Enum(self.str()?),
+            _ => {
+                return Err(DecodeError {
+                    at,
+                    what: "value kind",
+                });
+            }
+        })
+    }
+}
+
+/// The `infra call` message (into `wn_infra`, `wn_infra_wait`): the function
+/// (`devices.apply`, `components.list`, `changes.wait`) and its arguments, in order.
+pub fn encode_infra_call(function: &str, args: &[Value]) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.str(function).len(args.len());
+    for a in args {
+        w.value(a);
+    }
+    w.finish()
+}
+
+/// Reads an `infra call` message.
+pub fn decode_infra_call(bytes: &[u8]) -> Result<(String, Vec<Value>), DecodeError> {
+    whole(bytes, |r| {
+        let function = r.str()?;
+        let n = r.u32()?;
+        let args = (0..n).map(|_| r.value()).collect::<Result<Vec<_>, _>>()?;
+        Ok((function, args))
+    })
+}
+
+/// The `infra reply` message (out of `wn_infra`, `wn_infra_wait`).
+pub fn encode_infra_reply(reply: &Reply) -> Vec<u8> {
+    let mut w = Writer::new();
+    match reply {
+        Reply::Value(v) => w.u8(0).value(v),
+        Reply::Error(v) => w.u8(1).value(v),
+        Reply::Failed(m) => w.u8(2).str(m),
+    };
+    w.finish()
+}
+
+/// Reads an `infra reply` message.
+pub fn decode_infra_reply(bytes: &[u8]) -> Result<Reply, DecodeError> {
+    whole(bytes, |r| {
+        let at = r.at;
+        Ok(match r.u8()? {
+            0 => Reply::Value(r.value()?),
+            1 => Reply::Error(r.value()?),
+            2 => Reply::Failed(r.str()?),
+            _ => {
+                return Err(DecodeError {
+                    at,
+                    what: "reply kind",
+                });
+            }
+        })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -535,6 +941,8 @@ mod tests {
             apps: vec!["http-server".to_owned()],
             counters: true,
             lifecycle: true,
+            commands: true,
+            reconfigure: false,
         };
         assert_eq!(decode_instance(&encode_instance(&instance)), Ok(instance));
 

@@ -131,6 +131,20 @@ async function main(): Promise<void> {
   runButton.disabled = false;
   setStatus('Ready. Pick a seed and press Run.', 'ready');
 
+  // Another scenario of the Worker's, without the page's views: for tests and the console.
+  const plain = (v: unknown) => JSON.parse(JSON.stringify(v, (_k, x: unknown) => (typeof x === 'bigint' ? String(x) : x)));
+  (window as { wasmnetScenario?: unknown }).wasmnetScenario = async (scenario: Init['scenario'], seed = '42') => {
+    const journal: JournalEntry[] = [];
+    const run = runInWorker<Init, Done>(new URL('worker.js', import.meta.url), {
+      init: { seed, scenario, ...loaded },
+      timeoutMs: 120_000,
+      onMessage: (p) => journal.push(...(p as Progress).entries),
+    });
+    const outcome = await run.outcome;
+    if (outcome.status !== 'ok') throw new Error(`the run ended ${outcome.status}`);
+    return plain({ journal, outcome: outcome.value.outcome, answers: outcome.value.answers ?? null });
+  };
+
   runButton.addEventListener('click', async () => {
     const seed = seedInput.value.trim() || '0';
     if (!/^\d+$/.test(seed) || BigInt(seed) >= 1n << 64n) {

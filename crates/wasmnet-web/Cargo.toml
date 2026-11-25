@@ -20,6 +20,13 @@ thiserror.workspace = true
 [dev-dependencies]
 # Reading pcap packet directions back in the tests.
 wasmnet-wire = { path = "../wasmnet-wire" }
+# `tests/parity.rs`: the same scenarios on the wasmtime backend, and wasmtime standing in for
+# the page's JavaScript (it hosts the components and serves their imports as the page does).
+wasmnet-host = { path = "../wasmnet-host" }
+wasmtime-wasi.workspace = true
+wasmnet-det-cbor = { path = "../wasmnet-det-cbor" }
+# The shared test support of `wasmnet-host` (`tests/support`) reads frames with it.
+etherparse.workspace = true
 
 [lints]
 workspace = true

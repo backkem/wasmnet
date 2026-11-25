@@ -151,6 +151,35 @@ await step('another seed still fetches the page', async () => {
   return { entries: other.record.journal.length };
 });
 
+/** FNV-1a 64 of a string's UTF-8, in hex, as the HTTP apps journal a body's (`body-fnv`). */
+function fnv(text) {
+  let h = 0xcbf29ce484222325n;
+  for (const b of Buffer.from(text, 'utf8')) h = BigInt.asUintN(64, (h ^ BigInt(b)) * 0x100000001b3n);
+  return h.toString(16).padStart(16, '0');
+}
+
+await step('what an embedder controls: commands, arguments and environment', async () => {
+  const r = await page.evaluate(() => window.wasmnetScenario('controls', '42'));
+  const a = r.answers;
+  const want = { block: { ok: 'blocked' }, paths: { ok: 'block 0 3' }, server: null };
+  for (const [k, v] of Object.entries(want)) {
+    if (JSON.stringify(a[k]) !== JSON.stringify(v)) throw new Error(`answer ${k}: ${JSON.stringify(a[k])}, want ${JSON.stringify(v)}`);
+  }
+  if (!a.unknown?.err?.includes('unknown command')) throw new Error(`answer unknown: ${JSON.stringify(a.unknown)}`);
+  // The operator event at 5 ms unblocked the ports again.
+  if (a.after?.ok === undefined || a.after.ok.includes('block 0 3')) throw new Error(`after the run: ${JSON.stringify(a.after)}`);
+  const unblocked = events(r, 'ports-unblocked', 'sw');
+  if (unblocked.length !== 1 || unblocked[0].at !== '5000000') throw new Error(`ports-unblocked ${JSON.stringify(unblocked)}`);
+  if (events(r, 'ports-blocked', 'sw').length !== 1) throw new Error('no ports-blocked event');
+  // The server's page is its arguments and its environment variable, as it read them.
+  const body = '-v two words|hello from the tab';
+  const responses = events(r, 'http-response', 'server');
+  if (responses.length !== 1 || fieldsOf(responses[0])['body-fnv'] !== fnv(body)) throw new Error(`http-response ${JSON.stringify(responses)}, want body-fnv ${fnv(body)}`);
+  const done = events(r, 'http-get-done', 'client');
+  if (done.length !== 1 || fieldsOf(done[0]).status !== '200' || fieldsOf(done[0])['body-bytes'] !== String(Buffer.byteLength(body))) throw new Error(`http-get-done ${JSON.stringify(done)}`);
+  return { answers: a, switchEvents: unblocked.map((e) => `${e.at} ${e.kind}`), body: fieldsOf(responses[0])['body-fnv'] };
+});
+
 if (process.env.NATIVE_JOURNAL) {
   await step('agrees with the native example', async () => {
     // The native example prints `<t> ns  <device> <kind> k=v ...` for events and

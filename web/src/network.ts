@@ -12,7 +12,11 @@
 // The split: the simulator owns virtual time, the event queue, links, pcap taps and the
 // journal; this file instantiates the devices and serves their imports. A device's WASI comes
 // from the kit's `wasiImports` over a `World` that asks the simulator (clock, timers, seeded
-// entropy, stdout, config); its `wasmnet:link` imports go straight to the simulator.
+// entropy, stdout, config, arguments and environment); its `wasmnet:link` imports go straight
+// to the simulator, and so do its `wasmnet:infra` calls, as generic values (codec.ts): the
+// simulator serves them, so nothing here knows what a call does. A device's commands
+// (`wasmnet:control/commands`) and reconfiguration (`wasmnet:reconfigure`) are called when the
+// simulator asks, like `receive`. No decision is made in this file.
 //
 // The boundary is documented in crates/wasmnet-web/src/ffi.rs (exports `wn_*`, imports
 // `wasmnet_js.*`, who allocates, re-entry) and codec.rs (the encodings). One `Network` per
@@ -23,9 +27,9 @@ import { settle, touch } from './codelib-web/dist/loop.js';
 import { wasiImports } from './codelib-web/dist/wasi/index.js';
 import type { RandomStream, World } from './codelib-web/dist/worlds.js';
 import * as codec from './codec.js';
-import type { JournalEntry, Outcome, PortInfo } from './codec.js';
+import type { CommandAnswer, DeviceOptions, JournalEntry, Outcome, PortInfo } from './codec.js';
 
-export type { JournalEntry, Outcome } from './codec.js';
+export type { CommandAnswer, DeviceOptions, JournalEntry, Outcome } from './codec.js';
 
 /** Where a component's transpiled glue is, and its core modules if already compiled. */
 export interface ComponentSource {
@@ -78,7 +82,13 @@ interface Exports {
   wn_result_ptr(): number;
   wn_result_len(): number;
   wn_network_new(seed: bigint): number;
-  wn_add_device(name: number, nameLen: number, component: number, componentLen: number, config: number, configLen: number, flags: number): number;
+  wn_add_device(name: number, nameLen: number, component: number, componentLen: number, config: number, configLen: number, options: number, optionsLen: number): number;
+  wn_command(dev: number, command: number, commandLen: number, argument: number, argumentLen: number): number;
+  wn_schedule_command(dev: number, at: bigint, command: number, commandLen: number, argument: number, argumentLen: number): number;
+  wn_args(dev: number): number;
+  wn_env(dev: number): number;
+  wn_infra(dev: number, call: number, len: number): number;
+  wn_infra_wait(dev: number, call: number, len: number): number;
   wn_link(devA: number, portA: number, devB: number, portB: number, latency: bigint): number;
   wn_step(until: bigint): number;
   wn_take_dirty(): number;
@@ -115,7 +125,26 @@ interface Root {
   };
   lifecycle?: { start(): Promise<void> };
   counters?: { counters(): [string, bigint][] };
+  /** `wasmnet:control/commands`: `ok` returns, a refusal throws (jco's `ComponentError`). */
+  commands?: { invoke(now: bigint, command: string, argument: string): string };
+  /** `wasmnet:reconfigure/reconfigure`: a refusal throws `{ tag: 'restart' | 'invalid', val }`. */
+  reconfigure?: { reconfigure(now: bigint, config: [string, string][]): void };
   [app: string]: unknown;
+}
+
+/** The functions of `wasmnet:infra` the simulator serves, by interface (jco's names). */
+const INFRA: Record<string, string[]> = {
+  devices: ['apply', 'start', 'stop', 'remove', 'control', 'wire', 'unwire', 'controlAnswer', 'get', 'list', 'watch', 'logs'],
+  components: ['supply', 'release', 'list'],
+};
+
+const kebab = (s: string) => s.replace(/[A-Z]/g, (c) => `-${c.toLowerCase()}`);
+
+/** A `result`'s `err` that jco threw as a `ComponentError`: its payload. Anything else is a trap, thrown on. */
+function errPayload(err: unknown): unknown {
+  const e = err as { constructor?: { name?: string }; payload?: unknown } | null;
+  if (e?.constructor?.name === 'ComponentError') return e.payload;
+  throw err;
 }
 
 interface Instance {
@@ -151,6 +180,8 @@ export class Network {
   private stash: Uint8Array = new Uint8Array();
   /** Virtual timers by the simulator's id: the guest's wake-up. */
   private readonly timers = new Map<number, () => void>();
+  /** `changes.wait` calls by the simulator's id: their promise's resolution. */
+  private readonly waits = new Map<number, (rv: bigint) => void>();
   private journalNext = 0;
   private panicked: string | null = null;
 
@@ -297,6 +328,46 @@ export class Network {
         self.timers.delete(timer);
         wake?.();
       },
+      js_invoke: (dev: number, now: bigint, cp: number, cl: number, ap: number, al: number) => {
+        const self = n();
+        try {
+          const commands = self.instance(dev).root.commands;
+          if (!commands) throw new Error('no commands export');
+          const [command, argument] = [decoder.decode(self.view(cp, cl)), decoder.decode(self.view(ap, al))];
+          let answer: CommandAnswer;
+          try {
+            answer = { ok: self.sync(commands.invoke(U64(now), command, argument), 'invoke') };
+          } catch (err) {
+            answer = { err: String(errPayload(err)) };
+          }
+          return self.put(codec.encodeCommandAnswer(answer));
+        } catch (err) {
+          return self.fail(err);
+        }
+      },
+      js_reconfigure: (dev: number, now: bigint, ptr: number, len: number) => {
+        const self = n();
+        try {
+          const reconfigure = self.instance(dev).root.reconfigure;
+          if (!reconfigure) throw new Error('no reconfigure export');
+          const config = codec.decodeConfig(self.view(ptr, len).slice());
+          try {
+            self.sync(reconfigure.reconfigure(U64(now), config), 'reconfigure');
+            return self.put(codec.encodeReconfigured(0));
+          } catch (err) {
+            const r = errPayload(err) as { tag: string; val: string };
+            return self.put(codec.encodeReconfigured(r.tag === 'restart' ? 1 : 2, r.val));
+          }
+        } catch (err) {
+          return self.fail(err);
+        }
+      },
+      js_wait_done: (wait: number, rv: bigint) => {
+        const self = n();
+        const done = self.waits.get(wait);
+        self.waits.delete(wait);
+        done?.(U64(rv));
+      },
       js_panic: (ptr: number, len: number) => {
         const self = n();
         self.panicked = decoder.decode(self.view(ptr, len));
@@ -346,7 +417,12 @@ export class Network {
       return this.put(
         codec.encodeInstance(
           ports,
-          { counters: root.counters !== undefined, lifecycle: root.lifecycle !== undefined },
+          {
+            counters: root.counters !== undefined,
+            lifecycle: root.lifecycle !== undefined,
+            commands: root.commands !== undefined,
+            reconfigure: root.reconfigure !== undefined,
+          },
           apps.map((a) => a.name),
         ),
       );
@@ -358,8 +434,9 @@ export class Network {
   // ---- a device's imports ---------------------------------------------------------------------
 
   /** Device `dev`'s world, as the kit's WASI reads it: everything from the simulator. */
-  private world(dev: number, name: string): World {
+  private world(dev: number): World {
     const x = this.x;
+    const self = this;
     const stream = (s: RandomStream) => (s === 'secure' ? 0 : 1);
     const output = (stderr: number) => (bytes: Uint8Array) => {
       touch();
@@ -404,15 +481,46 @@ export class Network {
           return len < 0 ? [] : codec.decodeConfig(this.result(len));
         },
       },
-      args: [name],
-      env: [],
+      // Read when the guest asks (the simulator registers the device after the instance exists).
+      get args() {
+        return codec.decodeStrs(self.result(x.wn_args(dev)));
+      },
+      get env() {
+        return codec.decodeConfig(self.result(x.wn_env(dev)));
+      },
     };
   }
 
-  private imports(dev: number, name: string): Imports {
+  /** One `wasmnet:infra` call, served by the simulator; its error is thrown, as jco expects. */
+  private infra(dev: number, fn: string, args: unknown[]): unknown {
+    touch();
+    const len = this.withBytes(codec.encodeInfraCall(fn, args), (p, l) => this.x.wn_infra(dev, p, l));
+    const reply = codec.decodeInfraReply(this.result(len));
+    if ('value' in reply) return reply.value;
+    if ('error' in reply) throw { payload: reply.error };
+    throw new Error(reply.failed);
+  }
+
+  /** `changes.wait`: resolves when the simulator says (during a later step). */
+  private infraWait(dev: number, args: unknown[]): Promise<bigint> {
+    touch();
+    const id = this.withBytes(codec.encodeInfraCall('changes.wait', args), (p, l) => this.x.wn_infra_wait(dev, p, l));
+    if (id >= 0) return new Promise((resolve) => this.waits.set(id, resolve));
+    const reply = codec.decodeInfraReply(this.result());
+    if ('error' in reply) return Promise.reject({ payload: reply.error });
+    return Promise.reject(new Error('failed' in reply ? reply.failed : 'changes.wait'));
+  }
+
+  private imports(dev: number): Imports {
     const x = this.x;
+    const infra: Imports = { 'wasmnet:infra/types': {} };
+    for (const [iface, fns] of Object.entries(INFRA)) {
+      infra[`wasmnet:infra/${iface}`] = Object.fromEntries(fns.map((f) => [f, (...args: unknown[]) => this.infra(dev, `${iface}.${kebab(f)}`, args)]));
+    }
+    infra['wasmnet:infra/changes'] = { wait: (...args: unknown[]) => this.infraWait(dev, args) };
     return {
-      ...wasiImports(this.world(dev, name)),
+      ...wasiImports(this.world(dev)),
+      ...infra,
       'wasmnet:link/types': {},
       'wasmnet:link/wire': {
         transmit: (port: number, frame: Uint8Array) => {
@@ -438,14 +546,15 @@ export class Network {
 
   /**
    * Instantiates `component` (a key of `options.components`) as a device called `name`, with
-   * flat `key = value` config (nested keys dotted, as natively). `journalStdio` puts its stdout
-   * and stderr lines in the journal.
+   * flat `key = value` config (nested keys dotted, as natively) and `options` (its arguments
+   * and environment, a `wasmnet:infra` grant, its stdout and stderr lines in the journal: see
+   * `DeviceOptions`).
    */
-  async device(name: string, component: string, config: Record<string, string> = {}, options: { journalStdio?: boolean } = {}): Promise<Device> {
+  async device(name: string, component: string, config: Record<string, string> = {}, options: DeviceOptions = {}): Promise<Device> {
     const source = this.sources[component];
     if (!source) throw new Error(`no component ${component} (known: ${Object.keys(this.sources).join(', ')})`);
     const index = this.instances.length;
-    const loaded = await instantiate(source.url, this.imports(index, name), source.modules ? { modules: source.modules } : {});
+    const loaded = await instantiate(source.url, this.imports(index), source.modules ? { modules: source.modules } : {});
     const root = loaded.exports as unknown as Root;
     // A composed node exports one `app-<name>` instance per app; the kit lists them by WIT name
     // (`app-http-get#run`), whatever jco keys them by.
@@ -460,7 +569,9 @@ export class Network {
     const c = encoder.encode(component);
     const got = this.withBytes(n, (np, nl) =>
       this.withBytes(c, (cp, cl) =>
-        this.withBytes(codec.encodeConfig(pairs), (gp, gl) => this.x.wn_add_device(np, nl, cp, cl, gp, gl, options.journalStdio ? 1 : 0)),
+        this.withBytes(codec.encodeConfig(pairs), (gp, gl) =>
+          this.withBytes(codec.encodeOptions(options), (op, ol) => this.x.wn_add_device(np, nl, cp, cl, gp, gl, op, ol)),
+        ),
       ),
     );
     this.pending = null;
@@ -563,6 +674,33 @@ export class Network {
     if (len === -2) return null;
     if (len < 0) throw new Error(this.resultText());
     return codec.decodeCounters(this.result(len));
+  }
+
+  /**
+   * Runs `command` with `argument` in the device's `wasmnet:control/commands` export now,
+   * between runs: its answer, or null if the device takes no commands. Throws if the device
+   * trapped (the network failed) or refused the call (a paused device).
+   */
+  command(device: Device | number, command: string, argument = ''): CommandAnswer | null {
+    const dev = typeof device === 'number' ? device : device.index;
+    const len = this.withBytes(encoder.encode(command), (cp, cl) =>
+      this.withBytes(encoder.encode(argument), (ap, al) => this.x.wn_command(dev, cp, cl, ap, al)),
+    );
+    if (len === -2) return null;
+    if (len < 0) throw new Error(this.resultText());
+    return codec.decodeCommandAnswer(this.result(len));
+  }
+
+  /**
+   * Sends `command` with `argument` to the device at the start of virtual instant `at` (ns), as
+   * an operator event, during a later `run()`. Throws if the device takes no commands.
+   */
+  scheduleCommand(device: Device | number, at: bigint | number, command: string, argument = ''): void {
+    const dev = typeof device === 'number' ? device : device.index;
+    const got = this.withBytes(encoder.encode(command), (cp, cl) =>
+      this.withBytes(encoder.encode(argument), (ap, al) => this.x.wn_schedule_command(dev, U64(BigInt(at)), cp, cl, ap, al)),
+    );
+    if (got < 0) throw new Error(this.resultText());
   }
 
   /** Everything the device wrote to stdout (or stderr) so far. */

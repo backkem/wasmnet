@@ -21,15 +21,18 @@
 //! # Re-entrancy
 //!
 //! The network exports (`wn_network_new`, `wn_add_device`, `wn_link`, `wn_step`, `wn_finish`,
-//! `wn_journal`, `wn_link_*`, `wn_pcap`, `wn_counters`, `wn_stdout`) hold the network for their
-//! whole call, and several call into JavaScript while they do (`wn_add_device` instantiates,
-//! `wn_step`, `wn_finish` and `wn_counters` run devices). JavaScript must not call a network
-//! export from inside one of those imports, also not while a JSPI-suspended import waits: it is
-//! refused (an error, never a corrupted network). The device-side exports (`wn_transmit`,
-//! `wn_log`, `wn_event`, `wn_output`, `wn_now`, `wn_wall_now`, `wn_config_*`, `wn_random_*`,
-//! `wn_insecure_seed`, `wn_timer`, `wn_call_done`, `wn_take_dirty`) touch only the per-device
-//! [`Registry`] and may be called at any time, also from inside any import. A device-side call
-//! for a device that does not exist is counted and otherwise ignored.
+//! `wn_journal`, `wn_link_*`, `wn_pcap`, `wn_counters`, `wn_command`, `wn_schedule_command`,
+//! `wn_stdout`) hold the network for their whole call, and several call into JavaScript while
+//! they do (`wn_add_device` instantiates, `wn_step`, `wn_finish`, `wn_counters` and
+//! `wn_command` run devices). JavaScript must not call a network export from inside one of
+//! those imports, also not while a JSPI-suspended import waits: it is refused (an error, never
+//! a corrupted network). The device-side exports (`wn_transmit`, `wn_log`, `wn_event`,
+//! `wn_output`, `wn_now`, `wn_wall_now`, `wn_config_*`, `wn_args`, `wn_env`, `wn_random_*`,
+//! `wn_insecure_seed`, `wn_timer`, `wn_infra`, `wn_infra_wait`, `wn_call_done`,
+//! `wn_take_dirty`) touch only the per-device [`Registry`] (and, for `wasmnet:infra`, the
+//! network's device table, which only records and queues) and may be called at any time, also
+//! from inside any import. A device-side call for a device that does not exist is counted and
+//! otherwise ignored.
 //!
 //! # Imports (module `wasmnet_js`)
 //!
@@ -45,6 +48,9 @@
 //! | `js_start(dev, call) -> i32` | start `lifecycle.start()`, to end as `wn_call_done(dev, call, ..)`; 0, or a negative error |
 //! | `js_run_app(dev, app, call) -> i32` | start app number `app`'s `run()`, likewise |
 //! | `js_timer_fire(timer)` | the virtual timer `timer` (from `wn_timer`) is due: resolve the guest's wait |
+//! | `js_invoke(dev, now: u64, command, len, argument, len) -> i32` | `commands.invoke`; answers a `command` message (the device's `ok` or refusal), or a negative error (a trap) |
+//! | `js_reconfigure(dev, now: u64, config, len) -> i32` | `reconfigure.reconfigure` with a `config` message; answers a `reconfigured` message, or a negative error |
+//! | `js_wait_done(wait, rv: u64)` | the `changes.wait` call `wait` (from `wn_infra_wait`) ended with `rv`: resolve the guest's call |
 //! | `js_panic(msg, len)` | a panic's message, before the module traps |
 
 #![allow(unsafe_code)] // FFI exports and imports; every unsafe block is commented.
@@ -52,10 +58,11 @@
 use std::cell::RefCell;
 use std::sync::Once;
 
-use wasmnet_core::{DeviceConfig, DeviceId, DeviceOptions, Impairments, LinkId, Nanos};
+use wasmnet_core::{DeviceConfig, DeviceId, Impairments, LinkId, Nanos, Refusal};
 
 use crate::codec;
 use crate::host::{CallEnd, Instance, JsHost};
+use crate::infra::Reply;
 use crate::network::Network;
 use crate::runtime::{Entropy, Registry};
 
@@ -72,6 +79,16 @@ mod js {
         pub fn js_start(dev: u32, call: u32) -> i32;
         pub fn js_run_app(dev: u32, app: u32, call: u32) -> i32;
         pub fn js_timer_fire(timer: u32);
+        pub fn js_invoke(
+            dev: u32,
+            now: u64,
+            command: *const u8,
+            command_len: usize,
+            argument: *const u8,
+            argument_len: usize,
+        ) -> i32;
+        pub fn js_reconfigure(dev: u32, now: u64, config: *const u8, config_len: usize) -> i32;
+        pub fn js_wait_done(wait: u32, rv: u64);
         pub fn js_panic(msg: *const u8, len: usize);
     }
 }
@@ -166,6 +183,47 @@ impl JsHost for Js {
     fn timer_fire(&self, timer: u32) {
         // SAFETY: a plain value.
         unsafe { js::js_timer_fire(timer) }
+    }
+
+    fn invoke(
+        &self,
+        dev: u32,
+        now: Nanos,
+        command: &str,
+        argument: &str,
+    ) -> Result<Result<String, String>, String> {
+        // SAFETY: both strings are live for the duration of the call; JavaScript only reads
+        // them.
+        let len = unsafe {
+            js::js_invoke(
+                dev,
+                now,
+                command.as_ptr(),
+                command.len(),
+                argument.as_ptr(),
+                argument.len(),
+            )
+        };
+        let bytes = answer(len)?;
+        codec::decode_command_answer(&bytes).map_err(|e| format!("command answer: {e}"))
+    }
+
+    fn reconfigure(
+        &self,
+        dev: u32,
+        now: Nanos,
+        config: &DeviceConfig,
+    ) -> Result<Result<(), Refusal>, String> {
+        let config = codec::encode_config(config);
+        // SAFETY: `config` is live for the duration of the call; JavaScript only reads it.
+        let len = unsafe { js::js_reconfigure(dev, now, config.as_ptr(), config.len()) };
+        let bytes = answer(len)?;
+        codec::decode_reconfigured(&bytes).map_err(|e| format!("reconfigure answer: {e}"))
+    }
+
+    fn wait_done(&self, wait: u32, rv: u64) {
+        // SAFETY: plain values.
+        unsafe { js::js_wait_done(wait, rv) }
     }
 }
 
@@ -327,11 +385,11 @@ pub extern "C" fn wn_network_new(seed: u64) -> i32 {
 }
 
 /// Adds a device called `name` (UTF-8 at `name`), made from `component` (a key JavaScript
-/// understands), with `config` (a `config` message) and `flags` (bit 0: journal its stdout and
-/// stderr lines). Calls `js_instantiate` once, during which the device-side exports already
-/// serve it. Answers the device's index, or -1 with the message in the result (JavaScript then
-/// drops whatever it made for that index: the next device gets it). All inputs are JavaScript's
-/// to free.
+/// understands), with `config` (a `config` message) and `options` (an `options` message: its
+/// arguments and environment, a `wasmnet:infra` grant, journalled stdio, ...). Calls
+/// `js_instantiate` once, during which the device-side exports already serve it. Answers the
+/// device's index, or -1 with the message in the result (JavaScript then drops whatever it made
+/// for that index: the next device gets it). All inputs are JavaScript's to free.
 #[unsafe(no_mangle)]
 pub extern "C" fn wn_add_device(
     name: *const u8,
@@ -340,7 +398,8 @@ pub extern "C" fn wn_add_device(
     component_len: usize,
     config: *const u8,
     config_len: usize,
-    flags: u32,
+    options: *const u8,
+    options_len: usize,
 ) -> i32 {
     let name = text(name, name_len);
     let component = text(component, component_len);
@@ -348,7 +407,10 @@ pub extern "C" fn wn_add_device(
         Ok(c) => c,
         Err(e) => return fail(format!("config: {e}")),
     };
-    let options = DeviceOptions::default().journal_stdio(flags & 1 != 0);
+    let options = match codec::decode_options(bytes(options, options_len)) {
+        Ok(o) => o,
+        Err(e) => return fail(format!("options: {e}")),
+    };
     match with_network(|n| n.device_with_options(&name, &component, config, options)) {
         Ok(Ok(id)) => i32::try_from(id.index()).unwrap_or(i32::MAX),
         Ok(Err(e)) => fail(e),
@@ -539,6 +601,117 @@ pub extern "C" fn wn_stdout(dev: u32, stderr: u32) -> i32 {
     }
 }
 
+// ---- device commands -----------------------------------------------------------------------
+
+/// Runs a command in device `dev`'s `wasmnet:control/commands` export at the current instant,
+/// between steps (calls `js_invoke`): leaves a `command` message (its answer) in the result
+/// and answers its length. -1 (message in the result): no such device, no network, busy, or
+/// refused (a paused device). -2: the device takes no commands. -3 (message in the result):
+/// the device trapped, and the network failed.
+#[unsafe(no_mangle)]
+pub extern "C" fn wn_command(
+    dev: u32,
+    command: *const u8,
+    command_len: usize,
+    argument: *const u8,
+    argument_len: usize,
+) -> i32 {
+    let (command, argument) = (text(command, command_len), text(argument, argument_len));
+    let run = with_network(|n| {
+        device(n, dev).map(|id| {
+            let answer = n.command(id, &command, &argument);
+            (answer, n.failure().is_some())
+        })
+    });
+    match run {
+        Ok(Some((Ok(Some(answer)), _))) => set_result(codec::encode_command_answer(&answer)),
+        Ok(Some((Ok(None), _))) => -2,
+        Ok(Some((Err(e), failed))) => {
+            fail(e);
+            if failed { -3 } else { -1 }
+        }
+        Ok(None) => fail(format!("no device {dev}")),
+        Err(e) => fail(e),
+    }
+}
+/// Sends a command to device `dev` at the start of instant `at` (an operator event): answers
+/// the op's index, or -1 with the message in the result (no such device, or it takes no
+/// commands). Never calls JavaScript.
+#[unsafe(no_mangle)]
+pub extern "C" fn wn_schedule_command(
+    dev: u32,
+    at: u64,
+    command: *const u8,
+    command_len: usize,
+    argument: *const u8,
+    argument_len: usize,
+) -> i32 {
+    let (command, argument) = (text(command, command_len), text(argument, argument_len));
+    let added = with_network(|n| {
+        device(n, dev)
+            .ok_or_else(|| format!("no device {dev}"))
+            .and_then(|id| n.schedule_command(id, at, &command, &argument))
+    });
+    match added {
+        Ok(Ok(op)) => i32::try_from(op).unwrap_or(i32::MAX),
+        Ok(Err(e)) => fail(e),
+        Err(e) => fail(e),
+    }
+}
+
+// ---- arguments, environment, wasmnet:infra -------------------------------------------------
+
+/// `wasi:cli/environment.get-arguments` of device `dev`: its `argv` (its name first) as a
+/// `list<str>` message in the result; answers its length.
+#[unsafe(no_mangle)]
+pub extern "C" fn wn_args(dev: u32) -> i32 {
+    let args = registry().map(|r| r.args(dev)).unwrap_or_default();
+    set_result(codec::encode_strs(&args))
+}
+
+/// `wasi:cli/environment.get-environment` of device `dev`, as a `pairs` message in the result;
+/// answers its length.
+#[unsafe(no_mangle)]
+pub extern "C" fn wn_env(dev: u32) -> i32 {
+    let env = registry().map(|r| r.env(dev)).unwrap_or_default();
+    set_result(codec::encode_pairs(&env))
+}
+
+/// One `wasmnet:infra` call of device `dev` (an `infra call` message), served at once: leaves
+/// an `infra reply` in the result and answers its length. A device-side export.
+#[unsafe(no_mangle)]
+pub extern "C" fn wn_infra(dev: u32, call: *const u8, len: usize) -> i32 {
+    let reply = match codec::decode_infra_call(bytes(call, len)) {
+        Ok((function, args)) => match registry() {
+            Some(r) => r.infra(dev, &function, &args),
+            None => Reply::Failed("no network".to_owned()),
+        },
+        Err(e) => Reply::Failed(format!("infra call: {e}")),
+    };
+    set_result(codec::encode_infra_reply(&reply))
+}
+
+/// `changes.wait` of device `dev` (an `infra call` message for `changes.wait`): answers a wait
+/// id (`js_wait_done(id, rv)` comes when it ends, during a later step), or -1 with an
+/// `infra reply` in the result (answered at once: a refusal). Wakes the device. A device-side
+/// export.
+#[unsafe(no_mangle)]
+pub extern "C" fn wn_infra_wait(dev: u32, call: *const u8, len: usize) -> i32 {
+    let started = match codec::decode_infra_call(bytes(call, len)) {
+        Ok((_, args)) => match registry() {
+            Some(r) => r.infra_wait(dev, &args),
+            None => Err(Reply::Failed("no network".to_owned())),
+        },
+        Err(e) => Err(Reply::Failed(format!("infra call: {e}"))),
+    };
+    match started {
+        Ok(id) => i32::try_from(id).unwrap_or(i32::MAX),
+        Err(reply) => {
+            set_result(codec::encode_infra_reply(&reply));
+            -1
+        }
+    }
+}
 // ---- the devices' imports ----------------------------------------------------------------
 
 /// The wall clock (`wasi:clocks` wall-clock `now`): the network's epoch plus virtual time, in ns

@@ -1,7 +1,12 @@
 //! The JavaScript backend of the simulator: [`JsRuntime`] implements [`wasmnet_core::Runtime`] over
 //! a [`JsHost`], and [`Registry`] is the per-device state the JavaScript side reaches through the
-//! device-side exports (`wire.transmit`, `log`, clocks, entropy, config, timers, async call
-//! completions).
+//! device-side exports (`wire.transmit`, `log`, clocks, entropy, config, arguments and
+//! environment, `wasmnet:infra`, timers, async call completions).
+//!
+//! Everything a device is served comes from the sim core, as on the wasmtime backend: its
+//! entropy ([`DeviceEntropy`]), its `argv` ([`wasmnet_core::argv`]), its `wasmnet:infra` calls
+//! ([`Calls`]), the answers of its control calls ([`CommandCall`], [`ReconfigureCall`]) and its
+//! `app-exit` records ([`JournalEnd::app_exit`]). This module only routes.
 //!
 //! **Re-entrancy.** An actor calls into JavaScript (`receive`), the guest calls an import, and the
 //! import calls back into this crate (`transmit`) while the actor is still being polled. So
@@ -15,13 +20,18 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 
+use wasmnet_core::ext::ControlCall;
+use wasmnet_core::infra::{Calls, ChangeWait};
 use wasmnet_core::{
-    Command, DeviceConfig, DeviceContext, DeviceInstance, Fault, Inbox, JournalEnd, Level, Nanos,
-    OutputCapture, Record, Result as SimResult, Runtime, SimRng, Sleep, Status, VirtualClock, Wire,
-    derive_seed,
+    COMMANDS_EXPORT, Command, CommandCall, DeviceConfig, DeviceContext, DeviceEntropy,
+    DeviceInstance, Fault, Inbox, InfraEnd, JournalEnd, Level, Nanos, OutputCapture,
+    RECONFIGURE_EXPORT, ReconfigureCall, Result as SimResult, Runtime, Sleep, Status, VirtualClock,
+    Wire,
 };
 
+use crate::codec::Value;
 use crate::host::{CallEnd, JsHost};
+use crate::infra::{self, Reply};
 
 /// Entropy streams, seeded like the native host's, so a device draws the same numbers from the
 /// same seed on both backends.
@@ -38,16 +48,21 @@ struct DeviceState {
     clock: VirtualClock,
     wire: Wire,
     journal: JournalEnd,
+    /// What `wasi:config/store` serves (a reconfiguration the device took replaces it).
     config: DeviceConfig,
+    /// `wasi:cli/environment`.
+    argv: Vec<String>,
+    env: Vec<(String, String)>,
+    /// `wasmnet:infra`, if the network granted it.
+    infra: Option<InfraEnd>,
     stdout: OutputCapture,
     stderr: OutputCapture,
-    secure: SimRng,
-    insecure: SimRng,
-    insecure_seed: (u64, u64),
+    entropy: DeviceEntropy,
     /// The actor's waker, for completions and timers that arrive from JavaScript between polls.
     waker: Option<Waker>,
     completions: VecDeque<(u32, CallEnd)>,
     new_timers: Vec<(u32, Nanos)>,
+    new_waits: Vec<(u32, ChangeWait)>,
 }
 
 #[derive(Default)]
@@ -56,6 +71,7 @@ struct Inner {
     clock: Option<VirtualClock>,
     devices: BTreeMap<u32, DeviceState>,
     next_timer: u32,
+    next_wait: u32,
     /// Something reached an actor from JavaScript since the last [`Registry::take_dirty`].
     dirty: bool,
     /// Calls for devices that do not exist: counted, never fatal.
@@ -159,11 +175,54 @@ impl Registry {
         self.with_device(dev, |d| d.config.clone())
     }
 
+    /// `wasi:cli/environment.get-arguments`: `argv`, the device's name first (empty for an
+    /// unknown device).
+    pub fn args(&self, dev: u32) -> Vec<String> {
+        self.with_device(dev, |d| d.argv.clone())
+            .unwrap_or_default()
+    }
+
+    /// `wasi:cli/environment.get-environment`, in order.
+    pub fn env(&self, dev: u32) -> Vec<(String, String)> {
+        self.with_device(dev, |d| d.env.clone()).unwrap_or_default()
+    }
+
+    /// One `wasmnet:infra` call of the device (`devices.apply`, ...; [`infra::FUNCTIONS`]),
+    /// served by the sim core from its grant. Calls only record and queue, so this never runs
+    /// a device.
+    pub fn infra(&self, dev: u32, function: &str, args: &[Value]) -> Reply {
+        match self.with_device(dev, |d| d.infra.clone()) {
+            Some(end) => infra::serve(Calls::new(end.as_ref()), function, args),
+            None => Reply::Failed(format!("no device {dev}")),
+        }
+    }
+
+    /// `changes.wait(selector, since, deadline)` of the device: a wait id, whose end
+    /// [`JsHost::wait_done`] reports (during a later step), or the answer at once. Wakes the
+    /// device.
+    pub fn infra_wait(&self, dev: u32, args: &[Value]) -> Result<u32, Reply> {
+        let Some(end) = self.with_device(dev, |d| d.infra.clone()) else {
+            return Err(Reply::Failed(format!("no device {dev}")));
+        };
+        let wait = infra::start_wait(Calls::new(end.as_ref()), args)?;
+        let id = {
+            let mut inner = self.inner.borrow_mut();
+            let id = inner.next_wait;
+            inner.next_wait = inner.next_wait.wrapping_add(1);
+            if let Some(d) = inner.devices.get_mut(&dev) {
+                d.new_waits.push((id, wait));
+            }
+            id
+        };
+        self.wake(dev);
+        Ok(id)
+    }
+
     /// The next 64 random bits of the device's `which` stream (0 for an unknown device).
     pub fn random_u64(&self, dev: u32, which: Entropy) -> u64 {
         self.with_device(dev, |d| match which {
-            Entropy::Secure => d.secure.next_u64(),
-            Entropy::Insecure => d.insecure.next_u64(),
+            Entropy::Secure => d.entropy.secure.next_u64(),
+            Entropy::Insecure => d.entropy.insecure.next_u64(),
         })
         .unwrap_or(0)
     }
@@ -176,9 +235,9 @@ impl Registry {
         }
     }
 
-    /// `wasi:random/insecure-seed`.
+    /// `wasi:random/insecure-seed`, as the guest receives it.
     pub fn insecure_seed(&self, dev: u32) -> (u64, u64) {
-        self.with_device(dev, |d| d.insecure_seed)
+        self.with_device(dev, |d| d.entropy.insecure_seed)
             .unwrap_or_default()
     }
 
@@ -266,9 +325,6 @@ impl<H: JsHost + Clone + Unpin + 'static> Runtime for JsRuntime<H> {
             message: format!("too many devices for `{}`", ctx.name),
             detail: None,
         })?;
-        let seed = |stream| derive_seed(ctx.seed, &ctx.name, stream);
-        let mut seed_rng = SimRng::from_seed(seed("insecure-seed"));
-        let insecure_seed = (seed_rng.next_u64(), seed_rng.next_u64());
         {
             // Registered before JavaScript instantiates, so imports used meanwhile are served.
             let mut inner = self.registry.inner.borrow_mut();
@@ -280,14 +336,16 @@ impl<H: JsHost + Clone + Unpin + 'static> Runtime for JsRuntime<H> {
                     wire: ctx.wire.clone(),
                     journal: ctx.journal.clone(),
                     config: ctx.config.clone(),
+                    argv: wasmnet_core::argv(&ctx.name, &ctx.args),
+                    env: ctx.env.clone(),
+                    infra: ctx.infra.clone(),
                     stdout: ctx.stdout.clone(),
                     stderr: ctx.stderr.clone(),
-                    secure: SimRng::from_seed(seed("random")),
-                    insecure: SimRng::from_seed(seed("insecure")),
-                    insecure_seed,
+                    entropy: DeviceEntropy::new(ctx.seed, &ctx.name),
                     waker: None,
                     completions: VecDeque::new(),
                     new_timers: Vec::new(),
+                    new_waits: Vec::new(),
                 },
             );
         }
@@ -304,6 +362,14 @@ impl<H: JsHost + Clone + Unpin + 'static> Runtime for JsRuntime<H> {
                 });
             }
         };
+        // Optional exports control calls go to, in the wasmtime backend's order.
+        let mut exports = Vec::new();
+        if instance.commands {
+            exports.push(COMMANDS_EXPORT.to_owned());
+        }
+        if instance.reconfigure {
+            exports.push(RECONFIGURE_EXPORT.to_owned());
+        }
         let actor = Actor {
             host: self.host.clone(),
             registry: self.registry.clone(),
@@ -313,6 +379,8 @@ impl<H: JsHost + Clone + Unpin + 'static> Runtime for JsRuntime<H> {
             inbox: ctx.inbox,
             status: ctx.status,
             lifecycle: instance.lifecycle,
+            commands: instance.commands,
+            reconfigure: instance.reconfigure,
             apps: instance.apps.clone(),
             started: false,
             initialised: !instance.lifecycle,
@@ -320,10 +388,11 @@ impl<H: JsHost + Clone + Unpin + 'static> Runtime for JsRuntime<H> {
             next_call: 0,
             calls: BTreeMap::new(),
             timers: Vec::new(),
+            waits: Vec::new(),
         };
-        // No optional exports are served: control calls never reach these devices.
         Ok(DeviceInstance::new(instance.ports, Box::pin(actor))
             .has_counters(instance.counters)
+            .exports(exports)
             .apps(instance.apps))
     }
 }
@@ -334,7 +403,7 @@ enum CallKind {
 }
 
 /// One device's actor: `start()` first, then the apps' `run`s as daemons, then inbox commands as
-/// sync JavaScript calls; plus the device's virtual timers.
+/// sync JavaScript calls; plus the device's virtual timers and `changes.wait`s.
 struct Actor<H> {
     host: H,
     registry: Registry,
@@ -344,6 +413,9 @@ struct Actor<H> {
     inbox: Inbox,
     status: Status,
     lifecycle: bool,
+    /// It exports `wasmnet:control/commands`, `wasmnet:reconfigure/reconfigure`.
+    commands: bool,
+    reconfigure: bool,
     apps: Vec<String>,
     started: bool,
     initialised: bool,
@@ -352,6 +424,7 @@ struct Actor<H> {
     /// In-flight async calls: JavaScript call id -> (status id, kind).
     calls: BTreeMap<u32, (u64, CallKind)>,
     timers: Vec<(u32, Pin<Box<Sleep>>)>,
+    waits: Vec<(u32, Pin<Box<ChangeWait>>)>,
 }
 
 impl<H: JsHost> Actor<H> {
@@ -365,27 +438,45 @@ impl<H: JsHost> Actor<H> {
         call
     }
 
-    /// Journals an app's end the way the native host does (a log line and an `app-exit` event).
-    fn app_exit(&self, name: &str, ok: bool) {
-        let status = if ok { "ok" } else { "error" };
-        let now = self.clock.now();
-        self.journal.push(
-            now,
-            Record::Log {
-                level: Level::Info,
-                message: format!("app {name} exited: {status}"),
-            },
-        );
-        self.journal.push(
-            now,
-            Record::Event {
-                kind: "app-exit".to_owned(),
-                fields: vec![
-                    ("app".to_owned(), name.to_owned()),
-                    ("status".to_owned(), status.to_owned()),
-                ],
-            },
-        );
+    /// Serves one control call with the device's export, the way the wasmtime backend does:
+    /// a command or a reconfiguration through JavaScript, any other kind refused as
+    /// unsupported. The answer goes into the call's own slot.
+    fn control(&mut self, call: Box<dyn ControlCall>, now: Nanos) -> Result<(), Fault> {
+        let call = match CommandCall::downcast(call) {
+            Ok(call) if self.commands => {
+                let answer = self
+                    .host
+                    .invoke(self.dev, now, call.command(), call.argument())
+                    .map_err(Fault::new)?;
+                call.finish(answer);
+                return Ok(());
+            }
+            Ok(call) => {
+                call.unsupported();
+                return Ok(());
+            }
+            Err(other) => other,
+        };
+        match ReconfigureCall::downcast(call) {
+            Ok(call) if self.reconfigure => {
+                let answer = self
+                    .host
+                    .reconfigure(self.dev, now, call.config())
+                    .map_err(Fault::new)?;
+                // On `ok` its `wasi:config/store` serves the new config from now on. The config
+                // is taken out of the registry for the call: `finish` reaches the device table,
+                // never JavaScript or the registry, but no borrow is held across it anyway.
+                let mut served = self
+                    .registry
+                    .with_device(self.dev, |d| std::mem::take(&mut d.config))
+                    .unwrap_or_default();
+                call.finish_serving(answer, &mut served);
+                self.registry.with_device(self.dev, |d| d.config = served);
+            }
+            Ok(call) => call.unsupported(),
+            Err(other) => other.unsupported(),
+        }
+        Ok(())
     }
 
     /// One pass over everything the actor can do now. `Ok(true)` if anything happened.
@@ -400,14 +491,15 @@ impl<H: JsHost> Actor<H> {
             progress = true;
         }
 
-        // Completions and new timers that JavaScript reported since the last poll.
-        let (done, new_timers) = self
+        // Completions, new timers and new waits that JavaScript reported since the last poll.
+        let (done, new_timers, new_waits) = self
             .registry
             .with_device(self.dev, |d| {
                 d.waker = Some(cx.waker().clone());
                 (
                     std::mem::take(&mut d.completions),
                     std::mem::take(&mut d.new_timers),
+                    std::mem::take(&mut d.new_waits),
                 )
             })
             .unwrap_or_default();
@@ -422,17 +514,33 @@ impl<H: JsHost> Actor<H> {
             }
             match kind {
                 CallKind::Start => self.initialised = true,
-                CallKind::App(name) => self.app_exit(&name, end == CallEnd::Ok),
+                CallKind::App(name) => {
+                    self.journal
+                        .app_exit(self.clock.now(), &name, end == CallEnd::Ok);
+                }
             }
         }
         for (id, at) in new_timers {
             self.timers.push((id, Box::pin(self.clock.sleep_until(at))));
+        }
+        for (id, wait) in new_waits {
+            self.waits.push((id, Box::pin(wait)));
         }
         let mut i = 0;
         while i < self.timers.len() {
             if self.timers[i].1.as_mut().poll(cx).is_ready() {
                 let (id, _) = self.timers.remove(i);
                 self.host.timer_fire(id);
+                progress = true;
+            } else {
+                i += 1;
+            }
+        }
+        let mut i = 0;
+        while i < self.waits.len() {
+            if let Poll::Ready(rv) = self.waits[i].1.as_mut().poll(cx) {
+                let (id, _) = self.waits.remove(i);
+                self.host.wait_done(id, rv);
                 progress = true;
             } else {
                 i += 1;
@@ -478,16 +586,15 @@ impl<H: JsHost> Actor<H> {
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(values);
                 }
-                // This backend reports no optional exports, so the network sends none; refuse
-                // one anyway rather than leave its caller waiting.
                 Command::Control(call) => {
                     let reschedule = call.may_reschedule();
-                    call.unsupported();
+                    self.control(call, now)?;
+                    // The call may move a stepped device's deadline: let it say so.
                     if reschedule {
                         self.clock.poll_by(idx, now);
                     }
                 }
-                // Only operator events write stdin, and this crate's network API makes none.
+                // Not served yet: JavaScript has no stdin for its devices.
                 Command::Stdin(_) => {}
             }
         }
@@ -507,8 +614,9 @@ impl<H: JsHost + Unpin> Future for Actor<H> {
                 Err(fault) => return Poll::Ready(Err(fault)),
             }
         }
-        this.status
-            .set_guest_tasks_alive(!this.timers.is_empty() || !this.calls.is_empty());
+        this.status.set_guest_tasks_alive(
+            !this.timers.is_empty() || !this.calls.is_empty() || !this.waits.is_empty(),
+        );
         Poll::Pending
     }
 }

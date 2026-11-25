@@ -9,6 +9,11 @@
 //! clocks, entropy, config, timers). This crate drives the devices through a small host
 //! interface, [`JsHost`], which the wasm32 module implements with imports from JavaScript.
 //!
+//! This crate decides nothing the wasmtime backend also decides: a device's entropy, `argv`,
+//! `wasmnet:infra` answers, command and reconfiguration answers and `app-exit` records come from
+//! the core, as there (`docs/design/browser.md`, "What each backend does itself"). It only
+//! routes calls between JavaScript and the core.
+//!
 //! On top sits a network API shaped like the native host's ([`Network`]): a network with a seed,
 //! devices with flat `key = value` config, links with a latency, a run, the journal, each link's
 //! pcap-ng capture and the outcome. The same API crosses the wasm32 boundary as plain functions
@@ -47,7 +52,8 @@
 //!
 //! # Module map
 //!
-//! [`host`] (what JavaScript provides), [`runtime`] (the [`wasmnet_core::Runtime`] backend and
+//! [`host`] (what JavaScript provides), [`infra`] (`wasmnet:infra` calls across the boundary),
+//! [`runtime`] (the [`wasmnet_core::Runtime`] backend and
 //! the per-device [`Registry`]), [`network`] (the network API), [`codec`] (the boundary's byte
 //! encoding), and `ffi` (the wasm32 exports and imports, compiled for `wasm32` only; its module
 //! docs are the boundary's reference).
@@ -56,6 +62,7 @@
 
 pub mod codec;
 pub mod host;
+pub mod infra;
 pub mod network;
 pub mod runtime;
 

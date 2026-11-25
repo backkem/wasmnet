@@ -1,16 +1,18 @@
 //! What the JavaScript side provides: one call per device export (the `wasmnet:link` device
-//! contract, the lifecycle `start` and the apps' `run`), and timer completion.
+//! contract, the lifecycle `start`, the apps' `run`, and the optional `wasmnet:control/commands`
+//! and `wasmnet:reconfigure/reconfigure`), timer completion and `changes.wait` completion.
 //!
-//! Sync exports (`receive`, `link-state`, `poll`, `counters`) run to completion inside the call.
-//! Async exports (`start`, an app's `run`) only *start* here: JavaScript reports their end later
-//! through [`crate::Registry::call_done`], and resolves a guest's virtual wait when it hears
-//! [`JsHost::timer_fire`].
+//! Sync exports (`receive`, `link-state`, `poll`, `counters`, `invoke`, `reconfigure`) run to
+//! completion inside the call. Async exports (`start`, an app's `run`) only *start* here:
+//! JavaScript reports their end later through [`crate::Registry::call_done`], and resolves a
+//! guest's virtual wait when it hears [`JsHost::timer_fire`] or [`JsHost::wait_done`].
 //!
 //! Every method may re-enter this crate through the [`crate::Registry`] (a guest that transmits
-//! from inside `receive`, logs from inside `poll`, asks for a timer from inside `start`). It must
-//! not re-enter the [`crate::Network`] that made the call.
+//! from inside `receive`, logs from inside `poll`, asks for a timer from inside `start`, calls
+//! `wasmnet:infra` from inside `poll`). It must not re-enter the [`crate::Network`] that made
+//! the call.
 
-use wasmnet_core::{DeclaredPort, DeviceConfig, Nanos};
+use wasmnet_core::{DeclaredPort, DeviceConfig, Nanos, Refusal};
 
 /// A device JavaScript has instantiated: its `ports()` answer and what it exports.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -24,6 +26,11 @@ pub struct Instance {
     pub counters: bool,
     /// It exports `wasmnet:link/lifecycle` (an async node: `start()` runs first).
     pub lifecycle: bool,
+    /// It exports `wasmnet:control/commands` (it takes commands: [`JsHost::invoke`]).
+    pub commands: bool,
+    /// It exports `wasmnet:reconfigure/reconfigure` (it takes a config in place:
+    /// [`JsHost::reconfigure`]).
+    pub reconfigure: bool,
 }
 
 /// Chainable setters, one per field: `Instance::default().ports(ports).counters(true)`.
@@ -49,6 +56,18 @@ impl Instance {
     /// Sets [`lifecycle`](Self::lifecycle).
     pub fn lifecycle(mut self, on: bool) -> Self {
         self.lifecycle = on;
+        self
+    }
+
+    /// Sets [`commands`](Self::commands).
+    pub fn commands(mut self, on: bool) -> Self {
+        self.commands = on;
+        self
+    }
+
+    /// Sets [`reconfigure`](Self::reconfigure).
+    pub fn reconfigure(mut self, on: bool) -> Self {
+        self.reconfigure = on;
         self
     }
 }
@@ -93,4 +112,33 @@ pub trait JsHost {
     fn run_app(&self, dev: u32, app: u32, call: u32) -> Result<(), String>;
     /// Timer `timer` (from [`crate::Registry::timer`]) is due: resolve the guest's wait.
     fn timer_fire(&self, timer: u32);
+    /// `commands.invoke(now, command, argument)` of a device whose [`Instance::commands`] is
+    /// set: its answer, `ok` text or its refusal. The default: no device takes commands.
+    fn invoke(
+        &self,
+        dev: u32,
+        now: Nanos,
+        command: &str,
+        argument: &str,
+    ) -> Result<Result<String, String>, String> {
+        let _ = (dev, now, command, argument);
+        Err("this host serves no wasmnet:control/commands".to_owned())
+    }
+    /// `reconfigure.reconfigure(now, config)` of a device whose [`Instance::reconfigure`] is
+    /// set, with its whole new config: `ok`, or its refusal. The default: no device takes one.
+    fn reconfigure(
+        &self,
+        dev: u32,
+        now: Nanos,
+        config: &DeviceConfig,
+    ) -> Result<Result<(), Refusal>, String> {
+        let _ = (dev, now, config);
+        Err("this host serves no wasmnet:reconfigure".to_owned())
+    }
+    /// The `changes.wait` call `wait` (from [`crate::Registry::infra_wait`]) ended with the
+    /// resource version `rv`: resolve the guest's call. The default does nothing (a host whose
+    /// devices never wait).
+    fn wait_done(&self, wait: u32, rv: u64) {
+        let _ = (wait, rv);
+    }
 }
