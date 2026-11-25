@@ -181,6 +181,11 @@ pub use wasmnet_core::{
     Nanos, Outcome, PortInfo, PortRef, Record, Result, SimConfig, SimRng, Sleep, Stats, Stream,
     VirtualClock, derive_seed,
 };
+/// The wasmtime this host is built on, at the exact version and with the features it pins: an
+/// embedder names `wasmtime::component::Component` (what [`Host::load`] returns),
+/// `wasmtime::component::Linker` (a [`HostExtension`]'s) and `wasmtime::Error` through this
+/// re-export, and needs no wasmtime of its own in its manifest.
+pub use wasmtime;
 
 pub use wasi::HostState;
 

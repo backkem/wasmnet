@@ -11,10 +11,10 @@ use std::process::Command;
 use std::sync::OnceLock;
 
 use etherparse::{NetSlice, SlicedPacket, TransportSlice};
+use wasmnet_host::wasmtime::component::Component;
 use wasmnet_host::{
     DeviceConfig, DeviceId, FrameRecord, Host, JournalEntry, Network, PortRef, Record,
 };
-use wasmtime::component::Component;
 
 /// The host and the directory `cargo xtask build` wrote the components and nodes into.
 pub struct Built {

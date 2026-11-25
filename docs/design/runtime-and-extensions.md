@@ -51,7 +51,9 @@ core itself is built for `wasm32-unknown-unknown` and a browser's engine runs th
   metered unless the builder turns it off (`fuel(false)`, and with it the fuel guard). On
   request (`unmetered_engine(true)`, embedder surface) a second, unmetered engine serves
   components loaded with `Host::load_unmetered`, for components whose guard is something other
-  than wasmtime fuel.
+  than wasmtime fuel. The crate re-exports the wasmtime it is built on (`wasmnet_host::wasmtime`),
+  so an embedder names `Component` or `Linker` without pinning wasmtime's version and features
+  itself.
 - **One store per device**, with `HostState`: the WASI context, the resource table, the clock,
   the seed, the wire, the journal, the config, extension state and stdin.
 - **Deterministic WASI** ([src/wasi.rs](../../crates/wasmnet-host/src/wasi.rs)): p2 and p3
