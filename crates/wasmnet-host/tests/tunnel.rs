@@ -1200,3 +1200,37 @@ fn controllers_follow_the_tunnel_s_events_through_a_cut_and_heal() {
         r.same_as(&controlled_run(seed, &plan), &label);
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// A keyless tunnel's bytes do not change
+
+/// The SHA-256 of every link's capture of a run, in link order.
+fn capture_digest(r: &Run) -> String {
+    use sha2::{Digest as _, Sha256};
+    let mut h = Sha256::new();
+    for p in &r.pcaps {
+        h.update((p.len() as u64).to_be_bytes());
+        h.update(p);
+    }
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[test]
+fn a_keyless_tunnel_s_captures_are_unchanged() {
+    // Pinned before tunnels could have keys: a keyless tunnel puts the same bytes on every
+    // link as it did then (the NATs, the punching, Geneve, the fetch), at two seeds.
+    for (seed, want) in [
+        (
+            1,
+            "7688e0536cef171c45c0647c578dbc775f32cf9cb010b19ec334846b0e6ebfb2",
+        ),
+        (
+            2,
+            "bdd51798df53f055b4ba16ef0e22eaf97c68b7903b3981321b9b65224e874dcf",
+        ),
+    ] {
+        let r = run(seed, &Setup::new(nat(EI, APD), nat(EI, APD)));
+        assert!(r.fetched());
+        assert_eq!(capture_digest(&r), want, "seed={seed}");
+    }
+}
