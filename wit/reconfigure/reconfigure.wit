@@ -1,0 +1,51 @@
+/// In-place configuration changes: a running device takes a changed configuration and keeps its
+/// state (its tables, its connections, its counters), instead of being recreated.
+///
+/// A device that can exports `reconfigure`. The host finds the export when it instantiates the
+/// device and reports it as one of the device's optional exports, under the name
+/// `wasmnet:reconfigure/reconfigure`. A controller's `wasmnet:infra/devices.apply` that changes
+/// only a running device's config (the same component, options and cables) calls it when the
+/// request applies, at the controller's own position; a device without the export is recreated,
+/// as before.
+///
+/// Neither the host nor the simulator interprets a configuration: the device reads it as it
+/// reads `wasi:config/store`, key by key.
+///
+/// A package of its own, beside `wasmnet:control`, so that a device that takes commands does not
+/// change its world to take configurations, and the other way round.
+package wasmnet:reconfigure@0.1.0;
+
+/// Exported by a device that takes configuration changes while it runs.
+interface reconfigure {
+    /// Virtual time in nanoseconds since the simulation started (`wasmnet:link/types.instant`).
+    type instant = u64;
+
+    /// Why a device did not take a configuration.
+    variant refusal {
+        /// The change cannot be made in place (a different number of ports, a new MTU): the
+        /// caller recreates the device with the new configuration instead.
+        restart(string),
+        /// The configuration is wrong: the device changed nothing and keeps its old one.
+        invalid(string),
+    }
+
+    /// Takes `config` (the device's whole new configuration, every key, as `wasi:config/store`
+    /// would serve it from now on) at virtual time `now`.
+    ///
+    /// - `ok`: the device runs on with it, from `now`; what it keeps (learned tables, open
+    ///   connections, counters) is part of its contract. `wasi:config/store` serves the new
+    ///   configuration to it from then on.
+    /// - Timing: the host calls it inside the device's event loop at the instant the request
+    ///   applies, never while another export of the device is running, and calls
+    ///   `wasmnet:link/device.poll(now)` at the same instant after it (a stepped device can
+    ///   report a new deadline).
+    /// - Sync, and it must not block. It may transmit frames (they leave at `now`) and log. A
+    ///   malformed configuration is a `refusal`, never a trap: it comes from outside the device.
+    /// - Ownership: the device owns `config`; the host owns the answer.
+    reconfigure: func(now: instant, config: list<tuple<string, string>>) -> result<_, refusal>;
+}
+
+/// A device that takes configuration changes (what a device's own world includes).
+world reconfigurable {
+    export reconfigure;
+}

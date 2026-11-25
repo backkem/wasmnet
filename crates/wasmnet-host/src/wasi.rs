@@ -64,6 +64,78 @@ pub struct HostState {
     pub(crate) infra: Option<wasmnet_core::InfraEnd>,
     /// The guest's stdin: `Op::Stdin` operator events land here.
     pub(crate) stdin: wasmnet_core::InputQueue,
+    /// The device's memory, measured and (with [`wasmnet_core::DeviceOptions::memory`])
+    /// bounded; `None` for a command.
+    pub(crate) memory: Option<MemoryBudget>,
+}
+
+/// A device's linear memory, all its memories together: measured for its cost report and,
+/// with a limit, bounded (growing past it traps at the growing instruction, the same every run).
+pub(crate) struct MemoryBudget {
+    /// `None`: measured only.
+    limit: Option<u64>,
+    used: u64,
+    /// The last growth allowed (taken back if the growth then failed).
+    last: u64,
+    /// Where the device's cost report sees it.
+    meter: wasmnet_core::CostMeter,
+}
+
+impl MemoryBudget {
+    pub(crate) fn new(limit: Option<u64>, meter: wasmnet_core::CostMeter) -> Self {
+        Self {
+            limit,
+            used: 0,
+            last: 0,
+            meter,
+        }
+    }
+}
+
+impl Drop for MemoryBudget {
+    /// The store is gone (the device stopped): it holds no memory any more.
+    fn drop(&mut self) {
+        self.meter.set_memory(0);
+    }
+}
+
+impl wasmtime::ResourceLimiter for MemoryBudget {
+    fn memory_growing(
+        &mut self,
+        current: usize,
+        desired: usize,
+        _maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
+        let grow = desired.saturating_sub(current) as u64;
+        let after = self.used.saturating_add(grow);
+        if let Some(limit) = self.limit
+            && after > limit
+        {
+            return Err(wasmtime::format_err!(
+                "memory limit: growing a linear memory by {grow} bytes would take the device to \
+                 {after} bytes, past its {limit} bytes"
+            ));
+        }
+        self.used = after;
+        self.last = grow;
+        self.meter.set_memory(after);
+        Ok(true)
+    }
+
+    fn memory_grow_failed(&mut self, _error: wasmtime::Error) -> wasmtime::Result<()> {
+        self.used = self.used.saturating_sub(self.last);
+        self.meter.set_memory(self.used);
+        Ok(())
+    }
+
+    fn table_growing(
+        &mut self,
+        _current: usize,
+        _desired: usize,
+        _maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
+        Ok(true)
+    }
 }
 
 impl HostState {
@@ -174,6 +246,7 @@ impl HostState {
             extensions: BTreeMap::new(),
             infra: None,
             stdin,
+            memory: None,
         }
     }
 }

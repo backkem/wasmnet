@@ -113,6 +113,7 @@ mod control;
 mod extension;
 mod glue;
 mod infra;
+mod reconfigure;
 mod runtime;
 mod stdio;
 mod wasi;

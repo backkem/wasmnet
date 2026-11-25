@@ -34,17 +34,31 @@
 ///                                               ; by name; both served by wasi:cli/environment;
 ///                                               ; each text <= 4 KiB, no NUL, no `=` in a name
 ///   ? "fuel_per_instant": uint,
-///   ? "wire":    [ { "port": uint, "to": "sw:3" / "sw", ? "latency": uint (ns), ? "mtu": uint } ] }
+///   ? "memory":  uint,                          ; the most linear memory it may use, bytes, all
+///                                               ; its instances together: growing past it traps
+///                                               ; (it crashes alone, `crashed`)
+///   ? "wire":    [ cable ] }
+///
+/// cable := { "port": uint, "to": "sw:3" / "sw", ? "latency": uint (ns), ? "mtu": uint,
+///            ? "impair": impairment / [ impairment, impairment ] }
 ///                                               ; "to" without a port: the first free port
-///                                               ; of that device when the change applies
+///                                               ; of that device when the change applies;
+///                                               ; one impairment for both directions, or two by
+///                                               ; sending end (from this device first)
+/// impairment := { ? "rate": uint (bits/s), ? "queue": uint (frames), ? "loss_ppm": uint,
+///                 ? "jitter": uint (ns) }       ; what is left out is unimpaired
 /// ```
+///
+/// A cable's far end is a device the caller created or one of the network's own, never another
+/// controller's: the one rule for cables of a creation and of `devices.wire`.
 ///
 /// No other system's types cross this interface: a controller translates whatever it speaks
 /// into these specs.
 ///
-/// Versions: 0.1.1 added `devices.control`; 0.1.2 added `changes.wait`,
-/// `devices.control-answer` and the spec keys `args` and `env`. A component built against 0.1.0 or 0.1.1 still links, since an addition keeps
-/// the `0.1` line compatible.
+/// Versions: 0.1.1 added `devices.control`; 0.1.2 added `changes.wait`, `devices.control-answer`,
+/// `devices.wire`, `devices.unwire`, the spec keys `args`, `env` and `memory` and the cable key
+/// `impair`. A component built against 0.1.0 or 0.1.1 still links, since an addition keeps the
+/// `0.1` line compatible.
 package wasmnet:infra@0.1.2;
 
 interface types {
@@ -227,6 +241,31 @@ interface devices {
     /// and in a world split over sites. Fails with `not-found` for a request id the caller sent
     /// no command with, or one more than 256 commands ago.
     control-answer: func(request-id: string) -> result<option<command-answer>, error>;
+
+    /// Plugs `cable` (CBOR, a spec's cable, see the package docs) into port `cable.port` of
+    /// `name`, a device this caller created (0.1.2). Its far end follows the one rule of
+    /// cables: a device the caller created, or one of the network's own.
+    ///
+    /// - Like every mutation it only records and queues: the cable is plugged in when the
+    ///   derived event applies, at `now` and after any request still queued for `name` (so an
+    ///   `apply` followed by a `wire` reaches the new device), with its latency, MTU and
+    ///   impairments set before any frame crosses it, and journalled as `link-added` on `name`.
+    ///   A stopped end keeps the link down until it starts. Returns the device as asked for.
+    /// - When it applies it fails (`infra-failed {verb: wire}`, and the device's `message`) for
+    ///   a port that is taken or not declared, or a far device that is gone or has no free port.
+    ///   In a world split over sites, a far end on another site fails the whole run there, at
+    ///   that event (the same refusal as a creation's cable).
+    /// - Idempotent by request id only (a second cable from the same port fails when it
+    ///   applies). Fails with `not-found`, `denied` or `invalid` as `control` does, `denied` for
+    ///   a far end another controller created, `invalid` for a malformed cable.
+    wire: func(request-id: option<string>, name: string, cable: list<u8>) -> result<device, error>;
+
+    /// Unplugs the cable at `port` of `name`, a device this caller created (0.1.2): the link
+    /// goes down (frames in flight on it are lost) and both ports are free again; the link stays
+    /// in the records with its capture, journalled as `link-removed` on `name`. Queued like
+    /// `wire`; when it applies it fails if no cable is at that port, or if the cable leads to a
+    /// device another controller created.
+    unwire: func(request-id: option<string>, name: string, port: u32) -> result<device, error>;
 
     /// One device of the caller's view (including one still `pending`).
     get: func(name: string) -> result<device, error>;

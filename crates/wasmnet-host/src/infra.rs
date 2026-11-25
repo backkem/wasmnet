@@ -126,6 +126,30 @@ impl devices::Host for HostState {
             .map_err(error)
     }
 
+    fn wire(
+        &mut self,
+        request_id: Option<String>,
+        name: String,
+        cable: Vec<u8>,
+    ) -> Result<types::Device, types::Error> {
+        let end = self.infra.as_ref().ok_or_else(ungranted)?;
+        end.wire(request_id, &name, &cable)
+            .map(device)
+            .map_err(error)
+    }
+
+    fn unwire(
+        &mut self,
+        request_id: Option<String>,
+        name: String,
+        port: u32,
+    ) -> Result<types::Device, types::Error> {
+        let end = self.infra.as_ref().ok_or_else(ungranted)?;
+        end.unwire(request_id, &name, port)
+            .map(device)
+            .map_err(error)
+    }
+
     fn control_answer(
         &mut self,
         request_id: String,

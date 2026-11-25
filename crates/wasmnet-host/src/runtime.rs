@@ -43,6 +43,12 @@ impl Runtime for Host {
         // The component's own engine: metered, or not (see `Host::load_unmetered`).
         let (linker, metered) = self.linker_for(component);
         let mut store = Store::new(component.engine(), state);
+        // Its linear memory: measured for its cost report, bounded if it has a limit.
+        store.data_mut().memory = Some(crate::wasi::MemoryBudget::new(
+            ctx.memory,
+            ctx.inbox.cost().clone(),
+        ));
+        store.limiter(|s| s.memory.as_mut().expect("a memory budget"));
         self.store_created(&mut store);
         if metered {
             store
@@ -84,6 +90,13 @@ impl Runtime for Host {
         {
             exports.push(wasmnet_core::COMMANDS_EXPORT.to_owned());
             controls.push(Box::new(c));
+        }
+        if let Some(r) =
+            crate::reconfigure::Reconfigure::find(&pre, &mut store, &instance, &ctx.clock)
+                .map_err(runtime_error)?
+        {
+            exports.push(wasmnet_core::RECONFIGURE_EXPORT.to_owned());
+            controls.push(Box::new(r));
         }
         for e in self.extension_hooks() {
             if let Some((export, handler)) = e
