@@ -63,7 +63,8 @@ here so that nobody has to find these the hard way. Each entry names where the c
 - **What the browser backend does not do** ([design/browser.md](design/browser.md#what-each-backend-does-itself)):
   fuel (`fuel_per_instant` is ignored and fuel costs are 0: neither jco nor the page can meter a
   core module's instructions; the guard is `Guard::max_polls_per_instant`, 100 000 polls of one
-  instant), host extensions' imports, and sites. A page creates a device while the network runs
+  instant), host extensions' imports (a portable extension serves both backends instead), and
+  sites. A page creates a device while the network runs
   with JSPI (Chromium's `WebAssembly.Suspending`), and checks a component's imports against the
   `wasmnet:infra` grant only when it knows them (`ComponentSource.imports`; without them, every
   infra call of an ungranted device is `denied` instead). A WASI 0.2 stdin read with nothing
@@ -93,6 +94,17 @@ here so that nobody has to find these the hard way. Each entry names where the c
   ([design/links.md](design/links.md#notes-in-a-capture)). In a split network a link between
   two sites takes the first site's notes; both sites must set the same notes for its capture to
   match an unsplit run's.
+- **Portable extensions are new and partial** ([design/runtime-and-extensions.md](design/runtime-and-extensions.md#portable-extensions)).
+  Their WIT may not use signed integers, floats, `char`, flags, streams, futures or async
+  functions (the page's boundary does not carry them; the wasmtime adapter refuses them at
+  compile time). A served call answers at once: a call that waits (at a virtual instant, or for
+  page code) is not expressible, so an async import is still an embedder's own glue. Only
+  imports are portable: a device's optional exports (commands, reconfiguration, an inspection
+  export) are called through each backend's own control calls. A page reads the interfaces when
+  a network is created, so an extension added later serves only on wasmtime. A page cannot set
+  an extension's device options or build an extension's operator events from its plain objects;
+  an extension op still counts as a topology op in a split network (refused). A resource handle
+  a device drops in a page reaches the server only when jco disposes of the object.
 - **The browser binding reports errors as strings** (`wasmnet_web::Network::link`, the
   `JsHost` methods), where the native API has one typed error. Its TypeScript `Network` reaches
   operator events, device options and link options as plain objects that the simulator reads

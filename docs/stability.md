@@ -63,9 +63,21 @@ versions without notice. Rustdoc and the design notes mark it **embedder surface
   and the devices and links created while a network runs were added to its records);
 - the extension points (`wasmnet_core::ext`, `HostExtension`, `ControlHandler`,
   `HostBuilder::unmetered_engine` and `Host::load_unmetered`);
+- portable extensions ([design/runtime-and-extensions.md](design/runtime-and-extensions.md#portable-extensions)):
+  `Interface`, `ImportServer`, `Served`, `DeviceExt::serve`, `NetworkExtension::interfaces`,
+  `Status::set_fault`, `DeviceLife::replaced`, `DeviceSetup::seed`, `Network::add_boxed_extension`,
+  the value model `wasmnet_core::value`, `wasmnet_host::portable` with `portable_adapter!`, and in
+  a page `wn_import`, `wn_import_drop`, `wn_interfaces` and an embedder's own page module
+  (`wasmnet_web::install`, `install!`); the test fixture `wasmnet-pad` is their worked example.
 - the netstack's snapshot interface (`wasmnet:netstack/state`, `snapshot.paused`);
 - the HTTP apps' event-stream routes and `POST /echo` (`http-server`) and forward proxy
   (`http-get`).
+
+**What "unstable" means for a crate in another repository.** An extension built on this surface
+(a capability crate living elsewhere) pins the library's revision, as an embedder does, and
+follows it deliberately: a change to these points may need code changes in the extension, and
+the change's commit says what to do. Nothing here changes silently: a change that alters what a
+device observes changes a test that compares bytes in this repository first.
 
 Other parts of the tree, for reference: `crates/wasmnet-wire` (`no_std` wire helpers: MAC
 addresses, Ethernet, pcap-ng, DHCP and DNS codecs, DNS-SD's helpers), `crates/wasmnet-app-kit` (what an app needs: its
@@ -92,7 +104,8 @@ from outside the core, so a lost constructor fails the tests.
   - `Cable::new(port, to_device, to_port).latency(ns)`, `SeriesOptions::new(width, keep)`,
     `SimConfig::seeded(seed).wall_epoch(epoch)`, `Fault::new(message)`,
     `DeviceInstance::new(ports, actor).apps(apps)`, `JournalEntry::new(at, device, record)`,
-    `DeviceCommand::new(command, argument)`, `infra::Follow::new(name, kinds, since)`,
+    `DeviceCommand::new(command, argument)`, `Interface::new(name).function(f).resource(r)`,
+    `infra::Follow::new(name, kinds, since)`,
     `infra::TableSince::new(selector, since)` and, in `wasmnet-app-kit`,
     `mdns::Resolved::new(name, instance, host, port)`.
 - **Structs an embedder reads** (results, records, statistics and costs: `LinkStats`,
@@ -122,7 +135,8 @@ from outside the core, so a lost constructor fails the tests.
     messages (`sites::Msg`, `sites::Sync`, `RemoteFrame`), `infra::{Phase, ChangeKind,
     InfraError}` (the `wasmnet:infra` enums), `journal::{Level, Stream}`, the DHCP and DNS
     messages (`dhcp::Message`, `dns::{Message, Question, Record}`), and the browser boundary's
-    `wasmnet_web::codec::Value` and `wasmnet_web::infra::Reply`;
+    value model `wasmnet_core::value::Value` (re-exported as `wasmnet_web::codec::Value`),
+    `wasmnet_core::Served` and `wasmnet_web::infra::Reply`;
   - what a caller must handle in full, so that a new case is a compile error where it must be
     handled: a backend's `Command`, the stepping results `Step` and `sites::Step`, and
     `LinkKind` (Ethernet or a registered cable kind);
