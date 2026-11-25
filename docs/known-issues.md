@@ -182,6 +182,4 @@ here so that nobody has to find these the hard way. Each entry names where the c
 
 ## Tooling
 
-- **The browser page is tested only on pushes to `main`**, by the Pages workflow. A pull
-  request that breaks `web/` passes CI.
 - **The compile cache's stale-lock handling** is only exercised on Linux and Windows.

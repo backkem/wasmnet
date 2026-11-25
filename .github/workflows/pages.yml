@@ -1,8 +1,9 @@
 name: Pages
 
-# Builds the browser example (web/: the simulator for wasm32-unknown-unknown, three components
-# transpiled with the codelib-web kit, the page), tests it in headless Chromium against the
-# native example, and deploys it to https://backkem.github.io/wasmnet/.
+# Builds the browser example (web/: the simulator for wasm32-unknown-unknown, the components the
+# page runs, transpiled with the codelib-web kit, and the page) and tests it in headless Chromium
+# against the native example. A push to main also deploys it to
+# https://backkem.github.io/wasmnet/; a pull request only builds and tests.
 #
 # GitHub only runs workflows from the top of a repository, so this one starts working once this
 # directory is the repository's root. Repository settings: Pages > Build and deployment >
@@ -11,6 +12,7 @@ name: Pages
 on:
   push:
     branches: [main]
+  pull_request:
   workflow_dispatch:
 
 permissions:
@@ -19,7 +21,8 @@ permissions:
   id-token: write
 
 concurrency:
-  group: pages
+  # One deployment at a time; a pull request only builds and tests, in a group of its own.
+  group: ${{ github.event_name == 'pull_request' && format('pages-pr-{0}', github.ref) || 'pages' }}
   cancel-in-progress: false
 
 env:
@@ -61,12 +64,15 @@ jobs:
           NATIVE_JOURNAL: ../target/http-native.txt
 
       - uses: actions/configure-pages@v6
+        if: github.event_name != 'pull_request'
 
       - uses: actions/upload-pages-artifact@v5
+        if: github.event_name != 'pull_request'
         with:
           path: web/dist
 
   deploy:
+    if: github.event_name != 'pull_request'
     needs: build
     runs-on: ubuntu-latest
     environment:
