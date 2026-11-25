@@ -41,9 +41,10 @@ An app never runs alone: a composition plugs it into a netstack
 | `http-get` | `wasmnet-http-get` | `http-get.wasm` | An HTTP/1.1 client that fetches the URLs in its config. |
 | `http-lb` | `wasmnet-http-lb` | `http-lb.wasm` | An HTTP/1.1 load balancer: health checks, round-robin or random, an admin API. |
 | `http-server` | `wasmnet-http-server` | `http-server.wasm` | A small HTTP/1.1 server: static routes from config, keep-alive, generated bodies. |
-| `mdns-responder` | `wasmnet-mdns-responder` | `mdns-responder.wasm` | A Multicast DNS responder for one host name. |
+| `mdns-responder` | `wasmnet-mdns-responder` | `mdns-responder.wasm` | A Multicast DNS responder for one host name, which also advertises DNS-SD services. |
 | `ping` | `wasmnet-ping` | `ping.wasm` | ICMP echo over the netstack's ICMP echo sockets. |
 | `replicas` | `wasmnet-replicas` | `replicas.wasm` | A controller that keeps N copies of a device running through `wasmnet:infra`. |
+| `service-browse` | `wasmnet-service-browse` | `service-browse.wasm` | Browses DNS-SD services over Multicast DNS, resolves them and can fetch from one over HTTP. |
 | `traceroute` | `wasmnet-traceroute` | `traceroute.wasm` | The classic UDP traceroute. |
 | `udp-echo-client` | `wasmnet-udp-echo-client` | `udp-echo-client.wasm` | Sends UDP datagrams to an echo server and checks the replies. |
 | `udp-echo-server` | `wasmnet-udp-echo-server` | `udp-echo-server.wasm` | Sends every UDP datagram it receives straight back. |
@@ -74,6 +75,7 @@ A node is the netstack plus the apps in its composition, `compositions/<name>.wa
 | `node-mdns-web` | `netstack`, `http-server`, `mdns-responder` |
 | `node-ping` | `netstack`, `ping` |
 | `node-replicas` | `netstack`, `replicas` |
+| `node-service-browse` | `netstack`, `service-browse` |
 | `node-traceroute` | `netstack`, `traceroute` |
 | `node-traceroute-ping` | `netstack`, `traceroute`, `ping` |
 | `node-udp-echo-client` | `netstack`, `udp-echo-client` |

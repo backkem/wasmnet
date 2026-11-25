@@ -83,6 +83,17 @@ here so that nobody has to find these the hard way. Each entry names where the c
 - **`mdns-responder` does not announce a later address change.** Once it is ready it arms no
   timer, so a new DHCP lease is not announced. It also does not answer or defend its name
   while it is still announcing.
+- **DNS-SD is partial.** `mdns-responder` has no subtypes, no unicast DNS-SD domains, no
+  duplicate answer suppression (RFC 6762 §7.4) and no known-answer lists spread over several
+  packets (§7.2); its services are fixed by its config, so a TXT record never changes. It
+  answers NSEC for the types a service instance lacks and adds one for its host name to service
+  answers when it has no address of one family, but still sends no negative answer to a
+  question about its host name alone. Host and service answers to one query leave as separate
+  packets. The app kit's browser (`crates/wasmnet-app-kit/src/mdns.rs`) sends no QU question
+  (§5.4), suppresses no duplicate questions (§7.3), does not watch other hosts' queries go
+  unanswered (§10.5), and caches at most 4096 records. A node's port 5353 can be bound once per
+  family (the netstack has no `SO_REUSEPORT`), so `service-browse` beside `mdns-responder` on
+  one node queries from another port and gets unicast answers with TTLs of 10 s.
 - **`http-server` and `http-lb` have no timeouts on a slow peer.** `http-server` has no idle or
   read timeout and no cap on connections; `http-lb` writes to a client without a timeout and
   has no cap on tasks. Both are fine among well-behaved nodes and are not hardened against a

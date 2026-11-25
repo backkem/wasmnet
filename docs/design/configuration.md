@@ -51,6 +51,7 @@ built as `node-<name>.wasm`. The node has one config. It holds the netstack's ke
 | [`mdns-web.wac`](../../compositions/mdns-web.wac) | `http-server`, `mdns-responder` |
 | [`ping.wac`](../../compositions/ping.wac) | `ping` |
 | [`replicas.wac`](../../compositions/replicas.wac) | `replicas` |
+| [`service-browse.wac`](../../compositions/service-browse.wac) | `service-browse` |
 | [`traceroute.wac`](../../compositions/traceroute.wac) | `traceroute` |
 | [`traceroute-ping.wac`](../../compositions/traceroute-ping.wac) | `traceroute`, `ping` |
 | [`udp-echo-client.wac`](../../compositions/udp-echo-client.wac) | `udp-echo-client` |
@@ -541,7 +542,12 @@ Without any route, `GET /` answers `hello from wasmnet\n`; with `instance` set i
 
 A Multicast DNS responder (RFC 6762) for one host name: it probes for `<hostname>.local`,
 announces it, renames itself (`<hostname>-2`, ...) on a conflict, and answers A and AAAA
-questions with the node's addresses. It never returns.
+questions with the node's addresses. It also advertises the services in its config with
+DNS-SD (RFC 6763): once the host name is claimed, each service probes and announces its SRV
+and TXT records, is renamed `<instance> (2)`, `(3)`, ... on a conflict, answers browsing and
+resolving questions, and sends goodbyes when withdrawn. It never returns. The behaviour in
+detail is in
+[components/apps/mdns-responder/src/services.rs](../../components/apps/mdns-responder/src/services.rs).
 
 Source of truth: `Config::from_pairs` in
 [components/apps/mdns-responder/src/lib.rs](../../components/apps/mdns-responder/src/lib.rs).
@@ -551,9 +557,47 @@ Unknown keys are errors.
 |---|---|---|---|
 | `hostname` | one host name label: letters, digits and `-` (no dots, no `_`) | **required** | The name to claim: `alice` claims `alice.local`. Stored lowercase. |
 | `families` | `ipv4`, `ipv6`, or both as a comma-separated list | `ipv4,ipv6` | The groups to listen on: `224.0.0.251` and `ff02::fb`. |
-| `ttl` | duration in whole seconds, at least `1s`, at most `4294967295s` | `120s` | The TTL of its records. |
+| `ttl` | duration in whole seconds, at least `1s`, at most `4294967295s` | `120s` | The TTL of its A and AAAA records, and of its services' SRV and NSEC records. |
+| `service-ttl` | duration in whole seconds, at least `1s` | `4500s` | The TTL of its services' PTR and TXT records (RFC 6762 §10: 75 minutes). |
 | `link-local` | `true` or `false` | `false` | Also announce IPv6 link-local addresses. |
 | `start` | duration | `0` | Wait before probing. |
+| `service.<id>.instance` | 1 to 63 bytes of UTF-8, no control characters | **required** per service | The instance name, `Alpha Web`. Spaces, dots and any other characters are allowed. |
+| `service.<id>.type` | `_<name>._tcp` or `_<name>._udp`, the name 1 to 15 letters, digits and `-` | **required** per service | The service type. Stored lowercase. |
+| `service.<id>.port` | integer, 1..=65535 | **required** per service | The port in its SRV record. |
+| `service.<id>.txt` | comma-separated list of `key` or `key=value` | one empty string | Its TXT attributes, in order (RFC 6763 §6): `key` alone is a boolean, `key=` an empty value. Keys are printable ASCII without `=`, not repeated (in any case); each item at most 255 bytes. `\,` is a comma inside an item, `\\` a backslash. |
+| `service.<id>.until` | duration | never | Withdraw it at this time after the app started: goodbye packets (TTL 0), then no more answers. |
+
+`<id>` is letters, digits and `-`; it orders the services and appears in no record. Two
+services may not share an instance name and type.
+
+```text
+app.mdns-responder.hostname             = alpha
+app.mdns-responder.service.web.instance = Alpha Web
+app.mdns-responder.service.web.type     = _http._tcp
+app.mdns-responder.service.web.port     = 80
+app.mdns-responder.service.web.txt      = path=/,secure
+```
+
+### service-browse
+
+Browses DNS-SD service types over Multicast DNS with the app kit's browser
+([writing-an-app.md](writing-an-app.md#advertising-and-browsing-services)), resolves the
+instances it finds, journals what it sees (`dnssd-found`, `dnssd-removed`, `dnssd-resolved`)
+and can fetch `GET <path>` from one instance by the address and port it resolved
+(`dnssd-fetched`, `dnssd-fetch-failed`). It never returns.
+
+Source of truth: `Config::from_pairs` in
+[components/apps/service-browse/src/lib.rs](../../components/apps/service-browse/src/lib.rs).
+Unknown keys are errors.
+
+| Key | Value | Default | Meaning |
+|---|---|---|---|
+| `type` | comma-separated list of service types (`_http._tcp`) | **required** | What to browse, in `.local`. Stored lowercase. |
+| `families` | `ipv4`, `ipv6`, or both as a comma-separated list | `ipv4,ipv6` | The groups to query on. |
+| `resolve` | `all`, `none`, or a comma-separated list of instance names (`\,` is a comma) | `all` | Which instances to resolve when found. |
+| `fetch` | an instance name | none | Once it resolves, fetch from it over HTTP, once. |
+| `fetch-path` | a path starting with `/`, no spaces | `/` | What to fetch. |
+| `start` | duration | `0` | Wait before browsing. |
 
 ### ping
 

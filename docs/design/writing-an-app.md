@@ -121,6 +121,53 @@ only through operator events (`Op::Stdin`, `Op::StdinNamed`), at their instant
    [crates/wasmnet-host/tests/nodes.rs](../../crates/wasmnet-host/tests/nodes.rs) does with
    `http-get` and `http-server`.
 
+## Advertising and browsing services
+
+Service discovery is DNS-SD (RFC 6763) over Multicast DNS (RFC 6762), in apps, over ordinary
+UDP sockets: nothing in the netstack knows about it.
+
+**Advertising.** An app does not advertise itself: put `mdns-responder` in the node beside it
+and name its services in the responder's config, as
+[compositions/mdns-web.wac](../../compositions/mdns-web.wac) does for `http-server`:
+
+```text
+app.http-server.listen                  = 0.0.0.0:80
+app.mdns-responder.hostname             = alpha
+app.mdns-responder.service.web.instance = Alpha Web
+app.mdns-responder.service.web.type     = _http._tcp
+app.mdns-responder.service.web.port     = 80
+app.mdns-responder.service.web.txt      = path=/
+```
+
+The responder claims `alpha.local` first, then probes for `Alpha Web._http._tcp.local`,
+announces its PTR, SRV and TXT records, renames the instance `Alpha Web (2)` if someone else
+holds the name, and answers browsers. A service with `until` is withdrawn at that time with
+goodbye packets. The keys are in [configuration.md](configuration.md#mdns-responder).
+
+**Browsing.** `wasmnet_app_kit::mdns::Browser` is a browser with no I/O and no clock, which an
+app drives over its own sockets
+([crates/wasmnet-app-kit/src/mdns.rs](../../crates/wasmnet-app-kit/src/mdns.rs)):
+
+1. Open one UDP socket per family, bind it to port 5353 and join the group with
+   `wasmnet:sockets-ext/multicast` (`join-multicast-group`, hop limit 255, loopback off). Wire
+   `wasmnet:sockets-ext/multicast` into the app in its composition.
+2. `Browser::new(seed)`, then `browse(now, "_http._tcp")` for each type.
+3. Loop: wait for a datagram or `next_deadline()`. A datagram goes to `on_message(now, bytes)`,
+   the timer to `tick(now)`, which also returns the queries to send to `224.0.0.251:5353` and
+   `[ff02::fb]:5353`.
+4. Act on the events: `Found` (a new instance; call `resolve(now, name)` to learn where it
+   is), `Resolved` (host, port, TXT strings and addresses, once complete and again when they
+   change) and `Removed` (by goodbye or because its TTL ran out).
+
+The browser queries with RFC 6762's back-off (1 s doubling to an hour) and known answers,
+refreshes the records it needs at 80 to 95 % of their TTL, and honours goodbyes and the
+cache-flush bit. [components/apps/service-browse](../../components/apps/service-browse) is a
+complete app built on it: it journals what it sees and can fetch from an instance by the
+address and port it resolved. Port 5353 can be bound once per node and family, so on a node
+that also runs `mdns-responder` the app binds another port; responders then answer it by
+unicast with short TTLs (RFC 6762 §6.7), and the browser works the same. What of the RFCs is
+not done is in [known-issues.md](../known-issues.md).
+
 ## An app in another repository
 
 An app does not have to live in this tree. A crate anywhere needs one dependency and no WIT

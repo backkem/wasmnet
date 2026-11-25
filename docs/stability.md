@@ -14,7 +14,9 @@ are part of it ([design/links.md](design/links.md)). So are device commands: the
 address translation and packet filter with their keys and commands (`tests/nat.rs`,
 `tests/filter.rs`), and its tunnel ports with their keys and commands
 (`tests/tunnel.rs`), and the switch's blocks and delays between ports
-(`tests/partition.rs`). Sending them as
+(`tests/partition.rs`). So is DNS-SD: `mdns-responder`'s services, the app kit's browser
+(`wasmnet_app_kit::mdns`) and the `service-browse` app (`tests/service_discovery.rs`).
+Sending device commands as
 operator events (`Op::Control` with a `DeviceCommand`) is embedder surface like every
 operator event, though that test exercises it too. So are a device's arguments and
 environment (`DeviceOptions::args` and `env`, the spec keys `args` and `env`), a controller's
@@ -54,6 +56,6 @@ versions without notice. Rustdoc and the design notes mark it **embedder surface
   (`http-get`).
 
 Other parts of the tree, for reference: `crates/wasmnet-wire` (`no_std` wire helpers: MAC
-addresses, Ethernet, pcap-ng, DHCP and DNS codecs), `crates/wasmnet-app-kit` (what an app needs: its
+addresses, Ethernet, pcap-ng, DHCP and DNS codecs, DNS-SD's helpers), `crates/wasmnet-app-kit` (what an app needs: its
 bindings, and what the apps here share), and four test fixtures among the components
 (`blaster`, `reflector`, `clock-probe`, `infra-script`).
