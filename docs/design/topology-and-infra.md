@@ -424,7 +424,8 @@ in flight, forgets its neighbours, rewires its links under new names (`-2`) and 
 captures. A device that can change in place exports `wasmnet:control/commands`
 ([wit/control/control.wit](../../wit/control/control.wit)): one sync function,
 `invoke(now, command, argument) -> result<string, string>`. The router does: `route-add`,
-`route-replace`, `route-remove` and `routes`, in its configuration's own route syntax
+`route-replace`, `route-remove`, `routes-replace` (every static route at once, so a controller
+need not compute a diff) and `routes`, in its configuration's own route syntax
 ([wit/router/router.wit](../../wit/router/router.wit) has their semantics).
 
 The wasmtime host finds the export when it instantiates a device and reports it as the optional

@@ -26,7 +26,9 @@
 //!   it, and `stun-server` answers Binding requests (`docs/design/tunnels.md`).
 //! * **Commands** (`wasmnet:control/commands`, [`Router::command`]): `route-add`,
 //!   `route-replace` and `route-remove` change the static routes while the router runs, in the
-//!   config's route syntax; `routes` lists the table. Their semantics are in
+//!   config's route syntax; `routes-replace` sets all of them in one step (checked first, all
+//!   or nothing; a `routes` answer is a valid argument); `routes` lists the table. Their
+//!   semantics are in
 //!   `wit/router/router.wit`. `forward-add`, `forward-remove`, `forwards`, `mappings`,
 //!   `allow-add`, `allow-remove` and `rules` do the same for forwards and allow rules.
 //!   `tunnel-add`, `tunnel-remove`, `tunnel-peer`, `tunnel-peer-remove` and `tunnels` add,

@@ -461,3 +461,145 @@ fn a_controller_changes_the_routes_of_a_router_it_created() {
         assert_eq!(a.pcaps, b.pcaps, "{label}: pcaps");
     }
 }
+
+/// `routes-replace`: `r1`'s whole static table in one command, all or nothing.
+const TABLE: &str = "10.0.4.0/24 via 10.0.2.4,default via 10.0.2.254";
+/// Refused as a whole: its second route is for a connected prefix.
+const BAD_TABLE: &str = "10.0.5.0/24 via 10.0.2.5,10.0.1.0/24 via 10.0.2.2";
+const CONNECTED: [&str; 2] = [
+    "10.0.1.0/24 port 0 (connected)",
+    "10.0.2.0/24 port 1 (connected)",
+];
+
+fn routes_of(network: &mut Network, device: DeviceId) -> Vec<String> {
+    network
+        .command(device, "routes", "")
+        .unwrap()
+        .expect("takes commands")
+        .expect("routes answers")
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+fn table_routes() -> Vec<String> {
+    let mut want: Vec<String> = CONNECTED.iter().map(|l| (*l).to_owned()).collect();
+    want.push("10.0.4.0/24 via 10.0.2.4 port 1 (static)".to_owned());
+    want.push("0.0.0.0/0 via 10.0.2.254 port 1 (static)".to_owned());
+    want
+}
+
+#[test]
+fn an_embedder_replaces_a_routers_whole_static_table() {
+    let b = built();
+    let mut network = Network::new(&b.host, 1);
+    let r1 = network
+        .device_with_config("r1", &b.load("router"), config(&r1_config()))
+        .unwrap();
+    network.run_until(MS).unwrap();
+
+    // Between runs, through `wasmnet:control`.
+    let answer = network.command(r1, "routes-replace", TABLE).unwrap();
+    assert_eq!(answer, Some(Ok("added 2, removed 1, kept 0".to_owned())));
+    assert_eq!(routes_of(&mut network, r1), table_routes());
+    let refused = network.command(r1, "routes-replace", BAD_TABLE).unwrap();
+    assert!(
+        matches!(&refused, Some(Err(e)) if e.contains("connected")),
+        "{refused:?}"
+    );
+    assert_eq!(
+        routes_of(&mut network, r1),
+        table_routes(),
+        "nothing changed"
+    );
+    // The `routes` answer reads back as an argument.
+    let table = routes_of(&mut network, r1).join("\n");
+    let again = network.command(r1, "routes-replace", &table).unwrap();
+    assert_eq!(again, Some(Ok("unchanged".to_owned())));
+
+    // As an operator event: an empty table clears the static routes.
+    network
+        .add_op(
+            Op::control(r1, DeviceCommand::new("routes-replace", "").into_control()),
+            Placement::StartOf(5 * MS),
+        )
+        .unwrap();
+    network.run_until_quiescent().unwrap();
+    assert!(
+        matches!(network.op_states()[0], OpState::Applied { .. }),
+        "{:?}",
+        network.op_states()
+    );
+    assert_eq!(routes_of(&mut network, r1), CONNECTED);
+    let journal = network.journal();
+    let changes = |kind| -> Vec<String> {
+        events(&journal, "r1", kind)
+            .iter()
+            .map(|e| field(e, "prefix").to_owned())
+            .collect()
+    };
+    assert_eq!(changes("route-added"), ["10.0.4.0/24", "0.0.0.0/0"]);
+    assert_eq!(
+        changes("route-removed"),
+        ["10.0.3.0/24", "10.0.4.0/24", "0.0.0.0/0"]
+    );
+}
+
+#[test]
+fn a_controller_replaces_a_routers_whole_static_table() {
+    let b = built();
+    let mut network = Network::new(&b.host, 1);
+    let router = b.load("router");
+    network.set_component_resolver(Box::new(move |name, instantiate| match name {
+        "router" => instantiate(&router),
+        other => Err(sim::Error::Refused(format!("no component {other}"))),
+    }));
+    network.set_infra_catalog(vec!["router".to_owned()]);
+    let config_map = r1_config()
+        .into_iter()
+        .map(|(k, v)| (Value::text(k), Value::text(v)))
+        .collect();
+    let spec = Value::Map(vec![
+        (Value::text("component"), Value::text("router")),
+        (Value::text("config"), Value::Map(config_map)),
+    ])
+    .encode();
+    let steps = [
+        format!("0ms apply r1 {}", hex(&spec)),
+        format!("1ms control r1 routes-replace {TABLE}"),
+        format!("2ms control r1 routes-replace {BAD_TABLE}"),
+        "3ms answer step-1".to_owned(),
+        "3ms answer step-2".to_owned(),
+    ];
+    let keys: Vec<String> = (0..steps.len()).map(|n| format!("step.{n}")).collect();
+    let pairs: Vec<(&str, &str)> = keys
+        .iter()
+        .zip(&steps)
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    network
+        .device_with_options(
+            "ctl",
+            &b.load("infra_script"),
+            config(&pairs),
+            DeviceOptions::default().infra(true),
+        )
+        .unwrap();
+    network.run_until_quiescent().unwrap();
+
+    let journal = network.journal();
+    let log = transcript(&journal);
+    let steps = events(&journal, "ctl", "infra-script");
+    let answer = |step: &str| {
+        steps
+            .iter()
+            .find(|s| field(s, "step") == step)
+            .unwrap_or_else(|| panic!("step {step}\n{log}"))
+    };
+    assert_eq!(field(answer("3"), "result"), "ok", "{log}");
+    assert_eq!(field(answer("3"), "text"), "added 2, removed 1, kept 0");
+    assert_eq!(field(answer("4"), "result"), "err", "{log}");
+    assert!(field(answer("4"), "text").contains("connected"), "{log}");
+    let r1 = network.live_device("r1").expect("r1 exists");
+    assert_eq!(routes_of(&mut network, r1), table_routes());
+}

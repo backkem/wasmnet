@@ -389,6 +389,50 @@ fn tunnels_and_routes_from_the_config() {
 }
 
 #[test]
+fn routes_replace_names_tunnels_and_keeps_their_connected_routes() {
+    let tunnels = [
+        ("tunnel.to-b.id", "7"),
+        ("tunnel.to-b.local", "fd00:ff::a/128"),
+        ("tunnel.to-b.peer", "10.0.1.20:6081"),
+        ("tunnel.relay.id", "8"),
+        ("tunnel.relay.local", "10.255.0.1/32"),
+    ];
+    let (mut r, mut out) = router(&tunnels);
+    let wanted = "fd00:b::/64 tunnel to-b\n10.9.0.0/16 tunnel relay\n10.0.3.0/24 via 10.0.2.2";
+    assert_eq!(
+        r.command(0, "routes-replace", wanted, &mut out).as_deref(),
+        Ok("added 3, removed 0, kept 0")
+    );
+    assert_eq!(out.event("route-added").get("port"), Some("to-b"));
+    assert_eq!(port_for(&r, "fd00:b::1"), Some(3));
+    assert_eq!(port_for(&r, "10.9.0.1"), Some(2));
+    // The same table as a router started with these routes; its answer reads back unchanged.
+    let table = r.command(0, "routes", "", &mut out).unwrap();
+    let mut started = tunnels.to_vec();
+    let listed = wanted.replace('\n', ",");
+    started.push(("routes", listed.as_str()));
+    let (mut s, mut out2) = router(&started);
+    assert_eq!(s.command(0, "routes", "", &mut out2).unwrap(), table);
+    out.take();
+    assert_eq!(
+        r.command(0, "routes-replace", &table, &mut out).as_deref(),
+        Ok("unchanged")
+    );
+    // A tunnel's transit prefix is connected: not the command's to set.
+    let e = r
+        .command(0, "routes-replace", "10.255.0.1/32 tunnel to-b", &mut out)
+        .unwrap_err();
+    assert!(e.contains("connected"), "{e}");
+    // Clearing leaves the tunnels' connected routes.
+    assert_eq!(
+        r.command(0, "routes-replace", "", &mut out).as_deref(),
+        Ok("added 0, removed 3, kept 0")
+    );
+    assert_eq!(port_for(&r, "10.255.0.1"), Some(2));
+    assert_eq!(port_for(&r, "fd00:b::1"), None);
+}
+
+#[test]
 fn binding_requests_are_answered_and_unknown_ids_are_not() {
     let (mut r, mut out) = router(&[("stun-server", "3478")]);
     r.receive(

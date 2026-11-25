@@ -1971,9 +1971,10 @@ impl Router {
     // Commands (`wasmnet:control/commands`, documented in `wit/router/router.wit`)
 
     /// Runs one command at `now`: `route-add`, `route-replace` and `route-remove` change the
-    /// static routes, `routes` lists the table. `Ok` says what it did; `Err` changed nothing.
-    /// A change applies to every lookup from then on; queued packets, the neighbor table, the
-    /// ports and the counters other than the route ones are untouched.
+    /// static routes, `routes-replace` sets all of them at once, `routes` lists the table. `Ok`
+    /// says what it did; `Err` changed nothing. A change applies to every lookup from then on;
+    /// queued packets, the neighbor table, the ports and the counters other than the route ones
+    /// are untouched.
     pub fn command(
         &mut self,
         now: u64,
@@ -1986,6 +1987,7 @@ impl Router {
             "route-add" => self.set_route(argument, false, out),
             "route-replace" => self.set_route(argument, true, out),
             "route-remove" => self.remove_route(argument, out),
+            "routes-replace" => self.replace_routes(argument, out),
             "routes" if argument.is_empty() => Ok(self
                 .routes
                 .routes()
@@ -2016,7 +2018,8 @@ impl Router {
             "rules" => Ok(self.filter.listing()),
             "routes" => Err("`routes` takes no argument".to_owned()),
             other => Err(format!(
-                "unknown command `{other}` (route-add, route-replace, route-remove, routes, \
+                "unknown command `{other}` (route-add, route-replace, route-remove, \
+                 routes-replace, routes, \
                  forward-add, forward-remove, forwards, mappings, allow-add, allow-remove, rules, \
                  tunnel-add, tunnel-remove, tunnel-peer, tunnel-peer-remove, tunnels)"
             )),
@@ -2180,6 +2183,90 @@ impl Router {
                 Ok("removed".to_owned())
             }
         }
+    }
+
+    /// `routes-replace <routes>`: the whole static table at once, as the router would have it
+    /// had it started with these routes; the connected routes stay. Routes are separated by
+    /// newlines or commas, so a `routes` answer (its connected lines are skipped, its `(static)`
+    /// marks dropped) and a config's `routes` value both work; empty clears the static routes.
+    /// Every route is checked first, and any error changes nothing. A route that stays as it
+    /// was is kept without an event; every other change is journalled and counted as
+    /// `route-remove` and `route-add` would (a changed route is a removal, then an addition).
+    fn replace_routes(&mut self, text: &str, out: &mut impl Sink) -> Result<String, String> {
+        let wanted = self.parse_route_list(text)?;
+        let old: Vec<Route> = self
+            .routes
+            .routes()
+            .iter()
+            .filter(|r| r.kind == RouteKind::Static)
+            .copied()
+            .collect();
+        let removed: Vec<Route> = old
+            .iter()
+            .filter(|r| !wanted.contains(r))
+            .copied()
+            .collect();
+        let added: Vec<Route> = wanted
+            .iter()
+            .filter(|r| !old.contains(r))
+            .copied()
+            .collect();
+        // Rebuilt in the new order, as at start: connected routes first, then these.
+        for r in &old {
+            self.routes.remove(r.prefix);
+        }
+        for r in &wanted {
+            self.routes.insert(*r);
+        }
+        for r in &removed {
+            self.route_changed("route-removed", r, out);
+        }
+        for r in &added {
+            self.route_changed("route-added", r, out);
+        }
+        if removed.is_empty() && added.is_empty() {
+            return Ok("unchanged".to_owned());
+        }
+        Ok(format!(
+            "added {}, removed {}, kept {}",
+            added.len(),
+            removed.len(),
+            wanted.len() - added.len()
+        ))
+    }
+
+    /// The static routes of a `routes-replace` argument, each checked, none for a connected
+    /// prefix and no prefix twice.
+    fn parse_route_list(&self, text: &str) -> Result<Vec<Route>, String> {
+        let mut routes: Vec<Route> = Vec::new();
+        for line in text.split(['\n', ',']).map(str::trim) {
+            // A `routes` answer's line ends in its kind.
+            let line = match line.rsplit_once(" (") {
+                Some((_, "connected)")) => continue,
+                Some((route, "static)")) => route.trim_end(),
+                _ => line,
+            };
+            if line.is_empty() {
+                continue;
+            }
+            let r = self.parse_static(line)?;
+            if let Some(c) = self
+                .routes
+                .get(r.prefix)
+                .filter(|c| c.kind == RouteKind::Connected)
+            {
+                return Err(self.connected(c));
+            }
+            if let Some(twice) = routes.iter().find(|o| o.prefix == r.prefix) {
+                return Err(format!(
+                    "two routes for {}: `{}` and `{line}`",
+                    r.prefix,
+                    self.route_text(twice)
+                ));
+            }
+            routes.push(r);
+        }
+        Ok(routes)
     }
 
     /// A command's refusal to touch a connected route.

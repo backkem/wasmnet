@@ -1258,6 +1258,133 @@ fn commands_change_static_routes_and_are_idempotent() {
     assert_eq!(counter(&r, "routes-removed"), Some(3));
 }
 
+/// The `routes` answer of a router started with `routes` (the config's list).
+fn table_at_start(routes: &str) -> String {
+    let (mut r, mut out) = router(&[("routes", routes)]);
+    r.command(MS, "routes", "", &mut out).unwrap()
+}
+
+#[test]
+fn routes_replace_sets_the_static_table_as_a_start_with_those_routes_would() {
+    let (mut r, mut out) = router(&[(
+        "routes",
+        "10.0.3.0/24 via 10.0.2.2,10.0.4.0/24 via 10.0.2.3",
+    )]);
+    let cmd = |r: &mut Router, out: &mut Out, c: &str, a: &str| r.command(MS, c, a, out);
+
+    // One kept, one changed, two new: the changed one is a removal, then an addition.
+    let new = "10.0.4.0/24 via 10.0.2.3\n10.0.3.0/24 via 10.0.1.9\n\
+               default via 10.0.2.254\nfd00:5::/64 via fe80::5 port 1";
+    assert_eq!(
+        cmd(&mut r, &mut out, "routes-replace", new).as_deref(),
+        Ok("added 3, removed 1, kept 1")
+    );
+    assert_eq!(
+        out.kinds(),
+        ["route-removed", "route-added", "route-added", "route-added"]
+    );
+    assert_eq!(out.events[0].get("via"), Some("10.0.2.2"));
+    assert_eq!(
+        (out.events[1].get("prefix"), out.events[1].get("port")),
+        (Some("10.0.3.0/24"), Some("0"))
+    );
+    assert_eq!(port_for(&r, "10.0.3.9"), Some(0));
+    assert_eq!(port_for(&r, "192.0.2.1"), Some(1));
+    out.take();
+    // The table, in its order, is the one a router started with these routes has.
+    let table = cmd(&mut r, &mut out, "routes", "").unwrap();
+    assert_eq!(table, table_at_start(&new.replace('\n', ",")));
+    assert_eq!(counter(&r, "routes"), Some(8));
+    assert_eq!(
+        (counter(&r, "routes-added"), counter(&r, "routes-removed")),
+        (Some(3), Some(1))
+    );
+
+    // Read, modify, write: the `routes` answer is an argument (its connected lines skipped).
+    assert_eq!(
+        cmd(&mut r, &mut out, "routes-replace", &table).as_deref(),
+        Ok("unchanged")
+    );
+    assert!(out.events.is_empty());
+    let fewer: Vec<&str> = table
+        .lines()
+        .filter(|l| !l.starts_with("0.0.0.0/0"))
+        .collect();
+    assert_eq!(
+        cmd(&mut r, &mut out, "routes-replace", &fewer.join("\n")).as_deref(),
+        Ok("added 0, removed 1, kept 3")
+    );
+    assert_eq!(out.kinds(), ["route-removed"]);
+    assert_eq!(port_for(&r, "192.0.2.1"), None);
+    out.take();
+
+    // Commas work as in the config; nothing at all clears the static routes.
+    assert_eq!(
+        cmd(
+            &mut r,
+            &mut out,
+            "routes-replace",
+            "10.0.6.0/24 via 10.0.2.6, 10.0.7.0/24 port 0"
+        )
+        .as_deref(),
+        Ok("added 2, removed 3, kept 0")
+    );
+    assert_eq!(
+        cmd(&mut r, &mut out, "routes-replace", "  ").as_deref(),
+        Ok("added 0, removed 2, kept 0")
+    );
+    assert_eq!(
+        cmd(&mut r, &mut out, "routes", "").unwrap(),
+        table_at_start("")
+    );
+    assert_eq!(
+        cmd(&mut r, &mut out, "routes-replace", "").as_deref(),
+        Ok("unchanged")
+    );
+}
+
+#[test]
+fn routes_replace_checks_every_route_first_and_changes_nothing_on_an_error() {
+    let (mut r, mut out) = router(&[("routes", "10.0.3.0/24 via 10.0.2.2")]);
+    let before = r.command(MS, "routes", "", &mut out).unwrap();
+    let counters = r.counter_list();
+    let good = "10.0.4.0/24 via 10.0.2.4\ndefault via 10.0.2.254";
+    for (bad, needle) in [
+        ("10.0.1.0/24 via 10.0.2.2", "connected"),
+        ("fd00:2::/64 port 0", "connected"),
+        (
+            "10.0.5.0/24 via 10.0.2.5\n10.0.5.0/24 via 10.0.2.6",
+            "two routes",
+        ),
+        (
+            "10.0.5.0/24 via 10.0.2.5\n10.0.5.0/24 via 10.0.2.5",
+            "two routes",
+        ),
+        ("10.0.5.1/24 via 10.0.2.5", "host bits"),
+        ("10.0.5.0/24 port 7", "does not exist"),
+        ("10.0.5.0/24 via 10.0.9.5", "route"),
+        ("fd00:b::/64 tunnel to-b", "no tunnel"),
+        ("default", "default"),
+        ("10.0.5.0/24 via 10.0.2.5 (bogus)", "route"),
+    ] {
+        // The bad route anywhere in the list: last, or before good ones.
+        for list in [
+            format!("{good}\n{bad}"),
+            format!("{bad},{}", good.replace('\n', ",")),
+        ] {
+            let e = r
+                .command(MS, "routes-replace", &list, &mut out)
+                .unwrap_err();
+            assert!(e.contains(needle), "{list:?}: {e}");
+            assert!(out.events.is_empty() && out.tx.is_empty(), "{list:?}");
+            assert_eq!(r.command(MS, "routes", "", &mut out).unwrap(), before);
+            assert_eq!(r.counter_list(), counters, "{list:?}");
+        }
+    }
+    assert_eq!(port_for(&r, "10.0.3.9"), Some(1));
+    assert_eq!(port_for(&r, "10.0.4.9"), None);
+}
+
 #[test]
 fn a_route_change_keeps_queued_packets_and_known_neighbors() {
     const C_MAC: u8 = 0x0c;

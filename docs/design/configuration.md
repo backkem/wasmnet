@@ -374,8 +374,9 @@ Besides the errors above, the component traps if `get-all` itself fails.
 
 **Changing routes while it runs.** The config is read once, but the static routes can change
 later through the router's commands (`wasmnet:control/commands`): `route-add <route>`,
-`route-replace <route>`, `route-remove <prefix or route>` and `routes`, with routes in the
-syntax above. An embedder sends them with `Network::command` or as operator events, a controller
+`route-replace <route>`, `route-remove <prefix or route>`, `routes-replace <routes>` (the whole
+static table in one step: routes separated by newlines or commas, a `routes` answer included;
+checked first, all or nothing) and `routes`, with routes in the syntax above. An embedder sends them with `Network::command` or as operator events, a controller
 with `wasmnet:infra/devices.control`; nothing else about the router (ports, neighbours, links,
 counters) changes. Their semantics are in [wit/router/router.wit](../../wit/router/router.wit)
 and [topology-and-infra.md](topology-and-infra.md#commands-into-a-running-device).

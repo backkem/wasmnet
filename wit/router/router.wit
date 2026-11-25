@@ -23,6 +23,18 @@
 /// - `route-remove <prefix>` or `route-remove <route>`: removes the static route for the
 ///   prefix (`0.0.0.0/0` or `::/0` for a default route); given a whole route, only if it is
 ///   that route. `ok("removed")`; `ok("absent")` when there is none.
+/// - `routes-replace <routes>` (since 0.1.5): replaces every static route at once, so that the
+///   table is the one the router would have had it started with `<routes>`: the connected
+///   routes, then these static routes in this order. Routes are separated by newlines or
+///   commas, so the config's `routes` value and a `routes` answer both work (an answer's
+///   `(connected)` lines are skipped and its `(static)` marks dropped); an empty argument
+///   removes every static route. Every route is checked before anything changes: a malformed
+///   route, a port or tunnel that does not exist, a route for a connected prefix or two routes
+///   for one prefix is an `err` that changes nothing. A route that is already there stays
+///   without an event; each other change is journalled and counted as `route-remove` and
+///   `route-add` would (a changed route is a removal, then an addition, with all the removals
+///   before the additions). `ok("unchanged")` when no route changed, otherwise
+///   `ok("added <n>, removed <n>, kept <n>")`.
 /// - `routes` (no argument): the table, one route per line in table order (connected routes
 ///   first, then static routes in the order they were added; a replaced route keeps its place),
 ///   as `<prefix> [via <next-hop>] port <n> (connected|static)`.
@@ -128,9 +140,9 @@
 ///
 /// This package names that combination; it adds no interface of its own. (A world added to
 /// `wasmnet:link` would change that package for every device.) 0.1.2 documented the forward and
-/// allow commands, 0.1.3 the tunnel commands and 0.1.4 allow rules on tunnel ports; nothing in
-/// the WIT changed, so a host built against 0.1.1 runs it as is.
-package wasmnet:router@0.1.4;
+/// allow commands, 0.1.3 the tunnel commands, 0.1.4 allow rules on tunnel ports and 0.1.5
+/// `routes-replace`; nothing in the WIT changed, so a host built against 0.1.1 runs it as is.
+package wasmnet:router@0.1.5;
 
 world router {
     include wasmnet:link/stepped-device@0.1.0;
