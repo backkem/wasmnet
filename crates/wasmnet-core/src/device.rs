@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Waker};
 
+use crate::clock::Nanos;
 use crate::ext::ControlCall;
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -45,6 +46,15 @@ pub type CountersReply = Arc<Mutex<Option<Vec<(String, u64)>>>>;
 pub struct DeviceCost {
     /// Wasm fuel consumed (the backend's metering; 0 without one). Deterministic.
     pub fuel: u64,
+    /// The most fuel the device consumed in one virtual instant: everything its guest ran at
+    /// that instant, over every actor poll, command, timer and task at it, which is what has to
+    /// fit in its fuel per instant (`DeviceOptions::fuel_per_instant`). 0 without metering, and
+    /// from a backend that reports fuel without its instant ([`CostMeter::add_fuel`]).
+    /// Deterministic.
+    pub peak_fuel: u64,
+    /// The instant of [`peak_fuel`](Self::peak_fuel): the first one, if several instants
+    /// consumed as much. 0 while `peak_fuel` is 0.
+    pub peak_fuel_at: Nanos,
     /// Commands delivered (`receive`, `poll`, `link-state`, control calls). Deterministic.
     pub calls: u64,
     /// Actor polls. Deterministic.
@@ -60,21 +70,49 @@ pub struct DeviceCost {
 /// A device's cost, shared by the executor (calls, polls, wall) and the backend (fuel).
 #[derive(Clone, Default)]
 pub struct CostMeter {
-    inner: Arc<Mutex<DeviceCost>>,
+    inner: Arc<Mutex<MeterState>>,
+}
+
+#[derive(Default)]
+struct MeterState {
+    cost: DeviceCost,
+    /// The instant fuel was last reported at, and the fuel reported at it so far.
+    instant: Option<(Nanos, u64)>,
 }
 
 impl CostMeter {
-    /// Adds fuel the backend saw consumed.
+    /// Adds fuel the backend saw consumed, without saying at which instant: it counts in
+    /// [`DeviceCost::fuel`] only.
     pub fn add_fuel(&self, fuel: u64) {
-        lock(&self.inner).fuel += fuel;
+        let mut m = lock(&self.inner);
+        m.cost.fuel = m.cost.fuel.saturating_add(fuel);
+    }
+
+    /// Adds fuel the backend saw consumed at virtual instant `at`, under that instant's budget.
+    /// A backend reports an instant's fuel in as many parts as it likes, and may report the
+    /// last part at its next look, after time moved on, as long as it names the instant the
+    /// fuel was consumed at; instants are reported in order. The parts of one instant add up
+    /// in [`DeviceCost::peak_fuel`].
+    pub fn add_fuel_at(&self, at: Nanos, fuel: u64) {
+        let mut m = lock(&self.inner);
+        m.cost.fuel = m.cost.fuel.saturating_add(fuel);
+        let sum = match m.instant {
+            Some((t, sum)) if t == at => sum.saturating_add(fuel),
+            _ => fuel,
+        };
+        m.instant = Some((at, sum));
+        if sum > m.cost.peak_fuel {
+            m.cost.peak_fuel = sum;
+            m.cost.peak_fuel_at = at;
+        }
     }
 
     pub(crate) fn add_call(&self) {
-        lock(&self.inner).calls += 1;
+        lock(&self.inner).cost.calls += 1;
     }
 
     pub(crate) fn add_poll(&self, wall_ns: u64, idle: bool) {
-        let mut c = lock(&self.inner);
+        let c = &mut lock(&self.inner).cost;
         c.polls += 1;
         c.idle_polls += u64::from(idle);
         c.wall_ns += wall_ns;
@@ -82,7 +120,7 @@ impl CostMeter {
 
     /// The cost so far.
     pub fn get(&self) -> DeviceCost {
-        *lock(&self.inner)
+        lock(&self.inner).cost
     }
 }
 
@@ -194,5 +232,34 @@ impl Status {
             daemons: daemons.into_iter().map(|(w, _)| w.clone()).collect(),
             alive: s.guest_tasks_alive,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_peak_adds_up_one_instant_and_keeps_the_first_of_equals() {
+        let m = CostMeter::default();
+        assert_eq!((m.get().peak_fuel, m.get().peak_fuel_at), (0, 0));
+        // Instant 10 in three parts (as a backend reports at each look), then 20 and 30.
+        m.add_fuel_at(10, 40);
+        m.add_fuel_at(10, 0);
+        m.add_fuel_at(10, 60);
+        m.add_fuel_at(20, 99);
+        m.add_fuel_at(30, 100);
+        let c = m.get();
+        assert_eq!(c.fuel, 299);
+        assert_eq!(
+            (c.peak_fuel, c.peak_fuel_at),
+            (100, 10),
+            "the first of equals"
+        );
+        m.add_fuel_at(30, 1);
+        assert_eq!((m.get().peak_fuel, m.get().peak_fuel_at), (101, 30));
+        // Fuel without an instant counts in the total only.
+        m.add_fuel(1_000);
+        assert_eq!((m.get().fuel, m.get().peak_fuel), (1_300, 101));
     }
 }

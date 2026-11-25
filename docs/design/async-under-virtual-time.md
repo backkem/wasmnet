@@ -51,8 +51,10 @@ A run ends in one of three ways:
 
 The guards in `Guard` are deterministic. Fuel is per virtual instant: a store's fuel is set to
 its budget the first time its actor runs at a new instant, so a compute loop traps with
-`OutOfFuel` at the same instant on every run. The poll cap counts polls, not time. Neither
-depends on the wall clock.
+`OutOfFuel` at the same instant on every run. Each device reports the most it used in one
+instant (`DeviceCost::peak_fuel`), which is what to size its budget by
+([runtime-and-extensions.md](runtime-and-extensions.md#costs)). The poll cap counts polls, not
+time. Neither depends on the wall clock.
 
 A **control call** (`Network::counters`, `Network::control`) is queued into a live device's
 inbox between runs. The executor then settles the current instant (rounds only, no event is

@@ -66,7 +66,8 @@ core itself is built for `wasm32-unknown-unknown` and a browser's engine runs th
   environment must omit that function, made so that ordinary programs run unmodified and repeat
   exactly (so no byte a guest draws here is a secret).
 - **Guards**: each store's fuel is set to its per-instant budget (`Guard::fuel_per_instant`, or
-  `DeviceOptions::fuel_per_instant`) the first time its actor runs at a new instant.
+  `DeviceOptions::fuel_per_instant`) the first time its actor runs at a new instant; how to
+  choose it is under [Costs](#costs).
 - **The compile cache** ([src/cache.rs](../../crates/wasmnet-host/src/cache.rs)), off unless
   enabled with `Host::with_cache_dir(dir)`. It stores serialized components as
   `<dir>/<content>-<engine>.cwasm`, keyed by the SHA-256 of the component bytes and the engine's
@@ -81,6 +82,34 @@ core itself is built for `wasm32-unknown-unknown` and a browser's engine runs th
 A limit of the wasmtime backend: it drives instantiation and `ports()` with `block_on` on the
 network's own clock, which fires only timers and drops any other event it pops. A component
 must not wait on anything while it is instantiated or answers `ports()`.
+
+## Costs
+
+`Network::costs` (and `cost_of`) report what each device cost so far as a `DeviceCost`:
+commands, actor polls, idle polls, wall time (not deterministic, only with
+`Network::set_wall_clock`) and fuel. They are reports only: nothing in a run depends on them,
+and all but the wall time are the same on every replay. A device started again counts from
+zero.
+
+**An instant**, for fuel, is one value of virtual time. The budget is per instant: the store's
+fuel is set to `fuel_per_instant` the first time the device's actor runs at a new instant, and
+everything the guest runs at that instant (every actor poll, command, timer and task, however
+many times it is polled there) is paid from it. `fuel` is the total. `peak_fuel` is the most
+one instant consumed, and `peak_fuel_at` that instant (the first one, if several consumed as
+much). The backend reports fuel at each look into the store and names the instant it was
+consumed under (`CostMeter::add_fuel_at`), so guest work that is only seen at the next
+instant's first look still counts in its own. Instantiation and `ports()` run on a budget of
+their own and are in neither figure. Without metering (the browser backend, `fuel(false)`, an
+unmetered component) both are 0.
+
+**Choosing `fuel_per_instant`.** Run the workload once with a generous budget and read the
+devices' `peak_fuel`: a budget at or above it lets that run through unchanged (fuel never
+changes behaviour; it only traps), so give the busiest device its peak with headroom for the
+inputs the workload does not cover, say twice, through `DeviceOptions::fuel_per_instant`, and
+keep the network's `Guard::fuel_per_instant` for the rest. `peak_fuel_at` says which instant
+to look at in the journal when a peak is larger than expected. A device that runs out traps
+with `OutOfFuel` at the same instant on every replay, so a budget too small for a new workload
+shows up as a deterministic failure, never as a slow run.
 
 ## Extension points
 

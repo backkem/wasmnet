@@ -110,7 +110,8 @@ struct Fuel {
 
 impl Fuel {
     fn refill(&self, acc: &Accessor<HostState>) -> wasmtime::Result<()> {
-        // Guest work runs between the closure's polls: count it at the next one.
+        // Guest work runs between the closure's polls: count it at the next one, under the
+        // instant it ran at (before `last` moves on).
         self.account(acc)?;
         let now = self.clock.now();
         if self.last.get() != Some(now) {
@@ -124,13 +125,21 @@ impl Fuel {
     }
 
     /// Reports the fuel consumed since the last look (if a host call gave fuel back to the
-    /// store, so more is left than at the last look, that counts as nothing consumed).
+    /// store, so more is left than at the last look, that counts as nothing consumed). It was
+    /// all consumed under the budget of the instant of the last refill (`last`), even when it
+    /// is reported at the next instant's first look: only a refill resets the store's fuel.
     fn account(&self, acc: &Accessor<HostState>) -> wasmtime::Result<()> {
         if !self.metered {
             return Ok(());
         }
         let left = acc.with(|mut a| a.as_context_mut().get_fuel())?;
-        self.meter.add_fuel(self.left.get().saturating_sub(left));
+        let used = self.left.get().saturating_sub(left);
+        match self.last.get() {
+            Some(at) => self.meter.add_fuel_at(at, used),
+            // Before the first refill (instantiation and `ports()` ran on their own budget,
+            // and the first look sees none of it): nothing.
+            None => self.meter.add_fuel(used),
+        }
         self.left.set(left);
         Ok(())
     }
