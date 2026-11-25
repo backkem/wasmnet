@@ -671,3 +671,24 @@ fn a_two_port_snapshot_restores_onto_a_fresh_stack() {
     let err = single.restore(&saved).unwrap_err();
     assert!(err.contains("2 ports"), "{err}");
 }
+
+#[test]
+fn a_one_shot_mdns_query_asks_on_every_port() {
+    let mut lab = Lab::new(&[]);
+    let now = lab.now;
+    let (start, _) = lab.nodes[H].lookup_start("printer.local", now);
+    assert!(matches!(start, crate::resolver::Start::Pending(_)));
+    lab.step(H);
+    lab.run(lab.now + 10 * MS);
+    let queries = |port: usize, group: &str| {
+        lab.sent(H, port)
+            .into_iter()
+            .filter(|f| v4(f).or_else(|| v6(f)).is_some_and(|(_, d)| d == ip(group)))
+            .count()
+    };
+    // The A and the AAAA question (both by IPv4, as on a node with one port), on each port.
+    assert_eq!(
+        (queries(0, "224.0.0.251"), queries(1, "224.0.0.251")),
+        (2, 2)
+    );
+}
