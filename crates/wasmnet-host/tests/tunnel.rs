@@ -852,17 +852,8 @@ fn hex(bytes: &[u8]) -> String {
 /// The controller's script for box `me` (whose peer is box `other`): create the box router, add
 /// the tunnel, read its reflexive endpoint (`tunnels`), give the tunnel the peer's endpoint once
 /// the embedder has set it (`{peer}`), and route over the tunnel once `tunnels` says it is up.
-fn controller_steps(me: &str, other: &str) -> Vec<String> {
-    let mut steps = vec![
-        format!("0ms apply box-{me} {}", hex(&box_spec(me))),
-        format!(
-            "10ms id=add control box-{me} tunnel-add to-{other} id 7 local fd00:ff::{me}/128 \
-             reflector 203.0.113.50:3478 keepalive 1s dead 3500ms"
-        ),
-        format!("40ms id=reflexive control box-{me} tunnels"),
-        "41ms answer reflexive".to_owned(),
-        format!("50ms id=peer control box-{me} tunnel-peer to-{other} {{peer}}"),
-    ];
+fn controller_steps(me: &str, other: &str) -> Vec<(String, String)> {
+    let mut steps = signaling_steps(me, other);
     // Ask every 10 ms from 45 ms on whether the tunnel is up; route over it once it is.
     for k in 0..10 {
         let at = 45 + 10 * k;
@@ -872,7 +863,55 @@ fn controller_steps(me: &str, other: &str) -> Vec<String> {
             at + 5
         ));
     }
+    numbered(steps)
+}
+
+/// A script's steps as config keys (`step.<n>`).
+fn numbered(steps: Vec<String>) -> Vec<(String, String)> {
     steps
+        .into_iter()
+        .enumerate()
+        .map(|(k, s)| (format!("step.{k}"), s))
+        .collect()
+}
+
+/// What both kinds of controller do first: create the box router, add the tunnel (`keepalive`
+/// 1 s, `dead` 3.5 s), read its reflexive endpoint (`tunnels`, once) and give the tunnel the
+/// peer's endpoint once the embedder has set it (`{peer}`).
+fn signaling_steps(me: &str, other: &str) -> Vec<String> {
+    vec![
+        format!("0ms apply box-{me} {}", hex(&box_spec(me))),
+        format!(
+            "10ms id=add control box-{me} tunnel-add to-{other} id 7 local fd00:ff::{me}/128 \
+             reflector 203.0.113.50:3478 keepalive 1s dead 3500ms"
+        ),
+        format!("40ms id=reflexive control box-{me} tunnels"),
+        "41ms answer reflexive".to_owned(),
+        format!("50ms id=peer control box-{me} tunnel-peer to-{other} {{peer}}"),
+    ]
+}
+
+/// The script of a controller that follows its box's events instead of asking: when the
+/// tunnel to the other box comes up it routes the other's prefix over it, and when it goes down
+/// it takes that route away again (`routes-replace` with the whole static table each time), with
+/// no `tunnels` command after the one that reads the reflexive endpoint.
+fn event_steps(me: &str, other: &str) -> Vec<(String, String)> {
+    let mut config = numbered(signaling_steps(me, other));
+    config.push((
+        "on.0".to_owned(),
+        format!(
+            "box-{me} tunnel-up tunnel=to-{other} : control box-{me} routes-replace \
+             default via 192.168.1.1, fd00:{other}::/64 tunnel to-{other}"
+        ),
+    ));
+    config.push((
+        "on.1".to_owned(),
+        format!(
+            "box-{me} tunnel-down tunnel=to-{other} : control box-{me} routes-replace \
+             default via 192.168.1.1"
+        ),
+    ));
+    config
 }
 
 /// The value after `reflexive` in the text an `answer` step journalled.
@@ -886,7 +925,26 @@ fn reflexive_from(journal: &[JournalEntry], controller: &str) -> String {
     value(field(answer, "text"), "reflexive").to_owned()
 }
 
-fn controlled_run(seed: u64) -> Run {
+/// What a run with controllers varies.
+struct Controlled {
+    /// Each controller's config, for box `me` with peer `other`.
+    script: fn(&str, &str) -> Vec<(String, String)>,
+    /// Home B's Internet cable is down over this interval.
+    cut: Option<(u64, u64)>,
+    /// When `node-a` fetches.
+    fetch_at: &'static str,
+    end: u64,
+}
+
+/// Controllers that ask `tunnels` on a period.
+const POLLING: Controlled = Controlled {
+    script: controller_steps,
+    cut: None,
+    fetch_at: "2s",
+    end: 4 * S,
+};
+
+fn controlled_run(seed: u64, plan: &Controlled) -> Run {
     let b = built();
     let mut network = Network::new(&b.host, seed);
     let router = b.load("router");
@@ -928,7 +986,12 @@ fn controlled_run(seed: u64) -> Run {
                 ]),
             )
             .unwrap();
-        wan_links.push(link(&mut network, natd.port(1), wan.port(n as u32 + 1)));
+        let w = link(&mut network, natd.port(1), wan.port(n as u32 + 1));
+        if let (Some((down, up)), "b") = (plan.cut, me) {
+            network.schedule_link_state(w, down, false);
+            network.schedule_link_state(w, up, true);
+        }
+        wan_links.push(w);
         let mac = format!("02:00:00:00:0{n}:10");
         let addr = format!("fd00:{me}::10/64");
         let mut node = vec![
@@ -938,7 +1001,7 @@ fn controlled_run(seed: u64) -> Run {
         ];
         let component = if me == "a" {
             node.push(("app.http-get.url", "http://[fd00:b::10]/big?n=20000"));
-            node.push(("app.http-get.start", "2s"));
+            node.push(("app.http-get.start", plan.fetch_at));
             "node-http-get"
         } else {
             node.push(("app.http-server.listen", "[::]:80"));
@@ -947,11 +1010,9 @@ fn controlled_run(seed: u64) -> Run {
         network
             .device_with_config(&format!("node-{me}"), &b.load(component), pairs(&node))
             .unwrap();
-        let steps = controller_steps(me, other);
-        let keys: Vec<String> = (0..steps.len()).map(|k| format!("step.{k}")).collect();
-        let script: Vec<(&str, &str)> = keys
+        let config = (plan.script)(me, other);
+        let script: Vec<(&str, &str)> = config
             .iter()
-            .zip(&steps)
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
         let ctl = network
@@ -981,7 +1042,7 @@ fn controlled_run(seed: u64) -> Run {
         );
     }
     network
-        .run_until(4 * S)
+        .run_until(plan.end)
         .unwrap_or_else(|e| panic!("seed={seed}: {e}\n{}", transcript(&network.journal())));
     let mut listings = BTreeMap::new();
     let mut counters = BTreeMap::new();
@@ -1005,7 +1066,7 @@ fn controlled_run(seed: u64) -> Run {
 fn controllers_in_the_network_drive_a_tunnel_end_to_end() {
     for seed in [1, 2] {
         let label = format!("seed={seed}");
-        let r = controlled_run(seed);
+        let r = controlled_run(seed, &POLLING);
         let log = transcript(&r.journal);
         assert!(r.fetched(), "{label}\n{log}");
         for (ctl, me, tunnel, theirs) in [
@@ -1047,6 +1108,95 @@ fn controllers_in_the_network_drive_a_tunnel_end_to_end() {
             assert_eq!(field(&added[0], "port"), tunnel);
         }
         decode_wan(&r);
-        r.same_as(&controlled_run(seed), &label);
+        r.same_as(&controlled_run(seed, &POLLING), &label);
+    }
+}
+
+/// When each `kind` event of `device` was journalled.
+fn times(journal: &[JournalEntry], device: &str, kind: &str) -> Vec<u64> {
+    journal
+        .iter()
+        .filter(|e| e.device == device)
+        .filter(|e| matches!(&e.record, wasmnet_host::Record::Event { kind: k, .. } if k == kind))
+        .map(|e| e.at)
+        .collect()
+}
+
+#[test]
+fn controllers_follow_the_tunnel_s_events_through_a_cut_and_heal() {
+    // Home B's Internet cable is cut from 3 s to 7 s. Each box's tunnel goes down 3.5 s after
+    // the last answer and up again after the heal; each controller routes over the tunnel when
+    // `tunnel-up` comes and takes the route away when `tunnel-down` comes, in the same instant,
+    // and asks `tunnels` only once (for the reflexive endpoint). The fetch at 9 s goes through.
+    let plan = Controlled {
+        script: event_steps,
+        cut: Some((3 * S, 7 * S)),
+        fetch_at: "9s",
+        end: 11 * S,
+    };
+    for seed in [1, 2] {
+        let label = format!("seed={seed}");
+        let r = controlled_run(seed, &plan);
+        let log = transcript(&r.journal);
+        assert!(r.fetched(), "{label}\n{log}");
+        for (ctl, me, tunnel, other) in [
+            ("ctl-a", "box-a", "to-b", "b"),
+            ("ctl-b", "box-b", "to-a", "a"),
+        ] {
+            let up = times(&r.journal, me, "tunnel-up");
+            let down = times(&r.journal, me, "tunnel-down");
+            assert_eq!((up.len(), down.len()), (2, 1), "{label} {me}\n{log}");
+            assert!((5 * S..7 * S).contains(&down[0]), "{label}: {down:?}");
+            // One reaction per event, in the instant of the event.
+            let reactions = events(&r.journal, ctl, "infra-script")
+                .into_iter()
+                .filter(|f| field(f, "step").starts_with("on."))
+                .collect::<Vec<_>>();
+            let seen: Vec<(&str, &str)> = reactions
+                .iter()
+                .map(|f| (field(f, "event"), field(f, "result")))
+                .collect();
+            assert_eq!(
+                seen,
+                [
+                    ("tunnel-up", "ok"),
+                    ("tunnel-down", "ok"),
+                    ("tunnel-up", "ok")
+                ],
+                "{label} {ctl}"
+            );
+            let reacted = times(&r.journal, ctl, "infra-script")
+                .into_iter()
+                .zip(events(&r.journal, ctl, "infra-script"))
+                .filter(|(_, f)| field(f, "step").starts_with("on."))
+                .map(|(at, _)| at)
+                .collect::<Vec<_>>();
+            assert_eq!(reacted, [up[0], down[0], up[1]], "{label} {ctl}");
+            // The routes followed: added at each up, removed at the down, at those instants.
+            let prefix = format!("fd00:{other}::/64");
+            let added: Vec<u64> = r
+                .journal
+                .iter()
+                .filter(|e| e.device == me)
+                .filter(|e| {
+                    matches!(&e.record, wasmnet_host::Record::Event { kind, fields }
+                    if kind == "route-added"
+                        && fields.iter().any(|(k, v)| k == "prefix" && *v == prefix))
+                })
+                .map(|e| e.at)
+                .collect();
+            assert_eq!(added, [up[0], up[1]], "{label} {me}");
+            assert_eq!(times(&r.journal, me, "route-removed"), [down[0]], "{label}");
+            let removed = &events(&r.journal, me, "route-removed")[0];
+            assert_eq!(field(removed, "port"), tunnel);
+            // No polling: one `tunnels` command, for the reflexive endpoint.
+            let asked = events(&r.journal, ctl, "infra-control")
+                .into_iter()
+                .filter(|f| field(f, "command") == "tunnels")
+                .count();
+            assert_eq!(asked, 1, "{label} {ctl}");
+        }
+        decode_wan(&r);
+        r.same_as(&controlled_run(seed, &plan), &label);
     }
 }
