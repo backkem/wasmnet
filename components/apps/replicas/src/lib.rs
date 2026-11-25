@@ -22,7 +22,7 @@
 //! | `max` | the most `replicas` may become (stdin included) | `16` |
 //! | `prefix` | instance names `<prefix>-<n>` and their label `replicas=<prefix>` | `web` |
 //! | `period` | virtual time between two reconciles | `500ms` |
-//! | `wake` | `true`: also reconcile as soon as a device it sees changes (`wasmnet:infra/changes.wait`: a crash or an exit is handled at once, not at the next `period`) | `false` |
+//! | `wake` | `true`: also reconcile as soon as a device it sees changes (`wasmnet:infra/changes.wait-any` on its view: a crash or an exit is handled at once, not at the next `period`) | `false` |
 //! | `start` | virtual time before the first reconcile | `0` |
 //! | `grace` | a removed instance keeps running this long first (`stop` with grace) | `0` |
 //! | `template.component` | the instances' catalog name (`node:http-server`) | required, unless `template.fetch` |
@@ -181,7 +181,7 @@ pub struct Config {
     pub max: u32,
     pub prefix: String,
     pub period_ns: u64,
-    /// `wake`: between two reconciles, wait for a change in its view (`changes.wait`) as well
+    /// `wake`: between two reconciles, wait for a change in its view (`changes.wait-any`) as well
     /// as for `period`, so a crash or an exit is seen at once.
     pub wake: bool,
     pub start_ns: u64,

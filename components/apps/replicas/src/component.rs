@@ -50,6 +50,7 @@ wit_bindgen::generate!({
 });
 
 use wasi::config::store;
+use wasmnet::infra::events::TableSince;
 use wasmnet::infra::types::{ChangeKind, Phase};
 use wasmnet::infra::{changes, components, devices};
 use wasmnet::link::log::{self, Level};
@@ -347,9 +348,14 @@ async fn controller() -> Result<(), String> {
             step(&c, desired.get(), &mut registered).await;
         }
         if c.wake {
-            // Until a device it sees changes (its own requests applying included), or `period`.
+            // Until a device it sees changes (its own requests applying included), or `period`:
+            // `changes.wait-any` on its table view alone (the same wake as `changes.wait`).
             let deadline = monotonic_clock::now().saturating_add(c.period_ns);
-            if let Err(e) = changes::wait(labels.clone(), rv, Some(deadline)).await {
+            let table = TableSince {
+                selector: labels.clone(),
+                since: rv,
+            };
+            if let Err(e) = changes::wait_any(Some(table), Vec::new(), Some(deadline)).await {
                 error("wait", e);
                 monotonic_clock::wait_for(c.period_ns).await;
             }
