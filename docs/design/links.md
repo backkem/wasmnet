@@ -32,8 +32,10 @@ In order, for a frame transmitted on a wired Ethernet port at virtual time `now`
    counted in `frames` and `bytes` and in `lost_random`, and its fate is `lost`. It still
    occupied the transmitter. Nothing is queued for it.
 6. **Arrival** at `finish + latency + j + d`, where `j` is the jitter draw (uniform in
-   `[0, jitter]` ns) and `d` an operator delay. It is captured inbound on the receiver's
-   interface when it arrives, unless the link went down meanwhile (then it is `lost`).
+   `[0, jitter]` ns) and `d` an operator delay; with jitter, `finish + latency + j` is raised to
+   the previous frame's arrival if it would come first. It is captured inbound on the
+   receiver's interface when it arrives, unless the link went down meanwhile (then it is
+   `lost`).
 
 The capture's outbound timestamp is always `now`, the moment the device handed the frame to the
 link (it entered the queue), so each capture stays in time order; the inbound timestamp is the
