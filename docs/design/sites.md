@@ -1,4 +1,4 @@
-# Multi-site networks: the site-sync protocol (version 2)
+# Multi-site networks: the site-sync protocol (version 3)
 
 `wasmnet_core::sites` lets two simulators run **one network split into two sites** so that the
 result is byte for byte what one simulator would have produced (**multi-site equivalence**).
@@ -84,6 +84,16 @@ Merging the two sites' records by tag (`sites::merge`) gives the single-site ord
 a WAN link is rebuilt from both halves: the sender records a frame outbound at transmit time,
 the receiver inbound at arrival time.
 
+What crosses follows each link's capture options ([links.md](links.md#what-a-link-records)),
+which every site sets alike (they are part of building the network): a frame-log record or a
+tap carries the frame's length and only the bytes the link keeps (the first `snap_len`, or
+none with recording off, when a link records nothing it has no taps at all), and the merged
+capture of a WAN link takes its header (snap length, end descriptions) from the sites' own,
+so a split network's records equal the unsplit ones under every option
+(`crates/wasmnet-host/tests/measure.rs`). Frames sent to the peer for delivery
+(`RemoteFrame`) are always whole. A link's series ([links.md](links.md#counters)) does not
+cross: each site's counts what that site counted.
+
 The devices and links a site created while the network ran carry the tag of the processing
 context that created them (`Network::created_devices`, `Network::created_links`). The merge
 keeps the setup indices, sorts every creation of both sites by that tag (the unsplit creation
@@ -127,7 +137,7 @@ loop:
 Every message is one carrier message:
 
 ```text
-"WNS" (3 bytes) | version: u8 = 1 | type: u8 | body
+"WNS" (3 bytes) | version: u8 = 3 | type: u8 | body
 ```
 
 Integers are unsigned LEB128 (`uv`) unless noted. `bytes` is `uv length` then the bytes;
@@ -183,13 +193,16 @@ uv count, count x { tag, uv at, string device, entry }    (journal)
             | u8 1 (event): string kind, uv n, n x { string key, string value }
             | u8 2 (output): u8 stderr (0|1), string line
 uv journal_dropped
-uv count, count x { tag, uv link, end from, end to, uv sent_at, fate, bytes frame }  (frame log)
+uv count, count x { tag, uv link, end from, end to, uv sent_at, fate, uv len, bytes kept }
+                                                         (frame log)
 uv count, count x { uv frame_id, fate }                    (arrivals of the peer's frames)
-uv count, count x { tag, uv link, uv end, uv at, u8 inbound, bytes frame }  (WAN-link taps)
+uv count, count x { tag, uv link, uv end, uv at, u8 inbound, uv len, bytes kept }
+                                                         (WAN-link taps)
 uv count, count x { tag, uv at, uv link, u8 up }           (link transitions)
 uv count, count x { string name, end a, end b, uv latency, uv mtu, u8 up, u8 removed,
                     u8 kind (0 Ethernet, else a cable kind's code),
                     2 x { uv rate, uv queue, uv loss_ppm, uv jitter }   (impairments by sending end)
+                    u8 record, uv snap_len, u8 name_ends          (capture options)
                     7 x (uv, uv) stats,
                     bytes pcap }
 strings := uv n, n x string
@@ -204,7 +217,9 @@ The stats pairs are frames, bytes, dropped while down, oversize, lost, dropped a
 transmit queue and lost to seeded loss, each per end.
 
 Version 2 added the impairments, the last two stats pairs, drop reason 3 and the devices and
-links created while the network ran to RECORDS; the other messages are as in version 1. A
+links created while the network ran to RECORDS; the other messages are as in version 1.
+Version 3 added each frame's and tap's length on the wire (`len`, with only the bytes its
+link's capture keeps) and each link's capture options. A
 RECORDS message's device and link indices below the setup counts are the same on both sites;
 the others are the sender's own. The links a site did not create are the setup links, the
 same list on both sites. A site refuses a message of another version.

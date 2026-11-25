@@ -27,8 +27,8 @@ use wasmnet_wire::{Direction, PcapNgEncoder};
 use crate::clock::{Ctx, EventKey, KeyLevel, Nanos, Origin, Tag};
 use crate::journal::{JournalEntry, Level, Record, Stream};
 use crate::link::{
-    DropReason, FrameFate, FrameRecord, Impairments, LinkInfo, LinkKind, LinkStats, LinkTransition,
-    PortInfo, RemoteArrival, RemoteFrame, Tap,
+    CaptureOptions, DropReason, FrameFate, FrameRecord, Impairments, LinkInfo, LinkKind, LinkStats,
+    LinkTransition, PortInfo, RemoteArrival, RemoteFrame, Tap,
 };
 use crate::network::{DeviceId, LinkId, Network, PortRef, Runtime};
 use crate::{Outcome, Result};
@@ -65,7 +65,7 @@ pub enum Msg {
 /// The first bytes of every message, then the format version.
 pub const MAGIC: [u8; 3] = *b"WNS";
 /// The wire format version this implementation speaks.
-pub const VERSION: u8 = 2;
+pub const VERSION: u8 = 3;
 
 /// A message that could not be decoded, or a handshake that does not fit this site.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -444,6 +444,7 @@ impl Writer {
             self.port_ref(f.to);
             self.uv(f.sent_at);
             self.fate(&f.fate);
+            self.uv(f.len as u64);
             self.bytes(&f.bytes);
         }
         self.uv(r.arrivals.len() as u64);
@@ -458,6 +459,7 @@ impl Writer {
             self.uv(t.end as u64);
             self.uv(t.at);
             self.flag(t.inbound);
+            self.uv(t.len as u64);
             self.bytes(&t.bytes);
         }
         self.uv(r.transitions.len() as u64);
@@ -484,6 +486,9 @@ impl Writer {
                 self.uv(u64::from(imp.loss_ppm));
                 self.uv(imp.jitter);
             }
+            self.flag(info.capture.record);
+            self.uv(u64::from(info.capture.snap_len));
+            self.flag(info.capture.name_ends);
             for pair in [
                 stats.frames,
                 stats.bytes,
@@ -647,9 +652,13 @@ impl Reader<'_> {
                     to: self.port_ref()?,
                     sent_at: self.uv()?,
                     fate: self.fate()?,
+                    len: self.usize()?,
                     bytes: self.bytes()?.to_vec(),
                 },
             ));
+            if frames.last().is_some_and(|(_, f)| f.bytes.len() > f.len) {
+                return Err(self.err("frame bytes longer than the frame"));
+            }
         }
         let n = self.usize()?;
         let mut arrivals = Vec::new();
@@ -674,8 +683,12 @@ impl Reader<'_> {
                 end,
                 at: self.uv()?,
                 inbound: self.flag()?,
+                len: self.usize()?,
                 bytes: self.bytes()?.to_vec(),
             });
+            if taps.last().is_some_and(|t| t.bytes.len() > t.len) {
+                return Err(self.err("tap bytes longer than the frame"));
+            }
         }
         let n = self.usize()?;
         let mut transitions = Vec::new();
@@ -702,6 +715,7 @@ impl Reader<'_> {
                 removed: self.flag()?,
                 kind: LinkKind::from_code(self.u8()?),
                 impairments: [Impairments::default(); 2],
+                capture: CaptureOptions::default(),
             };
             for imp in &mut info.impairments {
                 *imp = Impairments {
@@ -711,6 +725,11 @@ impl Reader<'_> {
                     jitter: self.uv()?,
                 };
             }
+            info.capture = CaptureOptions {
+                record: self.flag()?,
+                snap_len: self.u32()?,
+                name_ends: self.flag()?,
+            };
             let mut pairs = [[0u64; 2]; 7];
             for p in &mut pairs {
                 *p = [self.uv()?, self.uv()?];
@@ -1396,28 +1415,32 @@ pub fn merge(
             (Some(_), Some(_)) => {
                 let mut stats = LinkStats::default();
                 for s in sites {
-                    let t = s.links[j].1;
-                    for e in 0..2 {
-                        let add = |a: &mut u64, b: u64| *a = a.saturating_add(b);
-                        add(&mut stats.frames[e], t.frames[e]);
-                        add(&mut stats.bytes[e], t.bytes[e]);
-                        add(&mut stats.dropped_down[e], t.dropped_down[e]);
-                        add(&mut stats.oversize[e], t.oversize[e]);
-                        add(&mut stats.lost[e], t.lost[e]);
-                        add(&mut stats.dropped_queue[e], t.dropped_queue[e]);
-                        add(&mut stats.lost_random[e], t.lost_random[e]);
-                    }
+                    stats.add(&s.links[j].1);
                 }
                 let mut taps: Vec<&Tap> = sites
                     .iter()
                     .flat_map(|s| s.taps.iter().filter(|t| t.link.index() == j))
                     .collect();
                 taps.sort_by(|x, y| x.tag.cmp(&y.tag));
+                // The header both sites wrote for the link (names, snap length, descriptions;
+                // without a readable one, the ends' names), then both halves' records, each
+                // with its original length.
+                let header = crate::pcap::parse_header(&sites[0].links[j].2)
+                    .map(|c| c.interfaces)
+                    .unwrap_or_default();
                 let mut pcap = PcapNgEncoder::new("wasmnet")?;
-                let ifaces = [
-                    pcap.add_ethernet_interface(&device_name(ea)?, 0)?,
-                    pcap.add_ethernet_interface(&device_name(eb)?, 0)?,
-                ];
+                let mut ifaces = Vec::new();
+                for (end, port) in [ea, eb].into_iter().enumerate() {
+                    let (name, snaplen, description) = match header.get(end) {
+                        Some(i) => (
+                            i.name.clone().unwrap_or_default(),
+                            i.snaplen,
+                            i.description.clone().unwrap_or_default(),
+                        ),
+                        None => (device_name(port)?, 0, String::new()),
+                    };
+                    ifaces.push(pcap.add_described_interface(&name, snaplen, &description)?);
+                }
                 for t in taps {
                     let dir = if t.inbound {
                         Direction::Inbound
@@ -1425,7 +1448,7 @@ pub fn merge(
                         Direction::Outbound
                     };
                     let iface = *ifaces.get(t.end).ok_or(MergeError::BadTapEnd(t.end))?;
-                    pcap.write_packet_directed(iface, t.at, &t.bytes, dir)?;
+                    pcap.write_packet_prefix(iface, t.at, &t.bytes, t.len, dir)?;
                 }
                 links.push((stats, pcap.bytes().to_vec()));
                 link_infos.push(info.clone());
@@ -1645,6 +1668,7 @@ mod tests {
                         to: port(3, 1),
                         sent_at: 1_000,
                         fate,
+                        len: 3,
                         bytes: vec![1, 2, 3],
                     },
                 )
@@ -1660,6 +1684,7 @@ mod tests {
                 end: 1,
                 at: 1_100,
                 inbound: true,
+                len: 60,
                 bytes: vec![9; 14],
             }],
             transitions: vec![(
@@ -1687,6 +1712,7 @@ mod tests {
                             .jitter(50_000),
                         Impairments::default(),
                     ],
+                    capture: CaptureOptions::default().snap_len(96).name_ends(true),
                 },
                 LinkStats {
                     frames: [1, 2],
@@ -1737,6 +1763,7 @@ mod tests {
                     removed: false,
                     kind: LinkKind::Ethernet,
                     impairments: [Impairments::default(); 2],
+                    capture: CaptureOptions::default(),
                 },
                 LinkStats::default(),
                 Vec::new(),
@@ -1748,6 +1775,7 @@ mod tests {
             to,
             sent_at: 0,
             fate: FrameFate::Delivered { at: 1 },
+            len: 1,
             bytes: vec![1],
         };
         let wan = link("sw-a.0-sw-b.0", port(0, 0), port(1, 0));

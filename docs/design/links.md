@@ -102,3 +102,53 @@ split network with impaired links (site-local or crossing sites) gives the same 
 unsplit one; `crates/wasmnet-host/tests/impairments.rs` checks this with real TCP over an
 impaired WAN link and an impaired site-local link. Changing impairments while a split network
 runs is an operator event, and split networks refuse those.
+
+## Counters
+
+`LinkStats` counts per sending end: `frames` and `bytes` that entered the wire, and the drops
+and losses above. Each is counted at the instant it happened: everything at transmit, except
+`lost` (a link that went down while the frame was in flight), counted at the instant the frame
+would have arrived. Every count uses the whole frame, whatever the capture keeps.
+
+- **As of now.** `Network::link_stats` reads the counters at the network's current position:
+  between runs (`run_until`, a `run_stoppable` stop) that is every event processed so far, the
+  current instant's included. Two reads subtracted (`LinkStats::since`) give the traffic of
+  the interval between them, without parsing a capture; `LinkStats::add` sums.
+- **Per interval.** A link can also keep a series: buckets of a fixed width, each the
+  `LinkStats` counted in it (`LinkMut::series(SeriesOptions { width, keep })`, or
+  `Network::set_series_defaults` for every link created from then on). Only buckets in which
+  something was counted exist, and the link keeps the last `keep` of them, so its memory is
+  bounded. `Network::link_series` returns `(bucket start, counters)`, oldest first; while no
+  bucket was dropped, the buckets add up to `link_stats`. A series reads nothing and draws
+  nothing: setting one changes no record.
+
+## What a link records
+
+Each Ethernet link keeps a capture (one pcap-ng file, two interfaces) and adds a record per
+transmission to the network's frame log. `CaptureOptions` says what they keep, per link
+(`LinkMut::capture`) or for every link created from then on, at build time or while the
+network runs (`Network::set_capture_defaults`). The default keeps everything and names
+nothing, so a network that sets no option records exactly the bytes it always did.
+
+- **`snap_len`**: at most this many bytes of each frame (0: whole frames). The capture's
+  interfaces carry it as their `snaplen`, and each packet keeps its original length (the
+  Enhanced Packet Block's original length, which Wireshark shows as "frame length"). The frame
+  log keeps the same first bytes in `FrameRecord::bytes`, with the frame's whole length in
+  `FrameRecord::len`.
+- **`record = false`**: no frame bytes at all. The capture is its header only (still a valid
+  file), and the frame log keeps each transmission's record (link, ends, time, fate, length)
+  with empty `bytes`. The records themselves remain: a link that records nothing still adds
+  one fixed-size record per transmission.
+- **`name_ends`**: the capture header names the link's two ends. Each interface's
+  `if_description` is a `pcap::LinkEnd`, in the format
+  `wasmnet-link-end/1 link=<link> end=<a|b> device=<device> port=<port> peer-device=<device> peer-port=<port> created-at=<ns>`
+  (values percent-encoded; `LinkEnd::parse` reads it, ignoring keys a later version adds). A
+  device removed and added again gets new links with new names (`-2`, ...), but their captures
+  name the same `device`, so a tool joins them by it and orders them by `created-at`. Off by
+  default: it adds options to the header, so turning it on changes the capture's bytes.
+
+Only the records change: devices get whole frames, counters count whole frames, and the
+journal, the outcome and every device's costs are the same under every option
+(`crates/wasmnet-host/tests/measure.rs`). Set the options before a link's first frame: its
+header is written again then; once it holds a packet, only `record` still changes. Cables have
+neither a capture nor a frame log, so the options do not concern them.

@@ -66,6 +66,167 @@ pub struct LinkStats {
     pub lost_random: [u64; 2],
 }
 
+impl LinkStats {
+    /// What was counted after `earlier`, a read of the same link's counters
+    /// ([`Network::link_stats`](crate::Network::link_stats)) taken before this one: the
+    /// traffic of the interval between the two reads. Saturating, so a read that is not
+    /// earlier gives zeros rather than wrapping.
+    ///
+    /// ```
+    /// # use wasmnet_core::LinkStats;
+    /// let mut before = LinkStats::default();
+    /// before.frames = [3, 1];
+    /// let mut after = before;
+    /// after.frames = [10, 4];
+    /// after.bytes = [600, 180];
+    /// let window = after.since(&before);
+    /// assert_eq!((window.frames, window.bytes), ([7, 3], [600, 180]));
+    /// ```
+    pub fn since(&self, earlier: &LinkStats) -> LinkStats {
+        let mut out = *self;
+        out.zip_with(earlier, u64::saturating_sub);
+        out
+    }
+
+    /// Adds `other`'s counters to these (saturating): two sites' halves of a link, or the
+    /// buckets of a series.
+    pub fn add(&mut self, other: &LinkStats) {
+        self.zip_with(other, u64::saturating_add);
+    }
+
+    fn zip_with(&mut self, other: &LinkStats, f: fn(u64, u64) -> u64) {
+        for (mine, theirs) in [
+            (&mut self.frames, other.frames),
+            (&mut self.bytes, other.bytes),
+            (&mut self.dropped_down, other.dropped_down),
+            (&mut self.oversize, other.oversize),
+            (&mut self.lost, other.lost),
+            (&mut self.dropped_queue, other.dropped_queue),
+            (&mut self.lost_random, other.lost_random),
+        ] {
+            for end in 0..2 {
+                mine[end] = f(mine[end], theirs[end]);
+            }
+        }
+    }
+}
+
+/// What a link's capture and frame log keep (`docs/design/links.md`, "What a link records").
+/// The default keeps everything and names nothing, exactly as a link without the option.
+///
+/// ```
+/// # use wasmnet_core::CaptureOptions;
+/// // Headers only: the first 128 bytes of each frame, and the capture names its ends.
+/// let headers = CaptureOptions::default().snap_len(128).name_ends(true);
+/// assert!(headers.record);
+/// assert_eq!(CaptureOptions::default().record(false).kept(1514), 0);
+/// assert_eq!(headers.kept(1514), 128);
+/// assert_eq!(headers.kept(60), 60);
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct CaptureOptions {
+    /// Keep frame bytes at all. Off, the capture holds its header and no packet, and the frame
+    /// log keeps each transmission's record (link, ends, time, fate, length) without its
+    /// bytes. Default on.
+    pub record: bool,
+    /// Keep at most this many bytes of each frame, in the capture (the `snaplen` of both
+    /// interfaces; each packet records its original length) and in the frame log
+    /// ([`FrameRecord::len`] is the original length). 0: whole frames (the default).
+    pub snap_len: u32,
+    /// Name the link's two ends in the capture header: each interface's `if_description` is a
+    /// [`LinkEnd`](crate::pcap::LinkEnd). Default off (no description, as before the option).
+    pub name_ends: bool,
+}
+
+impl Default for CaptureOptions {
+    fn default() -> Self {
+        Self {
+            record: true,
+            snap_len: 0,
+            name_ends: false,
+        }
+    }
+}
+
+impl CaptureOptions {
+    /// Keeping frame bytes, or not.
+    pub const fn record(mut self, on: bool) -> Self {
+        self.record = on;
+        self
+    }
+
+    /// Keeping at most `bytes` of each frame (0: whole frames).
+    pub const fn snap_len(mut self, bytes: u32) -> Self {
+        self.snap_len = bytes;
+        self
+    }
+
+    /// Naming the link's ends in the capture header, or not.
+    pub const fn name_ends(mut self, on: bool) -> Self {
+        self.name_ends = on;
+        self
+    }
+
+    /// How many bytes of a frame of `len` bytes are kept.
+    pub const fn kept(&self, len: usize) -> usize {
+        if !self.record {
+            0
+        } else if self.snap_len == 0 || len <= self.snap_len as usize {
+            len
+        } else {
+            self.snap_len as usize
+        }
+    }
+}
+
+/// A link's counters per interval of virtual time (`docs/design/links.md`, "Counters"):
+/// buckets of `width` ns, the last `keep` of those in which a counter changed. A link keeps
+/// at most `keep` [`LinkStats`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SeriesOptions {
+    /// The bucket width in ns (0 counts as 1).
+    pub width: Nanos,
+    /// How many buckets to keep (0 counts as 1): the oldest goes when one more starts.
+    pub keep: u32,
+}
+
+/// One link's bucketed counters.
+struct Series {
+    options: SeriesOptions,
+    /// `(bucket index, counters)`, oldest first: only buckets in which something counted.
+    buckets: VecDeque<(u64, LinkStats)>,
+}
+
+impl Series {
+    fn new(options: SeriesOptions) -> Self {
+        Self {
+            options,
+            buckets: VecDeque::new(),
+        }
+    }
+
+    /// The bucket of instant `at` (instants come in order).
+    fn bucket(&mut self, at: Nanos) -> &mut LinkStats {
+        let index = at / self.options.width.max(1);
+        if self.buckets.back().is_none_or(|&(i, _)| i != index) {
+            if self.buckets.len() >= self.options.keep.max(1) as usize {
+                self.buckets.pop_front();
+            }
+            self.buckets.push_back((index, LinkStats::default()));
+        }
+        &mut self.buckets.back_mut().expect("just pushed").1
+    }
+
+    /// `(bucket start, counters)`, oldest first.
+    fn read(&self) -> Vec<(Nanos, LinkStats)> {
+        let width = self.options.width.max(1);
+        self.buckets
+            .iter()
+            .map(|&(i, s)| (i.saturating_mul(width), s))
+            .collect()
+    }
+}
+
 /// [`Impairments::queue`] unless set: Linux's default `txqueuelen`.
 pub const DEFAULT_QUEUE: u32 = 1000;
 
@@ -182,6 +343,8 @@ pub struct LinkInfo {
     /// Each direction's impairments, indexed by the sending end (0 = `a`, 1 = `b`). Cables
     /// ignore them.
     pub impairments: [Impairments; 2],
+    /// What its capture and frame log keep.
+    pub capture: CaptureOptions,
 }
 
 /// What a link carries. A cable kind is a registered [`CableModel`] that names its
@@ -299,6 +462,10 @@ pub struct FrameRecord {
     /// Virtual time of the transmit call.
     pub sent_at: Nanos,
     pub fate: FrameFate,
+    /// The frame's length as transmitted.
+    pub len: usize,
+    /// The frame's bytes as the link's [`CaptureOptions`] keep them: all `len` of them by
+    /// default, the first `snap_len`, or none with recording off.
     pub bytes: Vec<u8>,
 }
 
@@ -330,6 +497,10 @@ pub struct Tap {
     pub end: usize,
     pub at: Nanos,
     pub inbound: bool,
+    /// The frame's length on the wire.
+    pub len: usize,
+    /// Its bytes as the link's capture keeps them (the first `snap_len`). A link that records
+    /// nothing has no taps.
     pub bytes: Vec<u8>,
 }
 
@@ -391,6 +562,9 @@ struct PanelState {
     rules: BTreeMap<Digest, FrameAction>,
     /// The network's seed: the links' loss and jitter streams derive from it.
     seed: u64,
+    /// What new links' captures keep, and their series (the network's defaults).
+    capture: CaptureOptions,
+    series: Option<SeriesOptions>,
 }
 
 struct DeviceEntry {
@@ -421,6 +595,14 @@ struct Link {
     cable: Option<Box<dyn Any + Send>>,
     /// Each direction's impairments and their state, by sending end.
     lanes: [Lane; 2],
+    /// What its capture and frame log keep (the snap length is the capture header's).
+    capture: CaptureOptions,
+    /// A packet was written to its capture (its header is fixed from then on).
+    recorded: bool,
+    /// The instant it was created.
+    created_at: Nanos,
+    /// Its counters per interval, if asked for.
+    series: Option<Series>,
 }
 
 impl Link {
@@ -428,6 +610,69 @@ impl Link {
         let (device, port) = self.ends[end];
         DeviceId(device).port(port)
     }
+
+    /// Counts at instant `at`: in the totals and in the series' bucket of `at`.
+    fn count(&mut self, at: Nanos, f: impl Fn(&mut LinkStats)) {
+        f(&mut self.stats);
+        if let Some(series) = &mut self.series {
+            f(series.bucket(at));
+        }
+    }
+
+    /// Writes one packet to the capture, unless the link records nothing (the encoder keeps
+    /// the snap length of the header).
+    fn tap(&mut self, end: usize, at: Nanos, frame: &[u8], direction: Direction) {
+        if !self.capture.record {
+            return;
+        }
+        // Only a > 4 GiB frame could fail to encode; such a frame is still delivered.
+        let _ = self
+            .pcap
+            .write_packet_directed(self.ifaces[end], at, frame, direction);
+        self.recorded = true;
+    }
+
+    /// The bytes of `frame` its frame log and taps keep.
+    fn kept(&self, frame: &[u8]) -> Vec<u8> {
+        frame[..self.capture.kept(frame.len())].to_vec()
+    }
+}
+
+/// A link's capture header: one interface per end, `<device>:<port>`, with the snap length
+/// and (with `name_ends`) a [`LinkEnd`](crate::pcap::LinkEnd) description each. `names` are
+/// the ends' `(device, port)`.
+fn capture_header(
+    link: &str,
+    names: [(&str, u32); 2],
+    created_at: Nanos,
+    capture: CaptureOptions,
+) -> (PcapNgEncoder, [InterfaceId; 2]) {
+    // Building a capture header cannot fail for names this short; fall back to no names.
+    let mut pcap = PcapNgEncoder::new(PCAP_USER_APPL).expect("static SHB fits");
+    let snap = capture.snap_len;
+    let mut iface = |end: usize| {
+        let (device, port) = names[end];
+        let (peer_device, peer_port) = names[1 - end];
+        let description = if capture.name_ends {
+            crate::pcap::LinkEnd {
+                link: link.to_owned(),
+                end,
+                device: device.to_owned(),
+                port,
+                peer_device: peer_device.to_owned(),
+                peer_port,
+                created_at,
+            }
+            .to_string()
+        } else {
+            String::new()
+        };
+        pcap.add_described_interface(&format!("{device}:{port}"), snap, &description)
+            .or_else(|_| pcap.add_ethernet_interface("", snap))
+            .expect("IDB without options fits")
+    };
+    let ifaces = [iface(0), iface(1)];
+    (pcap, ifaces)
 }
 
 /// One direction of a link: its impairments, its transmitter and its random streams.
@@ -555,13 +800,15 @@ impl Panel {
         self.state().devices[device].ports.clone()
     }
 
-    /// Wires `a` to `b` with the given latency. The link starts up, and its MTU is the smaller
-    /// of the two ports' MTUs.
+    /// Wires `a` to `b` with the given latency, at instant `at`. The link starts up, its MTU is
+    /// the smaller of the two ports' MTUs, and its capture and series follow the panel's
+    /// defaults.
     pub(crate) fn connect(
         &self,
         a: (DeviceIdx, u32),
         b: (DeviceIdx, u32),
         latency: Nanos,
+        at: Nanos,
     ) -> Result<usize, ConnectError> {
         let mut s = self.state();
         let mut mtu = u32::MAX;
@@ -578,14 +825,6 @@ impl Panel {
         let end_name =
             |s: &PanelState, (d, p): (DeviceIdx, u32)| format!("{}:{p}", s.devices[d].name);
         let (na, nb) = (end_name(&s, a), end_name(&s, b));
-        // Building a capture header cannot fail for names this short; fall back to no names.
-        let mut pcap = PcapNgEncoder::new(PCAP_USER_APPL).expect("static SHB fits");
-        let mut iface = |name: &str| {
-            pcap.add_ethernet_interface(name, 0)
-                .or_else(|_| pcap.add_ethernet_interface("", 0))
-                .expect("IDB without options fits")
-        };
-        let ifaces = [iface(&na), iface(&nb)];
         let id = s.links.len();
         // File-name safe: `blaster.0-reflector.0`. The same two ports wired again after an
         // unwire get `-2`, `-3`, ...: link names (and pcap files) stay unique.
@@ -596,6 +835,13 @@ impl Panel {
             n += 1;
             name = format!("{base}-{n}");
         }
+        let capture = s.capture;
+        let names = [
+            (s.devices[a.0].name.as_str(), a.1),
+            (s.devices[b.0].name.as_str(), b.1),
+        ];
+        let (pcap, ifaces) = capture_header(&name, names, at, capture);
+        let series = s.series.map(Series::new);
         s.links.push(Link {
             name,
             ends: [a, b],
@@ -610,6 +856,10 @@ impl Panel {
             ifaces,
             stats: LinkStats::default(),
             lanes: Default::default(),
+            capture,
+            recorded: false,
+            created_at: at,
+            series,
         });
         s.ends.insert(a, (id, 0));
         s.ends.insert(b, (id, 1));
@@ -694,6 +944,51 @@ impl Panel {
                 lane.imp = imp;
             }
         }
+    }
+
+    /// What links created from now on record, and their series.
+    pub(crate) fn set_defaults(&self, capture: CaptureOptions, series: Option<SeriesOptions>) {
+        let mut s = self.state();
+        s.capture = capture;
+        s.series = series;
+    }
+
+    pub(crate) fn defaults(&self) -> (CaptureOptions, Option<SeriesOptions>) {
+        let s = self.state();
+        (s.capture, s.series)
+    }
+
+    /// Sets what `link` records. Before its first packet the capture header is written again
+    /// (snap length, names); after it, only `record` changes.
+    pub(crate) fn set_capture(&self, link: usize, capture: CaptureOptions) {
+        let mut s = self.state();
+        let names = s.links[link]
+            .ends
+            .map(|(d, p)| (s.devices[d].name.clone(), p));
+        let l = &mut s.links[link];
+        if l.recorded {
+            l.capture.record = capture.record;
+            return;
+        }
+        let names = [
+            (names[0].0.as_str(), names[0].1),
+            (names[1].0.as_str(), names[1].1),
+        ];
+        (l.pcap, l.ifaces) = capture_header(&l.name, names, l.created_at, capture);
+        l.capture = capture;
+    }
+
+    /// Starts (or with `None` ends) `link`'s series; a new one starts empty.
+    pub(crate) fn set_series(&self, link: usize, series: Option<SeriesOptions>) {
+        self.state().links[link].series = series.map(Series::new);
+    }
+
+    /// `link`'s series: `(bucket start, counters)`, oldest first; empty without one.
+    pub(crate) fn link_series(&self, link: usize) -> Vec<(Nanos, LinkStats)> {
+        self.state().links[link]
+            .series
+            .as_ref()
+            .map_or_else(Vec::new, Series::read)
     }
 
     /// Adds (or replaces) the operator rule for the transmission with this digest.
@@ -804,6 +1099,7 @@ impl Panel {
             removed: l.removed,
             kind: l.kind,
             impairments: [l.lanes[0].imp, l.lanes[1].imp],
+            capture: l.capture,
         }
     }
 
@@ -955,15 +1251,18 @@ impl Panel {
             let link = &mut s.links[link_id];
             if !model.as_ref().is_none_or(|m| m.well_formed(&frame)) {
                 // A malformed message: dropped and counted, never a trap.
-                link.stats.oversize[end] += 1;
+                link.count(now, |c| c.oversize[end] += 1);
                 return;
             }
             if dropped || !link.up || peer_remote {
-                link.stats.dropped_down[end] += 1;
+                link.count(now, |c| c.dropped_down[end] += 1);
                 return;
             }
-            link.stats.frames[end] += 1;
-            link.stats.bytes[end] += frame.len() as u64;
+            let len = frame.len() as u64;
+            link.count(now, |c| {
+                c.frames[end] += 1;
+                c.bytes[end] += len;
+            });
             let at = now.saturating_add(link.latency).saturating_add(delay);
             let generation = link.generation;
             let ends = link.ends;
@@ -1038,10 +1337,10 @@ impl Panel {
         let drop_reason = if dropped {
             Some(DropReason::Operator)
         } else if !link.up {
-            link.stats.dropped_down[end] += 1;
+            link.count(now, |c| c.dropped_down[end] += 1);
             Some(DropReason::LinkDown)
         } else if payload_len(&frame) > link.mtu as usize {
-            link.stats.oversize[end] += 1;
+            link.count(now, |c| c.oversize[end] += 1);
             Some(DropReason::Oversize)
         } else {
             // The direction's queue, rate, loss and jitter. A plain direction (never shaped,
@@ -1051,7 +1350,7 @@ impl Panel {
                 shaped = lane.shape(now, frame.len(), link.latency, (seed, &link.name, end));
             }
             if matches!(shaped, Shaped::QueueFull) {
-                link.stats.dropped_queue[end] += 1;
+                link.count(now, |c| c.dropped_queue[end] += 1);
                 Some(DropReason::QueueFull)
             } else {
                 None
@@ -1068,41 +1367,45 @@ impl Panel {
                 None if lost => FrameFate::Lost,
                 None => FrameFate::InFlight,
             },
-            bytes: frame.clone(),
+            len: frame.len(),
+            bytes: link.kept(&frame),
         };
         if drop_reason.is_some() {
             s.frames.push(record);
             s.frame_tags.push(tag);
             return;
         }
-        // Only a > 4 GiB frame could fail to encode; such a frame is still delivered.
-        let _ = link
-            .pcap
-            .write_packet_directed(link.ifaces[end], now, &frame, Direction::Outbound);
-        link.stats.frames[end] += 1;
-        link.stats.bytes[end] += frame.len() as u64;
-        if lost {
-            link.stats.lost_random[end] += 1;
-        }
+        link.tap(end, now, &frame, Direction::Outbound);
+        let len = frame.len() as u64;
+        link.count(now, |c| {
+            c.frames[end] += 1;
+            c.bytes[end] += len;
+            c.lost_random[end] += u64::from(lost);
+        });
+        let record_taps = link.capture.record;
         let (peer, peer_port) = link.ends[to_end];
         let at = match shaped {
             Shaped::Arrive(at) => at.saturating_add(delay),
             Shaped::Lost | Shaped::QueueFull => now,
         };
         let generation = link.generation;
+        let tap_bytes = (peer_remote && record_taps).then(|| record.bytes.clone());
         s.frames.push(record);
         s.frame_tags.push(tag.clone());
         if peer_remote {
-            // A WAN link: record this site's half of the capture and hand the frame to site
-            // sync, keyed exactly as a local delivery would be.
-            s.taps.push(Tap {
-                tag,
-                link: LinkId(link_id),
-                end,
-                at: now,
-                inbound: false,
-                bytes: frame.clone(),
-            });
+            // A WAN link: record this site's half of the capture (as the link keeps it) and
+            // hand the frame to site sync, keyed exactly as a local delivery would be.
+            if let Some(bytes) = tap_bytes {
+                s.taps.push(Tap {
+                    tag,
+                    link: LinkId(link_id),
+                    end,
+                    at: now,
+                    inbound: false,
+                    len: frame.len(),
+                    bytes,
+                });
+            }
             if lost {
                 // Lost on the wire: this site's half of the capture has it, the peer gets
                 // nothing.
@@ -1149,20 +1452,16 @@ impl Panel {
         if d.frame_id == CABLE_MESSAGE {
             // A cable's message: nothing to tap on arrival.
             if !delivered {
-                link.stats.lost[1 - d.to_end] += 1;
+                link.count(at, |c| c.lost[1 - d.to_end] += 1);
             }
             return delivered;
         }
         if delivered {
-            let _ = link.pcap.write_packet_directed(
-                link.ifaces[d.to_end],
-                at,
-                &d.frame,
-                Direction::Inbound,
-            );
+            link.tap(d.to_end, at, &d.frame, Direction::Inbound);
         } else {
-            link.stats.lost[1 - d.to_end] += 1;
+            link.count(at, |c| c.lost[1 - d.to_end] += 1);
         }
+        let tap_bytes = (d.remote && delivered && link.capture.record).then(|| link.kept(&d.frame));
         let fate = if delivered {
             FrameFate::Delivered { at }
         } else {
@@ -1170,15 +1469,19 @@ impl Panel {
         };
         if d.remote {
             if delivered {
+                // The tag is taken whether or not the link records, as it always was.
                 let tag = clock.tag();
-                s.taps.push(Tap {
-                    tag,
-                    link: LinkId(d.link),
-                    end: d.to_end,
-                    at,
-                    inbound: true,
-                    bytes: d.frame.clone(),
-                });
+                if let Some(bytes) = tap_bytes {
+                    s.taps.push(Tap {
+                        tag,
+                        link: LinkId(d.link),
+                        end: d.to_end,
+                        at,
+                        inbound: true,
+                        len: d.frame.len(),
+                        bytes,
+                    });
+                }
             }
             s.arrivals.push(RemoteArrival {
                 frame_id: d.frame_id,
@@ -1230,7 +1533,7 @@ mod tests {
         let panel = Panel::default();
         let a = panel.add_device("a", vec![port(0, 1500), port(1, 1500)], false);
         let b = panel.add_device("b", vec![port(0, 1500), port(1, 100)], false);
-        let link = panel.connect((a, 0), (b, 1), 10).unwrap();
+        let link = panel.connect((a, 0), (b, 1), 10, 0).unwrap();
         (clock, panel, link)
     }
 
@@ -1253,15 +1556,15 @@ mod tests {
         assert_eq!(panel.link_info(link).mtu, 100);
         assert_eq!(panel.link_info(link).name, "a.0-b.1");
         assert_eq!(
-            panel.connect((0, 7), (1, 0), 0),
+            panel.connect((0, 7), (1, 0), 0, 0),
             Err(ConnectError::Unknown(0, 7))
         );
         assert_eq!(
-            panel.connect((0, 0), (1, 0), 0),
+            panel.connect((0, 0), (1, 0), 0, 0),
             Err(ConnectError::InUse(0, 0))
         );
         assert_eq!(
-            panel.connect((0, 1), (0, 1), 0),
+            panel.connect((0, 1), (0, 1), 0, 0),
             Err(ConnectError::InUse(0, 1))
         );
     }
@@ -1398,11 +1701,11 @@ mod tests {
         for i in 0..extra {
             let ports = vec![port(0, 1500), port(1, 1500)];
             let d = panel.add_device(&format!("x{i}"), ports, false);
-            panel.connect((d, 0), (d, 1), 5).unwrap();
+            panel.connect((d, 0), (d, 1), 5, 0).unwrap();
         }
         let a = panel.add_device("a", vec![port(0, 1500)], false);
         let b = panel.add_device("b", vec![port(1, 1500)], false);
-        let link = panel.connect((a, 0), (b, 1), 10).unwrap();
+        let link = panel.connect((a, 0), (b, 1), 10, 0).unwrap();
         panel.set_impairments(link, Some(0), imp);
         for _ in 0..n {
             panel.transmit(&clock, a, 0, frame(46));
@@ -1521,5 +1824,190 @@ mod tests {
         assert_eq!(drain(&clock), [(10, 0), (10, 1), (10, 2)]);
         assert!(!drew(&panel, link, 0));
         assert_eq!(panel.link_info(link).impairments[1].queue, 0);
+    }
+
+    // ---- what a link records (docs/design/links.md) ----
+
+    /// [`panel`] with `capture` for every link, wired at instant 5.
+    fn recording_panel(capture: CaptureOptions) -> (VirtualClock, Panel, usize) {
+        let clock = VirtualClock::new(Duration::ZERO);
+        let panel = Panel::default();
+        panel.set_defaults(capture, None);
+        let a = panel.add_device("a", vec![port(0, 1500)], false);
+        let b = panel.add_device("b", vec![port(1, 1500)], false);
+        let link = panel.connect((a, 0), (b, 1), 10, 5).unwrap();
+        (clock, panel, link)
+    }
+
+    /// Sends a 100-byte frame a -> b and a 60-byte one b -> a, and delivers both.
+    fn exchange(clock: &VirtualClock, panel: &Panel) -> Vec<Delivery> {
+        panel.transmit(clock, 0, 0, frame(86));
+        panel.transmit(clock, 1, 1, frame(46));
+        std::iter::from_fn(|| next_delivery(clock))
+            .map(|(at, d)| {
+                assert!(panel.arrive(clock, at, &d));
+                d
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_default_capture_header_is_the_one_links_always_had() {
+        let (_, panel, link) = panel();
+        let mut old = PcapNgEncoder::new(PCAP_USER_APPL).unwrap();
+        old.add_ethernet_interface("a:0", 0).unwrap();
+        old.add_ethernet_interface("b:1", 0).unwrap();
+        assert_eq!(panel.pcap(link), old.bytes());
+        assert_eq!(panel.link_info(link).capture, CaptureOptions::default());
+    }
+
+    #[test]
+    fn a_snap_length_cuts_the_capture_and_the_frame_log_but_not_the_delivery() {
+        let (clock, panel, link) = recording_panel(CaptureOptions::default().snap_len(20));
+        let delivered = exchange(&clock, &panel);
+        assert_eq!(
+            delivered.iter().map(|d| d.frame.len()).collect::<Vec<_>>(),
+            [100, 60],
+            "the far end gets whole frames"
+        );
+        let cap = crate::pcap::parse(&panel.pcap(link)).unwrap();
+        assert!(cap.interfaces.iter().all(|i| i.snaplen == 20));
+        let lens: Vec<_> = cap
+            .packets
+            .iter()
+            .map(|p| (p.data.len(), p.original_len))
+            .collect();
+        assert_eq!(lens, [(20, 100), (20, 60), (20, 100), (20, 60)]);
+        assert_eq!(cap.packets[0].data, frame(86)[..20]);
+        let log: Vec<_> = panel
+            .frames()
+            .iter()
+            .map(|f| (f.bytes.len(), f.len))
+            .collect();
+        assert_eq!(log, [(20, 100), (20, 60)]);
+        assert_eq!(
+            panel.link_stats(link).bytes,
+            [100, 60],
+            "counters count whole frames"
+        );
+    }
+
+    #[test]
+    fn recording_off_keeps_the_header_the_records_and_the_counters() {
+        let (clock, panel, link) = recording_panel(CaptureOptions::default().record(false));
+        exchange(&clock, &panel);
+        let cap = crate::pcap::parse(&panel.pcap(link)).unwrap();
+        assert_eq!((cap.interfaces.len(), cap.packets.len()), (2, 0));
+        let frames = panel.frames();
+        assert!(frames.iter().all(|f| f.bytes.is_empty()));
+        assert_eq!(frames.iter().map(|f| f.len).collect::<Vec<_>>(), [100, 60]);
+        assert_eq!(frames[0].fate, FrameFate::Delivered { at: 10 });
+        let stats = panel.link_stats(link);
+        assert_eq!((stats.frames, stats.bytes), ([1, 1], [100, 60]));
+    }
+
+    #[test]
+    fn a_capture_can_name_its_ends() {
+        let (clock, panel, link) = recording_panel(CaptureOptions::default().name_ends(true));
+        exchange(&clock, &panel);
+        let cap = crate::pcap::parse(&panel.pcap(link)).unwrap();
+        let ends: Vec<_> = cap
+            .interfaces
+            .iter()
+            .map(|i| crate::pcap::LinkEnd::parse(i.description.as_deref().unwrap()).unwrap())
+            .collect();
+        let want = |end, device: &str, port, peer: &str, peer_port| crate::pcap::LinkEnd {
+            link: "a.0-b.1".to_owned(),
+            end,
+            device: device.to_owned(),
+            port,
+            peer_device: peer.to_owned(),
+            peer_port,
+            created_at: 5,
+        };
+        assert_eq!(ends, [want(0, "a", 0, "b", 1), want(1, "b", 1, "a", 0)]);
+        assert_eq!(cap.interfaces[0].name.as_deref(), Some("a:0"));
+        assert_eq!(cap.packets.len(), 4);
+    }
+
+    #[test]
+    fn capture_options_rewrite_the_header_until_the_first_packet() {
+        let (clock, panel, link) = panel();
+        panel.set_capture(link, CaptureOptions::default().snap_len(16).name_ends(true));
+        let cap = crate::pcap::parse(&panel.pcap(link)).unwrap();
+        assert_eq!(cap.interfaces[0].snaplen, 16);
+        assert!(cap.interfaces[0].description.is_some());
+        panel.transmit(&clock, 0, 0, frame(10));
+        // After a packet only `record` changes: the header and its snap length stay.
+        panel.set_capture(link, CaptureOptions::default().record(false));
+        panel.transmit(&clock, 0, 0, frame(10));
+        let info = panel.link_info(link).capture;
+        assert_eq!(
+            (info.record, info.snap_len, info.name_ends),
+            (false, 16, true)
+        );
+        let cap = crate::pcap::parse(&panel.pcap(link)).unwrap();
+        assert_eq!(cap.packets.len(), 1);
+        assert_eq!(cap.interfaces[0].snaplen, 16);
+    }
+
+    #[test]
+    fn a_series_counts_per_bucket_and_keeps_the_last_ones() {
+        let (clock, panel, link) = panel();
+        panel.set_series(
+            link,
+            Some(SeriesOptions {
+                width: 100,
+                keep: 3,
+            }),
+        );
+        // One frame a -> b at 0, 50, 150, 420 and 430; one b -> a oversize at 420 (MTU 100).
+        for t in [0, 50, 150, 420, 430] {
+            clock.advance_to(t);
+            panel.transmit(&clock, 0, 0, frame(10));
+        }
+        clock.advance_to(430);
+        panel.transmit(&clock, 1, 1, frame(101));
+        // Delivered frames count nothing on arrival.
+        assert_eq!(drain_arrivals(&clock, &panel), 5);
+        let series = panel.link_series(link);
+        let frames: Vec<_> = series.iter().map(|(at, s)| (*at, s.frames[0])).collect();
+        assert_eq!(
+            frames,
+            [(0, 2), (100, 1), (400, 2)],
+            "empty buckets are absent"
+        );
+        assert_eq!(series[2].1.oversize, [0, 1]);
+        let mut sum = LinkStats::default();
+        for (_, s) in &series {
+            sum.add(s);
+        }
+        assert_eq!(
+            sum,
+            panel.link_stats(link),
+            "the buckets add up to the totals"
+        );
+        // A fourth bucket pushes out the first.
+        clock.advance_to(1_000);
+        panel.transmit(&clock, 0, 0, frame(10));
+        let starts: Vec<_> = panel.link_series(link).iter().map(|(at, _)| *at).collect();
+        assert_eq!(starts, [100, 400, 1_000]);
+        // Lost frames count at the instant they would have arrived.
+        panel.set_up(&clock, 1_000, link, false);
+        let _ = drain_arrivals(&clock, &panel);
+        let last = *panel.link_series(link).last().unwrap();
+        assert_eq!(last.0, 1_000);
+        assert_eq!(last.1.lost[0], 1);
+        assert_eq!(panel.link_series(link).len(), 3);
+    }
+
+    /// Fires every delivery left, as the executor would.
+    fn drain_arrivals(clock: &VirtualClock, panel: &Panel) -> usize {
+        let mut n = 0;
+        while let Some((at, d)) = next_delivery(clock) {
+            panel.arrive(clock, at, &d);
+            n += 1;
+        }
+        n
     }
 }

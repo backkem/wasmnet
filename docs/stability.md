@@ -20,7 +20,12 @@ environment (`DeviceOptions::args` and `env`, the spec keys `args` and `env`), a
 `logs` of its own devices, `devices.control-answer`, `DeviceOptions::infra_cascade` and
 `wasmnet:infra/changes.wait`
 (`crates/wasmnet-host/tests/infra_verbs.rs`). `Runtime::Component` must be `ToOwned`, so a
-network keeps each device's component to start it again.
+network keeps each device's component to start it again. So is what a run reports for
+measuring it (`crates/wasmnet-host/tests/measure.rs`): `DeviceCost` with its peak fuel per
+instant, `Network::link_stats` read between runs with `LinkStats::since` and `add`, a link's
+series (`SeriesOptions`, `Network::link_series`), and what links record (`CaptureOptions`,
+`Network::set_capture_defaults`, `LinkMut::capture`, `FrameRecord::len`) with the
+`wasmnet-link-end/1` end descriptions (`pcap::LinkEnd`) ([design/links.md](design/links.md)).
 
 ## Embedder surface, unstable
 
@@ -32,7 +37,8 @@ versions without notice. Rustdoc and the design notes mark it **embedder surface
   the component resolver for dynamic topology), including `Op::Impair` and `Op::ImpairNamed`,
   which change a link's impairments while the network runs;
 - multi-site runs (`wasmnet_core::sites` and the `Network` methods for them) and the
-  `wasmnet:wan` carrier contract (the site-sync wire format is at version 2 since impairments
+  `wasmnet:wan` carrier contract (the site-sync wire format is at version 3 since the records
+  carry frame lengths and capture options; version 2 added impairments
   and the devices and links created while a network runs were added to its records);
 - the extension points (`wasmnet_core::ext`, `HostExtension`, `ControlHandler`,
   `HostBuilder::unmetered_engine` and `Host::load_unmetered`);

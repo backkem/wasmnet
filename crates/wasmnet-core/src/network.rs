@@ -23,10 +23,12 @@ use crate::ext::{
 use crate::infra::{Infra, InfraEnd, Phase};
 use crate::journal::{Journal, JournalEnd, JournalEntry, Stream};
 use crate::link::{
+    CaptureOptions, FrameAction, Impairments, LinkKind, SeriesOptions, TransmitHook,
+};
+use crate::link::{
     ConnectError, FrameRecord, LinkInfo, LinkStats, LinkTransition, Panel, PortInfo, RemoteArrival,
     RemoteFrame, Tap, Wire,
 };
-use crate::link::{FrameAction, Impairments, LinkKind, TransmitHook};
 use crate::output::OutputCapture;
 use crate::{Error, Guard, Outcome, Result, SimConfig};
 use wasmnet_wire::MacAddr;
@@ -219,6 +221,24 @@ impl LinkMut<'_> {
     /// model decides what each message does and records. Set it before the first transmission.
     pub fn kind(self, kind: LinkKind) -> Self {
         self.panel.set_kind(self.id.0, kind);
+        self
+    }
+
+    /// Sets what its capture and frame log keep (`docs/design/links.md`): frame bytes or
+    /// none, a snap length, and whether the capture header names the link's ends. Default: the
+    /// network's ([`Network::set_capture_defaults`]). Set it before the first frame: the
+    /// capture header is written again then; once a packet was captured only `record`
+    /// changes.
+    pub fn capture(self, capture: CaptureOptions) -> Self {
+        self.panel.set_capture(self.id.0, capture);
+        self
+    }
+
+    /// Counts its traffic per interval of virtual time as well (`docs/design/links.md`):
+    /// buckets of `series.width` ns, the last `series.keep` kept
+    /// ([`Network::link_series`]). It starts empty, from now on.
+    pub fn series(self, series: SeriesOptions) -> Self {
+        self.panel.set_series(self.id.0, Some(series));
         self
     }
 
@@ -975,17 +995,20 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
     /// link down until it starts again.
     fn connect(&mut self, a: PortRef, b: PortRef) -> Result<LinkId> {
         let (ea, eb) = ((a.device.0, a.port), (b.device.0, b.port));
-        let id = self.panel.connect(ea, eb, 0).map_err(|e| match e {
-            ConnectError::InUse(d, port) => Error::PortInUse {
-                device: self.devices[d].name.clone(),
-                port,
-            },
-            ConnectError::Unknown(d, port) => Error::UnknownPort {
-                device: self.devices[d].name.clone(),
-                port,
-                declared: self.panel.ports(d).iter().map(|p| p.id).collect(),
-            },
-        })?;
+        let id = self
+            .panel
+            .connect(ea, eb, 0, self.clock.now())
+            .map_err(|e| match e {
+                ConnectError::InUse(d, port) => Error::PortInUse {
+                    device: self.devices[d].name.clone(),
+                    port,
+                },
+                ConnectError::Unknown(d, port) => Error::UnknownPort {
+                    device: self.devices[d].name.clone(),
+                    port,
+                    declared: self.panel.ports(d).iter().map(|p| p.id).collect(),
+                },
+            })?;
         let stopped = [ea, eb]
             .into_iter()
             .find(|&(d, _)| self.devices[d].phase != DevicePhase::Running);
@@ -1718,14 +1741,46 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
     /// recorded outbound on the sender's interface at transmit time and inbound on the
     /// receiver's interface at arrival time. Timestamps are virtual nanoseconds. Frames dropped
     /// at transmit (link down, oversize, a full transmit queue) are not in it; lost ones (in
-    /// flight when the link went down, or taken by its seeded loss) appear outbound only.
+    /// flight when the link went down, or taken by its seeded loss) appear outbound only. What
+    /// it keeps of each frame follows the link's [`CaptureOptions`].
     pub fn pcap(&self, link: LinkId) -> Vec<u8> {
         self.panel.pcap(link.0)
     }
 
-    /// Every transmission on a wired port so far, in transmit order, with its fate.
+    /// Every transmission on a wired port so far, in transmit order, with its fate (its bytes
+    /// as its link's [`CaptureOptions`] keep them).
     pub fn frames(&self) -> Vec<FrameRecord> {
         self.panel.frames()
+    }
+
+    /// What the captures and frame log of links created from now on keep
+    /// (`docs/design/links.md`): links the builder wires and links created while the network
+    /// runs (operator events, controllers' cables) alike. [`LinkMut::capture`] overrides it for
+    /// one link. The default, [`CaptureOptions::default`], keeps everything and names nothing.
+    pub fn set_capture_defaults(&mut self, capture: CaptureOptions) {
+        let (_, series) = self.panel.defaults();
+        self.panel.set_defaults(capture, series);
+    }
+
+    /// What new links' captures keep ([`set_capture_defaults`](Self::set_capture_defaults)).
+    pub fn capture_defaults(&self) -> CaptureOptions {
+        self.panel.defaults().0
+    }
+
+    /// Gives every link created from now on a series of its counters per interval
+    /// ([`LinkMut::series`]), or none with `None` (the default).
+    pub fn set_series_defaults(&mut self, series: Option<SeriesOptions>) {
+        let (capture, _) = self.panel.defaults();
+        self.panel.set_defaults(capture, series);
+    }
+
+    /// The link's counters per interval so far: `(bucket start, counters)`, oldest first, only
+    /// buckets in which a counter changed, at most the series' `keep` (the most recent). Empty
+    /// for a link without a series. Each counter is counted in the bucket of the instant it
+    /// changed at, as [`link_stats`](Self::link_stats) counts it: so while no bucket was
+    /// dropped, the buckets add up to `link_stats`.
+    pub fn link_series(&self, link: LinkId) -> Vec<(Nanos, LinkStats)> {
+        self.panel.link_series(link.0)
     }
 
     /// Every link up/down change so far (scripted ones; creation is not a transition).
@@ -1733,7 +1788,12 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
         self.panel.transitions()
     }
 
-    /// Frame and byte counters for the link.
+    /// The link's counters as of now: everything counted up to the network's current
+    /// position. Between runs (`run_until`, `run_stoppable` stops) that is every event
+    /// processed so far, so reading at two points and subtracting ([`LinkStats::since`]) gives
+    /// the traffic in between, without parsing captures. Frames are counted at transmit
+    /// (`frames`, `bytes` and the drops) and `lost` at the instant the frame would have
+    /// arrived.
     pub fn link_stats(&self, link: LinkId) -> LinkStats {
         self.panel.link_stats(link.0)
     }

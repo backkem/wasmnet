@@ -108,9 +108,9 @@ pub use infra::{Infra, InfraEnd};
 pub use input::InputQueue;
 pub use journal::{JournalEnd, JournalEntry, Level, Record, Stream};
 pub use link::{
-    DEFAULT_QUEUE, DropReason, FrameAction, FrameFate, FrameRecord, Impairments, LinkInfo,
-    LinkKind, LinkStats, LinkTransition, PPM, PortInfo, RemoteArrival, RemoteFrame, Tap, Transmit,
-    TransmitHook, Wire,
+    CaptureOptions, DEFAULT_QUEUE, DropReason, FrameAction, FrameFate, FrameRecord, Impairments,
+    LinkInfo, LinkKind, LinkStats, LinkTransition, PPM, PortInfo, RemoteArrival, RemoteFrame,
+    SeriesOptions, Tap, Transmit, TransmitHook, Wire,
 };
 pub use network::{
     CREATOR_RANGE, Cable, Cascade, ComponentResolver, DeclaredPort, DeviceContext, DeviceId,

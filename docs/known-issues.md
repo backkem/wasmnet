@@ -5,10 +5,12 @@ here so that nobody has to find these the hard way. Each entry names where the c
 
 ## The simulator
 
-- **Recording is unbounded in memory.** Every frame that crosses a link is kept in the frame
-  log and in the link's pcap encoder (`crates/wasmnet-core/src/link.rs`), with no cap and no
-  switch to turn it off. The journal and captured stdio have caps; frames do not. A long run
-  with heavy traffic grows until the process runs out of memory.
+- **Recording is unbounded by default.** Unless a link's `CaptureOptions` say otherwise, every
+  frame that crosses it is kept whole in the frame log and in its pcap encoder
+  (`crates/wasmnet-core/src/link.rs`). A snap length bounds the bytes kept per frame and
+  recording off keeps none ([design/links.md](design/links.md#what-a-link-records)), but the
+  frame log still adds one fixed-size record per transmission, and captures are only held in
+  memory (nothing streams them out). The journal and captured stdio have caps.
 - **A device has no memory limit.** Fuel bounds what a device computes per virtual instant;
   nothing bounds what it allocates.
 - **An event can be lost while a device is created.** `block_on`
@@ -32,8 +34,9 @@ here so that nobody has to find these the hard way. Each entry names where the c
   models, network extensions, control calls and the merging of two sites' recordings are used
   and tested by an embedder outside this repository. In this repository only the site-sync
   decoder has tests of its own, and operator events and control calls only as far as device
-  commands use them (`crates/wasmnet-host/tests/routes.rs`), and the merging of two sites'
-  recordings in `impairments.rs` and `infra_sites.rs` (in-world controllers). Treat that
+  commands use them (`crates/wasmnet-host/tests/routes.rs`) and a device removed and added
+  again (`measure.rs`), and the merging of two sites' recordings in `impairments.rs`,
+  `infra_sites.rs` (in-world controllers) and `measure.rs` (capture options). Treat that
   surface as unstable ([stability.md](stability.md)).
 - **Device commands are native only.** The browser backend (`wasmnet-web`) reports no
   optional exports, so it does not serve `wasmnet:control/commands`: an `Op::Control` with a
