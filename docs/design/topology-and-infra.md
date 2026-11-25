@@ -145,7 +145,9 @@ position after what is still queued for `name`, applied there (journalled as `li
 (`infra-failed`). One rule decides where any of a controller's cables may lead, a creation's
 or a `wire`'s: to a device it created or to one of the network's own, never to another
 controller's device (`denied` at the call when the table already shows it, `infra-failed`
-when it applies). Before 0.1.2 a creation's cable could also lead to another controller's
+when it applies). A name not in the table that starts with another controller's
+`infra_prefix` counts as that controller's, so a split network, where such a device may live
+on another site, refuses it exactly as the unsplit one. Before 0.1.2 a creation's cable could also lead to another controller's
 device; it no longer can. In a split network a cable whose far end is on another site fails
 the run, like a creation's ([sites.md](sites.md)); an `unwire` concerns the caller's own
 device, so it stays on its site.

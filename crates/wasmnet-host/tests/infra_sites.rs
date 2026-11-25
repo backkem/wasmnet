@@ -813,9 +813,10 @@ fn a_controller_on_each_site_matches_the_unsplit_run() {
     }
 }
 
-/// A cable to a device of another site cannot be wired on the controller's site: the split
-/// run fails at the request's event, with the same site, instant and message every time,
-/// where the unsplit run wires it.
+/// A cable to a device the network was built with on another site cannot be wired on the
+/// controller's site: the split run fails at the request's event, with the same site, instant
+/// and message every time, where the unsplit run wires it. A cable to another controller's
+/// device is refused by the rule of cables, the same split and unsplit.
 #[test]
 fn a_cable_to_another_site_fails_the_split_run_deterministically() {
     // `web`'s cable to `sw-b`, a device the network was built with, on site 1.
@@ -862,17 +863,19 @@ fn a_cable_to_another_site_fails_the_split_run_deterministically() {
         ],
         true,
     );
+    // That is another controller's device: the rule of cables refuses it, the same split or
+    // not (on site 0, where `b-r` does not exist, by `ctl-b`'s prefix), so the runs agree.
     let whole = run_whole(&plan, 42);
-    assert_eq!(
-        events(&whole.journal, "a-x", "device-added").len(),
-        1,
-        "the unsplit network creates it:\n{}",
+    let failed = events(&whole.journal, "ctl-a", "infra-failed");
+    assert!(
+        failed.iter().any(|f| field(f, "name") == "a-x"
+            && field(f, "message").contains("`b-r` belongs to `ctl-b`")),
+        "{failed:?}\n{}",
         transcript(&whole.journal)
     );
-    let (site, at, message) = failure(&plan);
-    assert_eq!((site, at), (0, 500 * MS), "{message}");
-    assert!(message.contains("from `a-x` to `b-r`"), "{message}");
-    assert_eq!(failure(&plan), (site, at, message));
+    assert!(events(&whole.journal, "a-x", "device-added").is_empty());
+    let split = run_split(&plan, 42).unwrap_or_else(|e| panic!("{e:?}"));
+    assert_same(&whole, &split, "a cable to another controller's device");
 }
 
 /// Controllers on both sites need disjoint name prefixes; a controller creates only names

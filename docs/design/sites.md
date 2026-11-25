@@ -54,10 +54,13 @@ site). What makes it work:
   `infra_prefix` (no two overlapping); a controller creates and changes only names under its
   own. A network without prefixes is refused when the second site's controller is added
   (`Error::Refused`, on both sites).
-- **Locality is checked when a creation applies.** A cable to a device of another site (a
-  placeholder, or a name under another site's controller's prefix) fails the split run with
+- **Locality is checked when a creation or a `wire` applies.** A cable to a device the network
+  was built with that runs on another site (a placeholder) fails the split run with
   `Error::Refused` at that derived event: the same site, instant and message on every rerun.
-  The unsplit network would have wired it, so no answer on one site could match.
+  The unsplit network would have wired it, so no answer on one site could match. A cable to a
+  device another controller created is refused by the rule of cables in both runs alike
+  (`infra-failed`): its owner is known on the site that has it, and the name's `infra_prefix`
+  tells the other site whose it is ([topology-and-infra.md](topology-and-infra.md)).
 
 What does not cross sites:
 

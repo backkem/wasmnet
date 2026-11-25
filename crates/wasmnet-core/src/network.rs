@@ -1174,8 +1174,10 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
         Ok(())
     }
 
-    /// The far device of a cable in creation `req` that runs on another site: a placeholder,
-    /// or a name only a controller on another site may create (its `infra_prefix`).
+    /// The far device of a cable in creation or `wire` `req` that is a placeholder: a device
+    /// the network was built with that runs on another site. (A name another site's controller
+    /// may create is refused by the rule of cables, [`cables`](Self::cables), the same split
+    /// or not.)
     fn cable_to_another_site(&self, req: &crate::infra::Request) -> Option<String> {
         use crate::infra::Verb;
         let wire = match &req.verb {
@@ -1186,19 +1188,32 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
             _ => return None,
         };
         wire.iter()
-            .find(|c| match self.live_device(&c.device) {
-                Some(d) => self.devices[d.0].remote,
-                None => self.devices.iter().any(|d| {
-                    d.remote
-                        && d.options.infra
+            .find(|c| {
+                self.live_device(&c.device)
+                    .is_some_and(|d| self.devices[d.0].remote)
+            })
+            .map(|c| c.device.clone())
+    }
+
+    /// The controller other than `caller` whose devices `name` would be: the owner of a device
+    /// in the table, or for a name not in it, the controller whose `infra_prefix` it starts with.
+    fn other_owner(&self, caller: &str, name: &str) -> Option<String> {
+        let owner = match self.infra.get(name) {
+            Ok(view) => view.owner,
+            Err(_) => self
+                .devices
+                .iter()
+                .find(|d| {
+                    d.options.infra
                         && d.phase != DevicePhase::Removed
                         && d.options
                             .infra_prefix
                             .as_deref()
-                            .is_some_and(|p| c.device.starts_with(p))
-                }),
-            })
-            .map(|c| c.device.clone())
+                            .is_some_and(|p| name.starts_with(p))
+                })
+                .map(|d| d.name.clone()),
+        };
+        owner.filter(|o| o != caller)
     }
 
     fn apply_request(
@@ -1354,18 +1369,18 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
         let mut taken: Vec<(usize, u32)> = Vec::new();
         let mut out = Vec::new();
         for c in wire {
-            let d = self
-                .live_device(&c.device)
-                .ok_or_else(|| format!("wire: no device `{}`", c.device))?;
-            if let Some(owner) = self.infra.owner_of(&c.device)
-                && owner != caller
-            {
+            // The rule first, so a name another site's controller owns is refused the same way
+            // on this site, where it does not exist, as in the unsplit network, where it does.
+            if let Some(owner) = self.other_owner(caller, &c.device) {
                 return Err(format!(
                     "wire: `{}` belongs to `{owner}`: a controller's cables go to its own \
                      devices and the network's",
                     c.device
                 ));
             }
+            let d = self
+                .live_device(&c.device)
+                .ok_or_else(|| format!("wire: no device `{}`", c.device))?;
             let far = match c.far {
                 Some(p) => p,
                 None => {
