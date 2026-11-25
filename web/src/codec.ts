@@ -307,6 +307,11 @@ export interface DeviceOptions {
   fuelPerInstant?: number | bigint;
   /** A fault of this device crashes it alone, not the network. */
   crashAlone?: boolean;
+  /**
+   * The options of the simulator's extensions, by the key each declares (`pad.fault-at`): the
+   * extension parses the value (`NetworkExtension::options`).
+   */
+  [extensionKey: `${string}.${string}`]: unknown;
 }
 
 /** One direction's impairments of a link (`docs/design/links.md`). */
@@ -332,7 +337,9 @@ export interface LinkOptions {
  * An operator event (`Op`) at virtual instant `at` (ns; `end`: after that instant's events): its
  * `kind` and the fields the simulator documents for it (`link-state`, `latency`, `impair`,
  * `inject`, `stdin`, `command`, `add-device`, `stop-device`, `pause-device`, `resume-device`,
- * `crash-device`, `start-device`, `remove-device`, `wire`, `unwire`).
+  * `crash-device`, `start-device`, `remove-device`, `wire`, `unwire`), or an extension's:
+ * `{ kind: 'extension', device, op, value }`, timed at `device`, built by the extension that
+ * declares `op` (`NetworkExtension::ops`).
  */
 export interface Op {
   kind: string;

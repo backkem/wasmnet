@@ -236,9 +236,24 @@ await step('devices created while the network runs: controllers, a restart, devi
 await step('a portable extension in the page: an embedder-built simulator serves its interface, a resource and 1 MiB, faults and life events', async () => {
   const r = await page.evaluate(() => window.wasmnetScenario('portable', '42'));
   const got = r.notes.lines;
-  for (const want of ['p pad-big size=1048576 tail=85868788898a8b8c8d8e8f9091929394 state=State::Written', 'q device-crashed message=pad: append 3 failed', 'r pad-boot boots=1', 'r pad-dropped notes=2', 'p pad-cleared notes=3']) {
+  const wants = [
+    'p pad-big size=1048576 tail=85868788898a8b8c8d8e8f9091929394 state=State::Written',
+    // An option of the extension's from a plain object (`pad.fault-at`).
+    'q device-crashed message=pad: append 3 failed',
+    'r pad-boot boots=1',
+    'r pad-dropped notes=2',
+    // An operator event of the extension's from a plain object, timed at `p`.
+    'p pad-cleared notes=3 by=operator',
+    // An import no extension serves for this device.
+    'lonely device-crashed message=wasmnet-test:pad/notes@0.1.0 is not served to this device',
+  ];
+  for (const want of wants) {
     if (!got.includes(want)) throw new Error(`no "${want}" in:\n${got}\noutcome: ${JSON.stringify(r.outcome)}\npage errors: ${errors.join(' | ')}`);
   }
+  // The embedder's own exports and import on the simulator module.
+  if (r.notes.notesOfR !== 'boot,log') throw new Error(`wn_pad_notes: ${r.notes.notesOfR}`);
+  if (r.notes.stamped !== '42') throw new Error(`wn_pad_stamp: ${r.notes.stamped}`);
+  if (!r.notes.refused.includes('four bytes')) throw new Error(`wn_pad_stamp refusal: ${r.notes.refused}`);
   // NATIVE_PAD: the same network natively (`page_scenario_native`): the same lines.
   if (process.env.NATIVE_PAD) {
     const [a, b] = [fs.readFileSync(process.env.NATIVE_PAD, 'utf8').trimEnd().split('\n'), got.split('\n')];

@@ -180,7 +180,12 @@ async function runtime(net: Network): Promise<Record<string, string>> {
 }
 
 serveRun<Init, Done>(async (init, ctx) => {
-  const net = await Network.create(init.simulator, { seed: BigInt(init.seed), components: init.components });
+  // The fixture's simulator imports `pad_page.stamp` (an embedder's own import); other modules ignore it.
+  const net = await Network.create(init.simulator, {
+    seed: BigInt(init.seed),
+    components: init.components,
+    imports: { pad_page: { stamp: (n: number) => n + 1 } },
+  });
   if (init.scenario === 'portable' || init.scenario === 'portable-cost') {
     const t0 = performance.now();
     const notes = init.scenario === 'portable' ? await portable(net) : await portableCost(net);
@@ -268,7 +273,10 @@ function eventLines(entries: JournalEntry[], kinds: RegExp): string {
 async function portable(net: Network): Promise<{ outcome: unknown; notes: Record<string, string> }> {
   net.setCatalog(['pad_probe']);
   await net.device('p', 'pad_probe', { period: '10ms', big: '1048576' }, { crashAlone: true });
-  await net.device('q', 'pad_probe', { period: '10ms' }, { crashAlone: true });
+  // An option of the extension's, from a plain object: `q`'s third append faults it.
+  await net.device('q', 'pad_probe', { period: '10ms' }, { crashAlone: true, 'pad.fault-at': 3 });
+  // A device the extension gives no server: its first call faults it.
+  await net.device('lonely', 'pad_probe', { period: '10ms' }, { crashAlone: true });
   const spec = (period: string) => hex(cbor({ component: 'pad_probe', config: { period } }));
   await net.device(
     'ctl',
@@ -286,9 +294,21 @@ async function portable(net: Network): Promise<{ outcome: unknown; notes: Record
   net.op({ kind: 'start-device', device: 'p', at: ms(60) });
   net.op({ kind: 'crash-device', device: 'p', message: 'operator crash', at: ms(85) });
   net.op({ kind: 'start-device', device: 'p', at: ms(90) });
+  // An operator event of the extension's, timed at a device, from a plain object.
+  net.op({ kind: 'extension', device: 'p', op: 'pad.clear', at: ms(100) });
   const entries: JournalEntry[] = [];
   const outcome = await net.run({ deadline: ms(120), onJournal: (e) => entries.push(...e) });
-  return { outcome, notes: { lines: eventLines(entries, /^(pad-|device-)/) } };
+  // The embedder's own exports: the extension's state between steps, and its own import.
+  const decoder = new TextDecoder();
+  const notesOfR = decoder.decode(net.callExport('wn_pad_notes', new TextEncoder().encode('r')));
+  const stamped = new DataView(net.callExport('wn_pad_stamp', new Uint8Array([41, 0, 0, 0])).buffer).getUint32(0, true);
+  let refused = '';
+  try {
+    net.callExport('wn_pad_stamp', new Uint8Array([1]));
+  } catch (err) {
+    refused = err instanceof Error ? err.message : String(err);
+  }
+  return { outcome, notes: { lines: eventLines(entries, /^(pad-|device-)/), notesOfR, stamped: String(stamped), refused } };
 }
 
 /**

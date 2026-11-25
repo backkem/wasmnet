@@ -63,6 +63,13 @@ export interface NetworkOptions {
    * component runs only if one of `components` has its `digest`.
    */
   supply?: (digest: string, bytes: Uint8Array) => ComponentSource | Promise<ComponentSource>;
+  /**
+   * More import modules for the simulator module (an embedder's own build of it imports what
+   * its extensions need from the page): merged beside `wasmnet_js`. A function that must wait
+   * is passed wrapped in `WebAssembly.Suspending`, and the export that reaches it is called
+   * with `callExport(name, bytes, { promising: true })`.
+   */
+  imports?: Record<string, Record<string, unknown>>;
 }
 
 /** One end of a link: a device's port. */
@@ -253,11 +260,15 @@ export class Network {
   private readonly stdinWaiters = new Map<number, () => void>();
   private journalNext = 0;
   private panicked: string | null = null;
+  /** The simulator module's exports as they are (`callExport`). */
+  private readonly raw: Record<string, AnyFn>;
+  private readonly promisingExports = new Map<string, AnyFn>();
   /** The portable interfaces the simulator's extensions serve (`wn_interfaces`, read at creation). */
   private interfaces: PortableInterface[] = [];
 
   private constructor(instance: WebAssembly.Instance, options: NetworkOptions) {
     const raw = instance.exports as unknown as Record<string, AnyFn>;
+    this.raw = raw;
     const wrapped: Record<string, unknown> = { ...raw };
     for (const name of PROMISING) wrapped[name] = jspi.promising(raw[name]!);
     this.x = wrapped as unknown as Exports;
@@ -281,7 +292,7 @@ export class Network {
     else if (typeof simulator === 'string' || simulator instanceof URL) module = await WebAssembly.compileStreaming(fetch(simulator));
     else module = await WebAssembly.compile(simulator);
     let self: Network | null = null;
-    const imports = { wasmnet_js: Network.jsImports(() => self!) };
+    const imports = { ...(options.imports ?? {}), wasmnet_js: Network.jsImports(() => self!) };
     const instance = await WebAssembly.instantiate(module, imports);
     self = new Network(instance, options);
     return self;
@@ -713,6 +724,33 @@ export class Network {
     const id = this.withBytes(codec.encodeInfraCall(fn, args), (p, l) => this.x.wn_infra_wait(dev, p, l));
     if (id < 0) return settle(codec.decodeInfraReply(this.result()));
     return new Promise((resolve) => this.waits.set(id, resolve)).then((reply) => settle(reply as codec.InfraReply));
+  }
+
+  /**
+   * Calls an export of an embedder's own build of the simulator module
+   * (`wasmnet_web::export!`): bytes in, bytes out; an error it answers is thrown. Between steps,
+   * or from an import the module calls. With `promising`, the export may reach an import
+   * wrapped in `WebAssembly.Suspending` (`NetworkOptions.imports`): the answer is a promise.
+   */
+  callExport(name: string, bytes?: Uint8Array): Uint8Array;
+  callExport(name: string, bytes: Uint8Array, options: { promising: true }): Promise<Uint8Array>;
+  callExport(name: string, bytes: Uint8Array = new Uint8Array(), options: { promising?: boolean } = {}): Uint8Array | Promise<Uint8Array> {
+    const raw = this.raw[name];
+    if (typeof raw !== 'function') throw new Error(`the simulator module has no export ${name}`);
+    let f = raw;
+    if (options.promising) {
+      f = this.promisingExports.get(name) ?? (jspi.promising(raw) as AnyFn);
+      this.promisingExports.set(name, f);
+    }
+    const ptr = this.x.wn_alloc(bytes.length);
+    this.view(ptr, bytes.length).set(bytes);
+    const done = (len: number): Uint8Array => {
+      this.x.wn_free(ptr, bytes.length);
+      if (len < 0) throw new Error(this.resultText());
+      return this.result(len);
+    };
+    const answer = (f as unknown as (p: number, l: number) => number | Promise<number>)(ptr, bytes.length);
+    return options.promising ? Promise.resolve(answer).then(done) : done(answer as number);
   }
 
   /** One call of a portable interface (`interface#function`), served by the simulator; its error is thrown, as jco expects. */

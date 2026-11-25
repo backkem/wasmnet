@@ -210,7 +210,7 @@ fn a_portable_extension_serves_hears_and_faults_alike_at_two_seeds() {
 fn page_scenario_native() {
     let w = world();
     let mut net = Network::new(&w.host, 42);
-    net.add_extension(Pad::default().fault_at("q", 3));
+    net.add_extension(Pad::default().without("lonely"));
     net.set_component_resolver(Box::new(move |name, instantiate| match name {
         "pad_probe" => instantiate(&w.probe),
         other => Err(sim::Error::Refused(format!("no component {other}"))),
@@ -224,7 +224,18 @@ fn page_scenario_native() {
         alone.clone(),
     )
     .unwrap();
-    net.device_with_options("q", &w.probe, config(&[("period", "10ms")]), alone)
+    // As the page sets it, from a generic value: `q`'s third append faults it.
+    let mut faulty = alone.clone();
+    net.set_option(
+        &mut faulty,
+        "pad.fault-at",
+        &wasmnet_host::sim::value::Value::U32(3),
+    )
+    .unwrap();
+    net.device_with_options("q", &w.probe, config(&[("period", "10ms")]), faulty)
+        .unwrap();
+    // Given no server by the extension: its first call faults it.
+    net.device_with_options("lonely", &w.probe, config(&[("period", "10ms")]), alone)
         .unwrap();
     let spec = |period: &str| {
         let bytes = Cbor::Map(vec![
@@ -260,6 +271,13 @@ fn page_scenario_native() {
     ] {
         net.add_op(op, Placement::StartOf(at * MS)).unwrap();
     }
+    // As the page builds it: the extension's op at `p`.
+    let p = net.live_device("p").unwrap();
+    let clear = net
+        .parse_op("pad.clear", &wasmnet_host::sim::value::Value::None)
+        .unwrap();
+    net.add_op(Op::extension_at(p, clear), Placement::StartOf(100 * MS))
+        .unwrap();
     net.run_until(120 * MS)
         .unwrap_or_else(|e| panic!("{e}\n{}", transcript(&net.journal())));
     let text = lines(&net.journal()) + "\n";
