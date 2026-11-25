@@ -61,6 +61,13 @@ etherparse = "0.21"
 sha2 = "0.10"
 # HTTP/1.1 head parsing in the http-server and http-get apps (guests; no_std core).
 httparse = { version = "1.10", default-features = false }
+# Keyed tunnels in the router: ESP with ChaCha20-Poly1305 (RFC 7634), keys derived with HKDF,
+# STUN MESSAGE-INTEGRITY-SHA256. RustCrypto, pure Rust, no_std; exact pins. sha1 checks the
+# RFC 5769 vectors in the router's tests only.
+chacha20poly1305 = { version = "=0.10.1", default-features = false }
+hkdf = { version = "=0.12.4", default-features = false }
+hmac = { version = "=0.12.1", default-features = false }
+sha1 = { version = "=0.10.7", default-features = false }
 
 # smoltcp 0.14.0 with six patches: neighbor discovery is rate-limited per address, not per
 # interface; the interface and socket state can be read and restored for snapshots; TCP fast

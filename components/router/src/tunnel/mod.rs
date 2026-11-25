@@ -27,11 +27,13 @@
 //! does. A tunnel sends one to each of its `reflector`s until one answers, so a controller can
 //! read the tunnel's reflexive endpoint and hand it to the peer's controller.
 
+pub mod esp;
 pub mod geneve;
+pub mod key;
 pub mod mss;
 pub mod stun;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::net::{IpAddr, SocketAddr, SocketAddrV4};
 
@@ -48,6 +50,14 @@ pub const MAX_CANDIDATES: usize = 8;
 pub const OVERHEAD: u16 = 20 + 8 + geneve::HEADER as u16;
 /// The default tunnel MTU: a 1500-byte path minus [`OVERHEAD`].
 pub const DEFAULT_MTU: u16 = 1500 - OVERHEAD;
+/// What a keyed tunnel adds to an inner packet whose length plus 2 is a multiple of 4: the outer
+/// IPv4 header, UDP and ESP (up to 3 more bytes of padding for other lengths).
+pub const KEYED_OVERHEAD: u16 = 20 + 8 + esp::OVERHEAD as u16;
+/// A keyed tunnel's default MTU: a 1500-byte path minus [`KEYED_OVERHEAD`] (1438, so a
+/// full-size packet needs no padding).
+pub const KEYED_MTU: u16 = 1500 - KEYED_OVERHEAD;
+/// Checks a keyed tunnel remembers while it waits for their answers.
+const PENDING: usize = 16;
 
 /// Check: a request to a candidate or the peer. Query: a request to a reflector.
 const TX_CHECK: u8 = 1;
@@ -74,6 +84,8 @@ pub struct Spec {
     pub keepalive_ns: u64,
     pub dead_ns: u64,
     pub mss_clamp: bool,
+    /// The tunnel key: with one, checks are signed and data is ESP ([`key`], [`esp`]).
+    pub key: Option<key::Key>,
 }
 
 /// The keys a spec takes, in the order a listing shows them.
@@ -89,6 +101,7 @@ pub const KEYS: &[&str] = &[
     "keepalive",
     "dead",
     "mss-clamp",
+    "key",
 ];
 
 /// A tunnel name: `a-z`, `0-9` and `-`, 1 to 32 characters, starting with a letter (so it never
@@ -163,7 +176,9 @@ impl Spec {
             None => return Err("a tunnel needs `local`".to_owned()),
             Some(v) => parse_local(v)?,
         };
+        let key = seen.get("key").map(|v| key::Key::parse(v)).transpose()?;
         let udp = match seen.get("udp") {
+            None if key.is_some() => esp::PORT,
             None => geneve::PORT,
             Some(v) => v
                 .parse::<u16>()
@@ -172,6 +187,7 @@ impl Spec {
                 .ok_or_else(|| format!("udp: `{v}` is not a port 1..=65535"))?,
         };
         let mtu = match seen.get("mtu") {
+            None if key.is_some() => KEYED_MTU,
             None => DEFAULT_MTU,
             Some(v) => v
                 .parse::<u16>()
@@ -204,6 +220,7 @@ impl Spec {
             keepalive_ns: dur("keepalive", 25_000_000_000)?,
             dead_ns: dur("dead", 80_000_000_000)?,
             mss_clamp,
+            key,
         };
         if spec.dead_ns <= spec.keepalive_ns {
             return Err("dead must be longer than keepalive".to_owned());
@@ -286,6 +303,11 @@ pub struct Counters {
     pub outer_drops: u64,
     pub roamed: u64,
     pub mss_clamped: u64,
+    /// Checks, answers and data refused by a keyed tunnel (or a signed check by a keyless one):
+    /// unsigned, under another key, reflected, replayed, stale.
+    pub auth_failed: u64,
+    /// Of those, replays: a check counter or an ESP sequence number seen before.
+    pub replayed: u64,
 }
 
 /// What the router does for a tunnel.
@@ -318,6 +340,106 @@ pub struct Tunnel {
     last_rx: u64,
     since: u64,
     pub c: Counters,
+    /// A keyed tunnel's keys and what it knows of its peer's.
+    crypto: Option<Crypto>,
+    /// The reasons of refusals journalled since the tunnel last came up or changed its key: each
+    /// is journalled once, then only counted.
+    reported: Vec<&'static str>,
+    /// A keyed tunnel's checks that await an answer, oldest first, at most [`PENDING`].
+    pending: VecDeque<stun::TransactionId>,
+}
+
+/// A keyed tunnel's keys: the current one and, after a replacement, the previous one until the
+/// peer proves it has the new key (or `dead` has passed).
+#[derive(Clone, Debug)]
+struct Crypto {
+    cur: Keyed,
+    prev: Option<Keyed>,
+    /// When `prev` became previous.
+    replaced: u64,
+}
+
+/// One key at this end: its epoch, the SPI this end receives on, the STUN password, and the
+/// peer's state under it once an authenticated message told it.
+#[derive(Clone, Debug)]
+struct Keyed {
+    key: key::Key,
+    id: String,
+    epoch: u64,
+    spi: u32,
+    password: Vec<u8>,
+    peer: Option<Peer>,
+}
+
+/// The peer under one key: its SPI and epoch (`TUNNEL-SA`), the highest check counter seen
+/// from it in that epoch, and the two SAs with their sequence number and replay window.
+#[derive(Clone, Debug)]
+struct Peer {
+    spi: u32,
+    epoch: u64,
+    checks: u64,
+    out: esp::Sa,
+    seq: u32,
+    inbound: esp::Sa,
+    window: esp::Window,
+}
+
+impl Keyed {
+    fn new(key: key::Key, epoch: u64, local: IpAddr) -> Keyed {
+        Keyed {
+            id: key.id(),
+            spi: key.spi(epoch, local),
+            password: key.stun_password(),
+            epoch,
+            key,
+            peer: None,
+        }
+    }
+
+    fn sa(&self) -> (u32, u64) {
+        (self.spi, self.epoch)
+    }
+
+    /// The peer's `TUNNEL-SA` in an authenticated message, with its check counter if it is a
+    /// check: refused if reflected, older than what is known, or a replayed check. A newer
+    /// epoch (the peer restarted or set the key again) starts fresh SAs.
+    fn learn(&mut self, sa: (u32, u64), check: Option<u64>) -> Result<(), &'static str> {
+        let (spi, epoch) = sa;
+        if spi == self.spi {
+            return Err("reflected");
+        }
+        match &self.peer {
+            Some(p) if epoch < p.epoch || (epoch == p.epoch && spi != p.spi) => {
+                return Err("stale");
+            }
+            Some(p) if epoch == p.epoch => {}
+            _ => {
+                self.peer = Some(Peer {
+                    spi,
+                    epoch,
+                    checks: 0,
+                    out: esp::Sa::new(&self.key.esp(spi, self.epoch)),
+                    seq: 0,
+                    inbound: esp::Sa::new(&self.key.esp(self.spi, epoch)),
+                    window: esp::Window::default(),
+                });
+            }
+        }
+        if let (Some(n), Some(p)) = (check, self.peer.as_mut()) {
+            if n <= p.checks {
+                return Err("replayed");
+            }
+            p.checks = n;
+        }
+        Ok(())
+    }
+}
+
+/// Which of a keyed tunnel's keys a message checked under.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Which {
+    Cur,
+    Prev,
 }
 
 fn ev(kind: &'static str, fields: Vec<(&str, String)>) -> Action {
@@ -354,10 +476,18 @@ pub fn parse_txid(t: &stun::TransactionId) -> (u8, u32, u64) {
 impl Tunnel {
     /// A new tunnel at `now`; its first round is due at once.
     pub fn new(name: &str, spec: Spec, now: u64) -> Tunnel {
+        let crypto = spec.key.clone().map(|k| Crypto {
+            cur: Keyed::new(k, now, spec.local.0),
+            prev: None,
+            replaced: now,
+        });
         let mut t = Tunnel {
             name: name.to_owned(),
             candidates: spec.peers.clone(),
             spec,
+            crypto,
+            reported: Vec::new(),
+            pending: VecDeque::new(),
             state: State::Idle,
             peer: None,
             reflexive: None,
@@ -397,13 +527,22 @@ impl Tunnel {
 
     /// The next instant `poll` has work.
     pub fn deadline(&self) -> Option<u64> {
-        match self.state {
+        let retire = self
+            .crypto
+            .as_ref()
+            .filter(|c| c.prev.is_some())
+            .map(|c| c.replaced.saturating_add(self.spec.dead_ns));
+        let own = match self.state {
             State::Up => Some(
                 self.next
                     .min(self.last_rx.saturating_add(self.spec.dead_ns)),
             ),
             State::Probing => Some(self.next),
             State::Idle | State::Failed => None,
+        };
+        match (own, retire) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
         }
     }
 
@@ -411,12 +550,32 @@ impl Tunnel {
         self.seq += 1;
         self.c.checks_sent += 1;
         let t = txid(TX_CHECK, self.spec.id, self.seq);
-        let datagram = stun::request(&t, Some(&self.spec.id.to_string()));
+        let user = self.spec.id.to_string();
+        let datagram = match &self.crypto {
+            Some(c) => {
+                if self.pending.len() == PENDING {
+                    self.pending.pop_front();
+                }
+                self.pending.push_back(t);
+                stun::request_signed(&t, &user, c.cur.sa(), &c.cur.password)
+            }
+            None => stun::request(&t, Some(&user)),
+        };
         out.push(Action::Send { to, datagram });
     }
 
     /// Timers: a probing round, a keepalive, or the peer gone silent.
     pub fn poll(&mut self, now: u64, out: &mut Vec<Action>) {
+        if let Some(c) = self.crypto.as_mut()
+            && c.prev.is_some()
+            && now >= c.replaced.saturating_add(self.spec.dead_ns)
+            && let Some(old) = c.prev.take()
+        {
+            out.push(ev(
+                "tunnel-key-retired",
+                vec![("tunnel", self.name.clone()), ("key", old.id)],
+            ));
+        }
         if self.state == State::Up && now >= self.last_rx.saturating_add(self.spec.dead_ns) {
             out.push(ev(
                 "tunnel-down",
@@ -540,6 +699,7 @@ impl Tunnel {
         self.last_rx = now;
         if self.state != State::Up {
             self.state = State::Up;
+            self.reported.clear();
             self.peer = Some(from);
             self.next = now + self.spec.keepalive_ns;
             out.push(ev(
@@ -632,12 +792,300 @@ impl Tunnel {
         self.heard(now, from, out);
     }
 
+    // ---- keys ------------------------------------------------------------------------------
+
+    /// Whether the tunnel has a key.
+    pub fn keyed(&self) -> bool {
+        self.crypto.is_some()
+    }
+
+    /// The current key's id (`-` without a key).
+    pub fn key_id(&self) -> String {
+        self.crypto
+            .as_ref()
+            .map_or_else(|| "-".to_owned(), |c| c.cur.id.clone())
+    }
+
+    /// Whether this tunnel receives ESP on `spi` (under its current or previous key).
+    pub fn has_spi(&self, spi: u32) -> bool {
+        self.crypto
+            .as_ref()
+            .is_some_and(|c| c.cur.spi == spi || c.prev.as_ref().is_some_and(|p| p.spi == spi))
+    }
+
+    /// A message refused for `reason`: counted, and journalled as `tunnel-auth-failed` the
+    /// first time this reason comes since the tunnel came up or changed its key.
+    pub fn refuse(&mut self, reason: &'static str, from: SocketAddrV4, out: &mut Vec<Action>) {
+        self.c.auth_failed += 1;
+        if reason == "replayed" {
+            self.c.replayed += 1;
+        }
+        if !self.reported.contains(&reason) {
+            self.reported.push(reason);
+            out.push(ev(
+                "tunnel-auth-failed",
+                vec![
+                    ("tunnel", self.name.clone()),
+                    ("from", from.to_string()),
+                    ("reason", reason.to_owned()),
+                ],
+            ));
+        }
+    }
+
+    /// Which key a signed message checks under, if any, and its `TUNNEL-SA`.
+    fn authenticate(
+        &self,
+        d: &[u8],
+        signed: &stun::Signed,
+    ) -> Result<(Which, (u32, u64)), &'static str> {
+        let Some(c) = &self.crypto else {
+            return Err("keyed-peer");
+        };
+        let Some(i) = &signed.integrity else {
+            return Err("unsigned");
+        };
+        let which = if stun::verify(d, i, &c.cur.password) {
+            Which::Cur
+        } else if c
+            .prev
+            .as_ref()
+            .is_some_and(|p| stun::verify(d, i, &p.password))
+        {
+            Which::Prev
+        } else {
+            return Err("integrity");
+        };
+        let sa = signed.sa.ok_or("unsigned")?;
+        Ok((which, sa))
+    }
+
+    fn keyed_mut(&mut self, which: Which) -> Option<&mut Keyed> {
+        let c = self.crypto.as_mut()?;
+        match which {
+            Which::Cur => Some(&mut c.cur),
+            Which::Prev => c.prev.as_mut(),
+        }
+    }
+
+    /// A message under the current key proves the peer has it: the previous key goes.
+    fn confirmed(&mut self, which: Which, out: &mut Vec<Action>) {
+        if which != Which::Cur {
+            return;
+        }
+        if let Some(c) = self.crypto.as_mut()
+            && let Some(old) = c.prev.take()
+        {
+            out.push(ev(
+                "tunnel-key-confirmed",
+                vec![
+                    ("tunnel", self.name.clone()),
+                    ("key", c.cur.id.clone()),
+                    ("previous", old.id),
+                ],
+            ));
+        }
+    }
+
+    /// A check (`d`, decoded) for this tunnel from `from`. Without a key, as [`on_request`]
+    /// (a signed check is refused: the peer has a key this end lacks). With one, only a check
+    /// that checks under the current or previous key, is not reflected, stale or replayed, is
+    /// answered (signed, with the same key) and counts as hearing the peer.
+    ///
+    /// [`on_request`]: Self::on_request
+    pub fn on_request_signed(
+        &mut self,
+        now: u64,
+        from: SocketAddrV4,
+        t: &stun::TransactionId,
+        d: &[u8],
+        signed: &stun::Signed,
+        out: &mut Vec<Action>,
+    ) {
+        if self.crypto.is_none() {
+            if signed.integrity.is_some() {
+                self.refuse("keyed-peer", from, out);
+            } else {
+                self.on_request(now, from, t, out);
+            }
+            return;
+        }
+        let (which, sa) = match self.authenticate(d, signed) {
+            Ok(a) => a,
+            Err(r) => return self.refuse(r, from, out),
+        };
+        let (_, _, counter) = parse_txid(t);
+        let k = self.keyed_mut(which).expect("authenticated");
+        if let Err(r) = k.learn(sa, Some(counter)) {
+            return self.refuse(r, from, out);
+        }
+        let datagram = stun::success_signed(t, SocketAddr::V4(from), k.sa(), &k.password);
+        self.c.requests_received += 1;
+        out.push(Action::Send { to: from, datagram });
+        self.confirmed(which, out);
+        if self.state == State::Up {
+            self.heard(now, from, out);
+        } else {
+            self.add_candidate(now, from, "peer-reflexive", out);
+        }
+    }
+
+    /// A success response (`d`, decoded) for this tunnel. Without a key, as [`on_response`]. A
+    /// keyed tunnel takes an answer to a reflector query as a keyless one does (its reflexive
+    /// endpoint, nothing more); an answer to a check counts only if it checks under one of its
+    /// keys and answers a check it is still waiting for (each once).
+    ///
+    /// [`on_response`]: Self::on_response
+    #[allow(clippy::too_many_arguments)] // the decoded message and its bytes, as on_response takes
+    pub fn on_response_signed(
+        &mut self,
+        now: u64,
+        from: SocketAddrV4,
+        t: &stun::TransactionId,
+        mapped: Option<SocketAddr>,
+        d: &[u8],
+        signed: &stun::Signed,
+        out: &mut Vec<Action>,
+    ) {
+        let (kind, _, _) = parse_txid(t);
+        if self.crypto.is_none() || kind == TX_QUERY {
+            if self.crypto.is_none() && signed.integrity.is_some() {
+                return self.refuse("keyed-peer", from, out);
+            }
+            return self.on_response(now, from, t, mapped, out);
+        }
+        let (which, sa) = match self.authenticate(d, signed) {
+            Ok(a) => a,
+            Err(r) => return self.refuse(r, from, out),
+        };
+        let Some(at) = self.pending.iter().position(|p| p == t) else {
+            return self.refuse("unexpected", from, out);
+        };
+        if let Err(r) = self
+            .keyed_mut(which)
+            .expect("authenticated")
+            .learn(sa, None)
+        {
+            return self.refuse(r, from, out);
+        }
+        self.pending.remove(at);
+        self.confirmed(which, out);
+        self.on_response(now, from, t, mapped, out);
+    }
+
+    /// An ESP packet `d` for one of this tunnel's SPIs from `from`: its inner packet, once it
+    /// opened under the SA of the key that SPI belongs to and was not a replay; the peer is
+    /// heard (and may roam) only then.
+    pub fn on_esp(
+        &mut self,
+        now: u64,
+        from: SocketAddrV4,
+        d: &[u8],
+        out: &mut Vec<Action>,
+    ) -> Option<Vec<u8>> {
+        let spi = esp::spi_of(d)?;
+        let which = match &self.crypto {
+            Some(c) if c.cur.spi == spi => Which::Cur,
+            Some(c) if c.prev.as_ref().is_some_and(|p| p.spi == spi) => Which::Prev,
+            _ => return None,
+        };
+        let k = self.keyed_mut(which).expect("its SPI");
+        let Some(p) = k.peer.as_mut() else {
+            self.refuse("no-sa", from, out);
+            return None;
+        };
+        let inner = match esp::open(&p.inbound, &mut p.window, d) {
+            Ok((inner, _)) => inner,
+            Err(esp::Error::Replayed) => {
+                self.refuse("replayed", from, out);
+                return None;
+            }
+            Err(_) => {
+                self.refuse("esp", from, out);
+                return None;
+            }
+        };
+        self.confirmed(which, out);
+        self.on_data(now, from, inner.len(), out);
+        Some(inner)
+    }
+
+    /// The ESP packet for `inner` toward the peer, under the newest key the peer has proven it
+    /// holds; `None` when it has proven none yet, or that key's SA has used every sequence
+    /// number (the controller must replace the key).
+    pub fn seal(&mut self, inner: &[u8], out: &mut Vec<Action>) -> Option<Vec<u8>> {
+        let name = self.name.clone();
+        let c = self.crypto.as_mut()?;
+        let k = if c.cur.peer.is_some() {
+            &mut c.cur
+        } else {
+            c.prev.as_mut().filter(|p| p.peer.is_some())?
+        };
+        let p = k.peer.as_mut()?;
+        if p.seq == u32::MAX {
+            if !self.reported.contains(&"exhausted") {
+                self.reported.push("exhausted");
+                out.push(ev(
+                    "tunnel-key-exhausted",
+                    vec![("tunnel", name), ("key", k.id.clone())],
+                ));
+            }
+            return None;
+        }
+        p.seq += 1;
+        Some(esp::seal(&p.out, p.spi, p.seq, inner))
+    }
+
+    /// Replaces the key: the new one is current from now on (a new epoch, a new SPI, checks
+    /// signed with it at once); the old one stays as the previous key, still accepted and still
+    /// used to send, until the peer proves it holds the new one or `dead` has passed. `false`:
+    /// the tunnel has this key already, or none at all (a keyless tunnel gets one only by being
+    /// added again).
+    pub fn replace_key(
+        &mut self,
+        now: u64,
+        key: key::Key,
+        out: &mut Vec<Action>,
+    ) -> Result<bool, String> {
+        let local = self.spec.local.0;
+        let Some(c) = self.crypto.as_mut() else {
+            return Err(format!(
+                "tunnel `{}` has no key: remove it and add it again with one",
+                self.name
+            ));
+        };
+        if c.cur.key == key {
+            return Ok(false);
+        }
+        let epoch = now.max(c.cur.epoch + 1);
+        let new = Keyed::new(key.clone(), epoch, local);
+        let old = std::mem::replace(&mut c.cur, new);
+        out.push(ev(
+            "tunnel-key-replaced",
+            vec![
+                ("tunnel", self.name.clone()),
+                ("key", c.cur.id.clone()),
+                ("previous", old.id.clone()),
+            ],
+        ));
+        c.prev = Some(old);
+        c.replaced = now;
+        self.spec.key = Some(key);
+        self.reported.clear();
+        self.pending.clear();
+        // Tell the peer at once: a check under the new key now, not at the next keepalive.
+        if self.state == State::Up {
+            self.next = now;
+        }
+        Ok(true)
+    }
+
     /// One line of the `tunnels` listing: the name, then `<key> <value>` pairs.
     pub fn listing(&self) -> String {
         let cands: Vec<String> = self.candidates.iter().map(ToString::to_string).collect();
         format!(
             "{} id {} udp {} local {}/{} state {} peer {} reflexive {} candidates {} \
-             tx-packets {} rx-packets {}",
+             tx-packets {} rx-packets {}{}",
             self.name,
             self.spec.id,
             self.spec.udp,
@@ -653,6 +1101,12 @@ impl Tunnel {
             },
             self.c.tx_packets,
             self.c.rx_packets,
+            // Only a keyed tunnel lists its key, so a keyless line is as it was.
+            if self.keyed() {
+                format!(" key {}", self.key_id())
+            } else {
+                String::new()
+            },
         )
     }
 }
@@ -663,5 +1117,7 @@ impl fmt::Display for State {
     }
 }
 
+#[cfg(test)]
+mod keyed_tests;
 #[cfg(test)]
 mod tests;

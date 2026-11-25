@@ -63,6 +63,14 @@ impl Tunnels {
             .position(|s| s.as_ref().is_some_and(|t| t.name == name))
     }
 
+    /// The keyed tunnel on `udp` that receives ESP on `spi`.
+    fn slot_for_spi(&self, udp: u16, spi: u32) -> Option<usize> {
+        self.slots.iter().position(|s| {
+            s.as_ref()
+                .is_some_and(|t| t.spec.udp == udp && t.has_spi(spi))
+        })
+    }
+
     fn slot_for(&self, udp: u16, id: u32) -> Option<usize> {
         self.slots.iter().position(|s| {
             s.as_ref()
@@ -228,16 +236,18 @@ impl Router {
         self.routes.insert(connected_route(&spec, port));
         self.filter.set_name(port, Some(name));
         self.traced_dsts.clear();
-        out.event(Event::new(
-            "tunnel-added",
-            vec![
-                kv("tunnel", name),
-                kv("id", spec.id),
-                kv("udp", spec.udp),
-                kv("local", format!("{}/{}", spec.local.0, spec.local.1)),
-                kv("mtu", spec.mtu),
-            ],
-        ));
+        let mut fields = vec![
+            kv("tunnel", name),
+            kv("id", spec.id),
+            kv("udp", spec.udp),
+            kv("local", format!("{}/{}", spec.local.0, spec.local.1)),
+            kv("mtu", spec.mtu),
+        ];
+        // A keyless tunnel's event is as it was before tunnels had keys.
+        if let Some(k) = &spec.key {
+            fields.push(kv("key", k.id()));
+        }
+        out.event(Event::new("tunnel-added", fields));
         self.tunnels.used = true;
         self.tunnels.slots[slot] = Some(Tunnel::new(name, spec, now));
         Ok("added".to_owned())
@@ -326,6 +336,32 @@ impl Router {
         Ok(done.to_owned())
     }
 
+    /// `tunnel-key <name> <64 hex digits>`: a keyed tunnel's new key (see
+    /// [`Tunnel::replace_key`]).
+    pub(super) fn tunnel_key(
+        &mut self,
+        now: u64,
+        text: &str,
+        out: &mut impl Sink,
+    ) -> Result<String, String> {
+        let words: Vec<&str> = text.split_whitespace().collect();
+        let [name, key] = words.as_slice() else {
+            return Err("needs `<tunnel> <key>`, the key as 64 hex digits".to_owned());
+        };
+        let key = tunnel::key::Key::parse(key)?;
+        let slot = self
+            .tunnels
+            .slot_of(name)
+            .ok_or_else(|| format!("no tunnel `{name}`"))?;
+        let mut actions = Vec::new();
+        let Some(t) = self.tunnels.slots[slot].as_mut() else {
+            return Err(format!("no tunnel `{name}`"));
+        };
+        let changed = t.replace_key(now, key, &mut actions)?;
+        self.apply(now, slot, actions, out);
+        Ok(if changed { "replaced" } else { "unchanged" }.to_owned())
+    }
+
     /// `tunnels`: one line per tunnel, by name.
     pub(super) fn tunnel_listing(&self) -> String {
         let mut lines: Vec<String> = self.tunnels.iter().map(Tunnel::listing).collect();
@@ -408,9 +444,26 @@ impl Router {
         if t.spec.mss_clamp && mss::clamp(&mut packet, t.spec.mtu) {
             t.c.mss_clamped += 1;
         }
+        let datagram = if t.keyed() {
+            let mut actions = Vec::new();
+            let sealed = t.seal(&packet, &mut actions);
+            if sealed.is_none() {
+                t.c.down_drops += 1;
+            }
+            self.apply(now, slot, actions, out);
+            match sealed {
+                Some(d) => d,
+                None => return,
+            }
+        } else {
+            geneve::encap(t.spec.id, &packet)
+        };
+        let Some(t) = self.tunnels.slots[slot].as_mut() else {
+            return;
+        };
         t.c.tx_packets += 1;
         t.c.tx_bytes += packet.len() as u64;
-        let (udp, datagram) = (t.spec.udp, geneve::encap(t.spec.id, &packet));
+        let udp = t.spec.udp;
         if !self.outer_send(now, None, udp, peer, &datagram, out)
             && let Some(t) = self.tunnels.slots[slot].as_mut()
         {
@@ -471,7 +524,7 @@ impl Router {
         payload: &[u8],
         out: &mut impl Sink,
     ) {
-        let msg = match stun::parse(payload) {
+        let (msg, signed) = match stun::parse_signed(payload) {
             Ok(m) => m,
             Err(_) => {
                 self.tunnels.c.malformed += 1;
@@ -501,7 +554,7 @@ impl Router {
                 };
                 let mut actions = Vec::new();
                 if let Some(t) = self.tunnels.slots[slot].as_mut() {
-                    t.on_request(now, from, &txid, &mut actions);
+                    t.on_request_signed(now, from, &txid, payload, &signed, &mut actions);
                 }
                 // The answer leaves from the address the check was sent to.
                 for a in actions {
@@ -521,7 +574,7 @@ impl Router {
                 };
                 let mut actions = Vec::new();
                 if let Some(t) = self.tunnels.slots[slot].as_mut() {
-                    t.on_response(now, from, &txid, mapped, &mut actions);
+                    t.on_response_signed(now, from, &txid, mapped, payload, &signed, &mut actions);
                 }
                 self.apply(now, slot, actions, out);
             }
@@ -537,6 +590,10 @@ impl Router {
         payload: &[u8],
         out: &mut impl Sink,
     ) {
+        // ESP: an SPI with its top bit set, which neither STUN nor Geneve (version 0) has.
+        if payload.first().is_some_and(|b| b & 0x80 != 0) {
+            return self.esp_in(now, dport, from, payload, out);
+        }
         let Ok(g) = geneve::decap(payload) else {
             self.tunnels.c.malformed += 1;
             return;
@@ -551,8 +608,15 @@ impl Router {
             self.tunnels.c.malformed += 1;
             return;
         }
-        let mut inner = g.inner.to_vec();
         let mut actions = Vec::new();
+        // A keyed tunnel never takes cleartext.
+        if let Some(t) = self.tunnels.slots[slot].as_mut()
+            && t.keyed()
+        {
+            t.refuse("cleartext", from, &mut actions);
+            return self.apply(now, slot, actions, out);
+        }
+        let mut inner = g.inner.to_vec();
         if let Some(t) = self.tunnels.slots[slot].as_mut() {
             t.on_data(now, from, inner.len(), &mut actions);
             if t.spec.mss_clamp && mss::clamp(&mut inner, t.spec.mtu) {
@@ -560,11 +624,48 @@ impl Router {
             }
         }
         self.apply(now, slot, actions, out);
+        self.inner_in(now, slot, &inner, out);
+    }
+
+    /// An ESP packet for a keyed tunnel: opened by the tunnel whose SPI it names.
+    fn esp_in(
+        &mut self,
+        now: u64,
+        dport: u16,
+        from: SocketAddrV4,
+        payload: &[u8],
+        out: &mut impl Sink,
+    ) {
+        let slot =
+            tunnel::esp::spi_of(payload).and_then(|spi| self.tunnels.slot_for_spi(dport, spi));
+        let Some(slot) = slot else {
+            self.tunnels.c.unknown_id += 1;
+            return;
+        };
+        let mut actions = Vec::new();
+        let mut inner = None;
+        if let Some(t) = self.tunnels.slots[slot].as_mut() {
+            inner = t.on_esp(now, from, payload, &mut actions);
+            if let Some(i) = inner.as_mut()
+                && t.spec.mss_clamp
+                && mss::clamp(i, t.spec.mtu)
+            {
+                t.c.mss_clamped += 1;
+            }
+        }
+        self.apply(now, slot, actions, out);
+        if let Some(inner) = inner {
+            self.inner_in(now, slot, &inner, out);
+        }
+    }
+
+    /// An inner packet that came out of tunnel `slot`: it enters the router on the tunnel's port.
+    fn inner_in(&mut self, now: u64, slot: usize, inner: &[u8], out: &mut impl Sink) {
         let port = (self.cabled() + slot) as u32;
-        if expected == 6 {
-            self.ipv6_in(now, port, MacAddr([0; 6]), &inner, out);
+        if inner.first().map(|b| b >> 4) == Some(6) {
+            self.ipv6_in(now, port, MacAddr([0; 6]), inner, out);
         } else {
-            self.ipv4_in(now, port, &inner, out);
+            self.ipv4_in(now, port, inner, out);
         }
     }
 
@@ -628,6 +729,8 @@ impl Router {
                 ("outer-drops", c.outer_drops),
                 ("roamed", c.roamed),
                 ("mss-clamped", c.mss_clamped),
+                ("auth-failed", c.auth_failed),
+                ("replayed", c.replayed),
                 ("up", u64::from(t.state() == tunnel::State::Up)),
             ] {
                 v.push((format!("tunnel-{name}-{k}"), val));
@@ -641,8 +744,13 @@ impl Router {
             lines.push(format!("  stun server: udp {p}"));
         }
         for t in self.tunnels.iter() {
+            let key = if t.keyed() {
+                format!(" key {}", t.key_id())
+            } else {
+                String::new()
+            };
             lines.push(format!(
-                "  tunnel {}: id {} udp {} local {}/{} mtu {} peers {}",
+                "  tunnel {}: id {} udp {} local {}/{} mtu {} peers {}{key}",
                 t.name,
                 t.spec.id,
                 t.spec.udp,

@@ -1999,6 +1999,7 @@ impl Router {
             "tunnel-remove" => self.tunnel_remove(argument, out),
             "tunnel-peer" => self.tunnel_peer(now, argument, true, out),
             "tunnel-peer-remove" => self.tunnel_peer(now, argument, false, out),
+            "tunnel-key" => self.tunnel_key(now, argument, out),
             "tunnels" if argument.is_empty() => Ok(self.tunnel_listing()),
             "forward-add" => self.forward_add(now, argument, out),
             "forward-remove" => self.forward_remove(argument, out),

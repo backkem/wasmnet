@@ -22,12 +22,17 @@ crate-type = ["cdylib"]
 [dependencies]
 wasmnet-wire = { path = "../../crates/wasmnet-wire" }
 etherparse = { workspace = true }
+chacha20poly1305.workspace = true
+hkdf.workspace = true
+hmac.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 wit-bindgen = { workspace = true, features = ["macros", "realloc"] }
 
 [dev-dependencies]
 # Runs inside wasmtime too (wasm32-wasip2 has std and getrandom support).
 proptest = { workspace = true }
+sha1.workspace = true
 
 [lints]
 workspace = true

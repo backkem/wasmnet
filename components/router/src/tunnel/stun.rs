@@ -5,9 +5,17 @@
 //! magic cookie at bytes 4..8, where a Geneve header has its VNI and a reserved zero byte, so
 //! no Geneve packet can be taken for STUN.
 //!
-//! No `MESSAGE-INTEGRITY` and no `FINGERPRINT`: there are no credentials to check yet.
+//! A keyed tunnel signs its checks and their answers with `MESSAGE-INTEGRITY-SHA256` (RFC 8489
+//! §14.6) under a short-term password derived from the tunnel key ([`super::key`]), and adds
+//! `TUNNEL-SA` ([`ATTR_TUNNEL_SA`]): the SPI the sender receives ESP on and its epoch. Received
+//! messages are parsed with both ([`parse_signed`]); attributes after an integrity attribute
+//! other than `FINGERPRINT` are ignored, as RFC 8489 §14.5-14.6 ask. No `FINGERPRINT` is sent.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+use hmac::digest::KeyInit;
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
 
 /// The magic cookie, bytes 4..8 of every STUN message.
 pub const MAGIC: u32 = 0x2112_A442;
@@ -19,6 +27,14 @@ const BINDING_SUCCESS: u16 = 0x0101;
 const BINDING_ERROR: u16 = 0x0111;
 const ATTR_USERNAME: u16 = 0x0006;
 const ATTR_XOR_MAPPED_ADDRESS: u16 = 0x0020;
+const ATTR_MESSAGE_INTEGRITY: u16 = 0x0008;
+const ATTR_MESSAGE_INTEGRITY_SHA256: u16 = 0x001C;
+/// `TUNNEL-SA`: the sender's inbound SPI (4 bytes) and epoch (8 bytes), big-endian. A
+/// comprehension-optional attribute of this library's own (not registered with IANA), so a
+/// STUN agent that does not know it skips it.
+pub const ATTR_TUNNEL_SA: u16 = 0xC0E5;
+/// `MESSAGE-INTEGRITY-SHA256`'s value as sent: the whole HMAC-SHA256.
+pub const INTEGRITY_SHA256: usize = 32;
 /// RFC 8489 §14.3: at most 763 bytes before padding; ours are much shorter.
 const MAX_USERNAME: usize = 763;
 
@@ -154,6 +170,32 @@ fn parse_xor_address(txid: &TransactionId, v: &[u8]) -> Result<SocketAddr, Error
 /// attributes (0x8000 and up) are skipped; an unknown comprehension-required one rejects the
 /// message, as RFC 8489 §7.3.1 asks (a server would answer 420; this side only drops it).
 pub fn parse(d: &[u8]) -> Result<Message, Error> {
+    parse_signed(d).map(|(m, _)| m)
+}
+
+/// A message integrity attribute as received: where it starts and its value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Integrity {
+    /// `MESSAGE-INTEGRITY-SHA256` (`false`: `MESSAGE-INTEGRITY`, HMAC-SHA1).
+    pub sha256: bool,
+    /// The offset of the attribute's header in the message.
+    pub offset: usize,
+    pub value: Vec<u8>,
+}
+
+/// What a keyed tunnel reads besides the message itself.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Signed {
+    /// The first integrity attribute; the attributes before it are what it covers.
+    pub integrity: Option<Integrity>,
+    /// `TUNNEL-SA` (only one before the integrity attribute counts): the sender's SPI and epoch.
+    pub sa: Option<(u32, u64)>,
+}
+
+/// [`parse`], with the integrity attribute and `TUNNEL-SA`. Attributes after the first
+/// integrity attribute are not used (RFC 8489 §14.5-14.6), except that a `FINGERPRINT` may
+/// follow; anything else there is ignored, so it cannot change what the message says.
+pub fn parse_signed(d: &[u8]) -> Result<(Message, Signed), Error> {
     if !is_stun(d) {
         return Err(Error::NotStun);
     }
@@ -166,12 +208,19 @@ pub fn parse(d: &[u8]) -> Result<Message, Error> {
     txid.copy_from_slice(&d[8..20]);
     let mut username = None;
     let mut mapped = None;
+    let mut signed = Signed::default();
     let mut at = HEADER;
     while at < d.len() {
         let head = d.get(at..at + 4).ok_or(Error::Attribute)?;
         let t = u16::from_be_bytes([head[0], head[1]]);
         let l = usize::from(u16::from_be_bytes([head[2], head[3]]));
         let value = d.get(at + 4..at + 4 + l).ok_or(Error::Attribute)?;
+        if signed.integrity.is_some() {
+            // Covered by nothing: ignored, required or not (a FINGERPRINT, a
+            // MESSAGE-INTEGRITY-SHA256 after a MESSAGE-INTEGRITY, anything else).
+            at += padded(l);
+            continue;
+        }
         match t {
             ATTR_USERNAME => {
                 if l > MAX_USERNAME {
@@ -181,17 +230,105 @@ pub fn parse(d: &[u8]) -> Result<Message, Error> {
                 username = Some(u.to_owned());
             }
             ATTR_XOR_MAPPED_ADDRESS => mapped = Some(parse_xor_address(&txid, value)?),
+            ATTR_MESSAGE_INTEGRITY | ATTR_MESSAGE_INTEGRITY_SHA256 => {
+                let sha256 = t == ATTR_MESSAGE_INTEGRITY_SHA256;
+                let ok = if sha256 {
+                    (16..=32).contains(&l) && l % 4 == 0
+                } else {
+                    l == 20
+                };
+                if !ok {
+                    return Err(Error::Value);
+                }
+                signed.integrity = Some(Integrity {
+                    sha256,
+                    offset: at,
+                    value: value.to_vec(),
+                });
+            }
+            ATTR_TUNNEL_SA => {
+                let v: [u8; 12] = value.try_into().map_err(|_| Error::Value)?;
+                if signed.sa.is_none() {
+                    let spi = u32::from_be_bytes([v[0], v[1], v[2], v[3]]);
+                    let mut e = [0u8; 8];
+                    e.copy_from_slice(&v[4..]);
+                    signed.sa = Some((spi, u64::from_be_bytes(e)));
+                }
+            }
             t if t < 0x8000 => return Err(Error::Unknown),
             _ => {}
         }
         at += padded(l);
     }
-    match kind {
-        BINDING_REQUEST => Ok(Message::Request { txid, username }),
-        BINDING_SUCCESS => Ok(Message::Success { txid, mapped }),
-        BINDING_ERROR => Ok(Message::Error { txid }),
-        _ => Err(Error::Method),
+    let m = match kind {
+        BINDING_REQUEST => Message::Request { txid, username },
+        BINDING_SUCCESS => Message::Success { txid, mapped },
+        BINDING_ERROR => Message::Error { txid },
+        _ => return Err(Error::Method),
+    };
+    Ok((m, signed))
+}
+
+/// The HMAC input for an integrity attribute at `offset` with a value of `value_len` bytes: the
+/// message up to the attribute, its length field set as if the attribute ended it.
+fn integrity_input(d: &[u8], offset: usize, value_len: usize) -> Vec<u8> {
+    let mut m = d[..offset].to_vec();
+    let len = (offset - HEADER + 4 + value_len) as u16;
+    m[2..4].copy_from_slice(&len.to_be_bytes());
+    m
+}
+
+fn hmac_sha256(password: &[u8]) -> Hmac<Sha256> {
+    <Hmac<Sha256> as KeyInit>::new_from_slice(password).expect("HMAC takes any key")
+}
+
+/// Whether `d`'s `MESSAGE-INTEGRITY-SHA256` checks under `password` (in constant time). A
+/// `MESSAGE-INTEGRITY` (HMAC-SHA1) never does: a keyed tunnel takes only SHA-256.
+pub fn verify(d: &[u8], integrity: &Integrity, password: &[u8]) -> bool {
+    if !integrity.sha256 || integrity.offset > d.len() {
+        return false;
     }
+    let mut mac = hmac_sha256(password);
+    mac.update(&integrity_input(d, integrity.offset, integrity.value.len()));
+    mac.verify_truncated_left(&integrity.value).is_ok()
+}
+
+/// Appends `TUNNEL-SA` and then `MESSAGE-INTEGRITY-SHA256` under `password` to message `m`.
+fn sign(mut m: Vec<u8>, sa: (u32, u64), password: &[u8]) -> Vec<u8> {
+    let mut v = [0u8; 12];
+    v[..4].copy_from_slice(&sa.0.to_be_bytes());
+    v[4..].copy_from_slice(&sa.1.to_be_bytes());
+    attribute(&mut m, ATTR_TUNNEL_SA, &v);
+    let offset = m.len();
+    let mut mac = hmac_sha256(password);
+    mac.update(&integrity_input(&m, offset, INTEGRITY_SHA256));
+    let tag = mac.finalize().into_bytes();
+    attribute(&mut m, ATTR_MESSAGE_INTEGRITY_SHA256, &tag);
+    let len = (m.len() - HEADER) as u16;
+    m[2..4].copy_from_slice(&len.to_be_bytes());
+    m
+}
+
+/// A keyed tunnel's check: a Binding request with `USERNAME`, `TUNNEL-SA` and
+/// `MESSAGE-INTEGRITY-SHA256`.
+pub fn request_signed(
+    txid: &TransactionId,
+    username: &str,
+    sa: (u32, u64),
+    password: &[u8],
+) -> Vec<u8> {
+    sign(request(txid, Some(username)), sa, password)
+}
+
+/// A keyed tunnel's answer to a check: [`success`] with `TUNNEL-SA` and
+/// `MESSAGE-INTEGRITY-SHA256`.
+pub fn success_signed(
+    txid: &TransactionId,
+    mapped: SocketAddr,
+    sa: (u32, u64),
+    password: &[u8],
+) -> Vec<u8> {
+    sign(success(txid, mapped), sa, password)
 }
 
 #[cfg(test)]
@@ -283,7 +420,7 @@ mod tests {
         assert_eq!(parse(&long), Err(Error::Attribute));
         // A comprehension-required attribute we do not know, and an optional one we skip.
         let mut m = header(BINDING_REQUEST, 8, &TX);
-        attribute(&mut m, 0x0008, &[0; 4]);
+        attribute(&mut m, 0x0009, &[0; 4]);
         assert_eq!(parse(&m), Err(Error::Unknown));
         let mut m = header(BINDING_REQUEST, 8, &TX);
         attribute(&mut m, 0x8022, &[0; 4]);
@@ -296,6 +433,129 @@ mod tests {
         assert!(!is_stun(&[
             0, 0, 0x86, 0xdd, 0x21, 0x12, 0xa4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
         ]));
+    }
+
+    fn unhex(s: &str) -> Vec<u8> {
+        let s: String = s.split_whitespace().collect();
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// HMAC-SHA1 over a message up to its `MESSAGE-INTEGRITY`, as RFC 5769 computes it: checks
+    /// the length adjustment and the input this module also feeds HMAC-SHA256.
+    fn rfc_5769_integrity(m: &[u8]) {
+        use hmac::Hmac;
+        use sha1::Sha1;
+        let (_, signed) = parse_signed(m).unwrap();
+        let i = signed.integrity.expect("MESSAGE-INTEGRITY");
+        assert!(!i.sha256);
+        let mut mac = <Hmac<Sha1> as KeyInit>::new_from_slice(b"VOkJxbRl1RmTxUk/WvJxBt").unwrap();
+        mac.update(&integrity_input(m, i.offset, i.value.len()));
+        assert!(mac.verify_slice(&i.value).is_ok());
+        assert!(
+            !verify(m, &i, b"VOkJxbRl1RmTxUk/WvJxBt"),
+            "SHA-1 is never enough"
+        );
+    }
+
+    #[test]
+    fn integrity_matches_rfc_5769() {
+        // §2.1: a request with SOFTWARE, PRIORITY, ICE-CONTROLLED, USERNAME, MESSAGE-INTEGRITY
+        // and FINGERPRINT. PRIORITY is comprehension-required and unknown here, so the message
+        // is checked from its integrity attribute alone.
+        let request = unhex(
+            "00010058 2112a442 b7e7a701 bc34d686 fa87dfae 80220010 5354554e 20746573
+             7420636c 69656e74 00240004 6e0001ff 80290008 932ff9b1 51263b36 00060009
+             6576746a 3a683676 59202020 00080014 9aeaa70c bfd8cb56 781ef2b5 b2d3f249
+             c1b571a2 80280004 e57a3bcf",
+        );
+        assert_eq!(parse(&request), Err(Error::Unknown));
+        let mut known = request.clone();
+        // PRIORITY (0x0024) as an optional attribute, so that the rest parses; integrity is
+        // then computed over the changed bytes, so put it back for the HMAC.
+        known[40] = 0x80;
+        let (_, signed) = parse_signed(&known).unwrap();
+        let i = signed.integrity.unwrap();
+        let mut mac =
+            <hmac::Hmac<sha1::Sha1> as KeyInit>::new_from_slice(b"VOkJxbRl1RmTxUk/WvJxBt").unwrap();
+        mac.update(&integrity_input(&request, i.offset, i.value.len()));
+        assert!(mac.verify_slice(&i.value).is_ok(), "the §2.1 HMAC-SHA1");
+        // §2.2: an IPv4 response with SOFTWARE, XOR-MAPPED-ADDRESS, MESSAGE-INTEGRITY and
+        // FINGERPRINT.
+        let response = unhex(
+            "0101003c 2112a442 b7e7a701 bc34d686 fa87dfae 8022000b 74657374 20766563
+             746f7220 00200008 0001a147 e112a643 00080014 2b91f599 fd9e90c3 8c7489f9
+             2af9ba53 f06be7d7 80280004 c07d4c96",
+        );
+        rfc_5769_integrity(&response);
+        let (m, _) = parse_signed(&response).unwrap();
+        assert_eq!(
+            m,
+            Message::Success {
+                txid: [
+                    0xb7, 0xe7, 0xa7, 0x01, 0xbc, 0x34, 0xd6, 0x86, 0xfa, 0x87, 0xdf, 0xae
+                ],
+                mapped: Some("192.0.2.1:32853".parse().unwrap()),
+            }
+        );
+    }
+
+    #[test]
+    fn signed_messages_check_under_their_password_only() {
+        let password = b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let m = request_signed(&TX, "7", (0x8000_0007, 42), password);
+        let (msg, signed) = parse_signed(&m).unwrap();
+        assert_eq!(
+            msg,
+            Message::Request {
+                txid: TX,
+                username: Some("7".into())
+            }
+        );
+        assert_eq!(signed.sa, Some((0x8000_0007, 42)));
+        let i = signed.integrity.unwrap();
+        assert!(i.sha256 && i.value.len() == INTEGRITY_SHA256);
+        assert!(verify(&m, &i, password));
+        assert!(!verify(&m, &i, b"another password"));
+        // Any changed byte before the attribute fails.
+        for at in [1, 9, 21, 25, 30, i.offset - 1] {
+            let mut bad = m.clone();
+            bad[at] ^= 0x01;
+            let ok = parse_signed(&bad)
+                .ok()
+                .and_then(|(_, s)| s.integrity)
+                .is_some_and(|i| verify(&bad, &i, password));
+            assert!(!ok, "byte {at}");
+        }
+        // An attribute after the integrity attribute changes nothing it says.
+        let mut extra = m.clone();
+        attribute(&mut extra, ATTR_TUNNEL_SA, &[0xff; 12]);
+        let len = (extra.len() - HEADER) as u16;
+        extra[2..4].copy_from_slice(&len.to_be_bytes());
+        let (_, s) = parse_signed(&extra).unwrap();
+        assert_eq!(s.sa, Some((0x8000_0007, 42)));
+        assert!(verify(&extra, &s.integrity.unwrap(), password));
+        // Answers too, with an IPv6 mapped address.
+        let a: SocketAddr = "[2001:db8::7]:4500".parse().unwrap();
+        let r = success_signed(&TX, a, (0x8000_0009, 1), password);
+        let (msg, s) = parse_signed(&r).unwrap();
+        assert_eq!(
+            msg,
+            Message::Success {
+                txid: TX,
+                mapped: Some(a)
+            }
+        );
+        assert!(verify(&r, &s.integrity.unwrap(), password));
+        // A malformed integrity attribute or TUNNEL-SA is refused.
+        let mut m = header(BINDING_REQUEST, 8, &TX);
+        attribute(&mut m, ATTR_MESSAGE_INTEGRITY_SHA256, &[0; 4]);
+        assert_eq!(parse_signed(&m), Err(Error::Value));
+        let mut m = header(BINDING_REQUEST, 8, &TX);
+        attribute(&mut m, ATTR_TUNNEL_SA, &[0; 4]);
+        assert_eq!(parse_signed(&m), Err(Error::Value));
     }
 
     proptest! {
