@@ -13,7 +13,7 @@ import type { Done, Init, Progress } from './worker.js';
  */
 interface Assets {
   simulator: { file: string; bytes: number };
-  components: Record<string, { module: string; moduleBytes: number; coreModules: { file: string; path: string; bytes: number }[]; imports: string[] }>;
+  components: Record<string, { module: string; moduleBytes: number; coreModules: { file: string; path: string; bytes: number }[]; imports: string[]; digest: string }>;
 }
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
@@ -104,7 +104,7 @@ async function load(): Promise<{ simulator: WebAssembly.Module; components: Reco
   const entries = await Promise.all(
     Object.entries(assets.components).map(async ([key, c]) => {
       const compiled = await Promise.all(c.coreModules.map(async (f) => [f.file, await compile(f.path)] as const));
-      return [key, { url: new URL(c.module, document.baseURI).href, modules: Object.fromEntries(compiled), imports: c.imports }] as const;
+      return [key, { url: new URL(c.module, document.baseURI).href, modules: Object.fromEntries(compiled), imports: c.imports, digest: c.digest }] as const;
     }),
   );
   return { simulator: await simulator, components: Object.fromEntries(entries) };

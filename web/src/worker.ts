@@ -63,8 +63,9 @@ const hex = (bytes: number[]) => bytes.map((b) => b.toString(16).padStart(2, '0'
  * The `runtime` scenario: devices the network creates while it runs. An `infra-script`
  * controller creates a router, commands it, stops it, starts it again (a fresh instance) and
  * commands it once more; a `replicas` controller (an async app, woken by `changes.wait`) keeps
- * two web servers running, and a client fetches from one of them. Every one of those devices is
- * instantiated by the page when the simulator asks for it.
+ * two web servers running, and a client fetches from one of them; a second `replicas` fetches a
+ * component's bytes from a store node, supplies them and runs two instances by digest. Every one
+ * of those devices is instantiated by the page when the simulator asks for it.
  */
 async function runtime(net: Network): Promise<Record<string, string>> {
   // A component that imports `wasmnet:infra`, for a device without the grant: refused before
@@ -76,7 +77,7 @@ async function runtime(net: Network): Promise<Record<string, string>> {
     refused = err instanceof Error ? err.message : String(err);
   }
   net.setCatalog(['router', 'node-http-server']);
-  const sw = await net.device('sw', 'switch', { ports: '8' });
+  const sw = await net.device('sw', 'switch', { ports: '12' });
   const r1 = hex(cbor({ component: 'router', config: { mac: '02:00:00:00:fe:10', 'port0.ipv4': '10.0.1.1/24', 'port1.ipv4': '10.0.2.1/24' } }));
   const steps = [
     `0ms apply r1 ${r1}`,
@@ -115,7 +116,42 @@ async function runtime(net: Network): Promise<Record<string, string>> {
   });
   net.link(rep.port(0), sw.port(0), 50_000n);
   net.link(client.port(0), sw.port(1), 50_000n);
-  return { refused };
+
+  // A component supplied as bytes: a store node serves the switch's component, a second
+  // replicas controller fetches it, supplies it (`wasmnet:infra/components`) and runs two
+  // instances of it by its digest, which the page runs from its own transpile of those bytes.
+  net.setSupplyAdmission(['wasi:*', 'wasmnet:link/*']);
+  const bytes = new Uint8Array(await (await fetch(new URL('raw/switch.wasm', self.location.href))).arrayBuffer());
+  let binary = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  const digest = `sha256:${[...new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))].map((b) => b.toString(16).padStart(2, '0')).join('')}`;
+  const store = await net.device('store', 'node-http-server', {
+    mac: '02:00:00:00:00:20',
+    ipv4: '10.0.0.20/24',
+    'app.http-server.route.sw.path': '/sw.wasm',
+    'app.http-server.route.sw.body-base64': btoa(binary),
+  });
+  const sup = await net.device(
+    'sup',
+    'node-replicas',
+    {
+      mac: '02:00:00:00:00:21',
+      ipv4: '10.0.0.21/24',
+      'app.replicas.replicas': '2',
+      'app.replicas.prefix': 'sup',
+      'app.replicas.period': '200ms',
+      'app.replicas.start': '10ms',
+      'app.replicas.template.fetch': 'http://10.0.0.20/sw.wasm',
+      'app.replicas.template.digest': digest,
+      'app.replicas.template.config.ports': '2',
+      'app.replicas.template.wire.0.port': '0',
+      'app.replicas.template.wire.0.to': 'sw:{n+7}',
+    },
+    { infra: true, infraPrefix: 'sup', infraSupply: true },
+  );
+  net.link(store.port(0), sw.port(5), 50_000n);
+  net.link(sup.port(0), sw.port(6), 50_000n);
+  return { refused, digest };
 }
 
 serveRun<Init, Done>(async (init, ctx) => {

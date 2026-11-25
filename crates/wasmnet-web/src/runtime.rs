@@ -316,6 +316,9 @@ impl Registry {
 pub struct JsRuntime<H> {
     host: H,
     registry: Registry,
+    /// The import names of the components controllers supplied, by digest: parsed by the core
+    /// when they were compiled, for the grant check at instantiation.
+    supplied: RefCell<BTreeMap<String, Vec<String>>>,
 }
 
 impl<H: JsHost + Clone + Unpin + 'static> JsRuntime<H> {
@@ -323,6 +326,7 @@ impl<H: JsHost + Clone + Unpin + 'static> JsRuntime<H> {
         Self {
             host,
             registry: Registry::default(),
+            supplied: RefCell::default(),
         }
     }
 
@@ -347,7 +351,8 @@ impl<H: JsHost + Clone + Unpin + 'static> Runtime for JsRuntime<H> {
         // The core's rule, as on wasmtime: a component that imports `wasmnet:infra` is refused
         // for a device without the grant, before JavaScript instantiates anything. JavaScript
         // reports the component's imports if it knows them.
-        if let Some(imports) = self.host.imports(component) {
+        let known = self.supplied.borrow().get(component).cloned();
+        if let Some(imports) = known.or_else(|| self.host.imports(component)) {
             wasmnet_core::infra::require_grant(&ctx.name, &imports, ctx.infra.is_some())
                 .map_err(wasmnet_core::Error::Refused)?;
         }
@@ -425,6 +430,30 @@ impl<H: JsHost + Clone + Unpin + 'static> Runtime for JsRuntime<H> {
             .has_counters(instance.counters)
             .exports(exports)
             .apps(instance.apps))
+    }
+
+    /// Supplied bytes, as the core judged them on every backend: a component
+    /// ([`wasmnet_core::component_imports`]) that imports only what the page serves ([`served`]),
+    /// which JavaScript then turns into something it instantiates ([`JsHost::compile`]: an
+    /// embedder's hook, or a pre-transpiled component with that digest). Its key is the digest.
+    fn compile_supplied(&self, digest: &str, bytes: &[u8]) -> Result<String, String> {
+        use wasmnet_core::supply::{not_compiled, not_linked};
+        let imports =
+            wasmnet_core::component_imports(bytes).map_err(|why| not_compiled(digest, &why))?;
+        let served = served();
+        if let Some(name) = imports.iter().find(|name| !served.allows(name)) {
+            return Err(not_linked(
+                digest,
+                &format!("it imports `{name}`, which this host does not serve"),
+            ));
+        }
+        self.host
+            .compile(digest, bytes)
+            .map_err(|why| not_compiled(digest, &why))?;
+        self.supplied
+            .borrow_mut()
+            .insert(digest.to_owned(), imports);
+        Ok(digest.to_owned())
     }
 }
 
@@ -663,4 +692,11 @@ impl<H: JsHost> Drop for Actor<H> {
             self.host.release(self.dev);
         }
     }
+}
+
+/// What the page links for every device (`web/src/network.ts`: the kit's WASI, `wasi:config`,
+/// `wasmnet:link`, `wasmnet:infra`): a supplied component that imports anything else does not
+/// link here.
+fn served() -> wasmnet_core::ImportPolicy {
+    wasmnet_core::ImportPolicy::devices().and(["wasmnet:infra/*"])
 }

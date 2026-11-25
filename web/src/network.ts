@@ -44,6 +44,11 @@ export interface ComponentSource {
    * is `denied` instead.
    */
   imports?: string[];
+  /**
+   * Its digest reference, `sha256:<hex>` of the component's bytes: a component a controller
+   * supplies with these bytes runs from this source (no `NetworkOptions.supply` needed).
+   */
+  digest?: string;
 }
 
 export interface NetworkOptions {
@@ -51,6 +56,13 @@ export interface NetworkOptions {
   seed: bigint | number;
   /** The components devices can be made from, by the key `device()` names. */
   components: Record<string, ComponentSource>;
+  /**
+   * Makes a component a controller supplied (`wasmnet:infra/components`) instantiable: given its
+   * digest and bytes (already checked by the simulator: digest, admission, imports), the source
+   * to load it from, for example the embedder's own transpile of it. Without it, a supplied
+   * component runs only if one of `components` has its `digest`.
+   */
+  supply?: (digest: string, bytes: Uint8Array) => ComponentSource | Promise<ComponentSource>;
 }
 
 /** One end of a link: a device's port. */
@@ -92,6 +104,7 @@ interface Exports {
   wn_add_device(name: number, nameLen: number, component: number, componentLen: number, config: number, configLen: number, options: number, optionsLen: number): Promise<number>;
   wn_command(dev: number, command: number, commandLen: number, argument: number, argumentLen: number): Promise<number>;
   wn_set_catalog(names: number, len: number): number;
+  wn_set_supply_admission(patterns: number, len: number): number;
   wn_schedule_command(dev: number, at: bigint, command: number, commandLen: number, argument: number, argumentLen: number): number;
   wn_args(dev: number): number;
   wn_env(dev: number): number;
@@ -198,6 +211,7 @@ const PROMISING = ['wn_add_device', 'wn_step', 'wn_finish', 'wn_command', 'wn_co
 export class Network {
   private readonly x: Exports;
   private readonly sources: Record<string, ComponentSource>;
+  private readonly supply: NetworkOptions['supply'];
   /** Devices by index; a slot is filled while `wn_add_device` asks for it. */
   private readonly instances: Instance[] = [];
   /** An instance waiting for `js_instantiate` to claim it. */
@@ -217,6 +231,7 @@ export class Network {
     for (const name of PROMISING) wrapped[name] = jspi.promising(raw[name]!);
     this.x = wrapped as unknown as Exports;
     this.sources = { ...options.components };
+    this.supply = options.supply;
     if (this.x.wn_network_new(U64(BigInt(options.seed))) !== 0) throw new Error(this.resultText());
   }
 
@@ -312,6 +327,7 @@ export class Network {
       js_release: (dev: number) => {
         delete n().instances[dev];
       },
+      js_compile: new jspi.Suspending(((dp: number, dl: number, bp: number, bl: number) => n().compile(dp, dl, bp, bl)) as AnyFn),
       js_receive: (dev: number, port: number, now: bigint, ptr: number, len: number) => {
         const self = n();
         try {
@@ -473,6 +489,30 @@ export class Network {
       (instance) => this.answer(dev, instance),
       (err: unknown) => this.fail(err),
     );
+  }
+
+
+  /**
+   * `js_compile`: a supplied component becomes instantiable under its digest. The simulator
+   * checked the bytes already; this only finds where to load them from.
+   */
+  private compile(dp: number, dl: number, bp: number, bl: number): Promise<number> {
+    const digest = decoder.decode(this.view(dp, dl));
+    const bytes = this.view(bp, bl).slice();
+    const known = () => {
+      const source = Object.values(this.sources).find((s) => s.digest === digest);
+      if (!source) throw new Error(`no compiled form of it on this page (NetworkOptions.supply, or a component with its digest)`);
+      return source;
+    };
+    return Promise.resolve()
+      .then(() => (this.supply ? this.supply(digest, bytes) : known()))
+      .then(
+        (source) => {
+          this.sources[digest] = source;
+          return 0;
+        },
+        (err: unknown) => this.fail(err instanceof Error ? err.message : err),
+      );
   }
 
   /** Instantiates `component` as device `dev` called `name`, its imports served for `dev`. */
@@ -663,6 +703,16 @@ export class Network {
    */
   setCatalog(components: readonly string[]): void {
     const got = this.withBytes(new codec.Writer().strs(components).finish(), (p, l) => this.x.wn_set_catalog(p, l));
+    if (got < 0) throw new Error(this.resultText());
+  }
+
+  /**
+   * Admits the components controllers supply by their imports: every import must match one of
+   * `patterns` (`wasi:*`, `wasmnet:link/*`; the simulator's `ImportPolicy`). Without it every
+   * supply is refused.
+   */
+  setSupplyAdmission(patterns: readonly string[]): void {
+    const got = this.withBytes(new codec.Writer().strs(patterns).finish(), (p, l) => this.x.wn_set_supply_admission(p, l));
     if (got < 0) throw new Error(this.resultText());
   }
 

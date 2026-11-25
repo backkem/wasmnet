@@ -32,7 +32,9 @@
 //! options    (into wn_add_device)   u32 flags (bit 0 journal stdio, 1 infra, 2 crash alone),
 //!            list<str> args, pairs env, str infra prefix (empty: none), u8 cascade (0 keep,
 //!            1 stop, 2 remove), opt infra max devices, opt memory, opt fuel per instant
-//!            (opt = u8 0, or u8 1 then u64)
+//!            (opt = u8 0, or u8 1 then u64), then the supply limits: u8 0 (no grant to supply
+//!            components), u8 1 then u64 max bytes, u32 max components, u64 max total, or u8 2
+//!            (the core's default limits)
 //! strs       (out of wn_args; into wn_set_catalog)   list<str>: argv, the device's name first;
 //!            the catalog's component names
 //! imports    (from js_imports)      u8 0 unknown, or u8 1 then list<str>: a component's import names
@@ -59,7 +61,7 @@
 
 use wasmnet_core::{
     Cascade, DeclaredPort, DeviceConfig, DeviceOptions, JournalEntry, Level, Outcome, Record,
-    Refusal, Stream,
+    Refusal, Stream, SupplyLimits,
 };
 
 use crate::host::Instance;
@@ -597,6 +599,14 @@ pub fn encode_options(options: &DeviceOptions) -> Vec<u8> {
     opt_u64(&mut w, options.infra_max_devices.map(u64::from));
     opt_u64(&mut w, options.memory);
     opt_u64(&mut w, options.fuel_per_instant);
+    match options.infra_supply {
+        Some(l) => w
+            .u8(1)
+            .u64(l.max_bytes)
+            .u32(l.max_components)
+            .u64(l.max_total),
+        None => w.u8(0),
+    };
     w.finish()
 }
 
@@ -628,6 +638,23 @@ pub fn decode_options(bytes: &[u8]) -> Result<DeviceOptions, DecodeError> {
             .transpose()?;
         let memory = read_opt_u64(r)?;
         let fuel = read_opt_u64(r)?;
+        let at = r.at;
+        let supply = match r.u8()? {
+            0 => None,
+            1 => Some(
+                SupplyLimits::default()
+                    .max_bytes(r.u64()?)
+                    .max_components(r.u32()?)
+                    .max_total(r.u64()?),
+            ),
+            2 => Some(SupplyLimits::default()),
+            _ => {
+                return Err(DecodeError {
+                    at,
+                    what: "supply limits",
+                });
+            }
+        };
         let mut o = DeviceOptions::default();
         o.journal_stdio = flags & OPT_JOURNAL_STDIO != 0;
         o.infra = flags & OPT_INFRA != 0;
@@ -639,6 +666,7 @@ pub fn decode_options(bytes: &[u8]) -> Result<DeviceOptions, DecodeError> {
         o.infra_max_devices = max;
         o.memory = memory;
         o.fuel_per_instant = fuel;
+        o.infra_supply = supply;
         Ok(o)
     })
 }
@@ -1026,6 +1054,51 @@ mod tests {
         ] {
             assert_eq!(decode_outcome(&encode_outcome(&outcome)), Ok(outcome));
         }
+    }
+
+    #[test]
+    fn options_values_and_infra_messages_round_trip() {
+        let o = DeviceOptions::default()
+            .journal_stdio(true)
+            .infra(true)
+            .infra_prefix("web".to_owned())
+            .infra_max_devices(3)
+            .memory(1 << 20)
+            .infra_supply(SupplyLimits::default().max_components(2));
+        let mut o = o;
+        o.args = vec!["-v".to_owned()];
+        o.env = vec![("A".to_owned(), "1".to_owned())];
+        assert_eq!(decode_options(&encode_options(&o)), Ok(o));
+        let args = vec![
+            Value::None,
+            Value::str("r1"),
+            Value::List(vec![Value::Tuple(vec![Value::str("k"), Value::str("v")])]),
+            Value::Bytes(vec![1, 2]),
+            Value::Some(Box::new(Value::U64(7))),
+            Value::record(vec![("a", Value::Enum("running".to_owned()))]),
+            Value::case("ok", Value::Bool(true)),
+            Value::U32(9),
+        ];
+        assert_eq!(
+            decode_infra_call(&encode_infra_call("devices.apply", &args)),
+            Ok(("devices.apply".to_owned(), args))
+        );
+        for reply in [
+            Reply::Value(Value::U64(1)),
+            Reply::Error(Value::case("denied", Value::str("no"))),
+            Reply::Failed("bad".to_owned()),
+        ] {
+            assert_eq!(decode_infra_reply(&encode_infra_reply(&reply)), Ok(reply));
+        }
+        assert_eq!(decode_imports(&encode_imports(None)), Ok(None));
+        let names = vec!["wasmnet:infra/devices@0.1.2".to_owned()];
+        assert_eq!(
+            decode_imports(&encode_imports(Some(&names))),
+            Ok(Some(names))
+        );
+        // A value nested deeper than any the interface has is malformed, not a stack overflow.
+        let deep = vec![1u8; 100_000];
+        assert!(Reader::new(&deep).value().is_err());
     }
 
     #[test]

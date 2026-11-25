@@ -258,6 +258,11 @@ export interface DeviceOptions {
   infraMaxDevices?: number;
   /** A fault of this device crashes it alone, not the network. */
   crashAlone?: boolean;
+  /**
+   * With `infra`: it may supply components as bytes (`wasmnet:infra/components`), within these
+   * bounds (`true`: the simulator's defaults, 16 MiB each, 8 at once, 64 MiB in all).
+   */
+  infraSupply?: true | { maxBytes: number | bigint; maxComponents: number; maxTotal: number | bigint };
 }
 
 const CASCADES = ['keep', 'stop', 'remove'] as const;
@@ -280,6 +285,10 @@ export function encodeOptions(o: DeviceOptions): Uint8Array {
   optU64(w, o.infraMaxDevices);
   optU64(w, undefined); // memory
   optU64(w, undefined); // fuel per instant
+  const s = o.infraSupply;
+  if (s === undefined) w.u8(0);
+  else if (s === true) w.u8(2); // the simulator's defaults
+  else w.u8(1).u64(BigInt(s.maxBytes)).u32(s.maxComponents).u64(BigInt(s.maxTotal));
   return w.finish();
 }
 

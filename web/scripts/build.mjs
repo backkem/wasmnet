@@ -10,6 +10,7 @@
 //   dist/cores/<hash>.wasm               their core modules, once per content
 //   dist/assets.json                     what the page downloads, with sizes
 //   dist/NOTICES.html                    the licences of what the page ships (notices.mjs)
+//   dist/raw/switch.wasm                 the switch's component bytes, for the test's supplied component
 //
 // Every URL in the page is relative, so the site works under any base path (GitHub Pages
 // serves it from /wasmnet/). The Rust inputs come from the workspace's target directory
@@ -98,10 +99,17 @@ for (const stem of COMPONENTS) {
     moduleBytes: statSync(join(dir, manifest.module)).size,
     coreModules,
     imports,
+    // Its digest reference: a controller that supplies these bytes runs this transpile of them.
+    digest: `sha256:${manifest.component}`,
   };
   const patches = manifest.patches.map((p) => `${p.name}x${p.count}`).join(' ');
   console.log(`  ${stem.padEnd(18)} ${manifest.coreModules.length} core modules, ${Math.round(performance.now() - t0)} ms; patches: ${patches || '(none)'}`);
 }
+// The switch's component bytes, which the page test's controller fetches from a store node and
+// supplies (`wasmnet:infra/components`): its instances run from the transpile above.
+mkdirSync(join(out, 'raw'), { recursive: true });
+cpSync(join(release, 'switch.wasm'), join(out, 'raw', 'switch.wasm'));
+
 writeFileSync(join(out, 'assets.json'), `${JSON.stringify(assets, null, 2)}\n`);
 
 // The licences of what was just assembled travel with it.

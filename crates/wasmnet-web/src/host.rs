@@ -156,4 +156,13 @@ pub trait JsHost {
     fn release(&self, dev: u32) {
         let _ = dev;
     }
+    /// Makes the component a controller supplied as `bytes` (with digest reference `digest`,
+    /// `sha256:<hex>`) instantiable by its digest: [`JsHost::instantiate`] gets `digest` as its
+    /// component from then on. The core has checked the digest, the embedder's admission and
+    /// the component's imports already. May take its time (JSPI). The default refuses: a page
+    /// that runs no supplied components.
+    fn compile(&self, digest: &str, bytes: &[u8]) -> Result<(), String> {
+        let _ = (digest, bytes);
+        Err("this page runs no supplied components".to_owned())
+    }
 }

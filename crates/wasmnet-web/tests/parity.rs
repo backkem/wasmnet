@@ -30,9 +30,10 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use wasmnet_core::supply::reference_of;
 use wasmnet_core::{
-    DeviceCommand, DeviceConfig, DeviceEntropy, DeviceId, DeviceOptions, JournalEntry, Nanos, Op,
-    OpState, Placement, Record, Refusal,
+    DeviceCommand, DeviceConfig, DeviceEntropy, DeviceId, DeviceOptions, ImportPolicy,
+    JournalEntry, Nanos, Op, OpState, Placement, Record, Refusal,
 };
 use wasmnet_det_cbor::Value as Cbor;
 use wasmnet_host::wasmtime::component::types::{ComponentFunc, ComponentItem, Type};
@@ -129,7 +130,8 @@ impl Device {
 struct Wasm {
     engine: Engine,
     seed: u64,
-    components: Rc<BTreeMap<String, Component>>,
+    /// By key; a supplied component under its digest ([`JsHost::compile`]).
+    components: Rc<RefCell<BTreeMap<String, Component>>>,
     devices: Rc<RefCell<BTreeMap<u32, Device>>>,
     now: Now,
 }
@@ -151,7 +153,7 @@ impl Wasm {
         Self {
             engine,
             seed,
-            components: Rc::new(components),
+            components: Rc::new(RefCell::new(components)),
             devices: Rc::default(),
             now: Now(Arc::default()),
         }
@@ -413,8 +415,11 @@ impl JsHost for Wasm {
     ) -> Result<Instance, String> {
         let c = self
             .components
+            .borrow()
             .get(component)
+            .cloned()
             .ok_or_else(|| format!("no component {component}"))?;
+        let c = &c;
         let registry = registry();
         let entropy = DeviceEntropy::new(self.seed, name);
         let insecure_seed = entropy.insecure_seed_u128();
@@ -552,6 +557,13 @@ impl JsHost for Wasm {
 
     fn timer_fire(&self, _: u32) {}
 
+    /// As an embedder's hook would: compiles the bytes the core checked already.
+    fn compile(&self, digest: &str, bytes: &[u8]) -> Result<(), String> {
+        let c = Component::from_binary(&self.engine, bytes).map_err(|e| format!("{e:?}"))?;
+        self.components.borrow_mut().insert(digest.to_owned(), c);
+        Ok(())
+    }
+
     fn invoke(
         &self,
         dev: u32,
@@ -641,6 +653,8 @@ trait Backend {
     ) -> Option<Result<String, String>>;
     fn op(&mut self, op: Op, placement: Placement) -> usize;
     fn op_states(&self) -> Vec<OpState>;
+    /// Admits supplied components by their imports.
+    fn admit(&mut self, policy: ImportPolicy);
     fn journal(&self) -> Vec<JournalEntry>;
 }
 
@@ -690,6 +704,9 @@ impl Backend for Native {
     }
     fn op_states(&self) -> Vec<OpState> {
         self.0.op_states()
+    }
+    fn admit(&mut self, policy: ImportPolicy) {
+        self.0.set_supply_admission(policy.admission());
     }
     fn journal(&self) -> Vec<JournalEntry> {
         self.0.journal()
@@ -759,6 +776,9 @@ impl Backend for Web {
     fn journal(&self) -> Vec<JournalEntry> {
         self.0.journal()
     }
+    fn admit(&mut self, policy: ImportPolicy) {
+        self.0.sim_mut().set_supply_admission(policy.admission());
+    }
 }
 
 fn config(pairs: &[(&str, &str)]) -> DeviceConfig {
@@ -822,7 +842,7 @@ fn seen(net: &dyn Backend, answers: Vec<Option<Result<String, String>>>, kinds: 
 }
 
 /// Runs `scenario` on both backends at two seeds and compares what they did.
-fn on_both(scenario: impl Fn(&mut dyn Backend) -> Seen) {
+fn on_both(mut scenario: impl FnMut(&mut dyn Backend) -> Seen) {
     for seed in [42, 7] {
         let native = scenario(&mut Native::new(seed));
         let web = scenario(&mut Web::new(seed));
@@ -1144,4 +1164,89 @@ fn arguments_and_environment_are_served_alike() {
         assert_eq!(s.answers[3], Some(Ok(String::new())), "{s:?}");
         s
     });
+}
+
+/// A controller supplies components as bytes (`wasmnet:infra/components`) and creates devices
+/// from their digests: the switch's component runs and answers a command; bytes that are no
+/// component are refused by the embedder's admission (the core's `ImportPolicy`); an app that
+/// imports `wasi:sockets` is admitted but does not link on either backend, which says so in the
+/// core's words.
+fn supplied(net: &mut dyn Backend) -> (Seen, Vec<String>) {
+    net.admit(ImportPolicy::devices().and(["wasi:sockets/*", "wasmnet:sockets-ext/*"]));
+    let read = |name: &str| std::fs::read(support::built().path(name)).expect("built");
+    let (sw, app) = (read("switch"), read("http_server"));
+    let spec = |component: &str, cfg: &[(&str, &str)]| hex(&spec(component, cfg));
+    let steps = [
+        format!("0ms id=s1 supply - {}", hex(&sw)),
+        // Not a component: the admission refuses it, at the call.
+        format!("0ms id=s2 supply - {}", hex(b"not a component")),
+        format!("0ms id=s3 supply {} {}", reference_of(&app), hex(&app)),
+        format!(
+            "1ms apply s9 {}",
+            spec(&reference_of(&sw), &[("ports", "2")])
+        ),
+        format!("1ms apply a9 {}", spec(&reference_of(&app), &[])),
+        "2ms id=c control s9 paths".to_owned(),
+        "3ms answer c".to_owned(),
+    ];
+    let script = steps
+        .iter()
+        .enumerate()
+        .map(|(n, s)| (format!("step.{n}"), s.clone()))
+        .collect();
+    let mut options = DeviceOptions::default();
+    options.infra = true;
+    options.infra_supply = Some(wasmnet_core::SupplyLimits::default());
+    // Decoding a megabyte of hex config costs more than an instant's default fuel natively.
+    options.fuel_per_instant = Some(4_000_000_000);
+    net.add("ctl", "infra_script", script, options);
+    net.run_to(5 * MS);
+    // A refusal names the backend's own reason after the core's words: compared by those.
+    let failed = net
+        .journal()
+        .into_iter()
+        .filter_map(|e| match e.record {
+            Record::Event { kind, fields } if kind == "infra-failed" => fields
+                .into_iter()
+                .find(|(k, _)| k == "message")
+                .map(|(_, m)| m),
+            _ => None,
+        })
+        .collect();
+    let seen = seen(
+        net,
+        Vec::new(),
+        &["infra-script", "infra-supply", "device-added"],
+    );
+    (seen, failed)
+}
+
+#[test]
+fn supplied_components_run_and_are_refused_alike() {
+    let mut refusals = Vec::new();
+    on_both(|net| {
+        let (s, failed) = supplied(net);
+        let results = field(&s, "infra-script", "result");
+        assert_eq!(results[0], "ok", "{s:#?}");
+        assert!(
+            results[1].contains("Denied") && results[1].contains("well-formed"),
+            "{s:#?}"
+        );
+        assert_eq!(results[2], "ok", "{s:#?}");
+        assert_eq!(results[6], "ok", "the supplied switch answers: {s:#?}");
+        assert!(
+            s.events
+                .iter()
+                .any(|e| e.2 == "device-added" && e.1 == "s9"),
+            "{s:#?}"
+        );
+        assert_eq!(failed.len(), 1, "{failed:?}");
+        refusals.push(failed[0].clone());
+        s
+    });
+    let app = std::fs::read(support::built().path("http_server")).expect("built");
+    let words = format!("`{}` does not link on this host: ", reference_of(&app));
+    for r in &refusals {
+        assert!(r.contains(&words) && r.contains("wasi:sockets/"), "{r}");
+    }
 }

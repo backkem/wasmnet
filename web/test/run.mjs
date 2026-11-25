@@ -180,7 +180,7 @@ await step('what an embedder controls: commands, arguments and environment', asy
   return { answers: a, switchEvents: unblocked.map((e) => `${e.at} ${e.kind}`), body: fieldsOf(responses[0])['body-fnv'] };
 });
 
-await step('devices created while the network runs: controllers, a restart, changes.wait', async () => {
+await step('devices created while the network runs: controllers, a restart, changes.wait, a supplied component', async () => {
   const r = await page.evaluate(() => window.wasmnetScenario('runtime', '42'));
   if (r.outcome.kind !== 'deadline') throw new Error(`outcome ${JSON.stringify(r.outcome)}`);
   // An ungranted importer of wasmnet:infra is refused before it is instantiated.
@@ -207,7 +207,15 @@ await step('devices created while the network runs: controllers, a restart, chan
   if (running.length < 2) throw new Error(`replicas-observed running: ${JSON.stringify(running)}`);
   const done = events(r, 'http-get-done', 'client');
   if (done.length !== 1 || fieldsOf(done[0]).status !== '200') throw new Error(`http-get-done ${JSON.stringify(done)}`);
-  return { refused: r.notes.refused, running: running.map((e) => `${e.at} ${fieldsOf(e).name}`), routes: steps[2].text, fetched: done[0].at };
+  // The supplied component: kept by the controller's store, and two instances made from its digest.
+  const supplied = events(r, 'infra-supply', 'sup');
+  if (supplied.length !== 1 || fieldsOf(supplied[0]).digest !== r.notes.digest) throw new Error(`infra-supply ${JSON.stringify(supplied)}, want ${r.notes.digest}`);
+  for (const name of ['sup-1', 'sup-2']) {
+    if (events(r, 'device-added', name).length !== 1) throw new Error(`${name} was not created from the supplied component`);
+  }
+  const supRunning = events(r, 'replicas-observed', 'sup').filter((e) => fieldsOf(e).phase === 'running');
+  if (supRunning.length < 2) throw new Error(`sup replicas-observed running: ${JSON.stringify(supRunning)}`);
+  return { refused: r.notes.refused, running: running.map((e) => `${e.at} ${fieldsOf(e).name}`), supplied: supRunning.map((e) => `${e.at} ${fieldsOf(e).name}`), routes: steps[2].text, fetched: done[0].at };
 });
 
 if (process.env.NATIVE_JOURNAL) {

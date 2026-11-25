@@ -53,6 +53,7 @@
 //! | `js_wait_done(wait, rv: u64)` | the `changes.wait` call `wait` (from `wn_infra_wait`) ended with `rv`: resolve the guest's call |
 //! | `js_imports(component, len) -> i32` | the component's import names, if known: answers an `imports` message (asked before it is instantiated, for the grant check) |
 //! | `js_release(dev)` | device `dev`'s instance is gone (stopped, crashed, removed): drop it |
+//! | `js_compile(digest, len, bytes, len) -> i32` | make a supplied component instantiable as `digest` (the core checked it already); 0, or a negative error. May suspend (JSPI) |
 //! | `js_panic(msg, len)` | a panic's message, before the module traps |
 
 #![allow(unsafe_code)] // FFI exports and imports; every unsafe block is commented.
@@ -93,6 +94,12 @@ mod js {
         pub fn js_wait_done(wait: u32, rv: u64);
         pub fn js_imports(component: *const u8, component_len: usize) -> i32;
         pub fn js_release(dev: u32);
+        pub fn js_compile(
+            digest: *const u8,
+            digest_len: usize,
+            bytes: *const u8,
+            bytes_len: usize,
+        ) -> i32;
         pub fn js_panic(msg: *const u8, len: usize);
     }
 }
@@ -241,6 +248,13 @@ impl JsHost for Js {
     fn release(&self, dev: u32) {
         // SAFETY: a plain value.
         unsafe { js::js_release(dev) }
+    }
+
+    fn compile(&self, digest: &str, bytes: &[u8]) -> Result<(), String> {
+        // SAFETY: both are live for the duration of the call; JavaScript only reads them.
+        status(unsafe {
+            js::js_compile(digest.as_ptr(), digest.len(), bytes.as_ptr(), bytes.len())
+        })
     }
 }
 
@@ -628,6 +642,23 @@ pub extern "C" fn wn_set_catalog(names: *const u8, len: usize) -> i32 {
         Err(e) => return fail(format!("catalog: {e}")),
     };
     match with_network(|n| n.sim_mut().set_infra_catalog(names)) {
+        Ok(()) => 0,
+        Err(e) => fail(e),
+    }
+}
+
+/// Admits the components controllers supply ([`wasmnet_core::Network::set_supply_admission`]) by
+/// the core's [`wasmnet_core::ImportPolicy`]: a `list<str>` message of import patterns
+/// (`wasi:*`, `wasmnet:link/*`). Without a call every supply is refused. Answers 0, or -1 with
+/// the message in the result. Never calls JavaScript.
+#[unsafe(no_mangle)]
+pub extern "C" fn wn_set_supply_admission(patterns: *const u8, len: usize) -> i32 {
+    let patterns = match codec::decode_strs(bytes(patterns, len)) {
+        Ok(p) => p,
+        Err(e) => return fail(format!("admission: {e}")),
+    };
+    let policy = wasmnet_core::ImportPolicy::new(patterns);
+    match with_network(|n| n.sim_mut().set_supply_admission(policy.admission())) {
         Ok(()) => 0,
         Err(e) => fail(e),
     }
