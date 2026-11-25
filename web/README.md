@@ -22,11 +22,19 @@ WebAssembly JSPI. The page says so where it is missing.
 ```js
 const net = await Network.create('wasmnet_web.wasm', { seed: 42n, components });
 const sw = await net.device('sw', 'switch', { ports: '4' });
-const web = await net.device('web', 'node-http-server', { ipv4: '10.0.0.1/24', /* ... */ });
+const web = await net.device('web', 'node-http-server', { ipv4: '10.0.0.1/24', /* ... */ },
+  { args: ['-v'], env: [['GREETING', 'hello']] }); // what wasi:cli/environment serves it
 net.link(web.port(0), sw.port(1), 150_000n); // nanoseconds
+net.command(sw, 'block', '0 3');              // { ok: 'blocked' }: wasmnet:control/commands
+net.scheduleCommand(sw, 5_000_000n, 'unblock', '0 3'); // the same, as an operator event at 5 ms
 const outcome = await net.run({ onJournal: (entries) => console.log(entries) });
 const pcap = net.pcap(net.links()[0]); // open it in Wireshark
 ```
+
+A device's options also grant `wasmnet:infra` (`infra: true`, with `infraPrefix`,
+`infraCascade`, `infraMaxDevices`): its calls are served by the simulator, as natively. The
+binding decides nothing itself; what the browser backend does not do yet (create a device while
+the network runs, among others) is in [docs/known-issues.md](../docs/known-issues.md).
 
 How it works: [docs/design/browser.md](../docs/design/browser.md).
 
@@ -52,7 +60,10 @@ npm run serve              # http://127.0.0.1:8080/wasmnet/
 `npm test` serves `dist/` under `/wasmnet/` (as GitHub Pages does), runs the example, checks the
 client's `http-get-done` (`status=200`, `body-bytes=19`), its `app-exit`, a quiescent outcome
 with the server still serving and both captures (pcap-ng with packets), runs it again with the
-same seed (same journal, same capture bytes) and with another seed, and checks the message a
+same seed (same journal, same capture bytes) and with another seed, runs the Worker's `controls`
+scenario (the switch programmed by command between runs and by an operator event, the server
+answering with its arguments and an environment variable; `window.wasmnetScenario`) and checks
+the answers, the switch's events and the page the client fetched, and checks the message a
 browser without JSPI gets. With `NATIVE_JOURNAL` pointing at the native example's output
 (`cargo run -p wasmnet-host --example http > target/http-native.txt`) it also checks that every
 journal line of the native run appears in the browser run, at the same virtual time, and compares

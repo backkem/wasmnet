@@ -195,7 +195,8 @@ that makes a fresh call each time it applies; the device's refusal becomes the o
 Two kinds of control call are built in: device commands (`wasmnet_core::commands`), for the
 `wasmnet:control/commands` export, and configuration changes in place
 (`wasmnet_core::reconfigure`), for the `wasmnet:reconfigure/reconfigure` export. `wasmnet-host`
-serves both itself (before any extension's handler); the browser backend serves neither
+serves both itself (before any extension's handler); the browser backend calls the page for
+both (`wasmnet-web`'s `JsHost::invoke` and `JsHost::reconfigure`)
 ([topology-and-infra.md](topology-and-infra.md#commands-into-a-running-device)).
 
 The wasmtime backend also measures every device's linear memory, all its instances together,

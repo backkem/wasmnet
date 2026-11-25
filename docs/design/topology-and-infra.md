@@ -428,8 +428,9 @@ captures. A device that can change in place exports `wasmnet:control/commands`
 need not compute a diff) and `routes`, in its configuration's own route syntax
 ([wit/router/router.wit](../../wit/router/router.wit) has their semantics).
 
-The wasmtime host finds the export when it instantiates a device and reports it as the optional
-export `wasmnet:control/commands` (`wasmnet_core::commands::COMMANDS_EXPORT`). Neither the
+Both backends find the export when they instantiate a device (the browser's page reports it) and
+report it as the optional export `wasmnet:control/commands`
+(`wasmnet_core::commands::COMMANDS_EXPORT`). Neither the
 host nor the sim core reads a command or its answer. Three ways in, all through the same
 control call (`CommandCall`), which runs inside the device's event loop at the current
 instant and is followed by a `poll` of the device at that instant:
