@@ -1,6 +1,7 @@
 //! mdns-responder: a Multicast DNS responder (RFC 6762) for one host name, as a wasmnet app.
 //! It claims `<hostname>.local` on the link, answers A and AAAA questions for it with
-//! the node's addresses, and never returns: a daemon.
+//! the node's addresses, advertises the services in its config with DNS-SD (RFC 6763; see
+//! [`services`]), and never returns: a daemon.
 //!
 //! # Config (`wasi:config`, keys under `app.mdns-responder.`)
 //!
@@ -8,9 +9,15 @@
 //! |---|---|---|
 //! | `hostname` | the name to claim, one label (`alice` claims `alice.local`) | required |
 //! | `families` | the groups to listen on: `ipv4` (224.0.0.251), `ipv6` (ff02::fb), or both (a list) | `ipv4,ipv6` |
-//! | `ttl` | the TTL of its records, whole seconds | `120s` |
+//! | `ttl` | the TTL of its host records (A, AAAA) and of SRV and NSEC, whole seconds | `120s` |
+//! | `service-ttl` | the TTL of its PTR and TXT records, whole seconds | `4500s` |
 //! | `link-local` | also announce IPv6 link-local addresses | `false` |
 //! | `start` | virtual time to wait before probing | `0` |
+//! | `service.<id>.instance` | the service's instance name: 1 to 63 bytes of UTF-8, no control characters | required per service |
+//! | `service.<id>.type` | its service type, `_<name>._tcp` or `_<name>._udp` | required per service |
+//! | `service.<id>.port` | its port, 1 to 65535 | required per service |
+//! | `service.<id>.txt` | its TXT attributes, a list of `key` or `key=value` (`\,` is a comma in a value) | none |
+//! | `service.<id>.until` | withdraw it (goodbye packets) at this virtual time after the start | never |
 //!
 //! # Behaviour (RFC 6762)
 //!
@@ -47,12 +54,17 @@
 //! `mdns-probing {name, attempt}`, `mdns-probe-lost {name, from}`, `mdns-conflict {name, from}`,
 //! `mdns-renamed {from, to}`,
 //! `mdns-announced {name, addresses}`, `mdns-answered {name, types, to, mode}` (`mode`:
-//! `legacy-unicast`, `unicast` or `multicast`).
+//! `legacy-unicast`, `unicast` or `multicast`); for services, the events listed in
+//! [`services`].
 
 #![deny(unsafe_code)]
 
 #[cfg(not(test))]
 mod component;
+pub mod services;
+
+use services::Service;
+pub use services::ServiceConfig;
 
 use std::net::{IpAddr, SocketAddr};
 pub use wasmnet_app_kit::app_pairs;
@@ -100,6 +112,17 @@ pub struct Config {
     pub ttl: u32,
     pub link_local: bool,
     pub start_ns: u64,
+    /// The TTL of PTR and TXT records, seconds (RFC 6762 §10: 75 minutes).
+    pub service_ttl: u32,
+    /// The services to advertise, in id order.
+    pub services: Vec<ServiceConfig>,
+}
+
+/// Whole seconds, at least one, as a TTL.
+fn ttl_seconds(value: &str) -> Option<u32> {
+    parse_duration(value)
+        .filter(|ns| *ns >= 1_000_000_000 && ns % 1_000_000_000 == 0)
+        .and_then(|ns| u32::try_from(ns / 1_000_000_000).ok())
 }
 
 impl Config {
@@ -112,13 +135,20 @@ impl Config {
             ttl: 120,
             link_local: false,
             start_ns: 0,
+            service_ttl: 4500,
+            services: Vec::new(),
         };
+        let mut services = services::Partial::default();
         for (key, value) in pairs {
             let invalid = |expected| ConfigError::Invalid {
                 key: key.clone(),
                 value: value.clone(),
                 expected,
             };
+            if let Some(rest) = key.strip_prefix("service.") {
+                services.add(&key, rest, &value)?;
+                continue;
+            }
             match key.as_str() {
                 "hostname" => {
                     // A host name label (RFC 1123 §2.1): no `_`, which DNS names allow.
@@ -136,10 +166,12 @@ impl Config {
                     c.ipv6 = list.contains(&"ipv6");
                 }
                 "ttl" => {
-                    c.ttl = parse_duration(&value)
-                        .filter(|ns| *ns >= 1_000_000_000 && ns % 1_000_000_000 == 0)
-                        .and_then(|ns| u32::try_from(ns / 1_000_000_000).ok())
-                        .ok_or_else(|| invalid("whole seconds, at least 1s"))?;
+                    c.ttl =
+                        ttl_seconds(&value).ok_or_else(|| invalid("whole seconds, at least 1s"))?;
+                }
+                "service-ttl" => {
+                    c.service_ttl =
+                        ttl_seconds(&value).ok_or_else(|| invalid("whole seconds, at least 1s"))?;
                 }
                 "link-local" => {
                     c.link_local = value.parse().map_err(|_| invalid("true or false"))?;
@@ -156,6 +188,7 @@ impl Config {
                 expected: "the name to claim, like alice",
             });
         }
+        c.services = services.finish()?;
         Ok(c)
     }
 }
@@ -206,6 +239,12 @@ pub struct Responder {
     begun: bool,
     /// The addresses last announced (filtered, in order).
     announced: Vec<IpAddr>,
+    /// The host name went out in an announcement and was not lost since: services may probe.
+    claimed: bool,
+    /// The services, in config order.
+    services: Vec<Service>,
+    /// Answers held back until their time (shared records, RFC 6762 §6), in order.
+    pending: Vec<(u64, Packet)>,
 }
 
 fn kv(k: &str, v: impl ToString) -> (String, String) {
@@ -220,16 +259,9 @@ fn fnv(s: &str) -> u64 {
 }
 
 /// A record's place in §8.2's lexicographical order: class (without the cache-flush bit), type,
-/// then the rdata's bytes. Host probes carry A and AAAA records, whose wire rdata is the address;
-/// other data is compared by its raw bytes, or its presentation text for names.
+/// then the rdata's bytes as on the wire, names written out in full.
 fn order_key(r: &Record) -> (u16, u16, Vec<u8>) {
-    let data = match &r.data {
-        RData::A(a) => a.octets().to_vec(),
-        RData::Aaaa(a) => a.octets().to_vec(),
-        RData::Other(raw) => raw.clone(),
-        other => other.text().into_bytes(),
-    };
-    (r.class & !MDNS_CLASS_BIT, r.rtype, data)
+    (r.class & !MDNS_CLASS_BIT, r.rtype, r.data.wire_bytes())
 }
 
 fn join(addrs: &[IpAddr]) -> String {
@@ -251,6 +283,7 @@ impl Responder {
     pub fn new(config: Config) -> Self {
         let name = format!("{}.local", config.hostname);
         let start = config.start_ns + (fnv(&name) % 250) * MS;
+        let services = config.services.iter().cloned().map(Service::new).collect();
         Self {
             config,
             name,
@@ -258,6 +291,9 @@ impl Responder {
             begun: false,
             state: State::Probing { n: 0, at: start },
             announced: Vec::new(),
+            claimed: false,
+            services,
+            pending: Vec::new(),
         }
     }
 
@@ -273,10 +309,11 @@ impl Responder {
 
     /// When [`tick`](Self::tick) must run next.
     pub fn next_deadline(&self) -> Option<u64> {
-        match self.state {
+        let host = match self.state {
             State::Probing { at, .. } | State::Announcing { at, .. } => Some(at),
             State::Ready => None,
-        }
+        };
+        [host, self.services_deadline()].into_iter().flatten().min()
     }
 
     pub fn is_ready(&self) -> bool {
@@ -320,6 +357,14 @@ impl Responder {
 
     /// Runs the timers at `now` with the node's current addresses `addrs`.
     pub fn tick(&mut self, now: u64, addrs: &[IpAddr]) -> (Vec<Packet>, Vec<Note>) {
+        let (mut out, mut notes) = self.host_tick(now, addrs);
+        let usable = self.usable(addrs);
+        self.services_tick(now, &usable, &mut out, &mut notes);
+        (out, notes)
+    }
+
+    /// The host name's timers: probing and announcing it.
+    fn host_tick(&mut self, now: u64, addrs: &[IpAddr]) -> (Vec<Packet>, Vec<Note>) {
         let mut out = Vec::new();
         let mut notes = Vec::new();
         let usable = self.usable(addrs);
@@ -383,6 +428,7 @@ impl Responder {
                     });
                 }
                 if n == 0 {
+                    self.claimed = true;
                     notes.push((
                         "mdns-announced",
                         vec![kv("name", &self.name), kv("addresses", join(&usable))],
@@ -417,6 +463,7 @@ impl Responder {
         notes.push(("mdns-renamed", vec![kv("from", old), kv("to", &self.name)]));
         self.announced.clear();
         self.state = State::Probing { n: 0, at: now };
+        self.host_lost();
     }
 
     /// §8.2, simultaneous probe tiebreaking: `m`, a query that arrived while we probe, is another
@@ -475,18 +522,33 @@ impl Responder {
         payload: &[u8],
         addrs: &[IpAddr],
     ) -> (Vec<Packet>, Vec<Note>) {
-        let mut out = Vec::new();
-        let mut notes = Vec::new();
         if !self.begun {
             // Not started yet: like a host that has not booted its responder.
-            return (out, notes);
+            return (Vec::new(), Vec::new());
         }
         let Ok(m) = Message::parse(payload) else {
-            return (out, notes);
+            return (Vec::new(), Vec::new());
         };
         if m.opcode() != 0 {
-            return (out, notes);
+            return (Vec::new(), Vec::new());
         }
+        let (mut out, mut notes) = self.host_on_message(now, from, v6, &m, addrs);
+        let usable = self.usable(addrs);
+        self.services_on_message(now, from, v6, &m, &usable, &mut out, &mut notes);
+        (out, notes)
+    }
+
+    /// The host name's part of a message: conflicts, tiebreaks, A and AAAA answers.
+    fn host_on_message(
+        &mut self,
+        now: u64,
+        from: SocketAddr,
+        v6: bool,
+        m: &Message,
+        addrs: &[IpAddr],
+    ) -> (Vec<Packet>, Vec<Note>) {
+        let mut out = Vec::new();
+        let mut notes = Vec::new();
         let ours = |r: &Record| dns::same_name(&r.name, &self.name);
         let usable = self.usable(addrs);
         if m.is_response() {
@@ -503,7 +565,7 @@ impl Responder {
             return (out, notes);
         }
         if let State::Probing { .. } = self.state {
-            self.tiebreak(now, from, &m, &usable, &mut notes);
+            self.tiebreak(now, from, m, &usable, &mut notes);
             return (out, notes);
         }
         if !self.is_ready() {

@@ -134,6 +134,11 @@ async fn serve() -> Result<(), String> {
     let t0 = monotonic_clock::now();
     let mut config = config;
     config.start_ns += t0;
+    for s in &mut config.services {
+        if let Some(until) = s.until_ns.as_mut() {
+            *until += t0;
+        }
+    }
     let mut r = Responder::new(config);
     log::log(
         Level::Info,
