@@ -660,6 +660,10 @@ trait Backend {
     fn op_states(&self) -> Vec<OpState>;
     /// Admits supplied components by their imports.
     fn admit(&mut self, policy: ImportPolicy);
+    /// Adds a network extension (the order test's pair).
+    fn extend(&mut self, extension: Box<dyn wasmnet_core::NetworkExtension>);
+    /// The network's parse of an extension option.
+    fn option(&self, key: &str, value: &Value) -> wasmnet_core::ExtValue;
     fn journal(&self) -> Vec<JournalEntry>;
 }
 
@@ -710,6 +714,12 @@ impl Backend for Native {
     }
     fn admit(&mut self, policy: ImportPolicy) {
         self.0.set_supply_admission(policy.admission());
+    }
+    fn extend(&mut self, extension: Box<dyn wasmnet_core::NetworkExtension>) {
+        self.0.add_boxed_extension(extension);
+    }
+    fn option(&self, key: &str, value: &Value) -> wasmnet_core::ExtValue {
+        self.0.parse_option(key, value).expect("option")
     }
     fn journal(&self) -> Vec<JournalEntry> {
         self.0.journal()
@@ -782,6 +792,12 @@ impl Backend for Web {
     }
     fn admit(&mut self, policy: ImportPolicy) {
         self.0.sim_mut().set_supply_admission(policy.admission());
+    }
+    fn extend(&mut self, extension: Box<dyn wasmnet_core::NetworkExtension>) {
+        self.0.sim_mut().add_boxed_extension(extension);
+    }
+    fn option(&self, key: &str, value: &Value) -> wasmnet_core::ExtValue {
+        self.0.sim().parse_option(key, value).expect("option")
     }
 }
 
@@ -1479,6 +1495,119 @@ fn a_portable_extension_is_served_alike() {
             ["0", "0", "1", "0"],
             "{s:?}"
         );
+        s
+    });
+}
+
+// ---- the order of extensions ----------------------------------------------------------------
+
+/// A test extension that journals what it hears, under its own name: the order of two of them
+/// is the order they were added, on both backends. Two types (a network keeps one extension
+/// per type).
+struct Order<const N: u8>(&'static str);
+
+impl<const N: u8> wasmnet_core::NetworkExtension for Order<N> {
+    fn device_setup(
+        &mut self,
+        setup: &wasmnet_core::ext::DeviceSetup<'_>,
+        _ext: &mut wasmnet_core::DeviceExt,
+    ) {
+        setup.journal.push(
+            setup.clock.now(),
+            Record::Event {
+                kind: "order-setup".into(),
+                fields: vec![("ext".into(), self.0.into())],
+            },
+        );
+    }
+
+    fn device_life(&mut self, life: &wasmnet_core::ext::DeviceLife<'_>) {
+        life.journal.push(
+            life.at,
+            Record::Event {
+                kind: "order-life".into(),
+                fields: vec![
+                    ("ext".into(), self.0.into()),
+                    ("event".into(), format!("{:?}", life.event)),
+                ],
+            },
+        );
+    }
+}
+
+fn order(net: &mut dyn Backend) -> Seen {
+    net.extend(Box::new(Order::<1>("first")));
+    net.extend(Box::new(Order::<2>("second")));
+    net.add(
+        "p",
+        "pad_probe",
+        config(&[("period", "10ms")]),
+        DeviceOptions::default(),
+    );
+    net.op(Op::stop_device("p"), Placement::StartOf(15 * MS));
+    net.op(Op::start_device("p"), Placement::StartOf(20 * MS));
+    net.run_to(30 * MS);
+    seen(net, Vec::new(), &["order-setup", "order-life"])
+}
+
+#[test]
+fn extensions_hear_a_device_in_the_order_they_were_added_alike() {
+    on_both(|net| {
+        let s = order(net);
+        let heard: Vec<(&str, &str)> = s
+            .events
+            .iter()
+            .map(|e| (e.2.as_str(), e.3[0].1.as_str()))
+            .collect();
+        // Every record comes as a pair, the first extension then the second: creation, the
+        // stop, the start (its setup and its life event).
+        assert_eq!(heard.len(), 8, "{s:?}");
+        for pair in heard.chunks(2) {
+            assert_eq!(
+                (pair[0].0, pair[0].1, pair[1].1),
+                (pair[1].0, "first", "second"),
+                "{s:?}"
+            );
+        }
+        s
+    });
+}
+
+/// An extension's option set from a generic value, and its operator event at a device, alike.
+fn options_and_ops(net: &mut dyn Backend) -> Seen {
+    let mut faulty = DeviceOptions::default().crash_alone(true);
+    faulty
+        .ext
+        .set_value(net.option("pad.fault-at", &Value::U32(2)));
+    net.add("f", "pad_probe", config(&[("period", "10ms")]), faulty);
+    let p = net.add(
+        "p",
+        "pad_probe",
+        config(&[("period", "10ms")]),
+        DeviceOptions::default(),
+    );
+    net.op(
+        Op::extension_at(p, wasmnet_core::ExtensionOp::new(wasmnet_pad::PadOp::Clear)),
+        Placement::StartOf(25 * MS),
+    );
+    net.run_to(40 * MS);
+    seen(
+        net,
+        Vec::new(),
+        &["pad-cleared", "pad-fault", "device-crashed"],
+    )
+}
+
+#[test]
+fn extension_options_and_ops_are_applied_alike() {
+    on_both(|net| {
+        let s = options_and_ops(net);
+        assert_eq!(
+            field(&s, "device-crashed", "message"),
+            ["pad: append 2 failed"],
+            "{s:?}"
+        );
+        assert_eq!(field(&s, "pad-cleared", "by"), ["operator"], "{s:?}");
         s
     });
 }
