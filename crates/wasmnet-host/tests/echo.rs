@@ -15,9 +15,9 @@ use std::process::Command;
 use std::sync::OnceLock;
 
 use sha2::{Digest, Sha256};
-use wasmnet_host::pcap::{self, Capture};
+use wasmnet_host::pcap::{self, Capture, Direction};
 use wasmnet_host::{Guard, Host, Network, Outcome, Record, SimConfig};
-use wasmnet_wire::{Direction, EthernetFrame, MacAddr};
+use wasmnet_wire::{EthernetFrame, MacAddr};
 use wasmtime::component::Component;
 
 /// Must match `COUNT` and `INTERVAL_NS` in components/blaster/src/lib.rs.

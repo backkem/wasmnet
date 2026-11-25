@@ -5,7 +5,9 @@
 //! Description and Enhanced Packet Blocks, and skips any other block type. Every length, padding
 //! and option is checked. Anything a strict reader such as Wireshark would reject is an error.
 
-use wasmnet_wire::Direction;
+/// The direction of a packet relative to its capturing interface: what [`Packet::direction`]
+/// holds (`wasmnet-wire`'s type, which the encoder writes).
+pub use wasmnet_wire::Direction;
 
 const SHB: u32 = 0x0A0D_0D0A;
 const IDB: u32 = 0x0000_0001;
