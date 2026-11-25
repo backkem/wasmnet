@@ -1,6 +1,7 @@
 //! wit-bindgen glue: a stepped device with no ports that exports `wasmnet:link/device` and
 //! `wasmnet:control/commands` (`set`, `variables`, `args`, `env`) and makes the script's calls
-//! through `wasmnet:infra/devices`.
+//! through `wasmnet:infra/devices` and `events` (its rules: read the followed devices' events,
+//! then arm a wake on them).
 
 // Generated bindings and `export!` need unsafe (raw ABI glue); our own code here does not.
 #![allow(unsafe_code)]

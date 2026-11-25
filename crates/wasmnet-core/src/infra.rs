@@ -347,7 +347,7 @@ struct Arm {
 }
 
 /// Wakes a stepped controller by queueing one more `poll` of it at the current instant
-/// ([`VirtualClock::wake_poll`]), the first time it is woken only.
+/// (`VirtualClock::wake_poll`), the first time it is woken only.
 struct PollWake {
     clock: VirtualClock,
     device: usize,
@@ -2293,7 +2293,7 @@ impl InfraEnd {
     /// something is ready already (as for [`Self::wait_any`]) it says what, and arms
     /// nothing. Otherwise it arms a one-shot wake: the first event, change or departure that
     /// would end the wait queues one more `poll` of the controller at that instant, in that
-    /// processing context ([`VirtualClock::wake_poll`]), which no poll deadline replaces. A new
+    /// processing context (`VirtualClock::wake_poll`), which no poll deadline replaces. A new
     /// `arm` replaces the armed one (with nothing to follow and no table, it only disarms), and
     /// a stop, a crash or a new instance of the controller disarms it.
     pub fn arm(
