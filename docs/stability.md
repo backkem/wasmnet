@@ -19,13 +19,16 @@ operator event, though that test exercises it too. So are a device's arguments a
 environment (`DeviceOptions::args` and `env`, the spec keys `args` and `env`), a controller's
 `logs` of its own devices, `devices.control-answer`, `DeviceOptions::infra_cascade` and
 `wasmnet:infra/changes.wait`
-(`crates/wasmnet-host/tests/infra_verbs.rs`). `Runtime::Component` must be `ToOwned`, so a
-network keeps each device's component to start it again. So is what a run reports for
-measuring it (`crates/wasmnet-host/tests/measure.rs`): `DeviceCost` with its peak fuel per
-instant, `Network::link_stats` read between runs with `LinkStats::since` and `add`, a link's
-series (`SeriesOptions`, `Network::link_series`), and what links record (`CaptureOptions`,
-`Network::set_capture_defaults`, `LinkMut::capture`, `FrameRecord::len`) with the
-`wasmnet-link-end/1` end descriptions (`pcap::LinkEnd`) ([design/links.md](design/links.md)).
+(`crates/wasmnet-host/tests/infra_verbs.rs`), and `devices.wire` and `devices.unwire`, cable
+impairments (also on `Op::Wire` and `Cable`), the `wasmnet:reconfigure` export and the switch's
+answer to it, `DeviceOptions::infra_max_devices` and `memory`, and `DeviceCost::memory` and
+`peak_memory` (`crates/wasmnet-host/tests/infra_limits.rs`). `Runtime::Component` must be
+`ToOwned`, so a network keeps each device's component to start it again. So is what a run
+reports for measuring it (`crates/wasmnet-host/tests/measure.rs`): `DeviceCost` with its peak
+fuel per instant, `Network::link_stats` read between runs with `LinkStats::since` and `add`, a
+link's series (`SeriesOptions`, `Network::link_series`), and what links record
+(`CaptureOptions`, `Network::set_capture_defaults`, `LinkMut::capture`, `FrameRecord::len`) with
+the `wasmnet-link-end/1` end descriptions (`pcap::LinkEnd`) ([design/links.md](design/links.md)).
 
 ## Embedder surface, unstable
 

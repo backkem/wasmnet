@@ -11,16 +11,14 @@ here so that nobody has to find these the hard way. Each entry names where the c
   recording off keeps none ([design/links.md](design/links.md#what-a-link-records)), but the
   frame log still adds one fixed-size record per transmission, and captures are only held in
   memory (nothing streams them out). The journal and captured stdio have caps.
-- **A device has no memory limit.** Fuel bounds what a device computes per virtual instant;
-  nothing bounds what it allocates.
+- **A memory limit is opt-in and native only.** `DeviceOptions::memory` (or a spec's `memory`)
+  bounds a device's linear memory on wasmtime; a device without one may allocate as much as
+  wasmtime lets it. The browser backend neither enforces it nor measures memory
+  (`DeviceCost::memory` stays 0 there). Tables are not counted.
 - **An event can be lost while a device is created.** `block_on`
   (`crates/wasmnet-core/src/exec.rs`) advances time while a device is instantiated or answers
   `ports()`. An event that is not a timer and comes due in that window is dropped without an
   error. Adding every device before the first `run` avoids it.
-- **A link wired by an operator event starts unimpaired.** `Op::Wire` and the cables of
-  `Op::AddDevice` take a latency and an MTU but no impairments; an `Op::ImpairNamed` applies
-  them one event later, so frames sent in between cross the plain link
-  (`crates/wasmnet-core/src/network.rs`).
 - **The transmit queue is bounded in frames only**, not in bytes, and serialisation counts the
   frame as transmitted, without Ethernet's preamble, FCS and inter-frame gap
   ([design/links.md](design/links.md)).

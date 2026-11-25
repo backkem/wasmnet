@@ -146,10 +146,15 @@ deliveries are queued `latency` later. A cable never crosses sites ([sites.md](s
 that `may_reschedule` is followed by a `poll` at the same instant. A call no handler serves is
 answered by `unsupported`. An operator event carries a `ControlRequest` (wrapped in `Control`)
 that makes a fresh call each time it applies; the device's refusal becomes the op's state.
-One kind of control call is built in: device commands (`wasmnet_core::commands`), for the
-`wasmnet:control/commands` export, which `wasmnet-host` serves itself (before any extension's
-handler) and the browser backend does not serve
+Two kinds of control call are built in: device commands (`wasmnet_core::commands`), for the
+`wasmnet:control/commands` export, and configuration changes in place
+(`wasmnet_core::reconfigure`), for the `wasmnet:reconfigure/reconfigure` export. `wasmnet-host`
+serves both itself (before any extension's handler); the browser backend serves neither
 ([topology-and-infra.md](topology-and-infra.md#commands-into-a-running-device)).
+
+The wasmtime backend also measures every device's linear memory, all its instances together,
+as it grows (`DeviceCost::memory` and `peak_memory`, deterministic), and bounds it when the
+device has `DeviceOptions::memory`: a growth past it traps at the growing instruction.
 
 **Extension ops** apply like topology changes. `ExtOp::apply` gets an `OpContext`: the op's
 instant, `running(name)`, `require_export`, `journal_event`, `control` (answered in the op's
