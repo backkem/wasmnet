@@ -88,6 +88,8 @@ fn run(step: &Step) -> (String, Vec<(String, String)>) {
         Verb::Start => devices::start(id, name).map(|_| "ok"),
         Verb::Stop => devices::stop(id, name, 0).map(|_| "ok"),
         Verb::Remove => devices::remove(id, name).map(|r| if r { "ok" } else { "unchanged" }),
+        Verb::Wire { cable } => devices::wire(id, name, cable).map(|_| "ok"),
+        Verb::Unwire { port } => devices::unwire(id, name, *port).map(|_| "ok"),
         Verb::Logs { stream, tail } => {
             return match devices::logs(name, stream, 0, *tail) {
                 Ok(lines) => {

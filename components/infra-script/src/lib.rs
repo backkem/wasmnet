@@ -15,6 +15,7 @@
 //! * `<verb> <name> [<rest>]`: `apply <name> <spec>` (the CBOR spec as hex, no labels),
 //!   `control <name> <command> [<argument>]` (the argument is the rest of the line, trimmed),
 //!   `start <name>`, `stop <name>` (no grace period), `remove <name>`, or
+//!   `wire <name> <cable>` (the cable's CBOR as hex), `unwire <name> <port>`,
 //!   `logs <name> [stdout|stderr] [<tail>]` (the device's journalled output lines, default
 //!   `stderr` and every line), or `answer <request-id>` (the answer to the command sent with
 //!   that request id: `devices.control-answer`).
@@ -60,6 +61,14 @@ pub enum Verb {
     },
     /// `devices.control-answer` for the step's name, a request id.
     Answer,
+    /// `devices.wire` with a cable (CBOR).
+    Wire {
+        cable: Vec<u8>,
+    },
+    /// `devices.unwire` of a port.
+    Unwire {
+        port: u32,
+    },
 }
 
 impl Verb {
@@ -72,6 +81,8 @@ impl Verb {
             Verb::Remove => "remove",
             Verb::Logs { .. } => "logs",
             Verb::Answer => "answer",
+            Verb::Wire { .. } => "wire",
+            Verb::Unwire { .. } => "unwire",
         }
     }
 }
@@ -133,7 +144,7 @@ fn hex(text: &str) -> Option<Vec<u8>> {
 /// Parses one step's value.
 pub fn parse_step(n: u32, text: &str) -> Result<Step, String> {
     let syntax = "`<at> [id=<id>] [when=<id>~|!<text>] \
-                  apply|control|start|stop|remove|logs|answer <name> [<rest>]`";
+                  apply|control|start|stop|remove|logs|answer|wire|unwire <name> [<rest>]`";
     let text = text.trim();
     let (at, rest) = text.split_once(char::is_whitespace).ok_or(syntax)?;
     let at = parse_duration(at).ok_or_else(|| format!("`{at}` is not a duration"))?;
@@ -187,6 +198,14 @@ pub fn parse_step(n: u32, text: &str) -> Result<Step, String> {
         "start" => Verb::Start,
         "stop" => Verb::Stop,
         "remove" => Verb::Remove,
+        "wire" => Verb::Wire {
+            cable: hex(rest).ok_or("wire: the cable must be hex")?,
+        },
+        "unwire" => Verb::Unwire {
+            port: rest
+                .parse()
+                .map_err(|_| format!("unwire: `{rest}` is not a port"))?,
+        },
         "answer" if !rest.is_empty() => {
             return Err("answer: takes only a request id".to_owned());
         }
@@ -374,6 +393,21 @@ mod tests {
             "5ms when=~x answer q",
             "5ms when=q~ answer q",
         ] {
+            assert!(parse_step(0, bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn wire_and_unwire_steps() {
+        assert_eq!(
+            parse_step(0, "5ms wire r1 a1").unwrap().verb,
+            Verb::Wire { cable: vec![0xa1] }
+        );
+        assert_eq!(
+            parse_step(0, "5ms unwire r1 2").unwrap().verb,
+            Verb::Unwire { port: 2 }
+        );
+        for bad in ["5ms wire r1 zz", "5ms unwire r1 x", "5ms unwire r1"] {
             assert!(parse_step(0, bad).is_err(), "{bad:?}");
         }
     }

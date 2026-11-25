@@ -14,7 +14,7 @@
 //!
 //! A port that goes down has its MAC entries flushed. Everything is counted per port
 //! ([`PortCounters`]), and table changes are reported as [`Event`]s (`mac-learned`, `mac-moved`,
-//! `mac-aged`, `mac-flushed`, `port-up`, `port-down`), which the component forwards to the
+//! `mac-aged`, `mac-flushed`, `port-up`, `port-down`, `reconfigured`), which the component forwards to the
 //! host's `wasmnet:link/log.event`.
 //!
 //! This file is pure logic with no bindings, so it is unit- and property-tested inside wasmtime.
@@ -151,12 +151,34 @@ pub struct PortCounters {
 /// A change of the MAC table or of a port, reported to the host as a structured event.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Event {
-    MacLearned { mac: MacAddr, port: u32 },
-    MacMoved { mac: MacAddr, from: u32, to: u32 },
-    MacAged { mac: MacAddr, port: u32 },
-    MacFlushed { mac: MacAddr, port: u32 },
-    PortUp { port: u32 },
-    PortDown { port: u32 },
+    MacLearned {
+        mac: MacAddr,
+        port: u32,
+    },
+    MacMoved {
+        mac: MacAddr,
+        from: u32,
+        to: u32,
+    },
+    MacAged {
+        mac: MacAddr,
+        port: u32,
+    },
+    MacFlushed {
+        mac: MacAddr,
+        port: u32,
+    },
+    PortUp {
+        port: u32,
+    },
+    PortDown {
+        port: u32,
+    },
+    /// It took a new configuration in place ([`Switch::reconfigure`]).
+    Reconfigured {
+        aging_ns: u64,
+        max_entries: usize,
+    },
 }
 
 impl Event {
@@ -169,6 +191,7 @@ impl Event {
             Event::MacFlushed { .. } => "mac-flushed",
             Event::PortUp { .. } => "port-up",
             Event::PortDown { .. } => "port-down",
+            Event::Reconfigured { .. } => "reconfigured",
         }
     }
 
@@ -187,6 +210,13 @@ impl Event {
                 kv("to", to.to_string()),
             ],
             Event::PortUp { port } | Event::PortDown { port } => vec![kv("port", port.to_string())],
+            Event::Reconfigured {
+                aging_ns,
+                max_entries,
+            } => vec![
+                kv("aging", format_duration(aging_ns)),
+                kv("max-entries", max_entries.to_string()),
+            ],
         }
     }
 }
@@ -257,6 +287,25 @@ impl Switch {
 
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// Takes `new` in place (`wasmnet:reconfigure`): a new aging time applies to every entry
+    /// from now on (an entry older than it ages at the next poll), a new table size to what is
+    /// learned from now on (a smaller one keeps the entries it has until they age). The table,
+    /// the ports and the counters stay. `Err`: `ports` or `mtu` changed, which only a restart
+    /// can do (the ports are declared once).
+    pub fn reconfigure(&mut self, new: Config, out: &mut impl Sink) -> Result<(), String> {
+        if (new.ports, new.mtu) != (self.config.ports, self.config.mtu) {
+            return Err("`ports` and `mtu` change only with a restart".to_owned());
+        }
+        if new != self.config {
+            self.config = new;
+            out.event(Event::Reconfigured {
+                aging_ns: new.aging_ns,
+                max_entries: new.max_entries,
+            });
+        }
+        Ok(())
     }
 
     /// Handles one frame received on `port` at `now`.
@@ -500,6 +549,42 @@ mod tests {
         let mut out = Out::default();
         let fwd = sw.receive(now, port, f, &mut out);
         (fwd, out)
+    }
+
+    #[test]
+    fn a_new_aging_time_applies_in_place_and_ports_need_a_restart() {
+        let mut sw = switch();
+        rx(&mut sw, 0, 0, &frame(mac(2), mac(1)));
+        let mut out = Out::default();
+        let longer = Config {
+            aging_ns: 10 * AGING,
+            ..*sw.config()
+        };
+        assert_eq!(sw.reconfigure(longer, &mut out), Ok(()));
+        assert_eq!(
+            out.events,
+            [Event::Reconfigured {
+                aging_ns: 10 * AGING,
+                max_entries: 1024
+            }]
+        );
+        // The table stayed: mac(1) is still known, and now lives ten times as long.
+        let (fwd, _) = rx(&mut sw, 5 * AGING, 3, &frame(mac(1), mac(3)));
+        assert_eq!(fwd, Forwarding::Unicast(0));
+        // The same config again changes nothing; other ports or another MTU need a restart.
+        let mut out = Out::default();
+        assert_eq!(sw.reconfigure(longer, &mut out), Ok(()));
+        assert!(out.events.is_empty());
+        for other in [
+            Config { ports: 8, ..longer },
+            Config {
+                mtu: 9000,
+                ..longer
+            },
+        ] {
+            assert!(sw.reconfigure(other, &mut Out::default()).is_err());
+        }
+        assert_eq!(sw.config(), &longer);
     }
 
     #[test]

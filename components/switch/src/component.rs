@@ -1,4 +1,5 @@
-//! wit-bindgen glue: exports `wasmnet:link/device` over [`crate::Switch`].
+//! wit-bindgen glue: exports `wasmnet:link/device` and `wasmnet:reconfigure/reconfigure` over
+//! [`crate::Switch`].
 
 // Generated bindings and `export!` need unsafe (raw ABI glue); our own code here does not.
 #![allow(unsafe_code)]
@@ -8,13 +9,21 @@ use std::cell::RefCell;
 use crate::{Config, Event, Sink, Switch};
 
 wit_bindgen::generate!({
-    world: "wasmnet:link/stepped-device",
-    path: ["../../wit/deps/config", "../../wit/link"],
+    inline: "
+        package wasmnet:switch-device;
+        world switch {
+            include wasmnet:link/stepped-device@0.1.0;
+            export wasmnet:reconfigure/reconfigure@0.1.0;
+        }
+    ",
+    path: ["../../wit/deps/config", "../../wit/link", "../../wit/reconfigure"],
+    generate_all,
     // Not covered by any WASI binding crate: generate our own bindings for the vendored WIT.
     with: { "wasi:config/store@0.2.0-rc.1": generate },
 });
 
 use exports::wasmnet::link::device::Guest;
+use exports::wasmnet::reconfigure::reconfigure::{self, Refusal};
 use wasi::config::store;
 use wasmnet::link::log::{self, Level};
 use wasmnet::link::types::PortInfo;
@@ -83,6 +92,20 @@ impl Guest for Component {
 
     fn link_state(now: u64, port: u32, up: bool) {
         with(|sw| sw.link_state(now, port, up, &mut Host));
+    }
+}
+
+impl reconfigure::Guest for Component {
+    /// A new aging time or table size in place; other ports or another MTU need a restart.
+    fn reconfigure(_now: u64, config: Vec<(String, String)>) -> Result<(), Refusal> {
+        let new = Config::from_lookup(|key| {
+            config
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
+        })
+        .map_err(|e| Refusal::Invalid(e.to_string()))?;
+        with(|sw| sw.reconfigure(new, &mut Host)).map_err(Refusal::Restart)
     }
 }
 
