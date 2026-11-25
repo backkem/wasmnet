@@ -14,14 +14,20 @@
 //!   segments addressed to it. No fragmentation, no ICMP rate limiting, no redirects.
 //! * **Router Advertisements** (optional, off by default): one when a port comes up, and one per
 //!   Router Solicitation.
+//! * **Commands** (`wasmnet:control/commands`, [`Router::command`]): `route-add`,
+//!   `route-replace` and `route-remove` change the static routes while the router runs, in the
+//!   config's route syntax; `routes` lists the table. Their semantics are in
+//!   `wit/router/router.wit`.
 //! * **Events** (`wasmnet:link/log.event`): `route-lookup {dst, result, prefix, via, port}`,
+//!   `route-added` / `route-removed {prefix, via, port}` (a command changed the table),
 //!   `arp-resolved` / `ndp-resolved {ip, mac, port, after-ns, queued}`, `arp-failed` /
 //!   `ndp-failed {ip, port, attempts, dropped}`, `ttl-decrement {proto, src, dst, ttl-in,
 //!   ttl-out, from-port, to-port}`, `icmp-error-sent {error, icmp-type, icmp-code, from, to,
 //!   about, proto}`, `forward-drop {reason, src, dst, proto, port}`, `port-up` / `port-down
 //!   {port}`. `route-lookup` and `ttl-decrement` can be one per packet, so by default they are
 //!   reported once per destination and once per flow (`trace.*` in [`config`]).
-//! * **Counters** (`wasmnet:link/counters`): router-wide ones and `p<N>-*` per port.
+//! * **Counters** (`wasmnet:link/counters`): router-wide ones and `p<N>-*` per port;
+//!   `routes-added` and `routes-removed` once a command changed the table.
 //!
 //! Everything here except `component.rs` is pure logic with no bindings: unit- and
 //! property-tested inside wasmtime (`cargo xtask test-guest`).

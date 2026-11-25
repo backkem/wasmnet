@@ -1,0 +1,56 @@
+/// Commands into a live device: what an operator or an in-world controller asks of a device
+/// while the network runs (a router's `route-add`, for example), without recreating it.
+///
+/// A device that takes commands exports `commands`. The host finds the export when it
+/// instantiates the device and reports it as one of the device's optional exports, under the
+/// name `wasmnet:control/commands`. Two paths reach it, and both make the same call:
+///
+/// - an operator event the embedder places (a control call, at a position in the event queue,
+///   or between runs);
+/// - `wasmnet:infra/devices.control`, from a controller device, on a device it created; the call
+///   is a derived operator event at the controller's own position.
+///
+/// Neither the host nor the simulator interprets a command or its answer: text goes in, text
+/// comes out. What a device's commands mean is part of that device's contract (the router's are
+/// documented in `wasmnet:router`).
+///
+/// This interface is generic on purpose: one export, one function, so the patch panel and the
+/// infra API carry commands for any device without knowing any of them, and a device adds
+/// commands without a change to this package.
+package wasmnet:control@0.1.0;
+
+/// Exported by a device that takes commands.
+interface commands {
+    /// Virtual time in nanoseconds since the simulation started (`wasmnet:link/types.instant`).
+    type instant = u64;
+
+    /// Runs `command` with `argument` at virtual time `now` and answers what it did.
+    ///
+    /// - `command`: a kebab-case name the device defines (`route-add`). `argument`: its text,
+    ///   possibly empty, in whatever syntax the device documents for that command (a router
+    ///   takes a route in its configuration's own syntax).
+    /// - Timing: the host calls it inside the device's event loop at the instant the operator
+    ///   event or the derived request applies (between runs: at the network's current instant),
+    ///   never while another export of the device is running. After it returns the host calls
+    ///   `wasmnet:link/device.poll(now)` at the same instant, after every other event already
+    ///   queued for it, so a stepped device can report a new deadline (an async device answers
+    ///   `none` as always).
+    /// - Sync, and it must not block. Unlike `counters`, it may change the device, transmit
+    ///   frames (they leave at `now`) and log. Re-entrancy as for every `wasmnet:link/device`
+    ///   export: never called from inside one of the device's own imports.
+    /// - Ownership: the device owns both strings; the host owns the answer.
+    /// - `ok(text)`: what the command did (a short word such as `added`, or the lines of a
+    ///   read); an operator or controller records it. `err(message)`: the device refused the
+    ///   command and changed nothing. An unknown command or a malformed argument is an `err`,
+    ///   never a trap: commands come from outside the device and a trap is a device crash.
+    /// - Commands should be idempotent where they can be (asking for what is already true
+    ///   succeeds and changes nothing): a controller's request is retried by request id, but an
+    ///   operator may well send the same command twice.
+    invoke: func(now: instant, command: string, argument: string) -> result<string, string>;
+}
+
+/// A device that takes commands (what a device's own world includes, beside its
+/// `wasmnet:link` world).
+world controllable {
+    export commands;
+}

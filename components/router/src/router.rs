@@ -103,6 +103,9 @@ pub struct Counters {
     pub ndp_failed: u64,
     pub ra_sent: u64,
     pub trace_suppressed: u64,
+    /// Static routes added and removed by commands (a replacement counts in both).
+    pub routes_added: u64,
+    pub routes_removed: u64,
     /// DHCP relay: requests relayed to a server, replies relayed to a client, requests
     /// dropped (too many hops).
     pub dhcp_relayed_to_server: u64,
@@ -186,6 +189,14 @@ fn v4_dst(p: &[u8]) -> Ipv4Addr {
 fn v6_at(p: &[u8], at: usize) -> Ipv6Addr {
     let o: [u8; 16] = p[at..at + 16].try_into().expect("16 bytes");
     Ipv6Addr::from(o)
+}
+
+/// A command's refusal to touch a connected route.
+fn connected(r: &Route) -> String {
+    format!(
+        "{} is connected to port {}: its route cannot be changed",
+        r.prefix, r.port
+    )
 }
 
 /// ICMPv4 error types (an error is never sent about one of these).
@@ -1488,6 +1499,128 @@ impl Router {
     }
 
     // ------------------------------------------------------------------------------------------
+    // Commands (`wasmnet:control/commands`, documented in `wit/router/router.wit`)
+
+    /// Runs one command at `now`: `route-add`, `route-replace` and `route-remove` change the
+    /// static routes, `routes` lists the table. `Ok` says what it did; `Err` changed nothing.
+    /// A change applies to every lookup from then on; queued packets, the neighbor table, the
+    /// ports and the counters other than the route ones are untouched.
+    pub fn command(
+        &mut self,
+        _now: u64,
+        command: &str,
+        argument: &str,
+        out: &mut impl Sink,
+    ) -> Result<String, String> {
+        let argument = argument.trim();
+        match command {
+            "route-add" => self.set_route(argument, false, out),
+            "route-replace" => self.set_route(argument, true, out),
+            "route-remove" => self.remove_route(argument, out),
+            "routes" if argument.is_empty() => Ok(self
+                .routes
+                .routes()
+                .iter()
+                .map(Route::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")),
+            "routes" => Err("`routes` takes no argument".to_owned()),
+            other => Err(format!(
+                "unknown command `{other}` (route-add, route-replace, route-remove, routes)"
+            )),
+        }
+    }
+
+    /// A static route from a command's argument, checked against the ports like the config's.
+    fn parse_static(&self, text: &str) -> Result<Route, String> {
+        let r = crate::config::parse_route(text, &self.cfg.ports)
+            .map_err(|why| format!("route `{text}`: {why}"))?;
+        Ok(Route {
+            prefix: r.prefix,
+            via: r.via,
+            port: r.port,
+            kind: RouteKind::Static,
+        })
+    }
+
+    fn set_route(
+        &mut self,
+        text: &str,
+        replace: bool,
+        out: &mut impl Sink,
+    ) -> Result<String, String> {
+        let new = self.parse_static(text)?;
+        match self.routes.get(new.prefix).copied() {
+            Some(old) if old.kind == RouteKind::Connected => Err(connected(&old)),
+            Some(old) if old == new => Ok("unchanged".to_owned()),
+            Some(old) if !replace => Err(format!(
+                "a route for {} exists ({old}): use route-replace",
+                old.prefix
+            )),
+            old => {
+                self.routes.replace(new);
+                if let Some(old) = old {
+                    self.route_changed("route-removed", &old, out);
+                }
+                self.route_changed("route-added", &new, out);
+                Ok(if old.is_some() { "replaced" } else { "added" }.to_owned())
+            }
+        }
+    }
+
+    fn remove_route(&mut self, text: &str, out: &mut impl Sink) -> Result<String, String> {
+        let (prefix, exact) = match text.split_whitespace().count() {
+            0 => return Err("route-remove needs a prefix or a route".to_owned()),
+            1 if text == "default" => {
+                return Err("`default` alone names no family: use 0.0.0.0/0 or ::/0".to_owned());
+            }
+            1 => {
+                let p: Prefix = text
+                    .parse()
+                    .map_err(|_| format!("`{text}` is not a prefix like 10.0.3.0/24"))?;
+                if !p.is_canonical() {
+                    return Err(format!("{text}: host bits are set (use {})", p.masked()));
+                }
+                (p, None)
+            }
+            _ => {
+                let r = self.parse_static(text)?;
+                (r.prefix, Some(r))
+            }
+        };
+        match self.routes.get(prefix).copied() {
+            None => Ok("absent".to_owned()),
+            Some(old) if old.kind == RouteKind::Connected => Err(connected(&old)),
+            Some(old) if exact.is_some_and(|e| e != old) => {
+                Err(format!("the route for {prefix} is `{old}`, not `{text}`"))
+            }
+            Some(old) => {
+                self.routes.remove(prefix);
+                self.route_changed("route-removed", &old, out);
+                Ok("removed".to_owned())
+            }
+        }
+    }
+
+    /// Journals one change and counts it. Every destination's next lookup is traced again.
+    fn route_changed(&mut self, kind: &'static str, r: &Route, out: &mut impl Sink) {
+        if kind == "route-added" {
+            self.counters.routes_added += 1;
+        } else {
+            self.counters.routes_removed += 1;
+        }
+        self.traced_dsts.clear();
+        out.event(Event::new(
+            kind,
+            vec![
+                kv("prefix", r.prefix),
+                kv("via", r.via.map_or("on-link".to_owned(), |v| v.to_string())),
+                kv("port", r.port),
+            ],
+        ));
+    }
+
+    // ------------------------------------------------------------------------------------------
     // Counters
 
     /// Every counter, in a stable order (the `counters` export).
@@ -1543,6 +1676,12 @@ impl Router {
         .into_iter()
         .map(|(k, v)| (k.to_owned(), v))
         .collect();
+        // Only routers whose routes a command changed list these (the others keep their
+        // counter lists).
+        if c.routes_added + c.routes_removed > 0 {
+            v.push(("routes-added".to_owned(), c.routes_added));
+            v.push(("routes-removed".to_owned(), c.routes_removed));
+        }
         // Only routers that relay DHCP list these (other routers keep their counter lists).
         if self.relays() {
             for (k, val) in [

@@ -1,5 +1,5 @@
-//! wit-bindgen glue: exports `wasmnet:link/device` and `wasmnet:link/counters` over
-//! [`crate::Router`] (world `wasmnet:router/router`).
+//! wit-bindgen glue: exports `wasmnet:link/device`, `wasmnet:link/counters` and
+//! `wasmnet:control/commands` over [`crate::Router`] (world `wasmnet:router/router`).
 
 // Generated bindings and `export!` need unsafe (raw ABI glue); our own code here does not.
 #![allow(unsafe_code)]
@@ -10,13 +10,20 @@ use crate::{Config, Event, Router, Sink};
 
 wit_bindgen::generate!({
     world: "wasmnet:router/router",
-    path: ["../../wit/deps/config", "../../wit/link", "../../wit/router"],
-    // The world lives in its own package, so the `wasmnet:link` interfaces are dependencies.
+    path: [
+        "../../wit/deps/config",
+        "../../wit/link",
+        "../../wit/control",
+        "../../wit/router",
+    ],
+    // The world lives in its own package, so the `wasmnet:link` and `wasmnet:control`
+    // interfaces are dependencies.
     generate_all,
     // Not covered by any WASI binding crate: generate our own bindings for the vendored WIT.
     with: { "wasi:config/store@0.2.0-rc.1": generate },
 });
 
+use exports::wasmnet::control::commands;
 use exports::wasmnet::link::{counters, device};
 use wasi::config::store;
 use wasmnet::link::log::{self, Level};
@@ -100,6 +107,12 @@ impl device::Guest for Component {
 impl counters::Guest for Component {
     fn counters() -> Vec<(String, u64)> {
         with(|r| r.counter_list())
+    }
+}
+
+impl commands::Guest for Component {
+    fn invoke(now: u64, command: String, argument: String) -> Result<String, String> {
+        with(|r| r.command(now, &command, &argument, &mut Host))
     }
 }
 

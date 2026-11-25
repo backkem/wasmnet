@@ -3,14 +3,59 @@
 /// A router is a stepped device (`wasmnet:link/stepped-device`: `ports`, `receive`, `poll`,
 /// `link-state`; config through `wasi:config/store`; events through `wasmnet:link/log`) that also
 /// exports `wasmnet:link/counters`, so tests can read its per-port and forwarding counters after a
-/// run. It needs no clock and no randomness: time arrives as `now` arguments, and its next
-/// deadline (an ARP/NDP retry) is `poll`'s answer.
+/// run, and `wasmnet:control/commands`, so its static routes can change while it runs. It needs
+/// no clock and no randomness: time arrives as `now` arguments, and its next deadline (an
+/// ARP/NDP retry) is `poll`'s answer.
 ///
-/// This package exists only to name that combination; it adds no interface. (A world added to
+/// # Commands
+///
+/// `wasmnet:control/commands.invoke(now, command, argument)` takes these commands. A route is
+/// written in the configuration's own syntax (`routes`: `10.0.3.0/24 via 10.0.2.2`,
+/// `default via 10.0.2.2`, `fd00:3::/64 via fe80::2 port 1`, `10.9.0.0/16 port 1`), checked
+/// against the router's ports exactly as at start. The table holds one route per prefix.
+///
+/// - `route-add <route>`: adds a static route. `ok("added")`; `ok("unchanged")` when that exact
+///   route is there already; an error when another route holds its prefix (use
+///   `route-replace`).
+/// - `route-replace <route>`: adds the route, or replaces the static route for its prefix.
+///   `ok("added")`, `ok("replaced")` or `ok("unchanged")`.
+/// - `route-remove <prefix>` or `route-remove <route>`: removes the static route for the
+///   prefix (`0.0.0.0/0` or `::/0` for a default route); given a whole route, only if it is
+///   that route. `ok("removed")`; `ok("absent")` when there is none.
+/// - `routes` (no argument): the table, one route per line in table order (connected routes
+///   first, then static routes in the order they were added; a replaced route keeps its place),
+///   as `<prefix> [via <next-hop>] port <n> (connected|static)`.
+///
+/// Every mutation is idempotent: asking for what is already true succeeds and changes nothing.
+/// A connected route (a port's own prefix) can be neither added, replaced nor removed, and an
+/// unknown command, a malformed route or a port that does not exist is an `err` that changes
+/// nothing.
+///
+/// What a change touches, and what it does not:
+///
+/// - It applies at `now`, to every lookup from then on: the next packet forwarded or
+///   originated takes the new route. A `poll(now)` follows the call, as after every command.
+/// - Packets already waiting for a neighbour's ARP or NDP answer stay queued for that neighbour
+///   and leave when it answers (or draw a host unreachable when it never does), as in a kernel,
+///   where the neighbour queue comes after routing.
+/// - The neighbour cache, the ports and their addresses, the links (their names, carriers and
+///   captures) and the counters are untouched: a new next hop that is already known is used at
+///   once, without an ARP request or Neighbor Solicitation.
+/// - Each change is journalled: `route-added {prefix, via, port}` and `route-removed {prefix,
+///   via, port}` (`via` is `on-link` for a route without a next hop); a replacement is a
+///   `route-removed` then a `route-added`. A change also resets the once-per-destination
+///   `route-lookup` trace (`trace.route-lookup = first`), so the next lookup of each destination
+///   is reported with its new route.
+/// - Counters: `routes` is the table's size; `routes-added` and `routes-removed` count the
+///   changes (a replacement counts in both) and are listed once a command has changed the
+///   table, so a router whose routes never change keeps its counter list.
+///
+/// This package names that combination; it adds no interface of its own. (A world added to
 /// `wasmnet:link` would change that package for every device.)
-package wasmnet:router@0.1.0;
+package wasmnet:router@0.1.1;
 
 world router {
     include wasmnet:link/stepped-device@0.1.0;
     export wasmnet:link/counters@0.1.0;
+    export wasmnet:control/commands@0.1.0;
 }

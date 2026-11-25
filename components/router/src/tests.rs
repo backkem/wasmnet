@@ -1113,7 +1113,213 @@ fn counters_are_listed_per_port() {
     let names: Vec<&str> = list.iter().map(|(k, _)| k.as_str()).collect();
     assert!(names.contains(&"forwarded-v4") && names.contains(&"p1-tx-frames"));
     assert_eq!(list.iter().find(|(k, _)| k == "routes").unwrap().1, 4);
+    assert!(
+        !names.contains(&"routes-added"),
+        "listed only once a command changed the table"
+    );
     let _ = IpAddr::V4(v4("10.0.0.1"));
+}
+
+// ---- commands ----
+
+fn counter(r: &Router, name: &str) -> Option<u64> {
+    r.counter_list()
+        .into_iter()
+        .find(|(k, _)| k == name)
+        .map(|(_, v)| v)
+}
+
+fn port_for(r: &Router, ip: &str) -> Option<u32> {
+    r.routes()
+        .lookup(ip.parse().unwrap())
+        .map(|route| route.port)
+}
+
+#[test]
+fn commands_change_static_routes_and_are_idempotent() {
+    let (mut r, mut out) = router(&[]);
+    let cmd = |r: &mut Router, out: &mut Out, c: &str, a: &str| r.command(MS, c, a, out);
+
+    assert_eq!(
+        cmd(&mut r, &mut out, "route-add", "10.0.3.0/24 via 10.0.2.2").as_deref(),
+        Ok("added")
+    );
+    let e = out.event("route-added");
+    assert_eq!(
+        (e.get("prefix"), e.get("via"), e.get("port")),
+        (Some("10.0.3.0/24"), Some("10.0.2.2"), Some("1"))
+    );
+    assert_eq!(port_for(&r, "10.0.3.9"), Some(1));
+    out.take();
+    // The same route again changes nothing; another route for the prefix needs a replace.
+    assert_eq!(
+        cmd(&mut r, &mut out, "route-add", " 10.0.3.0/24  via 10.0.2.2 ").as_deref(),
+        Ok("unchanged")
+    );
+    let taken = cmd(&mut r, &mut out, "route-add", "10.0.3.0/24 via 10.0.1.9").unwrap_err();
+    assert!(taken.contains("route-replace"), "{taken}");
+    assert!(out.events.is_empty(), "no event for a no-op or a refusal");
+    assert_eq!(
+        cmd(
+            &mut r,
+            &mut out,
+            "route-replace",
+            "10.0.3.0/24 via 10.0.1.9"
+        )
+        .as_deref(),
+        Ok("replaced")
+    );
+    assert_eq!(out.kinds(), ["route-removed", "route-added"]);
+    assert_eq!(out.events[0].get("via"), Some("10.0.2.2"));
+    assert_eq!(out.events[1].get("port"), Some("0"));
+    assert_eq!(port_for(&r, "10.0.3.9"), Some(0));
+    assert_eq!(
+        cmd(
+            &mut r,
+            &mut out,
+            "route-replace",
+            "10.0.3.0/24 via 10.0.1.9"
+        )
+        .as_deref(),
+        Ok("unchanged")
+    );
+    assert_eq!(
+        cmd(&mut r, &mut out, "route-replace", "default via fd00:2::fe").as_deref(),
+        Ok("added")
+    );
+    assert_eq!(port_for(&r, "2001:db8::1"), Some(1));
+    out.take();
+
+    // Connected routes are not the commands' to change.
+    for (c, a) in [
+        ("route-add", "10.0.1.0/24 via 10.0.2.2"),
+        ("route-replace", "fd00:2::/64 port 0"),
+        ("route-remove", "10.0.2.0/24"),
+    ] {
+        let e = cmd(&mut r, &mut out, c, a).unwrap_err();
+        assert!(e.contains("connected"), "{c} {a}: {e}");
+    }
+    // A removal by prefix, or of exactly this route; nothing to remove is fine.
+    let other = cmd(&mut r, &mut out, "route-remove", "10.0.3.0/24 via 10.0.2.2").unwrap_err();
+    assert!(other.contains("not"), "{other}");
+    assert_eq!(
+        cmd(
+            &mut r,
+            &mut out,
+            "route-remove",
+            "10.0.3.0/24 via 10.0.1.9 port 0"
+        )
+        .as_deref(),
+        Ok("removed")
+    );
+    assert_eq!(out.kinds(), ["route-removed"]);
+    assert_eq!(
+        cmd(&mut r, &mut out, "route-remove", "10.0.3.0/24").as_deref(),
+        Ok("absent")
+    );
+    assert_eq!(
+        cmd(&mut r, &mut out, "route-remove", "::/0").as_deref(),
+        Ok("removed")
+    );
+    assert_eq!(port_for(&r, "10.0.3.9"), None);
+    out.take();
+
+    // Malformed commands are refused, never trapped on.
+    for (c, a) in [
+        ("route-add", ""),
+        ("route-add", "10.0.3.1/24 via 10.0.2.2"),
+        ("route-add", "10.0.3.0/24 via 10.0.9.2"),
+        ("route-add", "10.0.3.0/24 port 7"),
+        ("route-add", "default"),
+        ("route-remove", ""),
+        ("route-remove", "default"),
+        ("route-remove", "10.0.3.1/24"),
+        ("route-remove", "somewhere"),
+        ("routes", "all"),
+        ("route-flush", ""),
+    ] {
+        assert!(cmd(&mut r, &mut out, c, a).is_err(), "{c} {a:?}");
+    }
+    assert!(out.events.is_empty() && out.tx.is_empty());
+
+    // The table, and the counters of the changes.
+    let table = cmd(&mut r, &mut out, "routes", "").unwrap();
+    assert_eq!(
+        table.lines().collect::<Vec<_>>(),
+        [
+            "10.0.1.0/24 port 0 (connected)",
+            "fd00:1::/64 port 0 (connected)",
+            "10.0.2.0/24 port 1 (connected)",
+            "fd00:2::/64 port 1 (connected)",
+        ]
+    );
+    assert_eq!(counter(&r, "routes"), Some(4));
+    assert_eq!(counter(&r, "routes-added"), Some(3));
+    assert_eq!(counter(&r, "routes-removed"), Some(3));
+}
+
+#[test]
+fn a_route_change_keeps_queued_packets_and_known_neighbors() {
+    const C_MAC: u8 = 0x0c;
+    const D_MAC: u8 = 0x0d;
+    let (mut r, mut out) = router(&[("routes", "10.0.3.0/24 via 10.0.2.2")]);
+    // 10.0.2.3 asks for the router, so the router knows it.
+    r.receive(
+        0,
+        1,
+        &arp_frame(1, C_MAC, "10.0.2.3", MacAddr::ZERO, "10.0.2.1"),
+        &mut out,
+    );
+    out.take();
+    let packet = frame_v4(
+        A_MAC,
+        RTR0,
+        "10.0.1.10",
+        "10.0.3.10",
+        PROTO_UDP,
+        64,
+        false,
+        &udp(1, 2, b"x"),
+    );
+    // Routed to 10.0.2.2, which is not known yet: queued behind an ARP request.
+    r.receive(MS, 0, &packet, &mut out);
+    assert_eq!(out.event("route-lookup").get("via"), Some("10.0.2.2"));
+    let tx = out.take();
+    assert_eq!(tx.len(), 1);
+    assert_eq!(dst_mac(&tx[0].1), MacAddr::BROADCAST);
+    assert_eq!(&tx[0].1[38..42], &[10, 0, 2, 2]);
+
+    // The route moves to the known 10.0.2.3: nothing is sent for the change itself.
+    assert_eq!(
+        r.command(
+            2 * MS,
+            "route-replace",
+            "10.0.3.0/24 via 10.0.2.3",
+            &mut out
+        )
+        .as_deref(),
+        Ok("replaced")
+    );
+    assert!(out.take().is_empty());
+    // The next packet goes straight to it, without an ARP request, and its lookup is traced
+    // again with the new route.
+    r.receive(3 * MS, 0, &packet, &mut out);
+    assert_eq!(out.event("route-lookup").get("via"), Some("10.0.2.3"));
+    let tx = out.take();
+    assert_eq!(tx.len(), 1);
+    assert_eq!((tx[0].0, dst_mac(&tx[0].1)), (1, mac(C_MAC)));
+    assert_eq!(r.counters.arp_requests, 1, "only the one for 10.0.2.2");
+    // The packet queued for 10.0.2.2 still waits for it, and leaves when it answers.
+    r.receive(
+        4 * MS,
+        1,
+        &arp_frame(2, D_MAC, "10.0.2.2", RTR1, "10.0.2.1"),
+        &mut out,
+    );
+    let tx = out.take();
+    assert_eq!(tx.len(), 1);
+    assert_eq!(dst_mac(&tx[0].1), mac(D_MAC));
+    assert_eq!(counter(&r, "neighbor-drops"), Some(0));
 }
 
 // ---- DHCP relay agent ----

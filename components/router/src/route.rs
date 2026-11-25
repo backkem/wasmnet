@@ -4,8 +4,10 @@
 //! lookup probes at most 33 (IPv4) or 129 (IPv6) maps from the longest length down, and the first
 //! hit is the longest match. Inserting a second route for the same prefix keeps the first one:
 //! connected routes are inserted before static ones, so they win ties (an administrative
-//! distance of 0), and among static routes the first in the config wins. The table is tested
-//! against a brute-force reference with proptest.
+//! distance of 0), and among static routes the first in the config wins. A running router
+//! changes its static routes with [`RouteTable::replace`] and [`RouteTable::remove`] (its
+//! commands, `wit/router/router.wit`). The table is tested against a brute-force reference with
+//! proptest, both as built and after random sequences of changes.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -187,6 +189,42 @@ impl RouteTable {
         fresh
     }
 
+    /// The route for exactly `prefix` (masked), if there is one.
+    pub fn get(&self, prefix: Prefix) -> Option<&Route> {
+        match prefix.masked() {
+            Prefix::V4(a, l) => self.v4[usize::from(l)].get(&a),
+            Prefix::V6(a, l) => self.v6[usize::from(l)].get(&a),
+        }
+    }
+
+    /// Puts `route` (its prefix masked) in the table: it replaces the route for the same prefix
+    /// and takes its place in the order, or is added at the end. Returns the route it replaced.
+    pub fn replace(&mut self, mut route: Route) -> Option<Route> {
+        route.prefix = route.prefix.masked();
+        let old = match route.prefix {
+            Prefix::V4(a, l) => self.v4[usize::from(l)].insert(a, route),
+            Prefix::V6(a, l) => self.v6[usize::from(l)].insert(a, route),
+        };
+        match self.order.iter_mut().find(|r| r.prefix == route.prefix) {
+            Some(slot) => *slot = route,
+            None => self.order.push(route),
+        }
+        old
+    }
+
+    /// Removes the route for exactly `prefix` (masked). Returns it.
+    pub fn remove(&mut self, prefix: Prefix) -> Option<Route> {
+        let prefix = prefix.masked();
+        let old = match prefix {
+            Prefix::V4(a, l) => self.v4[usize::from(l)].remove(&a),
+            Prefix::V6(a, l) => self.v6[usize::from(l)].remove(&a),
+        };
+        if old.is_some() {
+            self.order.retain(|r| r.prefix != prefix);
+        }
+        old
+    }
+
     /// The longest-prefix match for `ip`.
     pub fn lookup(&self, ip: IpAddr) -> Option<&Route> {
         match ip {
@@ -349,6 +387,53 @@ mod tests {
         })
     }
 
+    /// One change to a table.
+    #[derive(Clone, Copy, Debug)]
+    enum Change {
+        Insert(Route),
+        Replace(Route),
+        Remove(Prefix),
+    }
+
+    fn any_change() -> impl Strategy<Value = Change> {
+        prop_oneof![
+            any_route().prop_map(Change::Insert),
+            any_route().prop_map(Change::Replace),
+            any_route().prop_map(|r| Change::Remove(r.prefix)),
+        ]
+    }
+
+    #[test]
+    fn replace_keeps_the_place_and_remove_forgets_the_prefix() {
+        let mut t = RouteTable::default();
+        t.insert(route("10.0.1.0/24", 0));
+        t.insert(route("10.0.3.0/24", 1));
+        t.insert(route("0.0.0.0/0", 0));
+        assert_eq!(
+            t.replace(route("10.0.3.7/24", 2)).map(|r| r.port),
+            Some(1),
+            "same prefix once masked"
+        );
+        assert_eq!(port_of(&t, "10.0.3.9"), Some(2));
+        assert_eq!(
+            t.routes().iter().map(|r| r.port).collect::<Vec<_>>(),
+            [0, 2, 0],
+            "the replaced route keeps its place"
+        );
+        let p: Prefix = "10.0.3.0/24".parse().unwrap();
+        assert_eq!(t.remove(p).map(|r| r.port), Some(2));
+        assert_eq!(t.remove(p), None);
+        assert_eq!(
+            port_of(&t, "10.0.3.9"),
+            Some(0),
+            "the default route takes over"
+        );
+        assert_eq!(t.get(p), None);
+        assert_eq!(t.len(), 2);
+        assert_eq!(t.replace(route("fd00:3::/64", 3)), None, "added at the end");
+        assert_eq!(t.routes().last().map(|r| r.port), Some(3));
+    }
+
     proptest! {
         #![proptest_config(proptest::test_runner::Config {
             cases: 512,
@@ -357,6 +442,65 @@ mod tests {
             failure_persistence: None,
             ..proptest::test_runner::Config::default()
         })]
+
+        /// A table changed by a random sequence of inserts, replacements and removals agrees
+        /// with a reference that keeps a plain list of routes: the same routes in the same
+        /// order, and the same longest-prefix match for every probe.
+        #[test]
+        fn lookup_matches_the_reference_after_random_changes(
+            changes in prop::collection::vec(any_change(), 0..48),
+            probes4 in prop::collection::vec(v4(), 1..16),
+            probes6 in prop::collection::vec(v6(), 1..16),
+        ) {
+            let mut t = RouteTable::default();
+            let mut model: Vec<Route> = Vec::new();
+            for change in &changes {
+                match *change {
+                    Change::Insert(r) => {
+                        let r = Route { prefix: r.prefix.masked(), ..r };
+                        let fresh = !model.iter().any(|m| m.prefix == r.prefix);
+                        prop_assert_eq!(t.insert(r), fresh);
+                        if fresh {
+                            model.push(r);
+                        }
+                    }
+                    Change::Replace(r) => {
+                        let r = Route { prefix: r.prefix.masked(), ..r };
+                        let old = t.replace(r);
+                        match model.iter_mut().find(|m| m.prefix == r.prefix) {
+                            Some(m) => {
+                                prop_assert_eq!(old, Some(*m));
+                                *m = r;
+                            }
+                            None => {
+                                prop_assert_eq!(old, None);
+                                model.push(r);
+                            }
+                        }
+                    }
+                    Change::Remove(p) => {
+                        let p = p.masked();
+                        let pos = model.iter().position(|m| m.prefix == p);
+                        prop_assert_eq!(t.remove(p), pos.map(|i| model[i]));
+                        if let Some(i) = pos {
+                            model.remove(i);
+                        }
+                    }
+                }
+            }
+            prop_assert_eq!(t.routes(), model.as_slice());
+            prop_assert_eq!(t.len(), model.len());
+            for r in &model {
+                prop_assert_eq!(t.get(r.prefix), Some(r));
+            }
+            let ips = probes4
+                .iter()
+                .map(|&a| IpAddr::V4(Ipv4Addr::from(a)))
+                .chain(probes6.iter().map(|&a| IpAddr::V6(Ipv6Addr::from(a))));
+            for ip in ips {
+                prop_assert_eq!(t.lookup(ip).map(|r| r.port), reference(&model, ip), "{}", ip);
+            }
+        }
 
         #[test]
         fn lookup_matches_the_brute_force_reference(
