@@ -1,0 +1,20 @@
+// node-service-browse = the netstack + the service-browse app: a host that browses DNS-SD
+// services on its link (and can fetch from one it resolved).
+//
+// The app sends and receives mDNS over the netstack's `wasi:sockets` UDP and joins the groups
+// (224.0.0.251 / ff02::fb) through `wasmnet:sockets-ext/multicast`; a fetch is a TCP connection
+// over the same `wasi:sockets/types`.
+package wasmnet:node-service-browse;
+
+let net = new wasmnet:netstack { ... };
+
+let browse = new app:service-browse {
+    "wasi:sockets/types@0.3.0": net["wasi:sockets/types@0.3.0"],
+    "wasmnet:sockets-ext/multicast@0.1.0": net["wasmnet:sockets-ext/multicast@0.1.0"],
+    ...
+};
+
+export net["wasmnet:link/device@0.1.0"];
+export net["wasmnet:link/lifecycle@0.1.0"];
+export net["wasmnet:link/counters@0.1.0"];
+export browse["wasi:cli/run@0.3.0"] as "app-service-browse";

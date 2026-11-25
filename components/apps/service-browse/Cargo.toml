@@ -1,0 +1,32 @@
+[package]
+name = "wasmnet-service-browse"
+version = "0.0.0"
+description = "Browses DNS-SD services over Multicast DNS, resolves them and fetches from one over HTTP, as a WASI 0.3 app."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# A wasmnet app (world `wasmnet:app/app`): it browses the service types in its config with the
+# app kit's mDNS browser (`wasmnet_app_kit::mdns`) over `wasi:sockets@0.3.0` UDP and
+# `wasmnet:sockets-ext/multicast`, reports what it finds as events, and can fetch `GET /` from
+# one instance by the address and port it resolved. `src/lib.rs` is the config and the pure
+# helpers (guest-tested in wasmtime); `src/component.rs` the glue (two sockets, a daemon).
+
+[lib]
+# The artifact is named after the component, not the package: `service_browse.wasm`.
+name = "service_browse"
+crate-type = ["cdylib"]
+
+[dependencies]
+# What the apps share: bindings, config keys, address conversions, the mDNS browser.
+wasmnet-app-kit = { path = "../../../crates/wasmnet-app-kit" }
+wasmnet-wire = { path = "../../../crates/wasmnet-wire" }
+thiserror.workspace = true
+# The `run` export is an async func; one task, so no spawn and no inter-task wakeup.
+wit-bindgen = { workspace = true, features = ["macros", "realloc", "async"] }
+# The standard WASI 0.3 bindings: sockets and clocks, exactly as on any WASI host.
+wasip3 = { workspace = true, features = ["std"] }
+
+[lints]
+workspace = true

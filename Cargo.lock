@@ -1708,6 +1708,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "wasmnet-service-browse"
+version = "0.0.0"
+dependencies = [
+ "thiserror",
+ "wasip3",
+ "wasmnet-app-kit",
+ "wasmnet-wire",
+ "wit-bindgen 0.61.1",
+]
+
+[[package]]
 name = "wasmnet-switch"
 version = "0.0.0"
 dependencies = [
