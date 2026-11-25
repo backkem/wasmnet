@@ -10,9 +10,38 @@
 const encoder = new TextEncoder();
 const decoder = new TextDecoder('utf-8', { fatal: true });
 
-/** Builds one message. */
+/**
+ * Builds one message. Small fields gather in a list of numbers; a byte string of 64 bytes or
+ * more is kept as it is, by reference, so a large `list<u8>` is copied once, when the message
+ * is written out ([`finish`], or [`writeInto`] the simulator's memory), never byte by byte.
+ */
 export class Writer {
   private bytes: number[] = [];
+  private parts: Uint8Array[] = [];
+  private size = 0;
+
+  private flush(): void {
+    if (this.bytes.length > 0) {
+      this.parts.push(Uint8Array.from(this.bytes));
+      this.size += this.bytes.length;
+      this.bytes = [];
+    }
+  }
+
+  /** The message's length in bytes. */
+  get length(): number {
+    return this.size + this.bytes.length;
+  }
+
+  /** Writes the message into `target` (at least [`length`] bytes). */
+  writeInto(target: Uint8Array): void {
+    this.flush();
+    let at = 0;
+    for (const p of this.parts) {
+      target.set(p, at);
+      at += p.length;
+    }
+  }
 
   u8(v: number): this {
     this.bytes.push(v & 0xff);
@@ -35,7 +64,13 @@ export class Writer {
 
   raw(v: Uint8Array): this {
     this.u32(v.length);
-    for (const b of v) this.bytes.push(b);
+    if (v.length < 64) {
+      for (const b of v) this.bytes.push(b);
+    } else {
+      this.flush();
+      this.parts.push(v);
+      this.size += v.length;
+    }
     return this;
   }
 
@@ -56,7 +91,9 @@ export class Writer {
   }
 
   finish(): Uint8Array {
-    return Uint8Array.from(this.bytes);
+    const out = new Uint8Array(this.length);
+    this.writeInto(out);
+    return out;
   }
 }
 
@@ -422,7 +459,8 @@ export function readValue(r: Reader): unknown {
     case 5:
       return r.str();
     case 6:
-      return r.raw().slice();
+      // A view: every reader decodes a copy of the simulator's result already (`Network.result`).
+      return r.raw();
     case 7:
     case 8: {
       const n = r.u32();
@@ -457,6 +495,13 @@ export function encodeInfraCall(fn: string, args: readonly unknown[]): Uint8Arra
   const w = new Writer().str(fn).u32(args.length);
   for (const a of args) writeValue(w, a);
   return w.finish();
+}
+
+/** [`encodeInfraCall`], unwritten: a large byte string in it is copied once, where it is written. */
+export function infraCallWriter(fn: string, args: readonly unknown[]): Writer {
+  const w = new Writer().str(fn).u32(args.length);
+  for (const a of args) writeValue(w, a);
+  return w;
 }
 
 /** The `infra reply` message: the value, the error to throw, or a failure of the call. */

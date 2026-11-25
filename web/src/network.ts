@@ -177,6 +177,13 @@ const INFRA_WAITS: Record<string, string[]> = { changes: ['wait', 'waitAny'] };
 const kebab = (s: string) => s.replace(/[A-Z]/g, (c) => `-${c.toLowerCase()}`);
 const camel = (s: string) => s.replace(/-([a-z0-9])/g, (_, c: string) => c.toUpperCase());
 const pascal = (s: string) => camel(s).replace(/^[a-z]/, (c) => c.toUpperCase());
+/** A portable interface the simulator's extensions serve, as `wn_interfaces` lists it. */
+interface PortableInterface {
+  name: string;
+  functions: string[];
+  resources: string[];
+}
+
 /** Marks a resource class's construction from a handle the server answered (not the WIT constructor). */
 const FROM_HANDLE = Symbol('from handle');
 
@@ -246,6 +253,8 @@ export class Network {
   private readonly stdinWaiters = new Map<number, () => void>();
   private journalNext = 0;
   private panicked: string | null = null;
+  /** The portable interfaces the simulator's extensions serve (`wn_interfaces`, read at creation). */
+  private interfaces: PortableInterface[] = [];
 
   private constructor(instance: WebAssembly.Instance, options: NetworkOptions) {
     const raw = instance.exports as unknown as Record<string, AnyFn>;
@@ -256,6 +265,10 @@ export class Network {
     this.supply = options.supply;
     this.x.wn_install?.();
     if (this.x.wn_network_new(U64(BigInt(options.seed))) !== 0) throw new Error(this.resultText());
+    // The portable interfaces the installed extensions serve: read once, here, since devices are
+    // also instantiated inside a step, when the simulator cannot be asked.
+    const served = codec.decodeInfraReply(this.result(this.x.wn_interfaces()));
+    this.interfaces = ('value' in served ? served.value : []) as PortableInterface[];
   }
 
   /**
@@ -279,6 +292,18 @@ export class Network {
   /** A view of the simulator's memory (re-made each time: memory may have grown). */
   private view(ptr: number, len: number): Uint8Array {
     return new Uint8Array(this.x.memory.buffer, ptr >>> 0, len >>> 0);
+  }
+
+  /** As [`withBytes`], writing the message straight into the simulator's memory (one copy of a large byte string). */
+  private withWriter<T>(w: codec.Writer, f: (ptr: number, len: number) => T): T {
+    const len = w.length;
+    const ptr = this.x.wn_alloc(len);
+    w.writeInto(this.view(ptr, len));
+    try {
+      return f(ptr, len);
+    } finally {
+      this.x.wn_free(ptr, len);
+    }
   }
 
   private withBytes<T>(bytes: Uint8Array, f: (ptr: number, len: number) => T): T {
@@ -693,7 +718,7 @@ export class Network {
   /** One call of a portable interface (`interface#function`), served by the simulator; its error is thrown, as jco expects. */
   private portable(dev: number, call: string, args: unknown[]): unknown {
     touch();
-    const len = this.withBytes(codec.encodeInfraCall(call, args), (p, l) => this.x.wn_import(dev, p, l));
+    const len = this.withWriter(codec.infraCallWriter(call, args), (p, l) => this.x.wn_import(dev, p, l));
     const reply = codec.decodeInfraReply(this.result(len));
     if ('value' in reply) return reply.value;
     if ('error' in reply) throw { payload: reply.error };
@@ -708,8 +733,7 @@ export class Network {
    * as an instance of its class, at the top of an answer or inside an `option`.
    */
   private portableImports(dev: number): Imports {
-    const reply = codec.decodeInfraReply(this.result(this.x.wn_interfaces()));
-    const interfaces = ('value' in reply ? reply.value : []) as { name: string; functions: string[]; resources: string[] }[];
+    const interfaces = this.interfaces;
     const classes = new Map<string, new (...args: unknown[]) => codec.ResourceHandle>();
     const wrap = (v: unknown): unknown => {
       if (v instanceof codec.ResourceHandle) {
