@@ -98,15 +98,19 @@ here so that nobody has to find these the hard way. Each entry names where the c
   Their WIT may not use signed integers, floats, `char`, flags, streams, futures or async
   functions (the page's boundary does not carry them; the wasmtime adapter refuses them at
   compile time). A served call answers at once: a call that waits (at a virtual instant, or for
-  page code) is not expressible, so an async import is still an embedder's own glue. Only
-  imports are portable: a device's optional exports (commands, reconfiguration, an inspection
-  export) are called through each backend's own control calls. A page reads the interfaces when
-  a network is created, so an extension added later serves only on wasmtime. `Op::Extension`
+  page code) is not expressible, so an async import is still an embedder's own glue. Portable
+  exports ([design/runtime-and-extensions.md](design/runtime-and-extensions.md#portable-exports))
+  carry the same WIT; the typed wasmtime adapter serves freestanding functions of an exported
+  interface only (no resources), and other exports go through the dynamic handler, about 70 times
+  slower for large byte strings (a 4 MiB argument: 142 ms against 2 ms). Inside a control call
+  virtual time stands still, so a page export whose promise waits for a device timer fails. A
+  page reads the interfaces when a network is created, so an extension added later serves only
+  on wasmtime. `Op::Extension`
   still counts as a topology op in a split network (refused); `Op::ExtensionAt`, timed at a
   device, is accepted. A resource handle a device drops in a page reaches the server only when
   jco disposes of the object. An embedder that drives a page's run from its own export (instead
-  of the binding's `run`) has `wasmnet_web::Network::step`, `take_dirty` and `next_event_time`,
-  but no test or example of that yet.
+  of the binding's `run`, `wn_pad_run` in the fixture's module) does not let JavaScript settle
+  between instants, so it suits stepped devices only.
 - **The browser binding reports errors as strings** (`wasmnet_web::Network::link`, the
   `JsHost` methods), where the native API has one typed error. Its TypeScript `Network` reaches
   operator events, device options and link options as plain objects that the simulator reads

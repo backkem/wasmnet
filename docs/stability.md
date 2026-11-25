@@ -73,7 +73,15 @@ versions without notice. Rustdoc and the design notes mark it **embedder surface
   generic values (`ExtOption`, `ExtOpParser`, `NetworkExtension::{options, check_options, ops}`,
   `Network::{parse_option, set_option, option_keys, parse_op}`, `ExtOptions::set_value`,
   `Op::ExtensionAt`, `OpContext::device`, a spec's extension keys, the page's `extension` ops),
-  and `Network::register_cable` refusing a kind twice; the test fixture `wasmnet-pad` is their worked example.
+  and `Network::register_cable` refusing a kind twice, `Network::try_add_extension` (and
+  `try_add_boxed_extension`) refusing a second declaration of an option key or op kind; portable
+  exports (`ControlCall::{invocation, invoked}`, `Invocation`, `wasmnet_core::export`:
+  `ExportCall`, `ExportRequest`, `ExportAnswer`, `Answered`, `plain`, `unversioned`;
+  `Network::invoke`, `device_exports` listing every exported interface, `portable_adapter!` on a
+  world that exports interfaces, `wasmnet_host::portable::{now, invoked}`, in a page
+  `js_export`, `wn_invoke`, `wn_schedule_invoke`, `wn_exports` and `JsHost::export`, and in the
+  binding `Network.{invoke, scheduleInvoke, exports}`, `NetworkOptions.{deviceImports, compile,
+  instantiateCore}`); the test fixture `wasmnet-pad` is their worked example.
 - the netstack's snapshot interface (`wasmnet:netstack/state`, `snapshot.paused`);
 - the HTTP apps' event-stream routes and `POST /echo` (`http-server`) and forward proxy
   (`http-get`).

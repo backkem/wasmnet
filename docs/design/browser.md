@@ -235,6 +235,42 @@ decodes them into the `Vec<u8>` the server receives. What one 4 MiB append costs
 of it in Chromium is measured by the page test's step "a portable call carries 4 MiB through
 the page".
 
+## Portable exports
+
+The other direction needs nothing written for the page either. Every control call reaches a
+device in the page as one boundary import, `js_export(dev, now, call)`: `interface#function`
+(the interface without a version) and the arguments in jco's shapes. The binding finds the
+function by its WIT name through the kit (`exportFn`, by the interface's full name, so two
+interfaces of one short name never mix), calls it and answers its value, a `result`'s error
+(jco's thrown `ComponentError`), or, when the device has no such function, a refusal; anything
+else thrown is a trap, the device's fault. Commands and configuration changes in place come
+this way: the page has no code of its own for either (`CommandCall` and `ReconfigureCall` say
+which function they are, [runtime-and-extensions.md](runtime-and-extensions.md#portable-exports)).
+
+A device's exports are what the kit lists of its component (every exported interface, without a
+version), the same list wasmtime reports: `Network.exports(device)`. `Network.invoke(device,
+'iface#function', args)` calls one between runs and answers `{ value }`, `{ error }`,
+`{ refused }` or null (the device does not export the interface); `Network.scheduleInvoke(device,
+at, ...)` calls it as an operator event. The page test's step "portable exports in the page"
+does both with the pad's probe and checks the answers wasmtime gives.
+
+**Exports that wait.** `js_export` is a `WebAssembly.Suspending` import: an export jco made
+async (or wrapped for JSPI) answers a promise, and the call waits for it while driving the event
+loop (the kit's `until`), so it may itself reach a `Suspending` import of the embedder's. Virtual
+time does not move inside the call: a promise that waits for a device timer never settles there,
+and the kit's idle check fails the call (a trap). Every simulator export that runs devices is
+`promising` already. V8 suspends at every `Suspending` call even when it answers at once; the
+page test measures that (`jspiSuspendingNs`, a call through a `Suspending` import that answers
+at once, against `jspiPlainNs`, a plain import): 63 ns against 4.8 ns per call in headless
+Chromium, small beside the call itself.
+
+**Per-device imports and the kit's hooks.** `NetworkOptions.deviceImports({ index, name,
+component })` gives one device's component extra imports, asked each time it is instantiated and
+merged over the binding's own (by unversioned interface name): a capability the embedder serves
+in JavaScript to the devices it chooses, in this page only. `NetworkOptions.compile` and
+`NetworkOptions.instantiateCore` are the kit's hooks, passed through (the binding still sees every
+core instance to count the device's memories).
+
 ## An embedder's own page module
 
 The page loads the simulator as `wasmnet_web.wasm`, this repository's build of
@@ -300,8 +336,9 @@ call to the core. What the core decides for both:
 | a device's `argv` (`argv`): its name, then `DeviceOptions::args` | both backends' `wasi:cli/environment` |
 | an app's end in the journal (`JournalEnd::app_exit`) | both actors |
 | `wasmnet:infra`: every call, the answers to a device without the grant, the stream names of `logs`, the refusal of an ungranted importer (`infra::Calls`, `infra::require_grant`); the events kept of the devices controllers created, and the wake of an armed wait (`events.arm`: one more `poll` of the controller, queued by the core) | the host's bindings; the browser's `wn_infra` |
-| commands and their answers, a controller's `control-answer` (`commands`, `CommandCall::finish`) | both actors |
-| reconfiguration, and which config `wasi:config/store` serves after it (`ReconfigureCall::finish_serving`) | both actors |
+| commands and their answers, a controller's `control-answer` (`commands`, `CommandCall::finish`); which function a command is (`ControlCall::invocation`) | the host's typed binding; the browser's generic export call |
+| reconfiguration, and which config `wasi:config/store` serves after it (`ReconfigureCall::finish_serving`, `invoked`) | the host's typed binding; the browser's generic export call |
+| portable exports: a call of any export function by name, its answer in one shape (`ExportCall`, `export::plain`) | the host's typed adapters and its dynamic handler (`exports`); the browser's `js_export` |
 | a device's memory: what is counted, the limit and its error text (`MemoryBudget`: `growing` before a growth, `observe` after one) | the host's limiter; the browser's actor |
 | a device's stdin queue (`InputQueue`) | the host's stdio streams; the browser's registry |
 | which supplied bytes are admitted (`ImportPolicy`, `component_imports`) and how a refusal is worded (`supply::not_compiled`, `not_linked`) | the host's `compile_supplied`; the browser's `compile_supplied` |
@@ -314,7 +351,8 @@ What each backend still does itself, module by module:
 |---|---|
 | `runtime` (instantiate a component in a store, find its exports, `ports()`, compile supplied bytes, summarise wasmtime's reports) | wasmtime-specific |
 | `actor` (one `run_concurrent` per device, a `call_concurrent` per command, fuel per instant) | wasmtime-specific |
-| `control`, `reconfigure` (bindings of the two optional exports; the answers go to the core) | wasmtime-specific glue |
+| `control`, `reconfigure` (typed bindings of the two optional exports; the answers go to the core) | wasmtime-specific glue |
+| `exports` (any export function by name: `Value`s to `Val`s by the function's types) | wasmtime-specific glue |
 | `infra` (WIT types to and from the core's) | wasmtime-specific glue |
 | `glue` (`wasmnet:link` and `wasi:config/store` to the core's wire, journal and config) | wasmtime-specific glue |
 | `stdio` (wasmtime-wasi streams over the core's captures and stdin queue) | wasmtime-specific glue |

@@ -156,6 +156,7 @@ these figures say nothing about how fast a native build is.
 | `Action` | `Network::register_action(name, closure)`, called by `Op::Action` | when the operator event applies, in its own processing context, after its `action` record |
 | `HostExtension` | `Host::with_extension`, `Host::with_extensions` | at engine build, linking, store creation and device instantiation |
 | Portable imports: `NetworkExtension::interfaces`, `DeviceExt::serve`, `ImportServer` | the extension, with the network; its wasmtime adapter (`portable_adapter!`) with the host; nothing in a page | the server is called inside the device's own call, at the current instant ([below](#portable-extensions)) |
+| Portable exports: `ControlCall::invocation`, `ExportCall`, `ExportRequest` | `Network::invoke`, `Op::Control`, `OpContext::control`; typed on wasmtime by `portable_adapter!` with a world that exports the interface | inside the device's event loop, at the current instant ([below](#portable-exports)) |
 
 All of them are in [crates/wasmnet-core/src/ext.rs](../../crates/wasmnet-core/src/ext.rs), except
 `HostExtension` and its `ControlHandler`
@@ -313,7 +314,9 @@ embedder's own formats. Each goes through the extension's own parser, once per o
   instant like `Op::Extension`, `OpContext::device` names the device, and a split network
   accepts it (only the device's own site applies it), where it refuses `Op::Extension`.
 
-A key or kind two extensions declare goes to the first one added. `Network::register_cable`
+No two extensions of a network declare one option key or one operator event kind: adding the
+second is refused (`Network::try_add_extension` answers `Error::Refused` and changes nothing;
+`add_extension` panics). `Network::register_cable`
 refuses a cable kind that already has a model, so two extensions cannot share a code.
 
 **On wasmtime** a typed adapter is generated from the interfaces' WIT:
@@ -358,6 +361,11 @@ answers), which stops that device's whole run; in a page it must not, since the 
 thread. The order of extensions is the order they were added: `device_setup`, `device_life`
 and the servers' records follow it on both backends.
 
+**What a served call costs the device.** Only its own code's fuel: what the host does for the
+call (copying an argument in, the server reading the bytes out of the device's memory) is not
+metered. On wasmtime a 16 MiB write costs the device about what a 16-byte one does (3 566
+against 3 014 units of fuel in `portable_exports.rs`); in a page fuel is not metered at all.
+
 **A worked example: the test fixture `wasmnet-pad`** ([crates/wasmnet-pad](../../crates/wasmnet-pad),
 `wit/test-pad/pad.wit`). Each device keeps named notes:
 
@@ -375,3 +383,77 @@ It runs at two seeds with byte-identical reruns on wasmtime
 on both backends ([crates/wasmnet-web/tests/parity.rs](../../crates/wasmnet-web/tests/parity.rs),
 `a_portable_extension_is_served_alike`), and in a real page (`web/test`), whose lines must
 equal the native run's.
+
+## Portable exports
+
+The other direction: calling a function a device exports, by name, with `Value`s, on every
+backend through one mechanism. It is a control call like a command, so it reaches the device
+the three ways control calls do, inside the device's live event loop at the current instant:
+
+- between runs: `Network::invoke(device, Invocation::new(interface, function, args))`, which
+  answers `Ok(None)` when the device does not export the interface, else
+  `Ok(Some(answer))`;
+- as an operator event: `Op::control(device, ExportRequest::new(invocation).into_control())`
+  (refused when it is added if the device does not export the interface; a refusal later is
+  the op's state);
+- from inside a run: `OpContext::control(device, Box::new(ExportCall::new(invocation)))` from an
+  extension's op, whose rounds answer it.
+
+`interface` is the export's name without a version (`wasmnet-test:pad/inspect`), `function` its
+name in the interface. The answer (`ExportAnswer::get`) is `Ok(Ok(value))` (a `result`'s `ok`,
+or the plain value), `Ok(Err(value))` (a `result`'s `err`), or `Err(why)` when no backend
+served it (the device has no such function). Answers come in one shape whichever backend gave
+them (`export::plain`: an option's value bare, tuples as lists), which is jco's. A trap in the
+device, including an argument of the wrong type, is the device's fault, as any trap inside a
+control call. `ExportCall::reschedule(true)` lets a call move a stepped device's deadline (a
+`poll` at the same instant follows it); by default it does not.
+
+`Network::device_exports(device)` lists every interface the device exports, without a version
+and sorted, the same list on both backends (`wasmnet:link/device` included), so a caller can
+ask before it calls.
+
+**Underneath.** `ControlCall` has two methods with defaults: `invocation(now)` (the call as a
+call of one export function by name, or `None`) and `invoked(answer, config)` (the device's
+answer; `config` is what its `wasi:config/store` serves, which a reconfiguration taken in place
+replaces). Commands (`CommandCall`: `invoke(now, command, argument)`) and reconfiguration
+(`ReconfigureCall`: `reconfigure(now, config)`) implement them, which is how a page serves
+them: it has no code of its own for either.
+
+- **On wasmtime** the first handler that takes the call serves it: the host's own for commands
+  and reconfiguration (typed, as before), then the extensions' (`HostExtension::instance_ready`),
+  then a dynamic handler every device has, which converts the `Value`s with the function's own
+  types into `Val`s. A `Val` per list element is slow for large byte strings, so a world that
+  exports the interface gets a typed handler from the same macro that serves imports:
+
+  ```rust
+  wasmnet_host::portable_adapter!({
+      name: PadKeeper,
+      path: "wit/test-pad",
+      world: "wasmnet-test:pad/keeper", // imports notes, exports inspect
+  });
+  ```
+
+  The adapter links the world's imports as before and, for every device that exports one of
+  its exported interfaces, serves calls of them typed. Only freestanding functions of an
+  exported interface are supported (no resources yet).
+- **In a page** every call goes to JavaScript as `js_export(dev, now, call)`: the binding finds
+  the function by its WIT name through the kit (`exportFn`), calls it with the arguments in
+  jco's shapes and answers its value, its thrown `ComponentError` payload (a `result`'s error),
+  or, when there is no such function, a refusal. The page reports a device's exports from the
+  kit's list of the component's exports. `Network.invoke(device, 'iface#function', args)` and
+  `Network.scheduleInvoke(device, at, ...)` are the binding's methods.
+
+`crates/wasmnet-web/tests/parity.rs` (`portable_exports_are_called_alike`) runs the three ways
+on both backends with the pad's probe, which exports `wasmnet-test:pad/inspect` (`write`,
+`read`, `size`); `crates/wasmnet-host/tests/portable_exports.rs` checks that the typed and the
+dynamic handler answer and journal alike, and measures them (`export_cost`).
+
+**An embedder's own run loop.** `Network::next_event_time` and `run_until` let an embedder run a
+network one instant at a time and do its own work between instants (read a device through its
+export, add an operator event): runs chain, so the journal is the one a single `run_until`
+gives, as long as what it does between instants does not change the network
+(`an_embedder_drives_the_run_instant_by_instant` in `portable_exports.rs`). In a page the same
+loop runs from an embedder's own export on its module (`wn_pad_run` in
+[crates/wasmnet-pad/examples/pad_page.rs](../../crates/wasmnet-pad/examples/pad_page.rs), called
+`promising`); it does not let JavaScript settle between instants, so it suits stepped devices,
+while the binding's `run` serves async ones.
