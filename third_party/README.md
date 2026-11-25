@@ -4,7 +4,7 @@
 |---|---|---|
 | `smoltcp/` | [smoltcp](https://github.com/smoltcp-rs/smoltcp) 0.14.0, the crates.io release (`.cargo_vcs_info.json` names the commit) | 0BSD (`smoltcp/LICENSE-0BSD.txt`) |
 
-`smoltcp/` is the pristine crate plus five patches of ours, kept as patch files in
+`smoltcp/` is the pristine crate plus six patches of ours, kept as patch files in
 [`docs/upstream/`](../docs/upstream/):
 
 1. `smoltcp-0001-neighbor-rate-limit-per-address.patch`: neighbor discovery is rate-limited
@@ -17,6 +17,8 @@
    the receive window's right edge.
 5. `smoltcp-0005-fast-retransmit-of-a-lone-fin.patch`: a TCP fast retransmit with only the FIN
    outstanding retransmits the FIN.
+6. `smoltcp-0006-path-mtu-lowered.patch`: `Socket::path_mtu_lowered`, so the owner of a TCP
+   socket can lower its send MSS on an ICMP "fragmentation needed" or "packet too big".
 
 The workspace patches it in with `[patch.crates-io]`, and the version stays `=0.14.0`, so
 dropping a patch is one line once upstream has the change. Edit nothing here without

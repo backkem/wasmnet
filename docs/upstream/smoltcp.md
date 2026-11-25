@@ -1,6 +1,6 @@
 # smoltcp: issues found while building wasmnet
 
-Pinned version: **smoltcp =0.14.0** (`Medium::Ethernet`, features as in `components/netstack/Cargo.toml`), **vendored with five patches** (`third_party/smoltcp`, `[patch.crates-io]`; #2, #28, #31, #32 and #34 below). This is a running list of upstream bugs, spec deviations and API gaps that we hit, with the part of wasmnet where each was found and how we work around it today. Keep it current. When something gets filed upstream, add the link. When a fix lands, note the version and remove our workaround.
+Pinned version: **smoltcp =0.14.0** (`Medium::Ethernet`, features as in `components/netstack/Cargo.toml`), **vendored with six patches** (`third_party/smoltcp`, `[patch.crates-io]`; #2, #28, #31, #32, #34 and #35 below). This is a running list of upstream bugs, spec deviations and API gaps that we hit, with the part of wasmnet where each was found and how we work around it today. Keep it current. When something gets filed upstream, add the link. When a fix lands, note the version and remove our workaround.
 
 These are our own notes from building one stack on smoltcp. Unless the last column says so, an
 entry has not been reported upstream yet, and some may turn out to be our misreading: check
@@ -13,7 +13,7 @@ Legend: **bug**: violates an RFC or is clearly wrong. **gap**: missing behaviour
 | 1 | bug | **MLDv2 record types are swapped.** A join is sent as `CHANGE_TO_INCLUDE_MODE` with 0 sources, which RFC 3810 §6.1 defines as a *leave*. A leave is sent as `CHANGE_TO_EXCLUDE_MODE`. It breaks MLD-snooping switches and Wireshark's reading. | any MLD-snooping switch or capture reading a join or leave | Our switch must not depend on smoltcp's MLD record types. | not filed |
 | 2 | bug | **Neighbour discovery is rate-limited per interface, not per neighbour.** There is one `silent_until` in `neighbor::Cache`, so after any ARP request or NS the next one, for *any* address, waits 1 s. A socket that hits the limit then backs off for its own second. | netstack (ping), UDP sockets, router and traceroute | **Fixed in our vendored smoltcp**: `third_party/smoltcp` + `[patch.crates-io]`, a per-address `silent_until` (bounded map), 3 tests. A host now resolves several neighbours within a second, with no hand spacing between its first packets to them. | patch ready ([below](#upstream-ready-patch-per-address-neighbour-rate-limit-2), `smoltcp-0001-neighbor-rate-limit-per-address.patch`), not filed |
 | 3 | gap | **`poll_at` ignores multicast work.** After a join/leave, `poll_at` returns `None` even though an IGMP/MLD report is pending, and query-response timers are invisible. | multicast joins and leaves | The netstack polls after every control-plane call and keeps its own multicast deadline (polls every 1 ms through a query's max-response window). | not filed |
-| 4 | gap | **ICMP errors are ignored by TCP and UDP sockets.** Unreachable, port-unreachable and the rest never reach the socket, so a connect to an unroutable host retries for the full 75 s timeout, and there's no `ECONNREFUSED` for UDP. | router, ICMP errors and traceroute | The netstack classifies received ICMP errors itself, journals `icmp-error-received`, fails SYN-SENT connects with `remote-unreachable`, and exposes `IP_RECVERR`-style errors via `wasmnet:sockets-ext/udp`. | not filed |
+| 4 | gap | **ICMP errors are ignored by TCP and UDP sockets.** Unreachable, port-unreachable and the rest never reach the socket, so a connect to an unroutable host retries for the full 75 s timeout, and there's no `ECONNREFUSED` for UDP. | router, ICMP errors and traceroute | The netstack classifies received ICMP errors itself, journals `icmp-error-received`, fails SYN-SENT connects with `remote-unreachable`, and exposes `IP_RECVERR`-style errors via `wasmnet:sockets-ext/udp`. Since #35 it also lowers a TCP connection's send MSS on "fragmentation needed" and "packet too big". | not filed |
 | 5 | gap | **No TCP listen backlog.** One LISTEN socket takes one SYN, so simultaneous SYNs get RST. When our N-socket backlog is full, a further SYN is answered with RST, whereas Linux drops it silently. | servers that accept several simultaneous connections | The backlog is N LISTEN sockets per port, honouring `set-listen-backlog-size` (1..=64, default 8). | not filed |
 | 6 | gap | **No close reason.** A closed socket doesn't say whether it ended by FIN or RST. | reporting why a TCP connection ended | The netstack infers it from the state history (was the peer's FIN ever seen?). That's a heuristic. | not filed |
 | 7 | gap | **Wildcard binds ignore address family.** A datagram goes to the first socket that accepts it regardless of family, so `0.0.0.0:p` and `[::]:p` can't coexist. A `0.0.0.0` TCP listener also takes IPv6. Linux allows this with `IPV6_V6ONLY`. | UDP sockets, dual-stack servers | **Fixed in the netstack**: bindings of different families never conflict; after every poll, UDP datagrams on a port bound by both families are moved to their family's socket (`UdpSockets::demux`) and a TCP connection caught by the other family's listener is handed to its own (`TcpSockets::after_poll`). A server with one dual-stack socket serves IPv4 and IPv6 clients. An upstream fix would let a socket ask for one family (a `V6ONLY`-like flag on `IpListenEndpoint` matching). | not filed |
@@ -44,6 +44,7 @@ Legend: **bug**: violates an RFC or is clearly wrong. **gap**: missing behaviour
 | 32 | bug | **A FIN is accepted on a segment cut at the receive window's right edge.** `process` trims a segment to the window but took its FIN whenever the segment starts at or before `RCV.NXT` (`control == Fin && window_start < segment_start` was the only check), so the FIN took the sequence number of the first byte that was cut: the stream ended early with `CLOSE-WAIT`, and the ACK of the FIN acknowledged the first cut byte to the sender as if it had arrived. RFC 9293 §3.10.7.4 drops a FIN that lies beyond the window. A sender reaches past the window with a fast retransmission, which sends a full segment from `SND.UNA` without looking at the window, or with a segment sent against an older window that the receiver has since moved back by a few bytes (a scaled window counts in steps of `2^shift`). | TCP congestion-control tests: an app that stops reading while a stream ends, a loss: 1 to 3 bytes missing before EOF | **Fixed in our vendored smoltcp** (`smoltcp-0004-fin-past-the-receive-window.patch`, [below](#upstream-ready-patch-a-fin-past-the-receive-window-32)): the FIN of a segment cut at the right edge is ignored; the sender sends the cut bytes and the FIN again once the window opens. Fast retransmissions still ignore the window (harmless now). | patch ready, not filed |
 | 33 | gap | **No SACK-based recovery, Limited Transmit (RFC 3042), early retransmit (RFC 5827) or tail-loss probe, and a minimum RTO of 1 s** (`RTTE_MIN_RTO`, RFC 6298's SHOULD; Linux uses 200 ms). A loss that three duplicate ACKs do not reveal costs at least 1 s. smoltcp sends SACK blocks as a receiver but ignores the peer's. | TCP congestion control, lossy links | None; the costs are in `docs/design/netstack.md`. | not filed |
 | 34 | bug | **A connection could hang with only its FIN unacknowledged.** When every data byte is acknowledged but the FIN is not (here: the receiver's window was zero, and it dropped a retransmitted segment whose data it already had together with its FIN, while it accepts a bare FIN at a zero window), the receiver's repeated ACKs count as duplicate ACKs (`ack_number < remote_last_seq`). The third started a fast retransmit: `dispatch` set `pending_fast_retransmit` and idled the retransmission timer, but `seq_to_transmit` wanted a non-empty transmit buffer for a fast retransmit and `can_fin` needs `remote_last_seq == local_seq_no + tx_buffer.len()`, so nothing was sent and no timer was armed: the FIN never went again. | the netstack's simulation: `tcp.congestion = "none"`, the receiving app not reading, 1 MB with data segment 134 lost: every byte arrived, the end of the stream never did | **Fixed in our vendored smoltcp** (`smoltcp-0005-fast-retransmit-of-a-lone-fin.patch`, [below](#upstream-ready-patch-fast-retransmit-of-a-lone-fin-34)): with every data octet acknowledged, a fast retransmit sends the FIN alone. | patch ready, not filed |
+| 35 | gap | **No path MTU discovery, and no way to lower a connection's send MSS after the handshake.** smoltcp ignores ICMP "fragmentation needed" and "packet too big" (#4), and a socket's segment size is fixed by the interface MTU and the peer's MSS option. Over a path with a smaller MTU than both ends, every full-size segment is dropped by the router before the narrow link and resent unchanged on every timeout: the transfer stalls after the handshake. | the netstack between two routers joined by a 1280-byte link (`crates/wasmnet-host/tests/path_mtu.rs`) | **Our sixth vendored patch** (`smoltcp-0006-path-mtu-lowered.patch`, [below](#upstream-ready-patch-path-mtu-lowered-35)): `Socket::path_mtu_lowered(seq, mss)` lowers the send MSS when `seq` lies in the send window and resends the data in flight at once in the new size; the netstack validates the ICMP error and calls it (`TcpSockets::path_mtu`). | patch ready, not filed |
 
 
 ## Plan
@@ -51,6 +52,7 @@ Legend: **bug**: violates an RFC or is clearly wrong. **gap**: missing behaviour
 - ~~Fix #31~~: done (vendored patch, NewReno). Open the upstream PR below.
 - ~~Fix #32~~: done (vendored patch). Open the upstream PR below.
 - ~~Fix #34~~: done (vendored patch). Open the upstream PR below.
+- ~~Fix #35~~: done (vendored patch, path MTU discovery). Open the upstream PR below.
 - File the other half of #32: fast retransmissions ignore the receive window (harmless with the #32 fix: the receiver drops what is past the edge, and the sender sends it again once the window opens).
 - ~~Fix #7~~: done in the netstack (family demultiplexing). An upstream family filter would let us delete `UdpSockets::demux` and the TCP stray hand-off.
 - File upstream issues for #1, #3, #4, #5, #7, #8, #9, #18, #20, #21, #24, #26 and #27, with minimal repros. Our deterministic simulations make good reproducers.
@@ -224,3 +226,48 @@ it): exactly the change in `third_party/smoltcp`.
 stopped, each of the 142 data segments lost in turn, under Reno and without congestion
 control): before, losing segment 134 without congestion control delivered every byte and never
 the end of the stream.
+
+## Upstream-ready patch: path MTU lowered (#35)
+
+Ready to send as a PR against smoltcp `main` (written and tested against 0.14.0; not opened
+yet). The diff is [`smoltcp-0006-path-mtu-lowered.patch`](smoltcp-0006-path-mtu-lowered.patch)
+(1 file, +112 / -2; applies with `git apply` to the 0.14.0 crate, after the five patches
+before it): exactly the change in `third_party/smoltcp`.
+
+**Title:** tcp: let the owner lower a socket's send MSS on a path MTU error
+
+**Description:**
+
+> smoltcp does not process ICMP errors for TCP, and a socket's segment size is fixed once the
+> handshake has set the peer's MSS: `min(interface MTU, remote MSS)`. Over a path whose MTU is
+> smaller than both ends', every full-size segment is dropped by the router before the narrow
+> link, which answers with an ICMP "fragmentation needed" (IPv4, DF is always set) or "packet
+> too big" (IPv6), and the socket resends the same segment on every timeout: the connection
+> stalls right after the handshake.
+>
+> Whoever receives the ICMP errors (the application, or a future interface hook) can now
+> act on them. `Socket::path_mtu_lowered(seq, mss)` takes the sequence number of the quoted
+> segment and the segment size the reported MTU allows. It is trusted only if `seq` was sent
+> and not yet acknowledged (`SND.UNA <= seq < SND.NXT`, as Linux checks), and it only ever
+> lowers: a new `path_mss` caps the effective MSS from then on, beside the interface's and
+> the peer's. In a synchronized state the data in flight is sent again at once from
+> `SND.UNA` in the new size (the oversized segments were dropped); that is not a congestion
+> signal, so the congestion window and the retransmission timer are kept, and the RTT sample
+> in progress is dropped. `Socket::path_mss()` reads it back. The caller derives `mss` from
+> the reported MTU (less the IP and TCP headers), applies the family's minimum, and ignores
+> an MTU that is not below its own; RFC 1191's plateau search for errors without an MTU is
+> left to it as well.
+>
+> Test: `test_path_mtu_lowered_resends_in_the_new_size` (two 6-octet segments in flight;
+> sequence numbers outside the window and sizes that are not lower are refused; a lowering to
+> 4 resends all 12 octets at once in three segments; it never goes back up). `cargo test --lib`
+> passes with the default features (680 tests), with
+> `--features socket-tcp-reno,socket-tcp-cubic` (706), and with
+> `std,alloc,medium-ethernet,proto-ipv4,proto-ipv6,multicast,socket-tcp,socket-tcp-reno,socket-tcp-cubic,socket-udp,socket-icmp,socket-dhcpv4,auto-icmp-echo-reply` (318).
+
+**Found and verified in wasmnet:** `crates/wasmnet-host/tests/path_mtu.rs` (200 KB across two
+routers joined by a 1280-byte link, both directions, IPv4 and IPv6: before, the transfer
+stalled after the handshake; after, it takes 24 ms to 25 ms of virtual time) and the
+netstack's simulations `a_packet_too_big_lowers_the_segment_size_and_resends_at_once`,
+`a_packet_too_big_is_trusted_only_when_it_quotes_data_in_flight` and
+`an_ipv6_packet_too_big_under_1280_counts_as_1280`.

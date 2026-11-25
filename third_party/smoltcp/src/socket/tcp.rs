@@ -512,6 +512,9 @@ pub struct Socket<'a> {
     remote_has_sack: bool,
     /// The maximum number of data octets that the remote side may receive.
     remote_mss: usize,
+    /// The largest segment the path to the remote carries, learned by path MTU discovery
+    /// (`usize::MAX` until then); see [`Socket::path_mtu_lowered`].
+    path_mss: usize,
     /// The timestamp of the last packet received.
     remote_last_ts: Option<Instant>,
     /// The sequence number of the last packet received, used for sACK
@@ -612,6 +615,7 @@ impl<'a> Socket<'a> {
             remote_win_scale: None,
             remote_has_sack: false,
             remote_mss: DEFAULT_MSS,
+            path_mss: usize::MAX,
             remote_last_ts: None,
             local_rx_last_ack: None,
             local_rx_last_seq: None,
@@ -678,6 +682,51 @@ impl<'a> Socket<'a> {
             #[cfg(feature = "socket-tcp-cubic")]
             CongestionControl::Cubic => AnyController::Cubic(cubic::Cubic::new()),
         }
+    }
+
+    /// Lower the send MSS after path MTU discovery (RFC 1191, RFC 8201).
+    ///
+    /// The owner of the socket, who receives the ICMP errors, calls this for an ICMP
+    /// "fragmentation needed" or "packet too big" that quotes a segment of this connection
+    /// starting at `seq`: the path carries segments of at most `mss` octets (the reported MTU
+    /// less the IP and TCP headers; the caller bounds it by the family's minimum MTU and
+    /// ignores an MTU that is not below its own). The error is trusted only if `seq` was sent
+    /// and is not yet acknowledged, and the send MSS is only ever lowered.
+    ///
+    /// From then on no segment carries more than `mss` octets. In a synchronized state the
+    /// data in flight is sent again from the first unacknowledged octet, in the new size: the
+    /// segments too big for the path were dropped. That is not a congestion signal, so the
+    /// congestion window and the retransmission timer are left as they are.
+    ///
+    /// Returns whether the send MSS was lowered.
+    pub fn path_mtu_lowered(&mut self, seq: TcpSeqNumber, mss: usize) -> bool {
+        if !(self.local_seq_no <= seq && seq < self.remote_last_seq) {
+            return false;
+        }
+        if mss == 0 || mss >= self.remote_mss.min(self.path_mss) {
+            return false;
+        }
+        self.path_mss = mss;
+        self.congestion_controller.inner_mut().set_mss(mss);
+        if matches!(
+            self.state,
+            State::Established
+                | State::FinWait1
+                | State::Closing
+                | State::CloseWait
+                | State::LastAck
+        ) {
+            self.remote_last_seq = self.local_seq_no;
+            self.pending_fast_retransmit = false;
+            self.rtte.on_retransmit();
+        }
+        true
+    }
+
+    /// The send MSS learned by path MTU discovery, if any (see
+    /// [`path_mtu_lowered`](#method.path_mtu_lowered)).
+    pub fn path_mss(&self) -> Option<usize> {
+        (self.path_mss != usize::MAX).then_some(self.path_mss)
     }
 
     /// Return the current congestion control algorithm.
@@ -927,6 +976,7 @@ impl<'a> Socket<'a> {
         self.remote_win_scale = None;
         self.remote_win_shift = rx_cap_log2.saturating_sub(16) as u8;
         self.remote_mss = DEFAULT_MSS;
+        self.path_mss = usize::MAX;
         self.remote_last_ts = None;
         self.ack_delay_timer = AckDelayTimer::Idle;
         self.challenge_ack_timer = Instant::from_secs(0);
@@ -2369,7 +2419,10 @@ impl<'a> Socket<'a> {
         };
 
         let local_mss = cx.ip_mtu() - ip_header_len - TCP_HEADER_LEN;
-        let effective_mss = local_mss.min(self.remote_mss).saturating_sub(options_len);
+        let effective_mss = local_mss
+            .min(self.remote_mss)
+            .min(self.path_mss)
+            .saturating_sub(options_len);
 
         // Have we sent data that hasn't been ACKed yet?
         let data_in_flight = self.remote_last_seq != self.local_seq_no;
@@ -2691,7 +2744,10 @@ impl<'a> Socket<'a> {
                 // 4. Our congestion window
                 let options_len = repr.header_len() - TCP_HEADER_LEN;
                 let local_mss = cx.ip_mtu() - ip_repr.header_len() - TCP_HEADER_LEN;
-                let effective_mss = local_mss.min(self.remote_mss).saturating_sub(options_len);
+                let effective_mss = local_mss
+                    .min(self.remote_mss)
+                    .min(self.path_mss)
+                    .saturating_sub(options_len);
 
                 let offset = if self.pending_fast_retransmit {
                     let size = effective_mss.min(self.tx_buffer.len());
@@ -7790,6 +7846,60 @@ mod test {
             ack_number: Some(REMOTE_SEQ + 1),
             ..RECV_TEMPL
         }));
+    }
+
+    #[test]
+    fn test_path_mtu_lowered_resends_in_the_new_size() {
+        let mut s = socket_established();
+        s.remote_mss = 6;
+        s.send_slice(b"abcdefghijkl").unwrap();
+        recv!(s, time 0, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload: &b"abcdef"[..],
+            ..RECV_TEMPL
+        }));
+        recv!(s, time 0, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1 + 6,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload: &b"ghijkl"[..],
+            ..RECV_TEMPL
+        }));
+
+        // Not trusted: a sequence number that was never sent, or one before SND.UNA.
+        assert!(!s.path_mtu_lowered(LOCAL_SEQ + 1 + 12, 4));
+        assert!(!s.path_mtu_lowered(LOCAL_SEQ, 4));
+        // Not a lowering.
+        assert!(!s.path_mtu_lowered(LOCAL_SEQ + 1, 6));
+        assert_eq!(s.path_mss(), None);
+
+        // "abcdef" was too big for the path: everything in flight goes again, 4 octets at a
+        // time, at once.
+        assert!(s.path_mtu_lowered(LOCAL_SEQ + 1, 4));
+        assert_eq!(s.path_mss(), Some(4));
+        recv!(s, time 10, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload: &b"abcd"[..],
+            ..RECV_TEMPL
+        }));
+        recv!(s, time 10, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1 + 4,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload: &b"efgh"[..],
+            ..RECV_TEMPL
+        }));
+        recv!(s, time 10, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1 + 8,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload: &b"ijkl"[..],
+            ..RECV_TEMPL
+        }));
+        recv_nothing!(s, time 10);
+
+        // It never goes back up.
+        assert!(!s.path_mtu_lowered(LOCAL_SEQ + 1, 5));
+        assert_eq!(s.path_mss(), Some(4));
     }
 
     #[test]
