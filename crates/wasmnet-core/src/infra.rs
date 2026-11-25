@@ -24,6 +24,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::task::Waker;
 
 use wasmnet_det_cbor as det_cbor;
 
@@ -32,7 +33,7 @@ use det_cbor::Value;
 use crate::clock::{Nanos, VirtualClock};
 use crate::commands::DeviceCommand;
 use crate::config::DeviceConfig;
-use crate::journal::{Journal, JournalEnd, Record, Stream};
+use crate::journal::{Journal, JournalEnd, JournalEntry, Record, Stream};
 use crate::network::DeviceOptions;
 
 /// Answers kept per caller for request-id retries.
@@ -233,8 +234,8 @@ struct State {
     scopes: Vec<Option<String>>,
     /// Each controller's view: the indices of the changes it sees, in order.
     views: BTreeMap<String, Vec<usize>>,
-    /// Journal entries already folded in (`app-exit`).
-    journal_seen: usize,
+    /// The tasks waiting for a change in a controller's view ([`ChangeWait`]), by controller.
+    waiters: BTreeMap<String, Vec<Waker>>,
     /// The components controllers may create ([`crate::Network::set_infra_catalog`]); `None`: any.
     catalog: Option<std::collections::BTreeSet<String>>,
 }
@@ -268,17 +269,28 @@ fn matches(labels: &[(String, String)], selector: &[(String, String)]) -> bool {
 
 impl Infra {
     pub(crate) fn new(clock: VirtualClock, journal: Journal) -> Self {
+        let inner = Arc::new(Mutex::new(State {
+            items: BTreeMap::new(),
+            changes: Vec::new(),
+            requests: Vec::new(),
+            answers: BTreeMap::new(),
+            scopes: Vec::new(),
+            views: BTreeMap::new(),
+            waiters: BTreeMap::new(),
+            catalog: None,
+        }));
+        // App exits are folded in as they are journalled, in the exiting device's own
+        // processing context, so the change (and the wake it causes) is at the same place in
+        // every run and on every site.
+        let table = Arc::downgrade(&inner);
+        journal.set_observer(Arc::new(move |e: &JournalEntry| {
+            let exit = matches!(&e.record, Record::Event { kind, .. } if kind == "app-exit");
+            if exit && let Some(table) = table.upgrade() {
+                Self::fold(&mut table.lock().unwrap_or_else(PoisonError::into_inner), e);
+            }
+        }));
         Self {
-            inner: Arc::new(Mutex::new(State {
-                items: BTreeMap::new(),
-                changes: Vec::new(),
-                requests: Vec::new(),
-                answers: BTreeMap::new(),
-                scopes: Vec::new(),
-                views: BTreeMap::new(),
-                journal_seen: 0,
-                catalog: None,
-            })),
+            inner,
             clock,
             journal,
         }
@@ -301,41 +313,81 @@ impl Infra {
         };
         let index = s.changes.len();
         s.changes.push(Change { kind, device: view });
+        let mut woken = Vec::new();
         for (viewer, seen) in s.views.iter_mut() {
             if scope.as_ref().is_none_or(|o| o == viewer) {
                 seen.push(index);
+                woken.push(viewer.clone());
             }
         }
         s.scopes.push(scope);
+        // Wakers only mark their task runnable; the executor polls it in its next round.
+        for viewer in woken {
+            for w in s.waiters.remove(&viewer).unwrap_or_default() {
+                w.wake();
+            }
+        }
     }
 
-    /// Folds the journal's new `app-exit` events into the `apps` of the devices controllers
-    /// created. The devices the network was built with keep none: in a split network a
-    /// site's journal holds only its own devices' exits, so following them would make the
-    /// table differ from site to site.
-    fn refresh(&self, s: &mut State) {
-        let new = self.journal.entries_from(s.journal_seen);
-        s.journal_seen += new.len();
-        for e in new {
-            let Record::Event { kind, fields } = &e.record else {
-                continue;
-            };
-            if kind != "app-exit" || s.items.get(&e.device).is_none_or(|i| i.owner.is_none()) {
-                continue;
-            }
-            let field = |k: &str| {
-                fields
-                    .iter()
-                    .find(|(f, _)| f == k)
-                    .map(|(_, v)| v.clone())
-                    .unwrap_or_default()
-            };
-            let (app, status) = (field("app"), field("status"));
-            if let Some(item) = s.items.get_mut(&e.device) {
-                item.apps.insert(app, status);
-            }
-            Self::change(s, ChangeKind::Modified, &e.device);
+    /// Folds a journalled `app-exit` event into the `apps` of a device a controller created.
+    /// The devices the network was built with keep none: in a split network a site's journal
+    /// holds only its own devices' exits, so following them would make the table differ from
+    /// site to site.
+    fn fold(s: &mut State, e: &JournalEntry) {
+        let Record::Event { kind, fields } = &e.record else {
+            return;
+        };
+        if kind != "app-exit" || s.items.get(&e.device).is_none_or(|i| i.owner.is_none()) {
+            return;
         }
+        let field = |k: &str| {
+            fields
+                .iter()
+                .find(|(f, _)| f == k)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default()
+        };
+        let (app, status) = (field("app"), field("status"));
+        if let Some(item) = s.items.get_mut(&e.device) {
+            item.apps.insert(app, status);
+        }
+        Self::change(s, ChangeKind::Modified, &e.device);
+    }
+
+    /// The names of the devices `owner` created that are in the table, by name.
+    pub(crate) fn owned_by(&self, owner: &str) -> Vec<String> {
+        self.state()
+            .items
+            .iter()
+            .filter(|(_, i)| i.owner.as_deref() == Some(owner))
+            .map(|(n, _)| n.clone())
+            .collect()
+    }
+
+    /// Whether `viewer`'s view has a change after `since` matching `selector`; its latest
+    /// resource version. Registers `waker` otherwise.
+    fn changed_since(
+        &self,
+        viewer: &str,
+        selector: &[(String, String)],
+        since: u64,
+        waker: Option<&Waker>,
+    ) -> (bool, u64) {
+        let mut s = self.state();
+        let seen = s.views.get(viewer).map(Vec::as_slice).unwrap_or_default();
+        let latest = seen.len() as u64;
+        let from = usize::try_from(since).unwrap_or(usize::MAX);
+        let changed = seen
+            .iter()
+            .skip(from)
+            .any(|&i| matches(&s.changes[i].device.labels, selector));
+        if !changed && let Some(w) = waker {
+            let ws = s.waiters.entry(viewer.to_owned()).or_default();
+            if !ws.iter().any(|x| x.will_wake(w)) {
+                ws.push(w.clone());
+            }
+        }
+        (changed, latest)
     }
 
     // ---- what the network tells the table ------------------------------------------------
@@ -373,7 +425,6 @@ impl Infra {
     /// `request`) with `spec`.
     pub(crate) fn added(&self, name: &str, spec: Vec<u8>, at: Nanos, request: Option<usize>) {
         let mut s = self.state();
-        self.refresh(&mut s);
         let mine = request
             .and_then(|r| s.requests.get(r))
             .map(|r| r.uid.clone());
@@ -446,7 +497,6 @@ impl Infra {
     /// Device `name` stopped or started again.
     pub(crate) fn set_phase(&self, name: &str, phase: Phase, at: Nanos) {
         let mut s = self.state();
-        self.refresh(&mut s);
         let Some(item) = s.items.get_mut(name) else {
             return;
         };
@@ -462,7 +512,6 @@ impl Infra {
     /// Device `name` trapped and was stopped as crashed, with the trap's `message`.
     pub(crate) fn crashed(&self, name: &str, message: &str, at: Nanos) {
         let mut s = self.state();
-        self.refresh(&mut s);
         let Some(item) = s.items.get_mut(name) else {
             return;
         };
@@ -475,7 +524,6 @@ impl Infra {
     /// Device `name` was removed (unless a recreate is about to add it again).
     pub(crate) fn removed(&self, name: &str, at: Nanos) {
         let mut s = self.state();
-        self.refresh(&mut s);
         let Some(item) = s.items.get_mut(name) else {
             return;
         };
@@ -634,8 +682,7 @@ impl Infra {
     }
 
     fn get_as(&self, viewer: Option<&str>, name: &str) -> Result<DeviceView, InfraError> {
-        let mut s = self.state();
-        self.refresh(&mut s);
+        let s = self.state();
         let view = s
             .items
             .get(name)
@@ -650,8 +697,7 @@ impl Infra {
         viewer: Option<&str>,
         selector: &[(String, String)],
     ) -> (u64, Vec<DeviceView>) {
-        let mut s = self.state();
-        self.refresh(&mut s);
+        let s = self.state();
         let items = s
             .items
             .iter()
@@ -673,8 +719,7 @@ impl Infra {
         since: u64,
         max: u32,
     ) -> (u64, Vec<Change>) {
-        let mut s = self.state();
-        self.refresh(&mut s);
+        let s = self.state();
         let all: Vec<usize>;
         let seen = match viewer.and_then(|v| s.views.get(v)) {
             Some(seen) => seen.as_slice(),
@@ -893,7 +938,6 @@ impl InfraEnd {
         }
         let now = self.infra.clock.now();
         let mut s = self.infra.state();
-        self.infra.refresh(&mut s);
         let existing = match self.own(&s, name) {
             Ok(e) => e.cloned(),
             Err(InfraError::Denied(m)) if name != self.device => {
@@ -1050,7 +1094,6 @@ impl InfraEnd {
             self.mutable(name)?;
             let now = self.infra.clock.now();
             let mut s = self.infra.state();
-            self.infra.refresh(&mut s);
             let item = self
                 .own(&s, name)?
                 .cloned()
@@ -1107,7 +1150,6 @@ impl InfraEnd {
         self.mutable(name)?;
         let now = self.infra.clock.now();
         let mut s = self.infra.state();
-        self.infra.refresh(&mut s);
         let Some(item) = self.own(&s, name)?.cloned() else {
             return Ok((false, false));
         };
@@ -1183,7 +1225,6 @@ impl InfraEnd {
         }
         let now = self.infra.clock.now();
         let mut s = self.infra.state();
-        self.infra.refresh(&mut s);
         let item = self
             .own(&s, name)?
             .cloned()
@@ -1237,6 +1278,82 @@ impl InfraEnd {
             )));
         }
         self.infra.logs(name, stream, since, tail)
+    }
+
+    /// `changes.wait`: a future that completes once this controller's view has a change after
+    /// `since` to a device matching `selector` (at once if it has one), or once virtual time
+    /// reaches `deadline`, with the latest resource version of its view. A change wakes the
+    /// waiting task in the processing context the change is made in (a derived event, a
+    /// device's app exit), so it runs in that event's next round, the same on every replay and
+    /// on every site.
+    pub fn wait(
+        &self,
+        selector: Vec<(String, String)>,
+        since: u64,
+        deadline: Option<Nanos>,
+    ) -> ChangeWait {
+        ChangeWait {
+            end: self.clone(),
+            selector,
+            since,
+            deadline,
+            sleep: None,
+            waker: None,
+        }
+    }
+}
+
+/// The future of [`InfraEnd::wait`]. Dropping it stops waiting (and cancels its deadline).
+pub struct ChangeWait {
+    end: InfraEnd,
+    selector: Vec<(String, String)>,
+    since: u64,
+    deadline: Option<Nanos>,
+    sleep: Option<crate::clock::Sleep>,
+    /// The waker it registered last (taken out again when it is dropped).
+    waker: Option<std::task::Waker>,
+}
+
+impl Drop for ChangeWait {
+    fn drop(&mut self) {
+        if let Some(w) = self.waker.take() {
+            let mut s = self.end.infra.state();
+            if let Some(ws) = s.waiters.get_mut(&self.end.device) {
+                ws.retain(|x| !x.will_wake(&w));
+            }
+        }
+    }
+}
+
+impl std::future::Future for ChangeWait {
+    type Output = u64;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<u64> {
+        let this = &mut *self;
+        let infra = &this.end.infra;
+        let (changed, latest) = infra.changed_since(
+            &this.end.device,
+            &this.selector,
+            this.since,
+            Some(cx.waker()),
+        );
+        if changed {
+            return std::task::Poll::Ready(latest);
+        }
+        this.waker = Some(cx.waker().clone());
+        if let Some(deadline) = this.deadline {
+            let clock = infra.clock.clone();
+            let sleep = this
+                .sleep
+                .get_or_insert_with(|| clock.sleep_until(deadline));
+            if std::pin::Pin::new(sleep).poll(cx).is_ready() {
+                return std::task::Poll::Ready(latest);
+            }
+        }
+        std::task::Poll::Pending
     }
 }
 
@@ -1351,6 +1468,8 @@ pub(crate) fn parse_spec(bytes: &[u8]) -> Result<(DerivedSpec, Vec<u8>), InfraEr
                         .ok_or_else(|| invalid("fuel_per_instant: uint"))?,
                 );
             }
+            "args" => options.args = parse_args(val)?,
+            "env" => options.env = parse_env(val)?,
             "wire" => {
                 let Value::Array(cables) = val else {
                     return Err(invalid("wire: an array of cables"));
@@ -1359,7 +1478,7 @@ pub(crate) fn parse_spec(bytes: &[u8]) -> Result<(DerivedSpec, Vec<u8>), InfraEr
                     wire.push(parse_cable(c)?);
                 }
             }
-            "infra" | "infra_prefix" => {
+            "infra" | "infra_prefix" | "infra_cascade" => {
                 return Err(InfraError::Denied(format!(
                     "a controller cannot grant `{k}` (only the embedder can)"
                 )));
@@ -1381,6 +1500,67 @@ pub(crate) fn parse_spec(bytes: &[u8]) -> Result<(DerivedSpec, Vec<u8>), InfraEr
         Some(&spec.wire),
     );
     Ok((spec, canonical))
+}
+
+/// The most arguments, and the most environment variables, a spec gives a device.
+pub const MAX_ARGS: usize = 256;
+
+/// The longest argument, variable name or value a spec gives a device.
+pub const MAX_ARG: usize = 4096;
+
+fn check_text(what: &str, t: &str) -> Result<(), InfraError> {
+    if t.len() > MAX_ARG || t.contains('\0') {
+        return Err(invalid(format!("{what}: at most {MAX_ARG} bytes, no NUL")));
+    }
+    Ok(())
+}
+
+/// A spec's `args`: an array of text.
+fn parse_args(v: &Value) -> Result<Vec<String>, InfraError> {
+    let Value::Array(items) = v else {
+        return Err(invalid("args: an array of text"));
+    };
+    if items.len() > MAX_ARGS {
+        return Err(invalid(format!("args: at most {MAX_ARGS}")));
+    }
+    items
+        .iter()
+        .map(|a| {
+            let a = a
+                .as_text()
+                .ok_or_else(|| invalid("args: an array of text"))?;
+            check_text("an argument", a)?;
+            Ok(a.to_owned())
+        })
+        .collect()
+}
+
+/// A spec's `env`: a map of text to text, names without `=`; sorted by name (its canonical
+/// order).
+fn parse_env(v: &Value) -> Result<Vec<(String, String)>, InfraError> {
+    let Value::Map(entries) = v else {
+        return Err(invalid("env: a map of text to text"));
+    };
+    if entries.len() > MAX_ARGS {
+        return Err(invalid(format!("env: at most {MAX_ARGS} variables")));
+    }
+    let mut env = Vec::new();
+    for (k, v) in entries {
+        let (Some(k), Some(v)) = (k.as_text(), v.as_text()) else {
+            return Err(invalid("env: a map of text to text"));
+        };
+        if k.is_empty() || k.contains('=') {
+            return Err(invalid(format!("env: `{k}` is not a variable name")));
+        }
+        check_text("an environment variable", k)?;
+        check_text("an environment variable", v)?;
+        env.push((k.to_owned(), v.to_owned()));
+    }
+    env.sort();
+    if env.windows(2).any(|w| w[0].0 == w[1].0) {
+        return Err(invalid("env: a variable is given twice"));
+    }
+    Ok(env)
 }
 
 fn parse_cable(c: &Value) -> Result<CableReq, InfraError> {
@@ -1467,6 +1647,27 @@ pub(crate) fn spec_value(
     if let Some(prefix) = &options.infra_prefix {
         m.push((Value::text("infra_prefix"), Value::text(prefix.as_str())));
     }
+    match options.infra_cascade {
+        crate::Cascade::Keep => {}
+        crate::Cascade::Stop => m.push((Value::text("infra_cascade"), Value::text("stop"))),
+        crate::Cascade::Remove => m.push((Value::text("infra_cascade"), Value::text("remove"))),
+    }
+    if !options.args.is_empty() {
+        let args = options
+            .args
+            .iter()
+            .map(|a| Value::text(a.as_str()))
+            .collect();
+        m.push((Value::text("args"), Value::Array(args)));
+    }
+    if !options.env.is_empty() {
+        let env = options
+            .env
+            .iter()
+            .map(|(k, v)| (Value::text(k.as_str()), Value::text(v.as_str())))
+            .collect();
+        m.push((Value::text("env"), Value::Map(env)));
+    }
     if let Some(wire) = wire.filter(|w| !w.is_empty()) {
         let cables = wire
             .iter()
@@ -1516,6 +1717,57 @@ mod tests {
             ),
         ])
         .encode()
+    }
+
+    /// `args` and `env`: text only, names without `=`, env sorted by name in the canonical
+    /// form; the controller-only options cannot be granted.
+    #[test]
+    fn specs_take_arguments_and_environment() {
+        let with = |extra: Vec<(Value, Value)>| {
+            let mut m = vec![(Value::text("component"), Value::text("node:web"))];
+            m.extend(extra);
+            Value::Map(m).encode()
+        };
+        let env = |pairs: &[(&str, &str)]| {
+            Value::Map(
+                pairs
+                    .iter()
+                    .map(|(k, v)| (Value::text(*k), Value::text(*v)))
+                    .collect(),
+            )
+        };
+        let (s, canonical) = parse_spec(&with(vec![
+            (
+                Value::text("args"),
+                Value::Array(vec![Value::text("-v"), Value::text("x y")]),
+            ),
+            (Value::text("env"), env(&[("B", "2"), ("A", "1")])),
+        ]))
+        .expect("valid");
+        assert_eq!(s.options.args, ["-v", "x y"]);
+        assert_eq!(
+            s.options.env,
+            [
+                ("A".to_owned(), "1".to_owned()),
+                ("B".to_owned(), "2".to_owned())
+            ]
+        );
+        assert_eq!(parse_spec(&canonical).unwrap().1, canonical);
+        for bad in [
+            vec![(Value::text("args"), Value::text("-v"))],
+            vec![(Value::text("args"), Value::Array(vec![Value::Uint(1)]))],
+            vec![(Value::text("env"), env(&[("A=B", "1")]))],
+            vec![(Value::text("env"), env(&[("", "1")]))],
+            vec![(Value::text("env"), Value::Array(Vec::new()))],
+        ] {
+            assert!(
+                matches!(parse_spec(&with(bad.clone())), Err(InfraError::Invalid(_))),
+                "{bad:?}: {:?}",
+                parse_spec(&with(bad.clone()))
+            );
+        }
+        let cascade = with(vec![(Value::text("infra_cascade"), Value::text("stop"))]);
+        assert!(matches!(parse_spec(&cascade), Err(InfraError::Denied(_))));
     }
 
     #[test]

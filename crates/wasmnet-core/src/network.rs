@@ -8,6 +8,7 @@
 //! calls (`docs/design/async-under-virtual-time.md`).
 
 use std::any::{Any, TypeId};
+use std::borrow::Borrow;
 use std::sync::Arc;
 
 use crate::clock::{DeviceIdx, EventKey, HOST_DEVICE, Nanos, Tag, VirtualClock};
@@ -32,8 +33,10 @@ use wasmnet_wire::MacAddr;
 
 /// A runtime backend: turns a component into a running network device.
 pub trait Runtime {
-    /// What a device is made from (wasmtime: a compiled `Component`).
-    type Component: ?Sized;
+    /// What a device is made from (wasmtime: a compiled `Component`). The network keeps an
+    /// owned copy of each device's component, so a stopped device starts again without the
+    /// component resolver.
+    type Component: ?Sized + ToOwned;
 
     /// Instantiates `component` as the device described by `device`, calls its `ports()` at the
     /// network's current instant, and returns the answer with the device's actor: one future
@@ -83,6 +86,10 @@ pub struct DeviceContext {
     pub journal: JournalEnd,
     /// Served read-only (`wasi:config/store`).
     pub config: DeviceConfig,
+    /// Its arguments after `argv[0]` (the name) and its environment variables
+    /// ([`DeviceOptions::args`], [`DeviceOptions::env`]), for `wasi:cli/environment`.
+    pub args: Vec<String>,
+    pub env: Vec<(String, String)>,
     /// Where the guest's stdout and stderr go (journalled per [`DeviceOptions::journal_stdio`]).
     pub stdout: OutputCapture,
     pub stderr: OutputCapture,
@@ -250,9 +257,30 @@ pub struct DeviceOptions {
     /// needs one on every controller, so that names their devices take on different sites
     /// cannot collide (`docs/design/sites.md`).
     pub infra_prefix: Option<String>,
+    /// With `infra`: what becomes of the devices this controller created when it stops or is
+    /// removed ([`Cascade`]; by default they keep running).
+    pub infra_cascade: Cascade,
+    /// The device's arguments after `argv[0]` (its name), served by `wasi:cli/environment`.
+    pub args: Vec<String>,
+    /// Its environment variables, in this order, served by `wasi:cli/environment`.
+    pub env: Vec<(String, String)>,
     /// Options of the network's extensions, by type: where an embedder's grant of a capability
     /// its extension serves goes (embedder surface, unstable).
     pub ext: ExtOptions,
+}
+
+/// What becomes of the devices a controller created when the controller stops or is removed
+/// ([`DeviceOptions::infra_cascade`], `docs/design/topology-and-infra.md`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Cascade {
+    /// They keep running (and stay its).
+    #[default]
+    Keep,
+    /// They stop with it, at once, as on a power cut; a start of the controller does not start
+    /// them again.
+    Stop,
+    /// They are removed with it.
+    Remove,
 }
 
 struct DeviceRecord {
@@ -334,6 +362,8 @@ pub struct Network<'r, R: Runtime + ?Sized> {
     infra: Infra,
     /// The derived request being applied (its creation adopts the pending device).
     applying: Option<usize>,
+    /// Each device's component, by index, to start it again after a stop.
+    components: std::collections::BTreeMap<usize, <R::Component as ToOwned>::Owned>,
     /// How devices created while the network runs are numbered; fixed at the first creation.
     numbering: Option<Numbering>,
     /// The links created while the network ran (operator events, controllers' cables), with
@@ -390,6 +420,7 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
             incarnations: std::collections::BTreeMap::new(),
             infra,
             applying: None,
+            components: std::collections::BTreeMap::new(),
             numbering: None,
             created_links: Vec::new(),
         };
@@ -583,6 +614,7 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
         if let Some(rank) = rank {
             self.take_number(rank);
         }
+        self.components.insert(idx, component.to_owned());
         self.infra_added(idx, None);
         Ok(DeviceId(idx))
     }
@@ -794,6 +826,8 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
             },
             journal,
             config,
+            args: options.args.clone(),
+            env: options.env.clone(),
             stdout: stdout.clone(),
             stderr: stderr.clone(),
             inbox: inbox.clone(),
@@ -1067,7 +1101,20 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
         };
         // The device it was asked for may have been removed (or replaced) meanwhile.
         let current = self.infra.get(&req.name).ok().map(|d| d.uid);
-        let result = if current.as_deref() == Some(req.uid.as_str()) {
+        // A controller whose devices go with it: what it asked before it stopped is void.
+        let caller_gone = self
+            .devices
+            .iter()
+            .rfind(|d| d.name == req.caller)
+            .is_some_and(|d| {
+                d.options.infra_cascade != Cascade::Keep && d.phase != DevicePhase::Running
+            });
+        let result = if caller_gone {
+            Err(format!(
+                "`{}` stopped before this request applied",
+                req.caller
+            ))
+        } else if current.as_deref() == Some(req.uid.as_str()) {
             if let Some(far) = self.cable_to_another_site(&req) {
                 return Err(Error::Refused(format!(
                     "`{}` asked for a cable from `{}` to `{far}`, which runs on another site: \
@@ -1274,12 +1321,13 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
                     None,
                     SetupOrigin::Added,
                 );
-                let instance = self.resolve_instantiate(&component, context)?;
+                let (instance, resolved) = self.resolve_instantiate(&component, context)?;
                 self.register(
                     idx, number, &name, config, options, instance, handles, false,
                 )
                 .map_err(|e| e.to_string())?;
                 self.take_number(rank);
+                self.components.insert(idx, resolved);
                 self.devices[idx].created = Some(created);
                 self.devices[idx].component = Some(component.clone());
                 self.infra_added(idx, self.applying);
@@ -1308,6 +1356,7 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
                 self.stop_device(id.0, at);
                 self.infra.set_phase(&device, Phase::Stopped, at);
                 self.journal_event(&device, at, "device-stopped", Vec::new());
+                self.cascade(id.0, at);
             }
             Op::StartDevice { device } => {
                 let id = self
@@ -1318,10 +1367,12 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
                 if d.phase != DevicePhase::Stopped {
                     return Err(format!("`{device}` is not stopped"));
                 }
-                let component = d
-                    .component
-                    .clone()
-                    .ok_or_else(|| format!("`{device}`'s component is not known to the network"))?;
+                // The component it ran: kept since it was created, so no resolver is needed.
+                if !self.components.contains_key(&idx) {
+                    return Err(format!(
+                        "`{device}`'s component is not known to the network"
+                    ));
+                }
                 let (config, options) = (d.config.clone(), d.options.clone());
                 let captures = Some((d.stdout.clone(), d.stderr.clone()));
                 let (context, handles) = self.context(
@@ -1332,7 +1383,11 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
                     captures,
                     SetupOrigin::Restarted,
                 );
-                let instance = self.resolve_instantiate(&component, context)?;
+                let component = &self.components[&idx];
+                let instance = self
+                    .runtime
+                    .instantiate(context, component.borrow())
+                    .map_err(|e| e.to_string())?;
                 self.register(
                     idx,
                     self.devices[idx].number,
@@ -1354,16 +1409,8 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
                 let id = self
                     .live_device(&device)
                     .ok_or_else(|| format!("no device `{device}`"))?;
-                if self.devices[id.0].phase == DevicePhase::Running {
-                    self.stop_device(id.0, at);
-                }
-                for l in self.panel.links_of(id.0) {
-                    self.unwire(l, at);
-                }
-                self.devices[id.0].phase = DevicePhase::Removed;
-                self.devices[id.0].downed.clear();
-                self.infra.removed(&device, at);
-                self.journal_event(&device, at, "device-removed", Vec::new());
+                self.remove_device(id.0, at, Vec::new());
+                self.cascade(id.0, at);
             }
             Op::Wire {
                 a,
@@ -1482,25 +1529,77 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
         self.live_link(name).ok().map(LinkId)
     }
 
-    /// Instantiates `component` (a catalog name) with `context`, through the resolver.
+    /// Instantiates `component` (a catalog name) with `context`, through the resolver; with
+    /// the component it resolved to.
     fn resolve_instantiate(
         &self,
         component: &str,
         context: DeviceContext,
-    ) -> std::result::Result<DeviceInstance, String> {
+    ) -> std::result::Result<(DeviceInstance, <R::Component as ToOwned>::Owned), String> {
         let resolver = self
             .resolver
             .as_ref()
             .ok_or("this network has no component catalog")?;
         let runtime = self.runtime;
         let mut context = Some(context);
-        resolver(component, &mut |c| {
+        let mut resolved = None;
+        let instance = resolver(component, &mut |c| {
             let ctx = context
                 .take()
                 .ok_or_else(|| Error::Refused("instantiated twice".to_owned()))?;
+            resolved = Some(c.to_owned());
             runtime.instantiate(ctx, c)
         })
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+        let resolved = resolved.ok_or("the component resolver instantiated nothing")?;
+        Ok((instance, resolved))
+    }
+
+    /// Removes device `idx` at `at`: stopped if running, every link unwired, its name free;
+    /// journalled as `device-removed` with `fields`.
+    fn remove_device(&mut self, idx: usize, at: Nanos, fields: Vec<(&str, String)>) {
+        if self.devices[idx].phase == DevicePhase::Running {
+            self.stop_device(idx, at);
+        }
+        for l in self.panel.links_of(idx) {
+            self.unwire(l, at);
+        }
+        self.devices[idx].phase = DevicePhase::Removed;
+        self.devices[idx].downed.clear();
+        let name = self.devices[idx].name.clone();
+        self.infra.removed(&name, at);
+        self.journal_event(&name, at, "device-removed", fields);
+    }
+
+    /// Controller `idx` just stopped or was removed: its [`Cascade`] stops or removes the
+    /// devices it created, at once and in creation order, journalled on each with
+    /// `with-owner`.
+    fn cascade(&mut self, idx: usize, at: Nanos) {
+        let d = &self.devices[idx];
+        if !d.options.infra || d.options.infra_cascade == Cascade::Keep {
+            return;
+        }
+        let (owner, cascade) = (d.name.clone(), d.options.infra_cascade);
+        let mut owned: Vec<usize> = self
+            .infra
+            .owned_by(&owner)
+            .iter()
+            .filter_map(|name| self.live_device(name).map(|d| d.0))
+            .collect();
+        owned.sort_unstable();
+        for i in owned {
+            let name = self.devices[i].name.clone();
+            let fields = vec![("with-owner", owner.clone())];
+            match cascade {
+                Cascade::Stop if self.devices[i].phase == DevicePhase::Running => {
+                    self.stop_device(i, at);
+                    self.infra.set_phase(&name, Phase::Stopped, at);
+                    self.journal_event(&name, at, "device-stopped", fields);
+                }
+                Cascade::Remove => self.remove_device(i, at, fields),
+                _ => {}
+            }
+        }
     }
 
     /// Stops device `idx`: its links go down (the far ends see it), its actor is dropped.
@@ -2095,9 +2194,7 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
                 if let Op::ImpairNamed { from, .. } = op {
                     check_end(from)?;
                 }
-                if matches!(op, Op::AddDevice { .. } | Op::StartDevice { .. })
-                    && self.resolver.is_none()
-                {
+                if matches!(op, Op::AddDevice { .. }) && self.resolver.is_none() {
                     return Err(Error::Refused(
                         "this network has no component catalog: it cannot create devices"
                             .to_owned(),

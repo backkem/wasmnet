@@ -113,9 +113,9 @@ pub use link::{
     TransmitHook, Wire,
 };
 pub use network::{
-    CREATOR_RANGE, Cable, ComponentResolver, DeclaredPort, DeviceContext, DeviceId, DeviceInstance,
-    DeviceOptions, DevicePhase, Instantiate, LinkId, LinkMut, Network, Op, Placement, PortRef,
-    Records, Runtime,
+    CREATOR_RANGE, Cable, Cascade, ComponentResolver, DeclaredPort, DeviceContext, DeviceId,
+    DeviceInstance, DeviceOptions, DevicePhase, Instantiate, LinkId, LinkMut, Network, Op,
+    Placement, PortRef, Records, Runtime,
 };
 pub use output::{CAPTURE_LIMIT, OutputCapture};
 pub use rng::{SimRng, derive_seed};

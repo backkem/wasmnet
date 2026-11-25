@@ -99,11 +99,15 @@ pub(crate) struct Journal {
     clock: Option<VirtualClock>,
 }
 
+/// Sees every record the journal keeps, as it is appended, in the appending context.
+pub(crate) type Observer = Arc<dyn Fn(&JournalEntry) + Send + Sync>;
+
 #[derive(Default)]
 struct JournalState {
     entries: Vec<JournalEntry>,
     tags: Vec<Tag>,
     dropped: u64,
+    observer: Option<Observer>,
 }
 
 impl Journal {
@@ -119,10 +123,23 @@ impl Journal {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Calls `observer` with every record kept from now on, right before it is appended (the
+    /// journal is not locked meanwhile, so the observer may read it).
+    pub(crate) fn set_observer(&self, observer: Observer) {
+        self.state().observer = Some(observer);
+    }
+
     pub(crate) fn push(&self, entry: JournalEntry) {
         let tag = self.clock.as_ref().map(VirtualClock::tag);
+        let (kept, observer) = {
+            let s = self.state();
+            (s.entries.len() < MAX_ENTRIES, s.observer.clone())
+        };
+        if let Some(observe) = observer.filter(|_| kept) {
+            observe(&entry);
+        }
         let mut s = self.state();
-        if s.entries.len() < MAX_ENTRIES {
+        if kept {
             s.entries.push(entry);
             s.tags.extend(tag);
         } else {
