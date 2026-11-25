@@ -303,3 +303,31 @@ fn candidates_are_bounded() {
     }
     assert_eq!(t.candidates().len(), MAX_CANDIDATES);
 }
+
+#[test]
+fn the_peer_is_always_a_candidate_so_a_tunnel_that_goes_down_probes_it_again() {
+    let s = spec(&[("keepalive", "1s"), ("dead", "3s")]);
+    let mut t = Tunnel::new("to-b", s, 0);
+    let mut out = Vec::new();
+    for n in 0..MAX_CANDIDATES as u16 {
+        t.on_request(
+            MS,
+            SocketAddrV4::new([203, 0, 113, 2].into(), 2000 + n),
+            &[0; 12],
+            &mut out,
+        );
+    }
+    assert_eq!(t.candidates().len(), MAX_CANDIDATES);
+    // Data from a ninth endpoint brings it up: it takes the oldest candidate's place.
+    let peer = e("203.0.113.2:9999");
+    t.on_data(2 * MS, peer, 60, &mut out);
+    assert_eq!(t.peer(), Some(peer));
+    assert_eq!(t.candidates().len(), MAX_CANDIDATES);
+    assert!(t.candidates().contains(&peer));
+    assert!(!t.candidates().contains(&e("203.0.113.2:2000")));
+    // Silence takes it down; the next round checks the old peer among the others.
+    out.clear();
+    t.poll(4 * S, &mut out);
+    assert_eq!(t.state(), State::Probing);
+    assert!(sent(&out).iter().any(|(to, _)| *to == peer));
+}

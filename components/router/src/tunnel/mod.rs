@@ -279,9 +279,10 @@ pub struct Counters {
     pub checks_sent: u64,
     pub requests_received: u64,
     pub responses_received: u64,
-    /// Inner packets dropped because the tunnel was not up, or because the outer packet could
-    /// not leave (no route to the peer, a port down, too big for the egress port).
+    /// Inner packets dropped because the tunnel was not up.
     pub down_drops: u64,
+    /// Datagrams (data or checks) whose outer packet could not leave: no route to the peer, a
+    /// port down, too big for the egress port.
     pub outer_drops: u64,
     pub roamed: u64,
     pub mss_clamped: u64,
@@ -482,7 +483,7 @@ impl Tunnel {
         }
     }
 
-    /// Adds a candidate; `source` says where it came from (`config`, `command`,
+    /// Adds a candidate; `source` says where it came from (`command` or
     /// `peer-reflexive`). A tunnel that is idle or failed starts probing again at once.
     pub fn add_candidate(
         &mut self,
@@ -517,7 +518,8 @@ impl Tunnel {
         true
     }
 
-    /// Removes a candidate (not the current peer of a tunnel that is up).
+    /// Forgets a candidate. A tunnel that is up keeps its peer even so, but does not probe it
+    /// again after going down unless it is heard from or given again.
     pub fn remove_candidate(&mut self, e: SocketAddrV4) -> bool {
         let before = self.candidates.len();
         self.candidates.retain(|c| *c != e);
@@ -527,7 +529,12 @@ impl Tunnel {
     /// A packet with this tunnel's id came from `from`: the peer is alive, or has moved, or
     /// the tunnel comes up.
     fn heard(&mut self, now: u64, from: SocketAddrV4, out: &mut Vec<Action>) {
-        if !self.candidates.contains(&from) && self.candidates.len() < MAX_CANDIDATES {
+        // The endpoint heard from is always a candidate, so a tunnel that goes down probes its
+        // last peer again; at the bound it takes the oldest candidate's place.
+        if !self.candidates.contains(&from) {
+            if self.candidates.len() >= MAX_CANDIDATES {
+                self.candidates.remove(0);
+            }
             self.candidates.push(from);
         }
         self.last_rx = now;
