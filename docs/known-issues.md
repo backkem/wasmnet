@@ -90,6 +90,11 @@ here so that nobody has to find these the hard way. Each entry names where the c
   expire: fine for thousands of entries, slow for the 65536 the bound allows.
 - **A port that gets its first allow rule while traffic crosses it** does not know the flows
   already running: their answers are dropped unless a rule lets them in.
+- **The router's tunnels are unauthenticated and IPv4 outside.** A tunnel id is no credential:
+  whoever can send to a tunnel's UDP port can move its peer. Outer endpoints are IPv4 only;
+  packets from a tunnel are not filtered by `allow` rules; on a translating router, an inside
+  host's mapping on a tunnel's UDP port loses its inbound datagrams to the tunnel
+  ([design/tunnels.md](design/tunnels.md)).
 - **The switch scans its whole MAC table on every frame** to age entries: fine for tens of
   hosts, slow for thousands.
 

@@ -26,7 +26,7 @@ name, as a composition does: `wac` knows a fabric device as `wasmnet:<name>` and
 |---|---|---|---|
 | `netstack` | `wasmnet-netstack` | `netstack.wasm` | A smoltcp IP stack: `wasmnet:link` below, `wasi:sockets@0.3.0` and `wasmnet:sockets-ext` above. One per node: every app of a composition shares it. |
 | `switch` | `wasmnet-switch` | `switch.wasm` | A transparent learning Ethernet bridge. |
-| `router` | `wasmnet-router` | `router.wasm` | Routes IPv4 and IPv6 between its ports: ARP, NDP, ICMP errors, static routes, DHCP relay, address translation (NAT44) and a packet filter. |
+| `router` | `wasmnet-router` | `router.wasm` | Routes IPv4 and IPv6 between its ports: ARP, NDP, ICMP errors, static routes, DHCP relay, address translation (NAT44), a packet filter and tunnel ports (Geneve over UDP, STUN checks). |
 | `wan-port` | `wasmnet-wan-port` | `wan-port.wasm` | One end of a bridged WAN link between two sites. |
 
 ## Apps

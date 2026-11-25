@@ -188,7 +188,8 @@ Source of truth: `Config::from_lookup` in
 
 An IPv4/IPv6 router with ARP, NDP, ICMP, static routes, optional Router Advertisements and an
 optional DHCP relay per port, and optional address translation and a packet filter
-([nat.md](nat.md)). Ports are named `p0` to `p<N-1>`.
+([nat.md](nat.md)) and tunnel ports ([tunnels.md](tunnels.md)). Ports are named `p0` to
+`p<N-1>`.
 
 Source of truth: `Config::from_pairs` and `parse_route` in
 [components/router/src/config.rs](../../components/router/src/config.rs). It reads the whole
@@ -208,6 +209,7 @@ config with `get-all`. Unknown keys are errors. At least one port must exist.
 | `trace.ttl-decrement` | `first`, `all` or `none` | `first` | Which `ttl-decrement` events are logged: once per flow (protocol, addresses and ports), every one, or none. |
 | `trace.nat-filtered` | `first`, `all` or `none` | `first` | Which `nat-filtered` events (an inbound packet refused by NAT filtering) are logged: once per remote endpoint and external endpoint, every one, or none. |
 | `trace.filter-drop` | `first`, `all` or `none` | `first` | Which `filter-drop` events are logged: once per flow, every one, or none. |
+| `stun-server` | integer, 1..=65535 | none | A UDP port on which the router answers STUN Binding requests without a tunnel id with the endpoint they came from ([tunnels.md](tunnels.md)). |
 
 Per-port keys, `port<N>.<key>` with `N` in 0..=15 written without leading zeros (`port00` is
 unknown):
@@ -239,9 +241,12 @@ unknown):
   is used. A link-local next hop needs `port`.
 * `port <n>` must name an existing port. `port` without `via` makes the destination on-link
   through that port.
+* `tunnel <name>` routes the destination over a tunnel port (on-link, point to point); it takes
+  neither `via` nor `port`, and `default` is written `0.0.0.0/0` or `::/0` with it.
 
 Examples: `10.0.3.0/24 via 10.0.2.2`, `default via 10.0.2.2`, `fd00:3::/64 via fe80::2 port 1`,
-`10.9.0.0/16 port 0`. A full value: `routes = "10.0.3.0/24 via 10.0.2.2,default via fd00:1::fe"`.
+`10.9.0.0/16 port 0`, `fd00:b::/64 tunnel to-b`. A full value:
+`routes = "10.0.3.0/24 via 10.0.2.2,default via fd00:1::fe"`.
 
 **Address translation** ([nat.md](nat.md)). These keys need at least one `port<N>.nat`; on a
 router without one they are an error. All are optional.
@@ -281,6 +286,24 @@ packet passes a port with rules when it matches one, belongs to a flow the route
 through in either direction, or is an ICMP error about such a flow; traffic to the router
 itself is not filtered.
 
+**Tunnels** ([tunnels.md](tunnels.md)). Each tunnel is a group of keys `tunnel.<name>.<key>`;
+a name is `a-z`, `0-9` and `-`, 1 to 32 characters, starting with a letter. At most 256
+tunnels; their ports follow the cabled ones in name order. `id` and `local` are required.
+
+| Key | Value | Default | Meaning |
+|---|---|---|---|
+| `tunnel.<name>.id` | integer, 1..=16777215 | required | The Geneve VNI and the STUN `USERNAME` of its checks. Unique per UDP port. |
+| `tunnel.<name>.local` | `addr/len`, IPv4 or IPv6, not link-local | required | The transit address and its connected route (`fd00:ff::a/128`). |
+| `tunnel.<name>.udp` | integer, 1..=65535 | `6081` | The local UDP port, shared with other tunnels of other ids. |
+| `tunnel.<name>.peer` | IPv4 endpoints, comma-separated, at most 8 | none | Candidate endpoints of the peer. |
+| `tunnel.<name>.reflector` | IPv4 endpoints, comma-separated, at most 8 | none | Where to ask for the tunnel's reflexive endpoint (a router's `stun-server` or tunnel port). |
+| `tunnel.<name>.mtu` | integer, 1280..=9000 | `1464` | The tunnel port's IP MTU (1500 minus 36 bytes of outer IPv4, UDP and Geneve). |
+| `tunnel.<name>.probe` | duration above zero | `100ms` | Time between two probing rounds. |
+| `tunnel.<name>.rounds` | integer, 1..=1000 | `20` | Probing rounds without an answer before the tunnel is `failed`. |
+| `tunnel.<name>.keepalive` | duration above zero | `25s` | Time between two checks to the peer while up. |
+| `tunnel.<name>.dead` | duration above `keepalive` | `80s` | Silence from the peer that takes the tunnel down. |
+| `tunnel.<name>.mss-clamp` | `true` or `false` | `true` | Lower the MSS of TCP SYNs crossing the tunnel to fit its MTU. |
+
 Besides the errors above, the component traps if `get-all` itself fails.
 
 **Changing routes while it runs.** The config is read once, but the static routes can change
@@ -290,6 +313,10 @@ syntax above. An embedder sends them with `Network::command` or as operator even
 with `wasmnet:infra/devices.control`; nothing else about the router (ports, neighbours, links,
 counters) changes. Their semantics are in [wit/router/router.wit](../../wit/router/router.wit)
 and [topology-and-infra.md](topology-and-infra.md#commands-into-a-running-device).
+
+Tunnels change the same way: `tunnel-add <name> <key> <value>...` (the keys above),
+`tunnel-remove <name>`, `tunnel-peer <name> <ip:port>`, `tunnel-peer-remove <name> <ip:port>`
+and `tunnels`, the list a controller reads ([router.wit](../../wit/router/router.wit)).
 
 Port forwards and allow rules change the same way: `forward-add <forward>`,
 `forward-remove <forward or proto and external port>`, `forwards`, `allow-add <port> <rule>`,

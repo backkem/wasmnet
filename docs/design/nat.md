@@ -147,5 +147,9 @@ of new commands; no interface changed).
 ## Not covered
 
 NAT64 and NAT66, UPnP, PCP and NAT-PMP, application-level gateways (FTP, SIP), translation of
-IPv4 fragments, a NAT that pools several outside addresses, and tunnels. The filter has no deny
-rules, no source-port match and no rate limits.
+IPv4 fragments and a NAT that pools several outside addresses. The filter has no deny rules, no
+source-port match and no rate limits, and does not filter packets from tunnel ports.
+
+A translating router can also be a tunnel end ([tunnels.md](tunnels.md)): datagrams to a
+tunnel's UDP port on the outside address are the tunnel's before the translation table is
+asked, and the tunnel's outer packets leave from that address untranslated.

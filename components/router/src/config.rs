@@ -38,6 +38,15 @@
 //! | `conntrack.udp-timeout`, `conntrack.tcp-established-timeout`, `conntrack.tcp-transitory-timeout`, `conntrack.icmp-timeout` | idle timeouts | `300s`, `7440s`, `240s`, `60s` |
 //! | `conntrack.max-entries` | NAT sessions, and filter flows, 1..=65536 each | `4096` |
 //! | `trace.nat-filtered`, `trace.filter-drop` | `first` (once per flow), `all` or `none` | `first` |
+//!
+//! Tunnel ports (`docs/design/tunnels.md`), all optional; a tunnel needs `id` and `local`:
+//!
+//! | key | value | default |
+//! |---|---|---|
+//! | `tunnel.<name>.<key>` | a tunnel's settings, the keys of [`crate::tunnel::Spec`] (at most 256 tunnels) | none |
+//! | `stun-server` | a UDP port on which the router answers STUN Binding requests without a tunnel id | none |
+//!
+//! A route over a tunnel names it: `fd00:b::/64 tunnel to-b`.
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
