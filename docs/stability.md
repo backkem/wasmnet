@@ -100,7 +100,11 @@ from outside the core, so a lost constructor fails the tests.
   its constructor, which takes what the op needs, and set the rest with `with_*` methods:
   `Op::wire(("a", 0), ("b", 1)).with_latency(100_000)`, `Op::stop_device("web")`,
   `Op::add_device("web", "node:http-server").with_config(config).with_cable(cable)`. A `with_*`
-  method on an op it does not apply to panics. Match a variant with `..`:
+  method on an op it does not apply to panics. An op on something that exists takes its id
+  (`Op::stdin(device, bytes)`, `Op::control`, `Op::impair`, `Op::latency`, `Op::link_state`
+  take a `DeviceId` or a `LinkId`); an op on something an earlier op creates takes its name
+  (`Op::stdin_named("web", bytes)`, `Op::control_named`, `Op::impair_named`, `Op::set_link`,
+  and the device ops such as `Op::stop_device("web")`). Match a variant with `..`:
   `Op::Wire { a, b, .. }`. `Outcome`'s two variants are `#[non_exhaustive]` as well
   (`Outcome::Quiescent { at, .. }`); `Outcome::quiescent` and `Outcome::deadline` build them
   for code that decodes one.

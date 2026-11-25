@@ -33,8 +33,10 @@ cargo xtask test-guest     # component tests, inside wasmtime
   it is tested without an instance, and its wit-bindgen glue in `src/component.rs`.
 - **Tests run in wasmtime.** Anything that ships as a component is tested as wasm
   (`cargo test --target wasm32-wasip2 -p <crate>`), not natively.
-- **WIT is the API.** Document every function's timing and ownership. A breaking change
-  bumps the package version and updates every implementer in the same change.
+- **WIT is the API.** Document every function's timing and ownership. Every change to a
+  package's interface bumps its version, an addition included and whether or not the previous
+  version was ever released: a vendored copy must be able to tell two revisions apart by the
+  version alone. A breaking change also updates every implementer in the same change.
 - **No `unsafe`** outside generated bindings.
 
 ## License
