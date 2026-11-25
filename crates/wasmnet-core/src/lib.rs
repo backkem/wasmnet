@@ -91,6 +91,7 @@ pub mod pcap;
 pub mod reconfigure;
 mod rng;
 pub mod sites;
+pub mod supply;
 
 use std::any::Any;
 use std::fmt;
@@ -121,6 +122,7 @@ pub use network::{
 pub use output::{CAPTURE_LIMIT, OutputCapture};
 pub use reconfigure::{RECONFIGURE_EXPORT, ReconfigureCall, Refusal};
 pub use rng::{SimRng, derive_seed};
+pub use supply::{Admission, Supplied, SupplyLimits};
 
 /// Default wall-clock reading at virtual time 0: 2026-01-01T00:00:00Z.
 pub const DEFAULT_WALL_EPOCH: Duration = Duration::from_secs(1_767_225_600);

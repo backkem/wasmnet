@@ -71,6 +71,27 @@ pub trait Runtime {
     fn summarize(&self, message: &str) -> String {
         crate::infra::one_line(message)
     }
+
+    /// Compiles a component an in-world controller supplied as bytes
+    /// ([`crate::supply`], `docs/design/topology-and-infra.md`), named by its digest reference
+    /// `digest` (`sha256:<hex>`). The network calls it when a creation from that digest
+    /// applies and it has no result for the digest yet, after it checked the digest and the
+    /// embedder admitted the bytes; it keeps the result (a refusal too) while a controller's
+    /// store keeps the bytes. A refusal (`Err(why)`) fails the creation, never the network: a
+    /// backend refuses bytes that are not a component, and a component that imports
+    /// something it does not serve. The default refuses: a backend that cannot compile at run
+    /// time.
+    fn compile_supplied(
+        &self,
+        digest: &str,
+        bytes: &[u8],
+    ) -> std::result::Result<<Self::Component as ToOwned>::Owned, String> {
+        let _ = bytes;
+        Err(format!(
+            "this runtime cannot run supplied components (`{digest}`): it compiles nothing \
+             while a network runs"
+        ))
+    }
 }
 
 /// Everything a backend needs to run one device deterministically.
@@ -287,6 +308,11 @@ pub struct DeviceOptions {
     /// created that is in the table, whatever its phase); an `apply` of a new name beyond it
     /// is refused (`denied`) and changes nothing. `None`: no limit.
     pub infra_max_devices: Option<u32>,
+    /// With `infra`: the controller may supply components as bytes and create devices from
+    /// them by digest (`wasmnet:infra/components`), within these bounds; the network's
+    /// admission callback judges every one ([`Network::set_supply_admission`]). `None`: the
+    /// calls are `denied` and specs may name catalog components only.
+    pub infra_supply: Option<crate::supply::SupplyLimits>,
     /// The most linear memory the device may use, in bytes, all its instances together. A
     /// device that grows past it traps, deterministically, at the growing instruction: a
     /// device that crashes alone (a controller's, or one with [`crash_alone`](Self::crash_alone))
@@ -416,6 +442,14 @@ pub struct Network<'r, R: Runtime + ?Sized> {
     created_links: Vec<(usize, Tag)>,
     /// The embedder's actions, by name ([`Network::register_action`]).
     embedder_actions: std::collections::BTreeMap<String, Action<'r>>,
+    /// Components compiled from controllers' supplied bytes (or why they could not be), by
+    /// digest reference, while some controller's store keeps the bytes.
+    supplied: std::collections::BTreeMap<
+        String,
+        std::result::Result<<R::Component as ToOwned>::Owned, String>,
+    >,
+    /// How many components were compiled from supplied bytes.
+    supplied_compiles: u64,
 }
 
 /// The size of each creator's range of device numbers: a creator can create this many devices
@@ -471,6 +505,8 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
             numbering: None,
             created_links: Vec::new(),
             embedder_actions: std::collections::BTreeMap::new(),
+            supplied: std::collections::BTreeMap::new(),
+            supplied_compiles: 0,
         };
         runtime.install(&mut network);
         network
@@ -751,6 +787,9 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
         options: &DeviceOptions,
         remote: bool,
     ) -> std::result::Result<(), String> {
+        if !options.infra && options.infra_supply.is_some() {
+            return Err(format!("`{name}`: `infra_supply` needs `infra`"));
+        }
         if !options.infra {
             return match options.infra_prefix {
                 Some(_) => Err(format!("`{name}`: `infra_prefix` needs `infra`")),
@@ -815,6 +854,30 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
     /// component the resolver knows.
     pub fn set_infra_catalog(&mut self, components: Vec<String>) {
         self.infra.set_catalog(components);
+    }
+
+    /// Decides which components controllers granted [`DeviceOptions::infra_supply`] may supply
+    /// (`docs/design/topology-and-infra.md`): `admit` sees each one's bytes, digest and
+    /// controller before anything keeps, compiles or instantiates it, and answers `Ok` to keep
+    /// it or `Err(reason)` to refuse it (the controller's `denied(reason)`). It is called at
+    /// the controller's `supply` call, again at the same position on every rerun, so its
+    /// verdict must depend only on what it is given. Without one, every supply is refused. A
+    /// second call replaces the first.
+    pub fn set_supply_admission(
+        &mut self,
+        admit: impl Fn(&crate::supply::Supplied<'_>) -> std::result::Result<(), String>
+        + Send
+        + Sync
+        + 'static,
+    ) {
+        self.infra.set_admission(Arc::new(admit));
+    }
+
+    /// How many components this network compiled from controllers' supplied bytes so far: one
+    /// per digest while its bytes are kept, however many devices are made from it
+    /// ([`Runtime::compile_supplied`]).
+    pub fn supplied_compiles(&self) -> u64 {
+        self.supplied_compiles
     }
 
     /// The device table `wasmnet:infra` serves: every device by name, with its
@@ -892,6 +955,7 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
                     name,
                     options.infra_prefix.clone(),
                     options.infra_max_devices,
+                    options.infra_supply,
                 )
             }),
             ext,
@@ -1127,10 +1191,12 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
                     if let Err(message) = applied {
                         self.exec.fail_op(op, message);
                     }
+                    self.prune_supplied();
                 }
                 Flow::Derived(n) => {
                     let at = self.clock.now();
                     self.apply_derived(n, at)?;
+                    self.prune_supplied();
                 }
                 Flow::Crashed(i, message) => {
                     let at = self.clock.now();
@@ -1592,7 +1658,11 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
                     None,
                     SetupOrigin::Added,
                 );
-                let (instance, resolved) = self.resolve_instantiate(&component, context)?;
+                let (instance, resolved) = if crate::supply::is_reference(&component) {
+                    self.supplied_instantiate(&component, context)?
+                } else {
+                    self.resolve_instantiate(&component, context)?
+                };
                 self.register(
                     idx, number, &name, config, options, instance, handles, false,
                 )
@@ -1903,6 +1973,58 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
         .map_err(|e| e.to_string())?;
         let resolved = resolved.ok_or("the component resolver instantiated nothing")?;
         Ok((instance, resolved))
+    }
+
+    /// Instantiates the component a controller supplied under digest reference `component`
+    /// with `context`, for the derived request being applied: compiled from the caller's
+    /// bytes the first time (the result kept by digest), from the kept result after.
+    fn supplied_instantiate(
+        &mut self,
+        component: &str,
+        context: DeviceContext,
+    ) -> std::result::Result<(DeviceInstance, <R::Component as ToOwned>::Owned), String> {
+        let caller = self
+            .applying
+            .and_then(|n| self.infra.request(n))
+            .map(|r| r.caller)
+            .ok_or_else(|| {
+                format!(
+                    "`{component}` names a component a controller supplied: only that \
+                     controller's requests create devices from it"
+                )
+            })?;
+        let bytes = self
+            .infra
+            .supplied_bytes(&caller, component)
+            .ok_or_else(|| format!("`{caller}`'s store keeps no component `{component}`"))?;
+        // Forget the compiled components whose bytes went meanwhile.
+        self.prune_supplied();
+        if !self.supplied.contains_key(component) {
+            self.supplied_compiles += 1;
+            let compiled = self.runtime.compile_supplied(component, &bytes);
+            self.supplied.insert(component.to_owned(), compiled);
+        }
+        let owned = match &self.supplied[component] {
+            Ok(c) => {
+                let c: &R::Component = c.borrow();
+                c.to_owned()
+            }
+            Err(why) => return Err(why.clone()),
+        };
+        let instance = self
+            .runtime
+            .instantiate(context, owned.borrow())
+            .map_err(|e| e.to_string())?;
+        Ok((instance, owned))
+    }
+
+    /// Forgets the compiled components whose bytes no controller's store keeps any more.
+    fn prune_supplied(&mut self) {
+        if self.supplied.is_empty() {
+            return;
+        }
+        let kept = self.infra.stored_digests();
+        self.supplied.retain(|digest, _| kept.contains(digest));
     }
 
     /// Removes device `idx` at `at`: stopped if running, every link unwired, its name free;

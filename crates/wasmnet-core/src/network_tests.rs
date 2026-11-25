@@ -106,6 +106,18 @@ impl Runtime for Fake {
             apps: Vec::new(),
         })
     }
+
+    /// Supplied bytes are a spec in UTF-8; ones that start with `bad` do not compile.
+    fn compile_supplied(&self, digest: &str, bytes: &[u8]) -> std::result::Result<String, String> {
+        let spec = String::from_utf8(bytes.to_vec()).map_err(|e| e.to_string())?;
+        self.log.lock().unwrap().push(format!("compile {digest}"));
+        match spec.strip_prefix("bad") {
+            Some(_) => Err(format!(
+                "`{digest}` imports `nothing:here`, which is not served"
+            )),
+            None => Ok(spec),
+        }
+    }
 }
 
 /// The network's own records about devices' lives, in journal order.
@@ -607,4 +619,114 @@ fn an_action_runs_at_its_place_changes_extensions_and_places_ops() {
         states[states.len() - 1],
         OpState::Applied { at: 20, .. }
     ));
+}
+
+/// A controller's devices from supplied bytes: compiled once per digest, started again and
+/// recreated without compiling, a compile refusal fails the creation alone, and the bytes and
+/// their compiled component go once nothing names them.
+#[test]
+fn supplied_components_compile_once_per_digest() {
+    use crate::infra::Phase;
+    use crate::supply::{SupplyLimits, reference_of};
+    let fake = Fake::new();
+    let mut network = Network::new(&fake, 1);
+    let options = DeviceOptions {
+        infra: true,
+        infra_supply: Some(SupplyLimits::default()),
+        ..DeviceOptions::default()
+    };
+    network
+        .device_with_options("ctl", "", DeviceConfig::new(), options)
+        .unwrap();
+    // A supply grant needs `infra`.
+    let ungranted = DeviceOptions {
+        infra_supply: Some(SupplyLimits::default()),
+        ..DeviceOptions::default()
+    };
+    assert!(
+        network
+            .device_with_options("x", "", DeviceConfig::new(), ungranted)
+            .is_err()
+    );
+    network.set_supply_admission(|_| Ok(()));
+    let ctl = network
+        .infra()
+        .end("ctl", None, None, Some(SupplyLimits::default()));
+    let spec = |component: &str| det_cbor_spec(component, &[]);
+    let good = ctl.supply(None, b"tick=10").unwrap();
+    let bad = ctl.supply(None, b"bad").unwrap();
+    assert_eq!(good, reference_of(b"tick=10"));
+    ctl.apply(None, "w1", vec![], &spec(&good)).unwrap();
+    ctl.apply(None, "w2", vec![], &spec(&good)).unwrap();
+    ctl.apply(None, "b", vec![], &spec(&bad)).unwrap();
+    network.run_until(25).unwrap();
+    assert_eq!(network.supplied_compiles(), 2, "one per digest");
+    let table = network.infra();
+    assert_eq!(table.get("w1").unwrap().phase, Phase::Running);
+    assert_eq!(table.get("w2").unwrap().phase, Phase::Running);
+    let b = table.get("b").unwrap();
+    assert_eq!(b.phase, Phase::Failed);
+    assert!(b.message.unwrap().contains("nothing:here"));
+    assert!(fake.log().contains(&"w2@20 tick 10".to_owned()));
+    // Stopped and started again, recreated with a new config: nothing compiles.
+    ctl.stop(None, "w1", 0).unwrap();
+    network.run_until(30).unwrap();
+    ctl.start(None, "w1").unwrap();
+    network.run_until(35).unwrap();
+    ctl.apply(None, "w2", vec![], &det_cbor_spec(&good, &[("a", "1")]))
+        .unwrap();
+    network.run_until(36).unwrap();
+    let table = network.infra();
+    assert_eq!(table.get("w1").unwrap().phase, Phase::Running);
+    assert_eq!(table.get("w2").unwrap().generation, 2, "recreated");
+    assert_eq!(network.supplied_compiles(), 2);
+    // Released and its devices removed: the bytes and the compiled component go.
+    ctl.release(&good).unwrap();
+    ctl.release(&bad).unwrap();
+    assert_eq!(network.infra().stored_digests().len(), 2, "still named");
+    ctl.remove(None, "w1").unwrap();
+    ctl.remove(None, "w2").unwrap();
+    ctl.remove(None, "b").unwrap();
+    network.run_until(40).unwrap();
+    assert!(network.infra().stored_digests().is_empty());
+    assert!(network.supplied.is_empty());
+    let dropped = network
+        .journal()
+        .into_iter()
+        .filter(|e| matches!(&e.record, Record::Event { kind, .. } if kind == "component-dropped"))
+        .count();
+    assert_eq!(dropped, 2);
+    // A digest reference in an operator's creation is refused when it applies: only the
+    // controller that supplied it creates from it.
+    network.set_component_resolver(Box::new(|name, instantiate| instantiate(name)));
+    let op = add(
+        &mut network,
+        Op::AddDevice {
+            name: "op".into(),
+            component: good.clone(),
+            config: DeviceConfig::new(),
+            options: DeviceOptions::default(),
+            wire: Vec::new(),
+        },
+        Placement::StartOf(45),
+    );
+    network.run_until(50).unwrap();
+    assert!(matches!(
+        &network.op_states()[op],
+        OpState::Failed { message, .. } if message.contains("only that controller")
+    ));
+}
+
+/// A spec of `component` with `config`, as a controller sends it.
+fn det_cbor_spec(component: &str, config: &[(&str, &str)]) -> Vec<u8> {
+    use wasmnet_det_cbor::Value;
+    let config = config
+        .iter()
+        .map(|(k, v)| (Value::text(*k), Value::text(*v)))
+        .collect();
+    Value::Map(vec![
+        (Value::text("component"), Value::text(component)),
+        (Value::text("config"), Value::Map(config)),
+    ])
+    .encode()
 }

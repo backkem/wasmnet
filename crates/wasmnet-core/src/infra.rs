@@ -298,6 +298,13 @@ struct State {
     sent: BTreeMap<String, VecDeque<Sent>>,
     /// The components controllers may create ([`crate::Network::set_infra_catalog`]); `None`: any.
     catalog: Option<std::collections::BTreeSet<String>>,
+    /// Each controller's store of supplied components, by digest reference.
+    stores: BTreeMap<String, BTreeMap<String, crate::supply::Entry>>,
+    /// The queued creations and recreations from a supplied component, by request index:
+    /// `(caller, digest reference)` (each keeps its component in the caller's store).
+    queued_supplied: BTreeMap<usize, (String, String)>,
+    /// The embedder's verdict on supplied components ([`crate::Network::set_supply_admission`]).
+    admission: Option<crate::supply::Admission>,
 }
 
 /// One network's device table and derived requests. Cloning gives another handle to the same table.
@@ -340,6 +347,9 @@ impl Infra {
             command_ids: BTreeMap::new(),
             sent: BTreeMap::new(),
             catalog: None,
+            stores: BTreeMap::new(),
+            queued_supplied: BTreeMap::new(),
+            admission: None,
         }));
         // App exits are folded in as they are journalled, in the exiting device's own
         // processing context, so the change (and the wake it causes) is at the same place in
@@ -473,6 +483,7 @@ impl Infra {
         device: &str,
         prefix: Option<String>,
         max_devices: Option<u32>,
+        supply: Option<crate::supply::SupplyLimits>,
     ) -> InfraEnd {
         self.add_view(device);
         InfraEnd {
@@ -480,7 +491,102 @@ impl Infra {
             device: device.to_owned(),
             prefix,
             max_devices,
+            supply,
         }
+    }
+
+    // ---- supplied components ----------------------------------------------------------------
+
+    /// The embedder's verdict on supplied components ([`crate::Network::set_supply_admission`]).
+    pub(crate) fn set_admission(&self, admission: crate::supply::Admission) {
+        self.state().admission = Some(admission);
+    }
+
+    /// The bytes of the component `digest` in `controller`'s store, if it keeps it.
+    pub(crate) fn supplied_bytes(&self, controller: &str, digest: &str) -> Option<Arc<[u8]>> {
+        let s = self.state();
+        s.stores
+            .get(controller)?
+            .get(digest)
+            .map(|e| e.bytes.clone())
+    }
+
+    /// Every digest some controller's store keeps (the network keeps their compiled components).
+    pub(crate) fn stored_digests(&self) -> std::collections::BTreeSet<String> {
+        let s = self.state();
+        s.stores.values().flat_map(|m| m.keys().cloned()).collect()
+    }
+
+    /// How many devices in the table and queued requests of `controller` name `digest`.
+    fn supplied_users(s: &State, controller: &str, digest: &str) -> u32 {
+        let devices = s
+            .items
+            .values()
+            .filter(|i| i.owner.as_deref() == Some(controller))
+            .filter(|i| spec_component(&i.spec).as_deref() == Some(digest))
+            .count();
+        let queued = s
+            .queued_supplied
+            .values()
+            .filter(|(c, d)| c == controller && d == digest)
+            .count();
+        u32::try_from(devices + queued).unwrap_or(u32::MAX)
+    }
+
+    /// Drops every supplied component nobody needs any more (not held, named by no device of
+    /// its controller in the table and by no queued request); returns `(controller, digest,
+    /// size)` of each, for [`Self::journal_dropped`] once the state is unlocked.
+    fn collect(s: &mut State) -> Vec<(String, String, u64)> {
+        let mut gone = Vec::new();
+        for (controller, store) in &s.stores {
+            for (digest, e) in store {
+                if !e.held && Self::supplied_users(s, controller, digest) == 0 {
+                    gone.push((controller.clone(), digest.clone(), e.bytes.len() as u64));
+                }
+            }
+        }
+        for (controller, digest, _) in &gone {
+            if let Some(store) = s.stores.get_mut(controller) {
+                store.remove(digest);
+                if store.is_empty() {
+                    s.stores.remove(controller);
+                }
+            }
+        }
+        gone
+    }
+
+    /// Journals `component-dropped {digest, size}` on each controller whose component went.
+    fn journal_dropped(&self, gone: Vec<(String, String, u64)>) {
+        let at = self.clock.now();
+        for (controller, digest, size) in gone {
+            JournalEnd {
+                journal: self.journal.clone(),
+                device: controller,
+            }
+            .push(
+                at,
+                Record::Event {
+                    kind: "component-dropped".to_owned(),
+                    fields: vec![
+                        ("digest".to_owned(), digest),
+                        ("size".to_owned(), size.to_string()),
+                    ],
+                },
+            );
+        }
+    }
+
+    /// Drops the supplied components nobody needs any more, journalling each on its controller.
+    pub(crate) fn collect_supplied(&self) {
+        let gone = {
+            let mut s = self.state();
+            if s.stores.is_empty() {
+                return;
+            }
+            Self::collect(&mut s)
+        };
+        self.journal_dropped(gone);
     }
 
     /// The resource version, in a view whose changes are `seen`, of global version `rv`: how
@@ -622,6 +728,14 @@ impl Infra {
         item.target = None;
         Self::change(&mut s, ChangeKind::Deleted, name);
         s.items.remove(name);
+        // A removed controller holds no components any more; a removed device names none.
+        if let Some(store) = s.stores.get_mut(name) {
+            for e in store.values_mut() {
+                e.held = false;
+            }
+        }
+        drop(s);
+        self.collect_supplied();
     }
 
     /// The derived request `index` (the network applies it).
@@ -787,10 +901,17 @@ impl Infra {
         if let (Verb::Control(_), Some(m)) = (&req.verb, &error) {
             Self::answer(&mut s, index, &req, Err(m.clone()), at);
         }
+        // A creation from a supplied component no longer keeps it once it applied.
+        let gone = if s.queued_supplied.remove(&index).is_some() {
+            Self::collect(&mut s)
+        } else {
+            Vec::new()
+        };
         drop(s);
         if let Some(message) = error {
             self.journal_failed(&req, message, at);
         }
+        self.journal_dropped(gone);
     }
 
     // ---- reads (also for tools and tests) ---------------------------------------------------
@@ -966,6 +1087,8 @@ pub struct InfraEnd {
     pub(crate) prefix: Option<String>,
     /// The most devices it may have ([`crate::DeviceOptions::infra_max_devices`]).
     pub(crate) max_devices: Option<u32>,
+    /// Its grant to supply components, with its bounds ([`crate::DeviceOptions::infra_supply`]).
+    pub(crate) supply: Option<crate::supply::SupplyLimits>,
 }
 
 impl InfraEnd {
@@ -1037,6 +1160,12 @@ impl InfraEnd {
         item.target = Some(target);
         item.message = None;
         let index = s.requests.len();
+        if let Verb::Create(spec) | Verb::Recreate(spec) = &req.verb
+            && crate::supply::is_reference(&spec.component)
+        {
+            s.queued_supplied
+                .insert(index, (req.caller.clone(), spec.component.clone()));
+        }
         s.requests.push(req);
         self.infra.clock.schedule_derived(at, index);
     }
@@ -1086,8 +1215,161 @@ impl InfraEnd {
                 f.push(("request", id));
             }
             self.journal("infra-apply", f);
+            // A new spec may leave a supplied component unnamed.
+            self.infra.collect_supplied();
         }
         answer
+    }
+
+    /// Refuses a controller without the grant to supply components.
+    fn require_supply(&self) -> Result<crate::supply::SupplyLimits, InfraError> {
+        self.supply.ok_or_else(|| {
+            InfraError::Denied(format!(
+                "`{}` is not granted supplied components (`DeviceOptions::infra_supply`)",
+                self.device
+            ))
+        })
+    }
+
+    /// `components.supply`: keeps `bytes` in this controller's store, after checking them
+    /// against `digest` (if given) and the store's bounds, and after the embedder's admission
+    /// admitted them. Returns their digest reference. Bytes the store keeps already are not
+    /// judged again (the caller holds them again).
+    pub fn supply(&self, digest: Option<&str>, bytes: &[u8]) -> Result<String, InfraError> {
+        let limits = self.require_supply()?;
+        if let Some(d) = digest {
+            crate::supply::check_reference(d).map_err(InfraError::Invalid)?;
+        }
+        let size = bytes.len() as u64;
+        if size > limits.max_bytes {
+            return Err(InfraError::Denied(format!(
+                "a component of {size} bytes is larger than `{}` may supply ({} bytes)",
+                self.device, limits.max_bytes
+            )));
+        }
+        let reference = crate::supply::reference_of(bytes);
+        if let Some(d) = digest
+            && d != reference
+        {
+            return Err(InfraError::Invalid(format!(
+                "digest mismatch: the bytes are `{reference}`, not `{d}`"
+            )));
+        }
+        let admission = {
+            let mut s = self.infra.state();
+            let store = s.stores.entry(self.device.clone()).or_default();
+            if let Some(e) = store.get_mut(&reference) {
+                let newly = !e.held;
+                e.held = true;
+                drop(s);
+                if newly {
+                    self.journal(
+                        "infra-supply",
+                        vec![("digest", reference.clone()), ("size", size.to_string())],
+                    );
+                }
+                return Ok(reference);
+            }
+            let (count, total) = (
+                store.len(),
+                store.values().map(|e| e.bytes.len() as u64).sum::<u64>(),
+            );
+            if store.is_empty() {
+                s.stores.remove(&self.device);
+            }
+            if count >= limits.max_components as usize {
+                return Err(InfraError::Denied(format!(
+                    "`{}` may keep at most {} components, and keeps {count}: release one or \
+                     remove its devices first",
+                    self.device, limits.max_components
+                )));
+            }
+            if total.saturating_add(size) > limits.max_total {
+                return Err(InfraError::Denied(format!(
+                    "`{}` may keep at most {} bytes of components, and keeps {total}: release \
+                     one or remove its devices first",
+                    self.device, limits.max_total
+                )));
+            }
+            s.admission.clone()
+        };
+        // The embedder judges the bytes before anything keeps them (the state is not locked:
+        // the callback may take its time, and may read nothing of ours).
+        let verdict = match admission {
+            Some(admit) => admit(&crate::supply::Supplied {
+                controller: &self.device,
+                digest: &reference,
+                bytes,
+            }),
+            None => Err(
+                "this network admits no supplied components (no admission callback, \
+                         `Network::set_supply_admission`)"
+                    .to_owned(),
+            ),
+        };
+        verdict.map_err(InfraError::Denied)?;
+        self.infra
+            .state()
+            .stores
+            .entry(self.device.clone())
+            .or_default()
+            .insert(
+                reference.clone(),
+                crate::supply::Entry {
+                    bytes: Arc::from(bytes),
+                    held: true,
+                },
+            );
+        self.journal(
+            "infra-supply",
+            vec![("digest", reference.clone()), ("size", size.to_string())],
+        );
+        Ok(reference)
+    }
+
+    /// `components.release`: this controller no longer holds the component `digest`. It is
+    /// dropped once no device in the table and no queued request names it either. `false`:
+    /// it did not hold it (a successful no-op).
+    pub fn release(&self, digest: &str) -> Result<bool, InfraError> {
+        self.require_supply()?;
+        crate::supply::check_reference(digest).map_err(InfraError::Invalid)?;
+        let released = {
+            let mut s = self.infra.state();
+            match s
+                .stores
+                .get_mut(&self.device)
+                .and_then(|store| store.get_mut(digest))
+            {
+                Some(e) if e.held => {
+                    e.held = false;
+                    true
+                }
+                _ => false,
+            }
+        };
+        if released {
+            self.journal("infra-release", vec![("digest", digest.to_owned())]);
+            self.infra.collect_supplied();
+        }
+        Ok(released)
+    }
+
+    /// `components.list`: the components this controller's store keeps, by digest.
+    pub fn supplied(&self) -> Result<Vec<crate::supply::StoredComponent>, InfraError> {
+        self.require_supply()?;
+        let s = self.infra.state();
+        let Some(store) = s.stores.get(&self.device) else {
+            return Ok(Vec::new());
+        };
+        Ok(store
+            .iter()
+            .map(|(digest, e)| crate::supply::StoredComponent {
+                digest: digest.clone(),
+                size: e.bytes.len() as u64,
+                held: e.held,
+                users: Infra::supplied_users(&s, &self.device, digest),
+            })
+            .collect())
     }
 
     fn apply_now(
@@ -1103,7 +1385,20 @@ impl InfraEnd {
             return Err(InfraError::Invalid("a label key is given twice".into()));
         }
         let (parsed, canonical) = parse_spec(spec)?;
-        if let Some(c) = &self.infra.state().catalog
+        if crate::supply::is_reference(&parsed.component) {
+            self.require_supply()?;
+            crate::supply::check_reference(&parsed.component).map_err(InfraError::Invalid)?;
+            if self
+                .infra
+                .supplied_bytes(&self.device, &parsed.component)
+                .is_none()
+            {
+                return Err(InfraError::NotFound(format!(
+                    "component `{}` is not in `{}`'s store: supply it first",
+                    parsed.component, self.device
+                )));
+            }
+        } else if let Some(c) = &self.infra.state().catalog
             && !c.contains(&parsed.component)
         {
             return Err(InfraError::Denied(format!(
@@ -1152,13 +1447,17 @@ impl InfraEnd {
                 i.labels = labels;
                 if item.phase == Phase::Pending {
                     // Not created yet: the queued creation takes the new spec.
-                    if let Some(r) = s
+                    if let Some(index) = s
                         .requests
-                        .iter_mut()
-                        .rev()
-                        .find(|r| r.uid == item.uid && matches!(r.verb, Verb::Create(_)))
+                        .iter()
+                        .rposition(|r| r.uid == item.uid && matches!(r.verb, Verb::Create(_)))
                     {
-                        r.verb = Verb::Create(parsed);
+                        s.queued_supplied.remove(&index);
+                        if crate::supply::is_reference(&parsed.component) {
+                            s.queued_supplied
+                                .insert(index, (self.device.clone(), parsed.component.clone()));
+                        }
+                        s.requests[index].verb = Verb::Create(parsed);
                     }
                     return Ok((self.view(&s, name), true));
                 }
@@ -1832,7 +2131,7 @@ pub(crate) fn parse_spec(bytes: &[u8]) -> Result<(DerivedSpec, Vec<u8>), InfraEr
                     wire.push(parse_cable(c)?);
                 }
             }
-            "infra" | "infra_prefix" | "infra_cascade" | "infra_max_devices" => {
+            "infra" | "infra_prefix" | "infra_cascade" | "infra_max_devices" | "infra_supply" => {
                 return Err(InfraError::Denied(format!(
                     "a controller cannot grant `{k}` (only the embedder can)"
                 )));
@@ -2061,6 +2360,17 @@ fn cable_value(c: &CableReq) -> Value {
 
 /// A device's spec in its canonical CBOR form (the devices a network is built with: `wire`
 /// is `None`).
+/// The `component` of a spec in the table (canonical CBOR), if it has one.
+fn spec_component(spec: &[u8]) -> Option<String> {
+    let Value::Map(entries) = det_cbor::decode(spec).ok()? else {
+        return None;
+    };
+    entries
+        .iter()
+        .find(|(k, _)| k.as_text() == Some("component"))
+        .and_then(|(_, v)| v.as_text().map(str::to_owned))
+}
+
 pub(crate) fn spec_value(
     component: &str,
     config: &DeviceConfig,
@@ -2095,6 +2405,19 @@ pub(crate) fn spec_value(
         m.push((
             Value::text("infra_max_devices"),
             Value::Uint(u64::from(max)),
+        ));
+    }
+    if let Some(l) = options.infra_supply {
+        m.push((
+            Value::text("infra_supply"),
+            Value::Map(vec![
+                (Value::text("max_bytes"), Value::Uint(l.max_bytes)),
+                (
+                    Value::text("max_components"),
+                    Value::Uint(u64::from(l.max_components)),
+                ),
+                (Value::text("max_total"), Value::Uint(l.max_total)),
+            ]),
         ));
     }
     if let Some(bytes) = options.memory {
@@ -2235,8 +2558,8 @@ mod tests {
     fn calls_queue_requests_and_the_table_follows_the_network() {
         let clock = VirtualClock::new(std::time::Duration::ZERO);
         let infra = Infra::new(clock.clone(), Journal::new(clock.clone()));
-        let ctl = infra.end("ctl", None, None);
-        let other = infra.end("other", None, None);
+        let ctl = infra.end("ctl", None, None, None);
+        let other = infra.end("other", None, None, None);
         infra.added(
             "ctl",
             spec_value(
@@ -2339,7 +2662,7 @@ mod tests {
     fn commands_queue_for_the_callers_running_devices() {
         let clock = VirtualClock::new(std::time::Duration::ZERO);
         let infra = Infra::new(clock.clone(), Journal::new(clock.clone()));
-        let end = |device: &str| infra.end(device, None, None);
+        let end = |device: &str| infra.end(device, None, None, None);
         let (ctl, other) = (end("ctl"), end("other"));
         let spec_of = |c: &str| spec_value(c, &DeviceConfig::new(), DeviceOptions::default(), None);
         infra.added("ctl", spec_of("node:ctl"), 0, None);
@@ -2451,8 +2774,8 @@ mod tests {
         let infra = Infra::new(clock.clone(), Journal::new(clock.clone()));
         let spec_of = |c: &str| spec_value(c, &DeviceConfig::new(), DeviceOptions::default(), None);
         infra.added("sw", spec_of("switch"), 0, None);
-        let ctl = infra.end("ctl", None, Some(2));
-        let other = infra.end("other", None, None);
+        let ctl = infra.end("ctl", None, Some(2), None);
+        let other = infra.end("other", None, None, None);
         ctl.apply(None, "web", vec![], &spec("node:web")).unwrap();
         other
             .apply(None, "theirs", vec![], &spec("node:web"))
@@ -2521,7 +2844,7 @@ mod tests {
     fn a_controller_reads_its_commands_answers() {
         let clock = VirtualClock::new(std::time::Duration::ZERO);
         let infra = Infra::new(clock.clone(), Journal::new(clock.clone()));
-        let ctl = infra.end("ctl", None, None);
+        let ctl = infra.end("ctl", None, None, None);
         infra.added(
             "ctl",
             spec_value("ctl", &DeviceConfig::new(), DeviceOptions::default(), None),
@@ -2539,7 +2862,7 @@ mod tests {
             Err(InfraError::NotFound(_))
         ));
         assert!(matches!(
-            infra.end("other", None, None).control_answer("q"),
+            infra.end("other", None, None, None).control_answer("q"),
             Err(InfraError::NotFound(_))
         ));
         infra.added("r1", vec![], 0, Some(0));
@@ -2576,8 +2899,8 @@ mod tests {
         infra.added("sw", spec_of("switch"), 0, None);
         infra.added("ctl-a", spec_of("node:ctl"), 0, None);
         infra.added("ctl-b", spec_of("node:ctl"), 0, None);
-        let a = infra.end("ctl-a", Some("a-".to_owned()), None);
-        let b = infra.end("ctl-b", None, None);
+        let a = infra.end("ctl-a", Some("a-".to_owned()), None, None);
+        let b = infra.end("ctl-b", None, None, None);
         b.apply(None, "b-1", vec![], &spec("node:web")).unwrap();
         a.apply(None, "a-1", vec![], &spec("node:web")).unwrap();
         infra.added("b-1", vec![], 0, Some(0));
@@ -2642,5 +2965,162 @@ mod tests {
         ));
         assert!(matches!(a.stop(None, "b-1", 0), Err(InfraError::Denied(_))));
         assert!(a.stop(None, "a-1", 0).is_ok());
+    }
+
+    /// Supplied components: the grant, the digest check, the bounds, the admission's verdict,
+    /// specs by digest, and when the store lets go of them.
+    #[test]
+    fn controllers_supply_components_by_digest() {
+        use crate::supply::{SupplyLimits, reference_of};
+        let clock = VirtualClock::new(std::time::Duration::ZERO);
+        let journal = Journal::new(clock.clone());
+        let infra = Infra::new(clock.clone(), journal.clone());
+        let limits = SupplyLimits {
+            max_bytes: 8,
+            max_components: 2,
+            max_total: 10,
+        };
+        let ctl = infra.end("ctl", None, None, Some(limits));
+        let plain = infra.end("plain", None, None, None);
+        let other = infra.end("other", None, None, Some(limits));
+        let events = |kind: &str| {
+            journal
+                .entries()
+                .into_iter()
+                .filter(|e| matches!(&e.record, Record::Event { kind: k, .. } if k == kind))
+                .map(|e| match e.record {
+                    Record::Event { fields, .. } => (e.device, fields),
+                    _ => unreachable!(),
+                })
+                .collect::<Vec<_>>()
+        };
+        let (a, b, c) = (b"aaaa".as_slice(), b"bbbbbb".as_slice(), b"cccc".as_slice());
+        let (ra, rb) = (reference_of(a), reference_of(b));
+
+        // Without the grant: denied, and a spec by digest too.
+        assert!(matches!(plain.supply(None, a), Err(InfraError::Denied(_))));
+        assert!(matches!(plain.release(&ra), Err(InfraError::Denied(_))));
+        assert!(matches!(plain.supplied(), Err(InfraError::Denied(_))));
+        assert!(matches!(
+            plain.apply(None, "x", vec![], &spec(&ra)),
+            Err(InfraError::Denied(_))
+        ));
+        // Without an admission callback, every supply is refused.
+        assert!(
+            matches!(ctl.supply(None, a), Err(InfraError::Denied(m)) if m.contains("admission"))
+        );
+        infra.set_admission(Arc::new(|s: &crate::supply::Supplied<'_>| {
+            if s.bytes.starts_with(b"c") {
+                Err(format!("{} may not run {}", s.controller, s.digest))
+            } else {
+                Ok(())
+            }
+        }));
+        // The verdict reaches the controller; nothing is kept.
+        assert_eq!(
+            ctl.supply(None, c),
+            Err(InfraError::Denied(format!(
+                "ctl may not run {}",
+                reference_of(c)
+            )))
+        );
+        // A wrong digest, a malformed one, a component too large: refused, nothing kept.
+        assert!(
+            matches!(ctl.supply(Some(&rb), a), Err(InfraError::Invalid(m)) if m.contains("mismatch"))
+        );
+        assert!(matches!(
+            ctl.supply(Some("sha256:00"), a),
+            Err(InfraError::Invalid(_))
+        ));
+        assert!(matches!(
+            ctl.supply(None, b"123456789"),
+            Err(InfraError::Denied(_))
+        ));
+        assert_eq!(ctl.supplied().unwrap(), vec![]);
+        assert!(events("infra-supply").is_empty());
+
+        // Supplied: the digest comes back, stated or not; supplying it again changes nothing.
+        assert_eq!(ctl.supply(Some(&ra), a).unwrap(), ra);
+        assert_eq!(ctl.supply(None, a).unwrap(), ra);
+        assert_eq!(events("infra-supply").len(), 1);
+        assert_eq!(ctl.supply(None, b).unwrap(), rb);
+        // The bounds: count and total.
+        assert!(
+            matches!(ctl.supply(None, b"dd"), Err(InfraError::Denied(m)) if m.contains("at most 2 components"))
+        );
+        assert!(ctl.release(&rb).unwrap());
+        assert_eq!(
+            events("component-dropped").len(),
+            1,
+            "unused: dropped at once"
+        );
+        assert!(!ctl.release(&rb).unwrap(), "no longer held");
+        assert!(
+            matches!(ctl.supply(None, b"dddddddd"), Err(InfraError::Denied(m)) if m.contains("bytes of components"))
+        );
+
+        // A spec by digest: only from the caller's own store.
+        assert!(matches!(
+            other.apply(None, "o", vec![], &spec(&ra)),
+            Err(InfraError::NotFound(_))
+        ));
+        assert!(matches!(
+            ctl.apply(None, "w", vec![], &spec(&rb)),
+            Err(InfraError::NotFound(_))
+        ));
+        assert!(matches!(
+            ctl.apply(None, "w", vec![], &spec("sha256:12")),
+            Err(InfraError::Invalid(_))
+        ));
+        let (d, _) = ctl.apply(None, "w", vec![], &spec(&ra)).unwrap();
+        // Released while a queued request and then a device name it: kept.
+        assert!(ctl.release(&ra).unwrap());
+        assert_eq!(
+            ctl.supplied().unwrap(),
+            vec![crate::supply::StoredComponent {
+                digest: ra.clone(),
+                size: 4,
+                held: false,
+                users: 2,
+            }]
+        );
+        let req = infra.request(0).unwrap();
+        assert_eq!(req.uid, d.uid);
+        infra.added("w", vec![], 0, Some(0));
+        infra.applied(0, None, 0);
+        assert_eq!(infra.supplied_bytes("ctl", &ra).as_deref(), Some(a));
+        assert_eq!(ctl.supplied().unwrap()[0].users, 1);
+        assert_eq!(events("component-dropped").len(), 1);
+        // The device goes: so do the bytes, journalled on the controller.
+        infra.removed("w", 1);
+        assert_eq!(infra.supplied_bytes("ctl", &ra), None);
+        let dropped = events("component-dropped");
+        assert_eq!(dropped.len(), 2);
+        assert_eq!(dropped[1].0, "ctl");
+        assert_eq!(
+            dropped[1].1,
+            vec![
+                ("digest".to_owned(), ra.clone()),
+                ("size".to_owned(), "4".to_owned())
+            ]
+        );
+        assert!(infra.stored_digests().is_empty());
+
+        // A held component goes when its controller is removed.
+        other.supply(None, a).unwrap();
+        assert_eq!(infra.stored_digests().len(), 1);
+        infra.added("other", vec![], 2, None);
+        infra.removed("other", 3);
+        assert!(infra.stored_digests().is_empty());
+        // A controller cannot grant the supply either.
+        let granting = Value::Map(vec![
+            (Value::text("component"), Value::text("node:web")),
+            (Value::text("infra_supply"), Value::Bool(true)),
+        ])
+        .encode();
+        assert!(matches!(
+            ctl.apply(None, "g", vec![], &granting),
+            Err(InfraError::Denied(_))
+        ));
     }
 }
