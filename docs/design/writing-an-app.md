@@ -36,14 +36,18 @@ keeps running. Every app's keys are in [configuration.md](configuration.md).
 ## The app crate
 
 [components/apps/udp-echo-server](../../components/apps/udp-echo-server) is the smallest one.
-Its `Cargo.toml` makes a `cdylib` with `wit-bindgen` (features `macros`, `realloc`, `async`),
-`wasip3` (feature `std`) and `wasmnet-app-kit`. The glue, `src/component.rs`, generates bindings
-for `wasmnet:app/app` with one line, `wasmnet_app_kit::app_bindings!();`: a
-`wit_bindgen::generate!` that maps the standard interfaces to the `wasip3` crate, so only
-`wasi:config`, `wasmnet:link/log` and `wasmnet:sockets-ext` get bindings of their own, plus an
-`event(kind, fields)` helper for structured log events. The kit also converts socket addresses
-between `std::net` and `wasi:sockets` (`to_std`, `to_wit`). An app that needs another world
-(`replicas` adds `wasmnet:infra`) writes its own `generate!`.
+Its `Cargo.toml` makes a `cdylib` that depends on `wasmnet-app-kit`
+([crates/wasmnet-app-kit](../../crates/wasmnet-app-kit)); the apps here also name `wasip3` and
+`wit-bindgen` themselves, at the workspace's versions, which the kit re-exports as
+`wasmnet_app_kit::wasip3` and `wasmnet_app_kit::wit_bindgen`. The glue, `src/component.rs`, gets
+the bindings of `wasmnet:app/app` with one line, `wasmnet_app_kit::app_bindings!();`. The
+bindings are generated once, inside the kit (`wasmnet_app_kit::bindings`), so an app crate holds
+no WIT files and no `wit_bindgen::generate!`: the standard interfaces are the `wasip3` crate's,
+and only `wasi:config`, `wasmnet:link/log`, `wasmnet:sockets-ext` and the `wasi:cli/run` export
+are the kit's own. The line brings the modules `wasi`, `wasmnet` and `exports` into the glue,
+with the `export!` macro and an `event(kind, fields)` helper for structured log events. The kit
+also converts socket addresses between `std::net` and `wasi:sockets` (`to_std`, `to_wit`). An
+app that needs another world (`replicas` adds `wasmnet:infra`) writes its own `generate!`.
 
 `run` is an `async fn` that creates a `UdpSocket`, binds it, and loops on `receive().await` and
 `send(...).await`. Logic that needs no socket (config parsing, protocol encoding) lives in

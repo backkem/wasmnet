@@ -29,5 +29,6 @@ versions without notice. Rustdoc and the design notes mark it **embedder surface
   (`http-get`).
 
 Other parts of the tree, for reference: `crates/wasmnet-wire` (`no_std` wire helpers: MAC
-addresses, Ethernet, pcap-ng, DHCP and DNS codecs), `crates/wasmnet-app-kit` (what the apps
-share), and three test fixtures among the components (`blaster`, `reflector`, `clock-probe`).
+addresses, Ethernet, pcap-ng, DHCP and DNS codecs), `crates/wasmnet-app-kit` (what an app needs: its
+bindings, and what the apps here share), and three test fixtures among the components
+(`blaster`, `reflector`, `clock-probe`).

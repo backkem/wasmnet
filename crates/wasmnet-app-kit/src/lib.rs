@@ -1,64 +1,126 @@
-//! wasmnet-app-kit: what the apps under `components/apps` share, so each app keeps only its own
-//! logic.
+//! wasmnet-app-kit: what an app needs besides its own logic, for the apps under
+//! `components/apps` and for an app crate in another repository alike.
 //!
-//! * [`app_bindings!`]: the apps' `wit_bindgen::generate!` call (world `wasmnet:app/app`, the
-//!   standard WASI 0.3 socket and clock bindings from the `wasip3` crate, `wasi:config`,
-//!   `wasmnet:link/log` and `wasmnet:sockets-ext`), plus an `event` helper for structured log
-//!   events.
+//! * [`app_bindings!`]: an app's bindings (world `wasmnet:app/app`: the standard WASI 0.3
+//!   socket and clock bindings from the `wasip3` crate, `wasi:config`, `wasmnet:link/log`,
+//!   `wasmnet:sockets-ext` and the `wasi:cli/run` export), plus an `event` helper for
+//!   structured log events. They are generated once, in [`bindings`], so the app's crate needs
+//!   no WIT files and no `wit_bindgen::generate!` of its own.
+//! * [`wasip3`] and [`wit_bindgen`]: the two crates the bindings are made with, re-exported at
+//!   the versions they need.
+//! * [`WIT_DIR`]: where this repository's WIT packages are, for build scripts and composition
+//!   tools.
 //! * [`app_pairs`]: an app's own config keys (`app.<name>.<key>`, prefix stripped).
 //! * [`to_std`] and [`to_wit`]: socket addresses between `std::net` and `wasi:sockets`.
 //! * [`error_name`]: a `wasi:sockets` error code in kebab case, as the apps log it.
 //! * [`Fnv`]: the FNV-1a body hash the HTTP apps log.
 //!
-//! Everything here is pure (no imports are called), so it compiles natively and in guests.
+//! Everything but [`bindings`] and [`event`] is pure (no imports are called). The crate
+//! compiles natively too, where a call to an import panics.
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
 use wasip3::sockets::types::{IpSocketAddress, Ipv4SocketAddress, Ipv6SocketAddress};
 
-/// The bindings of an app (world `wasmnet:app/app`) in the invoking module: the standard WASI
-/// 0.3 socket and clock interfaces come from the `wasip3` crate; `wasi:config/store`,
-/// `wasmnet:link/log` and `wasmnet:sockets-ext` are generated here. Also defines
-/// `event(kind, fields)`, which journals a structured event through `wasmnet:link/log`.
+// The generated bindings and their export macro name this crate by its path, here as in an
+// app's crate.
+extern crate self as wasmnet_app_kit;
+
+/// The `wasip3` crate the bindings are generated against: the standard WASI 0.3 interfaces
+/// (`wasip3::sockets`, `wasip3::clocks`, `wasip3::random`, `wasip3::cli`).
+pub use wasip3;
+/// The `wit-bindgen` runtime the bindings use (streams, futures, `spawn_local`).
+pub use wit_bindgen;
+
+/// The directory of this repository's WIT packages (`wit/`), as an absolute path fixed when
+/// this crate is compiled: `wasmnet:app`, `wasmnet:link`, `wasmnet:sockets-ext`,
+/// `wasmnet:netstack` and the others, with the vendored WASI packages under `deps/`. For the
+/// build scripts and composition tools of a crate that depends on this one by path or by git
+/// (cargo checks the whole repository out, so the directory is there either way).
+pub const WIT_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../wit");
+
+/// The bindings of world `wasmnet:app/app`, generated once here so that an app crate anywhere
+/// gets them without the WIT files; [`app_bindings!`] brings them into an app's glue module.
 ///
-/// For a crate in `components/apps/<name>` (the WIT paths are relative to it) that depends on
-/// `wit-bindgen` and `wasip3`.
+/// The standard WASI 0.3 socket and clock interfaces are the `wasip3` crate's;
+/// `wasi:config/store`, `wasmnet:link/log` and `wasmnet:sockets-ext` are generated here, and so
+/// is the export of `wasi:cli/run` (`export_app!`).
+#[allow(unsafe_code)] // raw ABI glue
+#[allow(rustdoc::all)] // the WIT packages' own doc comments
+pub mod bindings {
+    wit_bindgen::generate!({
+        world: "wasmnet:app/app",
+        path: [
+            "../../wit/deps/clocks",
+            "../../wit/deps/random",
+            "../../wit/deps/filesystem",
+            "../../wit/deps/sockets",
+            "../../wit/deps/cli",
+            "../../wit/deps/config",
+            "../../wit/link",
+            "../../wit/sockets-ext",
+            "../../wit/app",
+        ],
+        generate_all,
+        with: {
+            // The standard WASI 0.3 bindings; `wasi:config`, `wasmnet:link/log` and
+            // `wasmnet:sockets-ext` are ours.
+            "wasi:sockets/types@0.3.0": wasip3::sockets::types,
+            "wasi:sockets/ip-name-lookup@0.3.0": wasip3::sockets::ip_name_lookup,
+            "wasi:clocks/types@0.3.0": wasip3::clocks::types,
+            "wasi:clocks/monotonic-clock@0.3.0": wasip3::clocks::monotonic_clock,
+        },
+        // The export macro is invoked from the app's crate.
+        pub_export_macro: true,
+        export_macro_name: "export_app",
+        default_bindings_module: "wasmnet_app_kit::bindings",
+        runtime_path: "wasmnet_app_kit::wit_bindgen::rt",
+    });
+}
+
+/// Journals a structured event (`kind` and its fields) through `wasmnet:link/log`.
+pub fn event(kind: &str, fields: &[(&str, String)]) {
+    let fields: Vec<(String, String)> = fields
+        .iter()
+        .map(|(k, v)| ((*k).to_owned(), v.clone()))
+        .collect();
+    bindings::wasmnet::link::log::event(kind, &fields);
+}
+
+/// The bindings of an app (world `wasmnet:app/app`) in the invoking module. It works in an app
+/// crate anywhere: the crate needs no WIT files, only this one as its dependency
+/// `wasmnet-app-kit`.
+///
+/// Brings in the modules `wasi` (`wasi::config::store`), `wasmnet` (`wasmnet::link::log`,
+/// `wasmnet::sockets_ext`) and `exports` (`exports::wasi::cli::run::Guest`, the trait an app
+/// implements), the `export!` macro that exports the implementing type, and
+/// [`event(kind, fields)`](event), which journals a structured event. The standard WASI 0.3
+/// socket and clock interfaces come from the `wasip3` crate ([`wasip3`](crate::wasip3) here,
+/// the version the bindings use).
+///
+/// ```ignore
+/// wasmnet_app_kit::app_bindings!();
+///
+/// use wasmnet::link::log::{self, Level};
+///
+/// struct App;
+///
+/// impl exports::wasi::cli::run::Guest for App {
+///     async fn run() -> Result<(), ()> {
+///         log::log(Level::Info, "hello");
+///         Ok(())
+///     }
+/// }
+///
+/// export!(App);
+/// ```
 #[macro_export]
 macro_rules! app_bindings {
     () => {
-        wit_bindgen::generate!({
-            world: "wasmnet:app/app",
-            path: [
-                "../../../wit/deps/clocks",
-                "../../../wit/deps/random",
-                "../../../wit/deps/filesystem",
-                "../../../wit/deps/sockets",
-                "../../../wit/deps/cli",
-                "../../../wit/deps/config",
-                "../../../wit/link",
-                "../../../wit/sockets-ext",
-                "../../../wit/app",
-            ],
-            generate_all,
-            with: {
-                // The standard WASI 0.3 bindings; `wasi:config`, `wasmnet:link/log` and
-                // `wasmnet:sockets-ext` are ours.
-                "wasi:sockets/types@0.3.0": wasip3::sockets::types,
-                "wasi:sockets/ip-name-lookup@0.3.0": wasip3::sockets::ip_name_lookup,
-                "wasi:clocks/types@0.3.0": wasip3::clocks::types,
-                "wasi:clocks/monotonic-clock@0.3.0": wasip3::clocks::monotonic_clock,
-            },
-        });
-
-        /// Journals a structured event (`kind` and its fields) through `wasmnet:link/log`.
-        #[allow(dead_code)]
-        fn event(kind: &str, fields: &[(&str, ::std::string::String)]) {
-            let fields: ::std::vec::Vec<(::std::string::String, ::std::string::String)> = fields
-                .iter()
-                .map(|(k, v)| ((*k).to_owned(), v.clone()))
-                .collect();
-            wasmnet::link::log::event(kind, &fields);
-        }
+        #[allow(unused_imports)]
+        use $crate::bindings::{export_app as export, exports, wasi, wasmnet};
+        #[allow(unused_imports)]
+        use $crate::event;
     };
 }
 

@@ -1,0 +1,21 @@
+# An app that lives outside this repository's workspace: `tests/external_app.rs` copies this
+# directory somewhere else, builds it there and runs it in a network. Everything it needs from
+# wasmnet is one dependency, and it carries no WIT files.
+[package]
+name = "hello-app"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+# The artifact: `hello.wasm`.
+name = "hello"
+crate-type = ["cdylib"]
+
+[dependencies]
+# From another repository this is a git dependency:
+#   wasmnet-app-kit = { git = "https://github.com/backkem/wasmnet", rev = "<commit>" }
+wasmnet-app-kit = { path = "../../../../wasmnet-app-kit" }
+
+# A workspace of its own, not a member of the one around it.
+[workspace]

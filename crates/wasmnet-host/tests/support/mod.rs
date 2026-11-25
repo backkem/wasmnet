@@ -20,13 +20,20 @@ use wasmtime::component::Component;
 pub struct Built {
     pub host: Host,
     dir: PathBuf,
+    /// The cargo target directory the build went into.
+    pub target: PathBuf,
 }
 
 impl Built {
+    /// The path of `<name>.wasm`.
+    pub fn path(&self, name: &str) -> PathBuf {
+        self.dir.join(format!("{name}.wasm"))
+    }
+
     /// Loads `<name>.wasm`: a component (`switch`, `router`) or a composed node
     /// (`node-http-server`).
     pub fn load(&self, name: &str) -> Component {
-        let path = self.dir.join(format!("{name}.wasm"));
+        let path = self.path(name);
         self.host
             .load(&path)
             .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
@@ -57,6 +64,7 @@ pub fn built() -> &'static Built {
         Built {
             host: Host::new().expect("host"),
             dir,
+            target,
         }
     })
 }

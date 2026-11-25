@@ -1,0 +1,16 @@
+// node-hello = wasmnet's netstack + the hello app, composed outside wasmnet's repository:
+//
+//   wac compose node.wac --dep wasmnet:netstack=<netstack.wasm> --dep app:hello=<hello.wasm>
+package example:node-hello;
+
+let net = new wasmnet:netstack { ... };
+
+let hello = new app:hello {
+    "wasi:sockets/types@0.3.0": net["wasi:sockets/types@0.3.0"],
+    ...
+};
+
+export net["wasmnet:link/device@0.1.0"];
+export net["wasmnet:link/lifecycle@0.1.0"];
+export net["wasmnet:link/counters@0.1.0"];
+export hello["wasi:cli/run@0.3.0"] as "app-hello";
