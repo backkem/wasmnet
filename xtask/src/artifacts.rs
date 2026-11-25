@@ -61,7 +61,9 @@ pub fn interfaces(bytes: &[u8]) -> Result<(Vec<String>, Vec<String>)> {
     Ok((imports, exports))
 }
 
-/// The commit of the working tree and whether it has changes; `unknown` without git.
+/// The commit of the working tree and whether it has changes; `unknown` without git, or when
+/// the git repository around `root` is another one (a copy of the source inside some other
+/// checkout).
 fn revision(root: &Path) -> (String, bool) {
     let git = |args: &[&str]| {
         Command::new("git")
@@ -72,6 +74,13 @@ fn revision(root: &Path) -> (String, bool) {
             .filter(|o| o.status.success())
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
     };
+    let ours = git(&["rev-parse", "--show-toplevel"]).is_some_and(|top| {
+        let same = |p: &Path| fs::canonicalize(p).ok();
+        same(Path::new(&top)).is_some() && same(Path::new(&top)) == same(root)
+    });
+    if !ours {
+        return ("unknown".to_owned(), true);
+    }
     match git(&["rev-parse", "HEAD"]) {
         Some(rev) => (
             rev,
@@ -501,6 +510,18 @@ mod tests {
         assert!(embedded_paths("x.wasm", clean, &root).is_empty());
         let backslash = b"\0asm components\\router\\src\\nat.rs";
         assert!(!embedded_paths("x.wasm", backslash, &root).is_empty());
+    }
+
+    #[test]
+    fn the_revision_is_this_checkouts_own() {
+        let root = crate::root();
+        let (rev, _) = revision(&root);
+        // A checkout without git (an unpacked archive) has no revision either.
+        if rev != "unknown" {
+            assert_eq!(rev.len(), 40, "{rev}");
+        }
+        // A directory inside the checkout is not a checkout of its own.
+        assert_eq!(revision(&root.join("docs")), ("unknown".to_owned(), true));
     }
 
     #[test]

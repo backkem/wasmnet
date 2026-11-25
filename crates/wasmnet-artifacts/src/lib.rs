@@ -86,13 +86,21 @@ pub enum Error {
         /// The size found.
         actual: u64,
     },
-    /// A component does not import or export what it was expected to.
-    #[error("{name} lacks {}", missing.join(", "))]
+    /// A component does not export what it was expected to.
+    #[error("{name} does not export {}", missing.join(", "))]
     Interfaces {
         /// The file's name.
         name: String,
         /// The interfaces it lacks, with their versions.
         missing: Vec<String>,
+    },
+    /// A component imports more than it was allowed to.
+    #[error("{name} imports {}, which is not allowed", extra.join(", "))]
+    Imports {
+        /// The file's name.
+        name: String,
+        /// The imports outside what was allowed.
+        extra: Vec<String>,
     },
     /// A file could not be read or written.
     #[error("{}: {source}", path.display())]
@@ -244,12 +252,9 @@ impl File {
         if extra.is_empty() {
             Ok(())
         } else {
-            Err(Error::Interfaces {
+            Err(Error::Imports {
                 name: self.name.clone(),
-                missing: extra
-                    .iter()
-                    .map(|i| format!("permission to import {i}"))
-                    .collect(),
+                extra: extra.iter().map(|i| (*i).to_owned()).collect(),
             })
         }
     }
