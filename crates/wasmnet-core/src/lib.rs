@@ -87,6 +87,7 @@ pub mod infra;
 mod input;
 pub mod journal;
 mod link;
+pub mod memory;
 mod network;
 mod output;
 pub mod pcap;
@@ -117,6 +118,7 @@ pub use link::{
     LinkInfo, LinkKind, LinkStats, LinkTransition, PPM, PortInfo, RemoteArrival, RemoteFrame,
     SeriesOptions, Tap, Transmit, TransmitHook, Wire,
 };
+pub use memory::MemoryBudget;
 pub use network::{
     CREATOR_RANGE, Cable, Cascade, ComponentResolver, DeclaredPort, DeviceContext, DeviceId,
     DeviceInstance, DeviceOptions, DevicePhase, Instantiate, LinkId, LinkMut, Network, Op,
