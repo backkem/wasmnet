@@ -1,5 +1,6 @@
 //! wit-bindgen glue: a stepped device with no ports that exports `wasmnet:link/device` and
-//! makes the script's calls through `wasmnet:infra/devices`.
+//! `wasmnet:control/commands` (`set`, `variables`) and makes the script's calls through
+//! `wasmnet:infra/devices`.
 
 // Generated bindings and `export!` need unsafe (raw ABI glue); our own code here does not.
 #![allow(unsafe_code)]
@@ -14,13 +15,20 @@ wit_bindgen::generate!({
         world infra-script {
             include wasmnet:link/stepped-device@0.1.0;
             import wasmnet:infra/devices@0.1.2;
+            export wasmnet:control/commands@0.1.0;
         }
     ",
-    path: ["../../wit/deps/config", "../../wit/link", "../../wit/infra"],
+    path: [
+        "../../wit/deps/config",
+        "../../wit/link",
+        "../../wit/infra",
+        "../../wit/control",
+    ],
     generate_all,
     with: { "wasi:config/store@0.2.0-rc.1": generate },
 });
 
+use exports::wasmnet::control::commands;
 use exports::wasmnet::link::device;
 use wasi::config::store;
 use wasmnet::infra::devices;
@@ -51,6 +59,14 @@ fn with<R>(f: impl FnOnce(&mut Script) -> R) -> R {
 
 /// Makes one step's call; its result for the journal, and any fields it adds.
 fn run(step: &Step) -> (String, Vec<(String, String)>) {
+    // A `control` argument's variables are filled in now, from what `set` was told so far.
+    let expanded = match &step.verb {
+        Verb::Control { argument, .. } => match with(|s| s.expand(argument)) {
+            Ok(a) => Some(a),
+            Err(name) => return (format!("unset {name}"), Vec::new()),
+        },
+        _ => None,
+    };
     let id = Some(step.request_id.as_str());
     let name = step.name.as_str();
     if let Some(when) = &step.when {
@@ -83,6 +99,7 @@ fn run(step: &Step) -> (String, Vec<(String, String)>) {
             devices::apply(id, name, &[], spec).map(|a| if a.changed { "ok" } else { "unchanged" })
         }
         Verb::Control { command, argument } => {
+            let argument = expanded.as_deref().unwrap_or(argument);
             devices::control(id, name, command, argument).map(|_| "ok")
         }
         Verb::Start => devices::start(id, name).map(|_| "ok"),
@@ -138,6 +155,27 @@ impl device::Guest for Component {
     }
 
     fn link_state(_now: u64, _port: u32, _up: bool) {}
+}
+
+impl commands::Guest for Component {
+    fn invoke(_now: u64, command: String, argument: String) -> Result<String, String> {
+        match command.as_str() {
+            "set" => {
+                let done = with(|s| s.set(&argument))?;
+                let mut words = argument.split_whitespace();
+                let fields = [
+                    ("variable".to_owned(), words.next().unwrap_or("").to_owned()),
+                    ("value".to_owned(), words.next().unwrap_or("").to_owned()),
+                ];
+                if done == "set" {
+                    log::event("infra-script-set", &fields);
+                }
+                Ok(done.to_owned())
+            }
+            "variables" if argument.trim().is_empty() => Ok(with(|s| s.variables())),
+            other => Err(format!("unknown command `{other}` (set, variables)")),
+        }
+    }
 }
 
 export!(Component);

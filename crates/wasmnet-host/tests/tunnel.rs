@@ -23,7 +23,10 @@ use std::collections::BTreeMap;
 
 use etherparse::{Ipv6Slice, NetSlice, SlicedPacket, TransportSlice};
 use support::{built, config, events, field, transcript};
-use wasmnet_host::{DeviceConfig, DeviceId, FrameRecord, JournalEntry, LinkId, Network, PortRef};
+use wasmnet_det_cbor::Value;
+use wasmnet_host::{
+    DeviceConfig, DeviceId, DeviceOptions, FrameRecord, JournalEntry, LinkId, Network, PortRef, sim,
+};
 
 const US: u64 = 1_000;
 const MS: u64 = 1_000_000;
@@ -801,4 +804,252 @@ fn allow_rules_on_a_tunnel_port_filter_what_crosses_it() {
         assert_eq!(field(&added[0], "port"), "to-a");
         decode_wan(r);
     });
+}
+
+// ---------------------------------------------------------------------------------------------
+// Controllers in the network drive the tunnel
+
+/// A box router's spec for its controller: the router, its config, and its two cables (to the
+/// home's NAT router and to the home's node).
+fn box_spec(name: &str) -> Vec<u8> {
+    let subnet = format!("fd00:{name}::1/64");
+    let mac = format!("02:00:00:00:b{}:00", if name == "a" { 0 } else { 1 });
+    let config: Vec<(Value, Value)> = [
+        ("mac", mac.as_str()),
+        ("port0.ipv4", "192.168.1.2/24"),
+        ("port1.ipv6", subnet.as_str()),
+        ("port1.ipv6-link-local", "fe80::1"),
+        ("routes", "default via 192.168.1.1"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (Value::text(k), Value::text(v)))
+    .collect();
+    let cable = |port: u64, to: String| {
+        Value::Map(vec![
+            (Value::text("port"), Value::Uint(port)),
+            (Value::text("to"), Value::text(&to)),
+            (Value::text("latency"), Value::Uint(100 * US)),
+        ])
+    };
+    Value::Map(vec![
+        (Value::text("component"), Value::text("router")),
+        (Value::text("config"), Value::Map(config)),
+        (
+            Value::text("wire"),
+            Value::Array(vec![
+                cable(0, format!("nat-{name}:0")),
+                cable(1, format!("node-{name}:0")),
+            ]),
+        ),
+    ])
+    .encode()
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The controller's script for box `me` (whose peer is box `other`): create the box router, add
+/// the tunnel, read its reflexive endpoint (`tunnels`), give the tunnel the peer's endpoint once
+/// the embedder has set it (`{peer}`), and route over the tunnel once `tunnels` says it is up.
+fn controller_steps(me: &str, other: &str) -> Vec<String> {
+    let mut steps = vec![
+        format!("0ms apply box-{me} {}", hex(&box_spec(me))),
+        format!(
+            "10ms id=add control box-{me} tunnel-add to-{other} id 7 local fd00:ff::{me}/128 \
+             reflector 203.0.113.50:3478 keepalive 1s dead 3500ms"
+        ),
+        format!("40ms id=reflexive control box-{me} tunnels"),
+        "41ms answer reflexive".to_owned(),
+        format!("50ms id=peer control box-{me} tunnel-peer to-{other} {{peer}}"),
+    ];
+    // Ask every 10 ms from 45 ms on whether the tunnel is up; route over it once it is.
+    for k in 0..10 {
+        let at = 45 + 10 * k;
+        steps.push(format!("{at}ms id=up-{k} control box-{me} tunnels"));
+        steps.push(format!(
+            "{}ms when=up-{k}.state=up control box-{me} route-add fd00:{other}::/64 tunnel to-{other}",
+            at + 5
+        ));
+    }
+    steps
+}
+
+/// The value after `reflexive` in the text an `answer` step journalled.
+fn reflexive_from(journal: &[JournalEntry], controller: &str) -> String {
+    let answers = events(journal, controller, "infra-script");
+    let answer = answers
+        .iter()
+        .find(|f| field(f, "verb") == "answer" && field(f, "name") == "reflexive")
+        .unwrap_or_else(|| panic!("{controller} read no answer"));
+    assert_eq!(field(answer, "result"), "ok");
+    value(field(answer, "text"), "reflexive").to_owned()
+}
+
+fn controlled_run(seed: u64) -> Run {
+    let b = built();
+    let mut network = Network::new(&b.host, seed);
+    let router = b.load("router");
+    let resolver_router = router.clone();
+    network.set_component_resolver(Box::new(move |name, instantiate| match name {
+        "router" => instantiate(&resolver_router),
+        other => Err(sim::Error::Refused(format!("no component {other}"))),
+    }));
+    network.set_infra_catalog(vec!["router".to_owned()]);
+    let wan = network
+        .device_with_config("wan", &b.load("switch"), pairs(&[("ports", "3")]))
+        .unwrap();
+    let relay = network
+        .device_with_config(
+            "relay",
+            &router,
+            pairs(&[
+                ("mac", "02:00:00:00:05:00"),
+                ("port0.ipv4", "203.0.113.50/24"),
+                ("stun-server", "3478"),
+            ]),
+        )
+        .unwrap();
+    link(&mut network, relay.port(0), wan.port(0));
+    let mut wan_links = Vec::new();
+    let mut controllers = Vec::new();
+    for (n, (me, other)) in [("a", "b"), ("b", "a")].into_iter().enumerate() {
+        let outside = format!("203.0.113.{}/24", n + 1);
+        let mac = format!("02:00:00:00:f{n}:00");
+        let natd = network
+            .device_with_config(
+                &format!("nat-{me}"),
+                &router,
+                pairs(&[
+                    ("mac", &mac),
+                    ("port0.ipv4", "192.168.1.1/24"),
+                    ("port1.ipv4", &outside),
+                    ("port1.nat", "masquerade"),
+                ]),
+            )
+            .unwrap();
+        wan_links.push(link(&mut network, natd.port(1), wan.port(n as u32 + 1)));
+        let mac = format!("02:00:00:00:0{n}:10");
+        let addr = format!("fd00:{me}::10/64");
+        let mut node = vec![
+            ("mac", mac.as_str()),
+            ("ipv6", addr.as_str()),
+            ("ipv6-gateway", "fe80::1"),
+        ];
+        let component = if me == "a" {
+            node.push(("app.http-get.url", "http://[fd00:b::10]/big?n=20000"));
+            node.push(("app.http-get.start", "2s"));
+            "node-http-get"
+        } else {
+            node.push(("app.http-server.listen", "[::]:80"));
+            "node-http-server"
+        };
+        network
+            .device_with_config(&format!("node-{me}"), &b.load(component), pairs(&node))
+            .unwrap();
+        let steps = controller_steps(me, other);
+        let keys: Vec<String> = (0..steps.len()).map(|k| format!("step.{k}")).collect();
+        let script: Vec<(&str, &str)> = keys
+            .iter()
+            .zip(&steps)
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        let ctl = network
+            .device_with_options(
+                &format!("ctl-{me}"),
+                &b.load("infra_script"),
+                pairs(&script),
+                DeviceOptions {
+                    infra: true,
+                    ..DeviceOptions::default()
+                },
+            )
+            .unwrap();
+        controllers.push(ctl);
+    }
+    // At 45 ms each controller has read its tunnel's reflexive endpoint. The embedder carries
+    // it to the other box's controller, as its own replicated state would: here, the test
+    // reads it from one controller's journal and sets it on the other with a command.
+    network.run_until(45 * MS).unwrap();
+    let journal = network.journal();
+    let endpoints = [
+        reflexive_from(&journal, "ctl-a"),
+        reflexive_from(&journal, "ctl-b"),
+    ];
+    for (i, ctl) in controllers.iter().enumerate() {
+        let peer = &endpoints[1 - i];
+        assert_eq!(
+            command(&mut network, *ctl, "set", &format!("peer {peer}")),
+            "set"
+        );
+    }
+    network
+        .run_until(4 * S)
+        .unwrap_or_else(|e| panic!("seed={seed}: {e}\n{}", transcript(&network.journal())));
+    let mut listings = BTreeMap::new();
+    let mut counters = BTreeMap::new();
+    for name in ["box-a", "box-b"] {
+        let d = network.live_device(name).unwrap();
+        listings.insert(name.to_owned(), command(&mut network, d, "tunnels", ""));
+        let c = network.counters(d).unwrap().unwrap();
+        counters.insert(name.to_owned(), c.into_iter().collect());
+    }
+    Run {
+        journal: network.journal(),
+        frames: network.frames(),
+        pcaps: support::pcaps(&network),
+        wan_links,
+        listings,
+        counters,
+    }
+}
+
+#[test]
+fn controllers_in_the_network_drive_a_tunnel_end_to_end() {
+    for seed in [1, 2] {
+        let label = format!("seed={seed}");
+        let r = controlled_run(seed);
+        let log = transcript(&r.journal);
+        assert!(r.fetched(), "{label}\n{log}");
+        for (ctl, me, tunnel, theirs) in [
+            ("ctl-a", "box-a", "to-b", "203.0.113.2:6081"),
+            ("ctl-b", "box-b", "to-a", "203.0.113.1:6081"),
+        ] {
+            // The controller was told the other side's endpoint and gave it to its tunnel.
+            let set = events(&r.journal, ctl, "infra-script-set");
+            assert_eq!(field(&set[0], "value"), theirs, "{label}");
+            let steps = events(&r.journal, ctl, "infra-script");
+            let result = |id: &str| -> Vec<String> {
+                steps
+                    .iter()
+                    .filter(|f| field(f, "name") == me && field(f, "step") == id)
+                    .map(|f| field(f, "result").to_owned())
+                    .collect()
+            };
+            assert_eq!(
+                result("4"),
+                ["ok"],
+                "{label}: tunnel-peer with {{peer}} filled in"
+            );
+            // It routed over the tunnel once it was up, not before: at 45 ms the tunnel had
+            // no peer yet.
+            let routes: Vec<String> = (0..10)
+                .map(|k| result(&(6 + 2 * k).to_string()).concat())
+                .collect();
+            let first = routes
+                .iter()
+                .position(|r| r == "ok")
+                .expect("a route step ran");
+            assert_eq!(routes[0], "skipped", "{label}: {routes:?}");
+            assert!(
+                routes[first..].iter().all(|r| r == "ok"),
+                "{label}: {routes:?}"
+            );
+            let added = events(&r.journal, me, "route-added");
+            assert_eq!(added.len(), 1, "{label}: later route-adds change nothing");
+            assert_eq!(field(&added[0], "port"), tunnel);
+        }
+        decode_wan(&r);
+        r.same_as(&controlled_run(seed), &label);
+    }
 }

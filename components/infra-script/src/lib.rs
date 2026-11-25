@@ -23,6 +23,18 @@
 //!   runs only if the answer to the command sent with that request id has come, is `ok`, and
 //!   contains (`~`) or does not contain (`!`) `<text>` (no spaces); otherwise its result is
 //!   `skipped`. That is a controller acting on what a device answered.
+//!   `when=<request-id>.<key>=<value>` asks instead for a line of the answer with the word
+//!   `<key>` followed by the word `<value>`, as in a `<key> <value>` listing (the router's
+//!   `tunnels`: `when=t1.state=up`).
+//! * `{<variable>}` in a `control` step's argument is replaced, when the step runs, by the value
+//!   the variable was given through the fixture's own command `set` (below); a variable not set
+//!   yet makes the step's result `unset <variable>`, and nothing is sent.
+//!
+//! The fixture takes commands (`wasmnet:control/commands`), which is how an embedder hands it
+//! what it learnt elsewhere (from another controller, for instance): `set <variable> <value>`
+//! (a name of `a-z`, `0-9` and `-`; a value without spaces) answers `set` or `unchanged` and
+//! journals `infra-script-set {variable, value}`; `variables` lists them, `<variable> <value>`
+//! per line.
 //!
 //! Every step's result is journalled as `infra-script {step, verb, name, result}`: `result` is
 //! `ok`, `unchanged` (an `apply` that changed nothing, a `remove` of nothing) or the error. A
@@ -105,17 +117,41 @@ pub struct Step {
 pub struct When {
     /// The request id the command was sent with.
     pub request_id: String,
-    /// `true`: the answer contains `text`; `false`: it does not.
-    pub contains: bool,
-    pub text: String,
+    pub test: Test,
+}
+
+/// What a condition asks of an answer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Test {
+    /// It contains the text (`~`).
+    Contains(String),
+    /// It does not (`!`).
+    Lacks(String),
+    /// A line has the word `key` followed by the word `value` (`.<key>=<value>`).
+    Pair(String, String),
 }
 
 impl When {
     /// Whether the condition holds for `answer`: the answer's `ok` text, if it came and was
     /// `ok`. No answer (yet), or a refusal, never satisfies it.
     pub fn holds(&self, answer: Option<&str>) -> bool {
-        answer.is_some_and(|a| a.contains(self.text.as_str()) == self.contains)
+        let Some(a) = answer else { return false };
+        match &self.test {
+            Test::Contains(t) => a.contains(t.as_str()),
+            Test::Lacks(t) => !a.contains(t.as_str()),
+            Test::Pair(k, v) => a.lines().any(|line| {
+                let words: Vec<&str> = line.split_whitespace().collect();
+                words.windows(2).any(|w| w[0] == k && w[1] == v)
+            }),
+        }
     }
+}
+
+/// A variable's name: `a-z`, `0-9` and `-`, 1 to 32 characters.
+fn valid_variable(n: &str) -> bool {
+    (1..=32).contains(&n.len())
+        && n.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
 /// A step that could not be parsed.
@@ -157,17 +193,36 @@ pub fn parse_step(n: u32, text: &str) -> Result<Step, String> {
     }
     let mut when = None;
     if let Some(cond) = rest.strip_prefix("when=") {
-        let shape = "when: `<request-id>~<text>` or `<request-id>!<text>`";
+        let shape = "when: `<request-id>~<text>`, `<request-id>!<text>` or \
+                     `<request-id>.<key>=<value>`";
         let (cond, after) = cond.split_once(char::is_whitespace).ok_or(syntax)?;
-        let at = cond.find(['~', '!']).ok_or(shape)?;
-        let (id, text) = (&cond[..at], &cond[at + 1..]);
-        if id.is_empty() || text.is_empty() {
-            return Err(shape.to_owned());
-        }
-        when = Some(When {
-            request_id: id.to_owned(),
-            contains: cond.as_bytes()[at] == b'~',
-            text: text.to_owned(),
+        when = Some(match cond.find(['~', '!']) {
+            Some(at) => {
+                let (id, text) = (&cond[..at], &cond[at + 1..]);
+                if id.is_empty() || text.is_empty() {
+                    return Err(shape.to_owned());
+                }
+                let text = text.to_owned();
+                When {
+                    request_id: id.to_owned(),
+                    test: if cond.as_bytes()[at] == b'~' {
+                        Test::Contains(text)
+                    } else {
+                        Test::Lacks(text)
+                    },
+                }
+            }
+            None => {
+                let (id, pair) = cond.split_once('.').ok_or(shape)?;
+                let (key, value) = pair.split_once('=').ok_or(shape)?;
+                if id.is_empty() || key.is_empty() || value.is_empty() {
+                    return Err(shape.to_owned());
+                }
+                When {
+                    request_id: id.to_owned(),
+                    test: Test::Pair(key.to_owned(), value.to_owned()),
+                }
+            }
         });
         rest = after.trim_start();
     }
@@ -248,6 +303,8 @@ pub fn parse_step(n: u32, text: &str) -> Result<Step, String> {
 pub struct Script {
     steps: Vec<Step>,
     next: usize,
+    /// Set by the `set` command, used as `{<variable>}` in `control` arguments.
+    variables: std::collections::BTreeMap<String, String>,
 }
 
 impl Script {
@@ -274,7 +331,11 @@ impl Script {
             steps.push(step);
         }
         steps.sort_by_key(|s| (s.at, s.n));
-        Ok(Self { steps, next: 0 })
+        Ok(Self {
+            steps,
+            next: 0,
+            variables: Default::default(),
+        })
     }
 
     /// The steps due at `now` that have not run yet, in order (they count as run).
@@ -289,6 +350,58 @@ impl Script {
     /// When the next step is due.
     pub fn next_deadline(&self) -> Option<u64> {
         self.steps.get(self.next).map(|s| s.at)
+    }
+
+    /// `set <variable> <value>`: `Ok("set")`, `Ok("unchanged")` or why not.
+    pub fn set(&mut self, argument: &str) -> Result<&'static str, String> {
+        let words: Vec<&str> = argument.split_whitespace().collect();
+        let [name, value] = words.as_slice() else {
+            return Err("set needs `<variable> <value>` (a value without spaces)".to_owned());
+        };
+        if !valid_variable(name) {
+            return Err(format!(
+                "`{name}`: a variable is a-z, 0-9 and -, 1 to 32 characters"
+            ));
+        }
+        let old = self
+            .variables
+            .insert((*name).to_owned(), (*value).to_owned());
+        Ok(if old.as_deref() == Some(*value) {
+            "unchanged"
+        } else {
+            "set"
+        })
+    }
+
+    /// Every variable, `<variable> <value>` per line, by name.
+    pub fn variables(&self) -> String {
+        self.variables
+            .iter()
+            .map(|(k, v)| format!("{k} {v}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// `text` with every `{<variable>}` replaced by its value; `Err(name)` names the first
+    /// variable not set. Other braces are left as they are.
+    pub fn expand(&self, text: &str) -> Result<String, String> {
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text;
+        while let Some(open) = rest.find('{') {
+            let Some(close) = rest[open..].find('}') else {
+                break;
+            };
+            let name = &rest[open + 1..open + close];
+            out.push_str(&rest[..open]);
+            if valid_variable(name) {
+                out.push_str(self.variables.get(name).ok_or_else(|| name.to_owned())?);
+            } else {
+                out.push_str(&rest[open..=open + close]);
+            }
+            rest = &rest[open + close + 1..];
+        }
+        out.push_str(rest);
+        Ok(out)
     }
 
     pub fn len(&self) -> usize {
@@ -374,8 +487,7 @@ mod tests {
             when,
             When {
                 request_id: "q".into(),
-                contains: false,
-                text: "10.0.3.0/24".into()
+                test: Test::Lacks("10.0.3.0/24".into()),
             }
         );
         assert_eq!(s.request_id, "x");
@@ -386,12 +498,22 @@ mod tests {
             .unwrap()
             .when
             .unwrap();
-        assert!(has.contains && has.holds(Some("a port")));
+        assert!(has.holds(Some("a port")));
+        let pair = parse_step(3, "5ms when=t1.state=up control r1 route-add x")
+            .unwrap()
+            .when
+            .unwrap();
+        assert_eq!(pair.test, Test::Pair("state".into(), "up".into()));
+        assert!(pair.holds(Some("to-a id 8 state idle\nto-b id 7 state up peer -")));
+        assert!(!pair.holds(Some("to-b id 7 state probing up 1")));
         for bad in [
             "5ms answer q extra",
             "5ms when=q answer q",
             "5ms when=~x answer q",
             "5ms when=q~ answer q",
+            "5ms when=q.state answer q",
+            "5ms when=.state=up answer q",
+            "5ms when=q.=up answer q",
         ] {
             assert!(parse_step(0, bad).is_err(), "{bad:?}");
         }
@@ -464,5 +586,27 @@ mod tests {
             Script::from_pairs([("step.0", "1ms stop")]),
             Err(ConfigError::Invalid { .. })
         ));
+    }
+}
+
+#[cfg(test)]
+mod variable_tests {
+    use super::*;
+
+    #[test]
+    fn variables_are_set_by_command_and_expanded_in_arguments() {
+        let mut s = Script::default();
+        assert_eq!(s.expand("to-b {peer}"), Err("peer".to_owned()));
+        assert_eq!(s.set("peer 203.0.113.2:6081"), Ok("set"));
+        assert_eq!(s.set("peer 203.0.113.2:6081"), Ok("unchanged"));
+        assert_eq!(
+            s.expand("to-b {peer}").as_deref(),
+            Ok("to-b 203.0.113.2:6081")
+        );
+        assert_eq!(s.expand("{not a name} {").as_deref(), Ok("{not a name} {"));
+        assert_eq!(s.variables(), "peer 203.0.113.2:6081");
+        for bad in ["peer", "Peer x", "peer a b", ""] {
+            assert!(s.set(bad).is_err(), "{bad:?}");
+        }
     }
 }

@@ -295,9 +295,14 @@ change of the device (its `message` the refusal, or none), so a controller waiti
 `changes.wait` wakes when it comes. This is new for `ok` answers: before 0.1.2 an answer that
 was not a refusal left the table as it was, so a controller that sends commands now sees one
 more change, and one more resource version, per command. The `infra-script` fixture reads
-answers (`answer <request-id>`) and makes a step depend on one (`when=<id>~<text>`, `!<text>`):
+answers (`answer <request-id>`) and makes a step depend on one (`when=<id>~<text>`, `!<text>`,
+or `when=<id>.<key>=<value>` for a line of `<key> <value>` pairs):
 [crates/wasmnet-host/tests/infra_verbs.rs](../../crates/wasmnet-host/tests/infra_verbs.rs) adds a
-route to a router only when its `routes` answer lacks it.
+route to a router only when its `routes` answer lacks it, and
+[crates/wasmnet-host/tests/tunnel.rs](../../crates/wasmnet-host/tests/tunnel.rs) routes over a
+tunnel once its `tunnels` answer says `state up`. The fixture also takes commands of its own
+(`set <variable> <value>`, `variables`): a `{<variable>}` in a `control` step's argument is
+filled in when the step runs, which is how a test hands one controller what another learnt.
 
 The package went from `wasmnet:infra@0.1.0` to `0.1.1` (`devices.control`) and to `0.1.2`
 (`changes.wait`, `devices.control-answer`, `devices.wire`, `devices.unwire`, the spec keys `args`,

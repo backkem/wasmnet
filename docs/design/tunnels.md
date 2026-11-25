@@ -161,8 +161,14 @@ The `tunnels` answer is meant to be parsed: one line per tunnel, by name, the na
 `<key> <value>` pairs in a fixed order (`id`, `udp`, `local`, `state`, `peer`, `reflexive`,
 `candidates`, `tx-packets`, `rx-packets`); later versions may append pairs, never reorder them.
 An embedder sends the commands with `Network::command` (or as operator events) and reads their
-answers; an in-world controller sends them with `wasmnet:infra/devices.control`, which does not
-return a command's answer today.
+answers; an in-world controller sends them with `wasmnet:infra/devices.control` and reads the
+answer with `devices.control-answer` once the command has run.
+`crates/wasmnet-host/tests/tunnel.rs` has two such controllers (the `infra-script` fixture),
+one per home: each creates its box router, adds the tunnel, reads its reflexive endpoint from
+`tunnels`, gives the tunnel the peer's endpoint, and adds the route once `tunnels` says `state
+up`. What carries one controller's endpoint to the other is the embedder's business; in the
+test the harness reads it from one controller's journal and sets it on the other with a
+command, where a real embedder would use its own replicated state or a message over the network.
 
 **A relay** is a router with one tunnel per relayed peer and a route per relayed prefix over
 each. Its tunnels need no candidates: each learns its peer from the peer's first check. A box
