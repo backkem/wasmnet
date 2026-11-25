@@ -22,27 +22,30 @@
 //!
 //! ```text
 //! plan       (to js_instantiate)    str name, str component, pairs config
-//! instance   (from js_instantiate)  list<port>, u32 flags, list<str> apps
+//! instance   (from js_instantiate)  list<port>, u32 flags, list<str> apps, list<str> exports
+//!            (every exported interface, without a version)
 //!            port = u32 id, str name, bytes mac (empty: none, else 6 bytes), u32 mtu
 //!            flags: bit 0 exports wasmnet:link/counters, bit 1 wasmnet:link/lifecycle,
 //!                   bit 2 wasmnet:control/commands, bit 3 wasmnet:reconfigure/reconfigure
 //! counters   (from js_counters, out of wn_counters)   list<(str name, u64 value)>
 //! event      (into wn_event)        str kind, pairs fields
-//! config     (into wn_add_device and js_reconfigure, out of wn_config_all)   pairs
+//! config     (into wn_add_device, out of wn_config_all)   pairs
 //! value      (into wn_add_device as its options, wn_link_with, wn_add_op; out of wn_op_states,
 //!            wn_costs)   one `value` (below): plain JavaScript objects, read by `crate::ops`
 //! strs       (out of wn_args; into wn_set_catalog)   list<str>: argv, the device's name first;
 //!            the catalog's component names
 //! imports    (from js_imports)      u8 0 unknown, or u8 1 then list<str>: a component's import names
 //! pairs      (out of wn_env)        pairs, in order
-//! command    (from js_invoke, out of wn_command)   u8 0 ok, 1 refused; str text
-//! reconfigured (from js_reconfigure)  u8 0 ok, 1 restart, 2 invalid; str message (empty for ok)
-//! infra call (into wn_infra, wn_infra_wait)   str function (`devices.apply`), list<value> args
-//! infra reply (out of wn_infra, wn_infra_wait)  u8 0 value, then value; 1 error, then value
-//!            (thrown in JavaScript); 2 failed (a malformed call), then str message
+//! command    (out of wn_command)   u8 0 ok, 1 refused; str text
+//! infra call (into wn_infra, wn_infra_wait, wn_import; to js_export)   str function
+//!            (`devices.apply`, `wasmnet:control/commands#invoke`), list<value> args
+//! infra reply (out of wn_infra, wn_infra_wait, wn_import; from js_export)  u8 0 value, then
+//!            value; 1 error, then value (thrown in JavaScript); 2 failed (a malformed call),
+//!            then str message
 //! value      u8 kind, then by kind: 0 none, 1 some + value, 2 bool (u8), 3 u32, 4 u64, 5 str,
 //!            6 bytes, 7 list<value>, 8 tuple (list<value>), 9 record (list<(str field,
-//!            value)>, WIT names), 10 variant (str case, u8 0 or 1 + value), 11 enum (str)
+//!            value)>, WIT names), 10 variant (str case, u8 0 or 1 + value), 11 enum (str),
+//!            12 resource (str resource, u32 handle)
 //! journal    (out of wn_journal)    list<row>
 //!            row = u64 at (ns), str device, u8 record, then by record:
 //!              0 log:    u8 level (0 trace, 1 debug, 2 info, 3 warn, 4 error), str message
@@ -55,9 +58,7 @@
 //!              2 failed:    u64 at, str message
 //! ```
 
-use wasmnet_core::{
-    DeclaredPort, DeviceConfig, JournalEntry, Level, Outcome, Record, Refusal, Stream,
-};
+use wasmnet_core::{DeclaredPort, DeviceConfig, JournalEntry, Level, Outcome, Record, Stream};
 
 use crate::host::Instance;
 use crate::infra::Reply;
@@ -271,7 +272,10 @@ pub fn encode_instance(instance: &Instance) -> Vec<u8> {
         + u32::from(instance.lifecycle) * FLAG_LIFECYCLE
         + u32::from(instance.commands) * FLAG_COMMANDS
         + u32::from(instance.reconfigure) * FLAG_RECONFIGURE;
-    w.u32(flags).strs(&instance.apps).finish()
+    w.u32(flags)
+        .strs(&instance.apps)
+        .strs(&instance.exports)
+        .finish()
 }
 
 /// Reads an `instance` message. Unknown flag bits are ignored.
@@ -294,9 +298,11 @@ pub fn decode_instance(bytes: &[u8]) -> Result<Instance, DecodeError> {
             .collect::<Result<Vec<_>, DecodeError>>()?;
         let flags = r.u32()?;
         let apps = r.strs()?;
+        let exports = r.strs()?;
         Ok(Instance {
             ports,
             apps,
+            exports,
             counters: flags & FLAG_COUNTERS != 0,
             lifecycle: flags & FLAG_LIFECYCLE != 0,
             commands: flags & FLAG_COMMANDS != 0,
@@ -553,7 +559,7 @@ pub fn decode_outcome(bytes: &[u8]) -> Result<RunOutcome, DecodeError> {
 
 // ---- device commands and reconfiguration ---------------------------------------------------
 
-/// The `command` message (into `js_invoke`, out of `wn_command`): the device's answer.
+/// The `command` message (out of `wn_command`): the device's answer.
 pub fn encode_command_answer(answer: &Result<String, String>) -> Vec<u8> {
     match answer {
         Ok(text) => Writer::new().u8(0).str(text).finish(),
@@ -569,38 +575,6 @@ pub fn decode_command_answer(bytes: &[u8]) -> Result<Result<String, String>, Dec
             0 => Ok(Ok(r.str()?)),
             1 => Ok(Err(r.str()?)),
             _ => Err(DecodeError { at, what: "answer" }),
-        }
-    })
-}
-
-/// The `reconfigured` message (from `js_reconfigure`): the device's answer.
-pub fn encode_reconfigured(answer: &Result<(), Refusal>) -> Vec<u8> {
-    match answer {
-        Ok(()) => Writer::new().u8(0).str("").finish(),
-        Err(Refusal::Restart(m)) => Writer::new().u8(1).str(m).finish(),
-        Err(Refusal::Invalid(m)) => Writer::new().u8(2).str(m).finish(),
-        // A refusal newer than this encoding: the reader refuses it.
-        Err(other) => Writer::new()
-            .u8(u8::MAX)
-            .str(&format!("{other:?}"))
-            .finish(),
-    }
-}
-
-/// Reads a `reconfigured` message.
-pub fn decode_reconfigured(bytes: &[u8]) -> Result<Result<(), Refusal>, DecodeError> {
-    whole(bytes, |r| {
-        let at = r.at;
-        let kind = r.u8()?;
-        let text = r.str()?;
-        match kind {
-            0 => Ok(Ok(())),
-            1 => Ok(Err(Refusal::Restart(text))),
-            2 => Ok(Err(Refusal::Invalid(text))),
-            _ => Err(DecodeError {
-                at,
-                what: "refusal",
-            }),
         }
     })
 }
@@ -844,6 +818,7 @@ mod tests {
             lifecycle: true,
             commands: true,
             reconfigure: false,
+            exports: vec!["wasmnet:control/commands".to_owned()],
         };
         assert_eq!(decode_instance(&encode_instance(&instance)), Ok(instance));
 

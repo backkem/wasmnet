@@ -109,7 +109,7 @@ pub unsafe fn input(ptr: *const u8, len: usize) -> Vec<u8> {
 macro_rules! export {
     ($name:ident, $body:expr) => {
         #[cfg(target_arch = "wasm32")]
-        #[allow(unsafe_code)]
+        #[allow(unsafe_code, clippy::not_unsafe_ptr_arg_deref)]
         #[unsafe(no_mangle)]
         pub extern "C" fn $name(ptr: *const u8, len: usize) -> i32 {
             // SAFETY: the page passes a buffer it allocated in this module, live for the call.

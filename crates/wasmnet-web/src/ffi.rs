@@ -22,10 +22,11 @@
 //!
 //! The network exports (`wn_network_new`, `wn_add_device`, `wn_link`, `wn_step`, `wn_finish`,
 //! `wn_journal`, `wn_link_*`, `wn_add_op`, `wn_op_states`, `wn_costs`, `wn_pcap`, `wn_counters`,
-//! `wn_command`, `wn_schedule_command`, `wn_stdout`) hold the network for their whole call, and
-//! several call into JavaScript while they do (`wn_add_device` instantiates, `wn_step`, `wn_finish`, `wn_counters` and
-//! `wn_command` run devices). JavaScript must not call a network export from inside one of
-//! those imports, also not while a JSPI-suspended import waits: it is refused (an error, never
+//! `wn_command`, `wn_schedule_command`, `wn_invoke`, `wn_schedule_invoke`, `wn_stdout`) hold the
+//! network for their whole call, and several call into JavaScript while they do (`wn_add_device`
+//! instantiates, `wn_step`, `wn_finish`, `wn_counters`, `wn_command` and `wn_invoke` run
+//! devices). JavaScript must not call a network export from inside one of those imports, also
+//! not while a JSPI-suspended import waits: it is refused (an error, never
 //! a corrupted network). The device-side exports (`wn_transmit`, `wn_log`, `wn_event`,
 //! `wn_output`, `wn_now`, `wn_wall_now`, `wn_config_*`, `wn_args`, `wn_env`, `wn_stdin`, `wn_random_*`,
 //! `wn_insecure_seed`, `wn_timer`, `wn_infra`, `wn_infra_wait`, `wn_call_done`,
@@ -48,8 +49,7 @@
 //! | `js_start(dev, call) -> i32` | start `lifecycle.start()`, to end as `wn_call_done(dev, call, ..)`; 0, or a negative error |
 //! | `js_run_app(dev, app, call) -> i32` | start app number `app`'s `run()`, likewise |
 //! | `js_timer_fire(timer)` | the virtual timer `timer` (from `wn_timer`) is due: resolve the guest's wait |
-//! | `js_invoke(dev, now: u64, command, len, argument, len) -> i32` | `commands.invoke`; answers a `command` message (the device's `ok` or refusal), or a negative error (a trap) |
-//! | `js_reconfigure(dev, now: u64, config, len) -> i32` | `reconfigure.reconfigure` with a `config` message; answers a `reconfigured` message, or a negative error |
+//! | `js_export(dev, now: u64, call, len) -> i32` | one of the device's export functions by name (an `infra call` message: `interface#function`, the interface without a version, and the arguments in jco's shapes; commands and configuration changes in place come this way); answers an `infra reply`: its value, a `result`'s error (thrown `ComponentError`), or `failed` (no such function: the call is refused); a negative error is a trap |
 //! | `js_wait_done(wait, reply, len)` | the waiting call `wait` (`changes.wait`, `changes.wait-any`; from `wn_infra_wait`) is answered with an `infra reply`: resolve (or reject) the guest's call |
 //! | `js_imports(component, len) -> i32` | the component's import names, if known: answers an `imports` message (asked before it is instantiated, for the grant check) |
 //! | `js_release(dev)` | device `dev`'s instance is gone (stopped, crashed, removed): drop it |
@@ -63,7 +63,7 @@
 use std::cell::RefCell;
 use std::sync::Once;
 
-use wasmnet_core::{DeviceConfig, DeviceId, LinkId, Nanos, Refusal};
+use wasmnet_core::{DeviceConfig, DeviceId, LinkId, Nanos};
 
 use crate::codec::{self, Value};
 use crate::host::{CallEnd, Instance, JsHost};
@@ -85,15 +85,7 @@ mod js {
         pub fn js_start(dev: u32, call: u32) -> i32;
         pub fn js_run_app(dev: u32, app: u32, call: u32) -> i32;
         pub fn js_timer_fire(timer: u32);
-        pub fn js_invoke(
-            dev: u32,
-            now: u64,
-            command: *const u8,
-            command_len: usize,
-            argument: *const u8,
-            argument_len: usize,
-        ) -> i32;
-        pub fn js_reconfigure(dev: u32, now: u64, config: *const u8, config_len: usize) -> i32;
+        pub fn js_export(dev: u32, now: u64, call: *const u8, call_len: usize) -> i32;
         pub fn js_wait_done(wait: u32, reply: *const u8, reply_len: usize);
         pub fn js_imports(component: *const u8, component_len: usize) -> i32;
         pub fn js_release(dev: u32);
@@ -202,40 +194,25 @@ impl JsHost for Js {
         unsafe { js::js_timer_fire(timer) }
     }
 
-    fn invoke(
+    fn export(
         &self,
         dev: u32,
         now: Nanos,
-        command: &str,
-        argument: &str,
-    ) -> Result<Result<String, String>, String> {
-        // SAFETY: both strings are live for the duration of the call; JavaScript only reads
-        // them.
-        let len = unsafe {
-            js::js_invoke(
-                dev,
-                now,
-                command.as_ptr(),
-                command.len(),
-                argument.as_ptr(),
-                argument.len(),
-            )
-        };
+        invocation: &wasmnet_core::Invocation,
+    ) -> Result<Option<Result<Value, Value>>, String> {
+        let call = codec::encode_infra_call(
+            &format!("{}#{}", invocation.interface, invocation.function),
+            &invocation.args,
+        );
+        // SAFETY: `call` is live for the duration of the call; JavaScript only reads it.
+        let len = unsafe { js::js_export(dev, now, call.as_ptr(), call.len()) };
         let bytes = answer(len)?;
-        codec::decode_command_answer(&bytes).map_err(|e| format!("command answer: {e}"))
-    }
-
-    fn reconfigure(
-        &self,
-        dev: u32,
-        now: Nanos,
-        config: &DeviceConfig,
-    ) -> Result<Result<(), Refusal>, String> {
-        let config = codec::encode_config(config);
-        // SAFETY: `config` is live for the duration of the call; JavaScript only reads it.
-        let len = unsafe { js::js_reconfigure(dev, now, config.as_ptr(), config.len()) };
-        let bytes = answer(len)?;
-        codec::decode_reconfigured(&bytes).map_err(|e| format!("reconfigure answer: {e}"))
+        match codec::decode_infra_reply(&bytes).map_err(|e| format!("export answer: {e}"))? {
+            Reply::Value(v) => Ok(Some(Ok(v))),
+            Reply::Error(v) => Ok(Some(Err(v))),
+            // JavaScript found no such function: not a trap, a refusal.
+            Reply::Failed(_) => Ok(None),
+        }
     }
 
     fn wait_done(&self, wait: u32, reply: &Reply) {
@@ -723,7 +700,7 @@ pub extern "C" fn wn_set_supply_admission(patterns: *const u8, len: usize) -> i3
 // ---- device commands -----------------------------------------------------------------------
 
 /// Runs a command in device `dev`'s `wasmnet:control/commands` export at the current instant,
-/// between steps (calls `js_invoke`): leaves a `command` message (its answer) in the result
+/// between steps (calls `js_export`): leaves a `command` message (its answer) in the result
 /// and answers its length. -1 (message in the result): no such device, no network, busy, or
 /// refused (a paused device). -2: the device takes no commands. -3 (message in the result):
 /// the device trapped, and the network failed.
@@ -774,6 +751,83 @@ pub extern "C" fn wn_schedule_command(
     match added {
         Ok(Ok(op)) => i32::try_from(op).unwrap_or(i32::MAX),
         Ok(Err(e)) => fail(e),
+        Err(e) => fail(e),
+    }
+}
+
+// ---- portable exports ----------------------------------------------------------------------
+
+/// The invocation an `infra call` message names: `interface#function` (the interface without a
+/// version) and its arguments.
+fn invocation(call: *const u8, len: usize) -> Result<wasmnet_core::Invocation, String> {
+    let (name, args) =
+        codec::decode_infra_call(bytes(call, len)).map_err(|e| format!("export call: {e}"))?;
+    let (interface, function) = name
+        .split_once('#')
+        .ok_or_else(|| format!("`{name}` is not `interface#function`"))?;
+    Ok(wasmnet_core::Invocation::new(interface, function, args))
+}
+
+/// Calls one of device `dev`'s export functions by name at the current instant, between steps
+/// (an `infra call` message: `interface#function`, the interface without a version, and its
+/// arguments): leaves an `infra reply` in the result (its value, a `result`'s error, or
+/// `failed` with why no backend served it) and answers its length. -1, -2 and -3 as for
+/// `wn_command` (-2: the device does not export the interface).
+#[unsafe(no_mangle)]
+pub extern "C" fn wn_invoke(dev: u32, call: *const u8, len: usize) -> i32 {
+    let invocation = match invocation(call, len) {
+        Ok(i) => i,
+        Err(e) => return fail(e),
+    };
+    let run = with_network(|n| {
+        device(n, dev).map(|id| {
+            let answer = n.invoke(id, invocation);
+            (answer, n.failure().is_some())
+        })
+    });
+    let reply = |r: Reply| set_result(codec::encode_infra_reply(&r));
+    match run {
+        Ok(Some((Ok(Some(Ok(Ok(v)))), _))) => reply(Reply::Value(v)),
+        Ok(Some((Ok(Some(Ok(Err(v)))), _))) => reply(Reply::Error(v)),
+        Ok(Some((Ok(Some(Err(why))), _))) => reply(Reply::Failed(why)),
+        Ok(Some((Ok(None), _))) => -2,
+        Ok(Some((Err(e), failed))) => {
+            fail(e);
+            if failed { -3 } else { -1 }
+        }
+        Ok(None) => fail(format!("no device {dev}")),
+        Err(e) => fail(e),
+    }
+}
+
+/// Calls one of device `dev`'s export functions at the start of instant `at` (an operator
+/// event; the call as for `wn_invoke`): answers the op's index, or -1 with the message in the
+/// result (no such device, or it does not export the interface). Never calls JavaScript.
+#[unsafe(no_mangle)]
+pub extern "C" fn wn_schedule_invoke(dev: u32, at: u64, call: *const u8, len: usize) -> i32 {
+    let invocation = match invocation(call, len) {
+        Ok(i) => i,
+        Err(e) => return fail(e),
+    };
+    let added = with_network(|n| {
+        device(n, dev)
+            .ok_or_else(|| format!("no device {dev}"))
+            .and_then(|id| n.schedule_invoke(id, at, invocation))
+    });
+    match added {
+        Ok(Ok(op)) => i32::try_from(op).unwrap_or(i32::MAX),
+        Ok(Err(e)) => fail(e),
+        Err(e) => fail(e),
+    }
+}
+
+/// Every interface device `dev` exports, without a version and sorted (the list both backends
+/// report): a `list<str>` message in the result; answers its length, or -1 (no such device).
+#[unsafe(no_mangle)]
+pub extern "C" fn wn_exports(dev: u32) -> i32 {
+    match with_network(|n| device(n, dev).map(|id| n.sim_mut().device_exports(id).to_vec())) {
+        Ok(Some(exports)) => set_result(codec::encode_strs(&exports)),
+        Ok(None) => fail(format!("no device {dev}")),
         Err(e) => fail(e),
     }
 }

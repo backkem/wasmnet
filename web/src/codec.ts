@@ -181,12 +181,14 @@ export function encodeInstance(
   ports: readonly PortInfo[],
   flags: { counters: boolean; lifecycle: boolean; commands: boolean; reconfigure: boolean },
   apps: readonly string[],
+  exports: readonly string[] = [],
 ): Uint8Array {
   const w = new Writer().u32(ports.length);
   for (const p of ports) w.u32(p.id).str(p.name).raw(p.mac ?? new Uint8Array()).u32(p.mtu);
   return w
     .u32((flags.counters ? 1 : 0) | (flags.lifecycle ? 2 : 0) | (flags.commands ? 4 : 0) | (flags.reconfigure ? 8 : 0))
     .strs(apps)
+    .strs(exports)
     .finish();
 }
 
@@ -388,17 +390,8 @@ export function decodeValue(bytes: Uint8Array): unknown {
 /** A command's answer: `ok` text or the device's refusal. */
 export type CommandAnswer = { ok: string } | { err: string };
 
-export function encodeCommandAnswer(a: CommandAnswer): Uint8Array {
-  return 'ok' in a ? new Writer().u8(0).str(a.ok).finish() : new Writer().u8(1).str(a.err).finish();
-}
-
 export function decodeCommandAnswer(bytes: Uint8Array): CommandAnswer {
   return whole(bytes, (r) => (r.u8() === 0 ? { ok: r.str() } : { err: r.str() }));
-}
-
-/** A reconfiguration's answer: 0 ok, 1 `restart(m)`, 2 `invalid(m)`. */
-export function encodeReconfigured(kind: 0 | 1 | 2, message = ''): Uint8Array {
-  return new Writer().u8(kind).str(message).finish();
 }
 
 // ---- values: wasmnet:infra calls --------------------------------------------------------------
@@ -495,6 +488,26 @@ export function readValue(r: Reader): unknown {
     default:
       throw new Error(`malformed value: kind ${kind}`);
   }
+}
+
+/** Reads an `infra call` message (the simulator's call of an export by name, `js_export`). */
+export function decodeInfraCall(bytes: Uint8Array): { fn: string; args: unknown[] } {
+  return whole(bytes, (r) => {
+    const fn = r.str();
+    const n = r.u32();
+    const args: unknown[] = [];
+    for (let i = 0; i < n; i++) args.push(readValue(r));
+    return { fn, args };
+  });
+}
+
+/** Writes an `infra reply` message (an export's answer, for `js_export`). */
+export function encodeInfraReply(reply: InfraReply): Uint8Array {
+  const w = new Writer();
+  if ('value' in reply) writeValue(w.u8(0), reply.value);
+  else if ('error' in reply) writeValue(w.u8(1), reply.error);
+  else w.u8(2).str(reply.failed);
+  return w.finish();
 }
 
 /** The `infra call` message: the function (`devices.apply`) and the arguments jco passed. */

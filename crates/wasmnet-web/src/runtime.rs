@@ -23,10 +23,9 @@ use std::task::{Context, Poll, Waker};
 use wasmnet_core::ext::ControlCall;
 use wasmnet_core::infra::Calls;
 use wasmnet_core::{
-    COMMANDS_EXPORT, Command, CommandCall, DeviceConfig, DeviceContext, DeviceEntropy,
-    DeviceInstance, Fault, Inbox, InfraEnd, InputQueue, JournalEnd, Level, MemoryBudget, Nanos,
-    OutputCapture, RECONFIGURE_EXPORT, ReconfigureCall, Result as SimResult, Runtime, Sleep,
-    Status, VirtualClock, Wire,
+    COMMANDS_EXPORT, Command, DeviceConfig, DeviceContext, DeviceEntropy, DeviceInstance, Fault,
+    Inbox, InfraEnd, InputQueue, JournalEnd, Level, MemoryBudget, Nanos, OutputCapture,
+    RECONFIGURE_EXPORT, Result as SimResult, Runtime, Sleep, Status, VirtualClock, Wire,
 };
 
 use crate::codec::Value;
@@ -486,14 +485,21 @@ impl<H: JsHost + Clone + Unpin + 'static> Runtime for JsRuntime<H> {
                 detail: None,
             });
         }
-        // Optional exports control calls go to, in the wasmtime backend's order.
-        let mut exports = Vec::new();
+        // Every interface it exports, by name without a version, sorted: what control calls reach
+        // by name (as the wasmtime backend reports them).
+        let mut exports: Vec<String> = instance
+            .exports
+            .iter()
+            .map(|e| wasmnet_core::export::unversioned(e).to_owned())
+            .collect();
         if instance.commands {
             exports.push(COMMANDS_EXPORT.to_owned());
         }
         if instance.reconfigure {
             exports.push(RECONFIGURE_EXPORT.to_owned());
         }
+        exports.sort();
+        exports.dedup();
         let actor = Actor {
             memory,
             host: self.host.clone(),
@@ -505,8 +511,7 @@ impl<H: JsHost + Clone + Unpin + 'static> Runtime for JsRuntime<H> {
             inbox: ctx.inbox,
             status: ctx.status,
             lifecycle: instance.lifecycle,
-            commands: instance.commands,
-            reconfigure: instance.reconfigure,
+            exports: exports.clone(),
             apps: instance.apps.clone(),
             started: false,
             initialised: !instance.lifecycle,
@@ -565,9 +570,8 @@ struct Actor<H: JsHost> {
     inbox: Inbox,
     status: Status,
     lifecycle: bool,
-    /// It exports `wasmnet:control/commands`, `wasmnet:reconfigure/reconfigure`.
-    commands: bool,
-    reconfigure: bool,
+    /// The interfaces it exports, by name without a version (control calls reach them by name).
+    exports: Vec<String>,
     apps: Vec<String>,
     started: bool,
     initialised: bool,
@@ -595,41 +599,35 @@ impl<H: JsHost> Actor<H> {
     /// Serves one control call with the device's export, the way the wasmtime backend does:
     /// a command or a reconfiguration through JavaScript, any other kind refused as
     /// unsupported. The answer goes into the call's own slot.
+    /// A control call into one of the device's exports, by name ([`ControlCall::invocation`]):
+    /// commands, configuration changes in place and any other export, one way. A trap is the
+    /// device's fault; a call it has no export for is refused by the call's own words.
     fn control(&mut self, call: Box<dyn ControlCall>, now: Nanos) -> Result<(), Fault> {
-        let call = match CommandCall::downcast(call) {
-            Ok(call) if self.commands => {
-                let answer = self
-                    .host
-                    .invoke(self.dev, now, call.command(), call.argument())
-                    .map_err(Fault::new)?;
-                call.finish(answer);
-                return Ok(());
-            }
-            Ok(call) => {
-                call.unsupported();
-                return Ok(());
-            }
-            Err(other) => other,
+        let Some(invocation) = call.invocation(now) else {
+            call.unsupported();
+            return Ok(());
         };
-        match ReconfigureCall::downcast(call) {
-            Ok(call) if self.reconfigure => {
-                let answer = self
-                    .host
-                    .reconfigure(self.dev, now, call.config())
-                    .map_err(Fault::new)?;
-                // On `ok` its `wasi:config/store` serves the new config from now on. The config
-                // is taken out of the registry for the call: `finish` reaches the device table,
-                // never JavaScript or the registry, but no borrow is held across it anyway.
-                let mut served = self
-                    .registry
-                    .with_device(self.dev, |d| std::mem::take(&mut d.config))
-                    .unwrap_or_default();
-                call.finish_serving(answer, &mut served);
-                self.registry.with_device(self.dev, |d| d.config = served);
-            }
-            Ok(call) => call.unsupported(),
-            Err(other) => other.unsupported(),
+        if !self.exports.contains(&invocation.interface) {
+            call.unsupported();
+            return Ok(());
         }
+        let Some(answer) = self
+            .host
+            .export(self.dev, now, &invocation)
+            .map_err(Fault::new)?
+        else {
+            call.unsupported();
+            return Ok(());
+        };
+        // What its `wasi:config/store` serves, which the call may replace (a configuration
+        // taken in place). Taken out of the registry for the call: `invoked` reaches the core
+        // (the device table), never JavaScript or the registry.
+        let mut served = self
+            .registry
+            .with_device(self.dev, |d| std::mem::take(&mut d.config))
+            .unwrap_or_default();
+        call.invoked(answer, &mut served);
+        self.registry.with_device(self.dev, |d| d.config = served);
         Ok(())
     }
 

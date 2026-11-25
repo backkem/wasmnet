@@ -140,7 +140,7 @@ async function main(): Promise<void> {
   (window as { wasmnetScenario?: unknown }).wasmnetScenario = async (scenario: Init['scenario'], seed = '42') => {
     const journal: JournalEntry[] = [];
     // The portable-extension scenarios run on the simulator with the test fixture in it.
-    const portable = scenario === 'portable' || scenario === 'portable-cost';
+    const portable = scenario === 'portable' || scenario === 'portable-cost' || scenario === 'exports';
     if (portable && !assets.extended) throw new Error('this build has no simulator with the test fixture');
     const simulator = portable ? await WebAssembly.compileStreaming(fetch(assets.extended!.file)) : loaded.simulator;
     const run = runInWorker<Init, Done>(new URL('worker.js', import.meta.url), {

@@ -12,7 +12,7 @@
 //! `wasmnet:infra` from inside `poll`). It must not re-enter the [`crate::Network`] that made
 //! the call.
 
-use wasmnet_core::{DeclaredPort, DeviceConfig, Nanos, Refusal};
+use wasmnet_core::{DeclaredPort, DeviceConfig, Nanos};
 
 /// A device JavaScript has instantiated: its `ports()` answer and what it exports.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -26,11 +26,14 @@ pub struct Instance {
     pub counters: bool,
     /// It exports `wasmnet:link/lifecycle` (an async node: `start()` runs first).
     pub lifecycle: bool,
-    /// It exports `wasmnet:control/commands` (it takes commands: [`JsHost::invoke`]).
+    /// It exports `wasmnet:control/commands` (it takes commands). Reported among its exports
+    /// when [`exports`](Self::exports) does not list it.
     pub commands: bool,
-    /// It exports `wasmnet:reconfigure/reconfigure` (it takes a config in place:
-    /// [`JsHost::reconfigure`]).
+    /// It exports `wasmnet:reconfigure/reconfigure` (it takes a config in place). As `commands`.
     pub reconfigure: bool,
+    /// Every interface it exports, by name without a version (`wasmnet:control/commands`): the
+    /// exports control calls reach by name ([`JsHost::export`]).
+    pub exports: Vec<String>,
 }
 
 /// Chainable setters, one per field: `Instance::default().ports(ports).counters(true)`.
@@ -68,6 +71,12 @@ impl Instance {
     /// Sets [`reconfigure`](Self::reconfigure).
     pub fn reconfigure(mut self, on: bool) -> Self {
         self.reconfigure = on;
+        self
+    }
+
+    /// Sets [`exports`](Self::exports).
+    pub fn exports(mut self, exports: Vec<String>) -> Self {
+        self.exports = exports;
         self
     }
 }
@@ -112,28 +121,22 @@ pub trait JsHost {
     fn run_app(&self, dev: u32, app: u32, call: u32) -> Result<(), String>;
     /// Timer `timer` (from [`crate::Registry::timer`]) is due: resolve the guest's wait.
     fn timer_fire(&self, timer: u32);
-    /// `commands.invoke(now, command, argument)` of a device whose [`Instance::commands`] is
-    /// set: its answer, `ok` text or its refusal. The default: no device takes commands.
-    fn invoke(
+    /// A call of one of the device's export functions by name ([`wasmnet_core::Invocation`]:
+    /// its interface, one of [`Instance::exports`], its function and its arguments in the
+    /// shapes jco takes): `Ok(Some(Ok(value)))` its value (a `result`'s `ok`),
+    /// `Ok(Some(Err(value)))` a `result`'s `err`, `Ok(None)` the device has no such function (the
+    /// call is refused), `Err(message)` a trap. Commands and configuration changes in place come
+    /// this way too. The default: no device exports anything callable.
+    #[allow(clippy::type_complexity)]
+    fn export(
         &self,
         dev: u32,
         now: Nanos,
-        command: &str,
-        argument: &str,
-    ) -> Result<Result<String, String>, String> {
-        let _ = (dev, now, command, argument);
-        Err("this host serves no wasmnet:control/commands".to_owned())
-    }
-    /// `reconfigure.reconfigure(now, config)` of a device whose [`Instance::reconfigure`] is
-    /// set, with its whole new config: `ok`, or its refusal. The default: no device takes one.
-    fn reconfigure(
-        &self,
-        dev: u32,
-        now: Nanos,
-        config: &DeviceConfig,
-    ) -> Result<Result<(), Refusal>, String> {
-        let _ = (dev, now, config);
-        Err("this host serves no wasmnet:reconfigure".to_owned())
+        invocation: &wasmnet_core::Invocation,
+    ) -> Result<Option<Result<wasmnet_core::value::Value, wasmnet_core::value::Value>>, String>
+    {
+        let _ = (dev, now, invocation);
+        Ok(None)
     }
     /// The waiting call `wait` (`changes.wait`, `changes.wait-any`; from
     /// [`crate::Registry::infra_wait`]) is answered with `reply`: resolve the guest's call. The

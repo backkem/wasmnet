@@ -269,6 +269,36 @@ await step('a portable call carries 4 MiB through the page', async () => {
   return r.notes;
 });
 
+await step('portable exports in the page: called by name between runs and as an operator event, alike wasmtime; an embedder run loop; per-device imports', async () => {
+  const r = await page.evaluate(() => window.wasmnetScenario('exports', '42'));
+  const n = r.notes;
+  const wants = {
+    write: '{"value":"5n"}',
+    size: '{"value":"11n"}',
+    none: '{"value":null}',
+    read: '{"value":"bytes:hello world"}',
+    nope: 'null',
+    // After the module's own run loop to 60 ms: six 64-byte appends.
+    log: '{"value":"384n"}',
+  };
+  for (const [k, v] of Object.entries(wants)) {
+    if (n[k] !== v) throw new Error(`${k}: ${n[k]}, want ${v}\n${JSON.stringify(n)}\npage errors: ${errors.join(' | ')}`);
+  }
+  if (!n.missing.startsWith('{"refused"')) throw new Error(`missing: ${n.missing}`);
+  // From 30 ms (where the binding's run stopped) to 60 ms: the polls at 40, 50 and 60 ms.
+  if (n.instants !== '3') throw new Error(`instants: ${n.instants}`);
+  // NetworkOptions.deviceImports was asked for the device; instantiateCore saw its core modules.
+  if (!n.asked.split(',').includes('p:pad_probe')) throw new Error(`deviceImports asked: ${n.asked}`);
+  if (!(Number(n.cores) > 0)) throw new Error(`instantiateCore: ${n.cores}`);
+  for (const e of ['wasmnet-test:pad/inspect', 'wasmnet:link/device']) {
+    if (!n.exports.split(',').includes(e)) throw new Error(`exports: ${n.exports}`);
+  }
+  for (const l of ['p pad-written name=ext size=5', 'p pad-written name=ext size=11']) {
+    if (!n.lines.includes(l)) throw new Error(`no "${l}" in ${n.lines}`);
+  }
+  return { exports: n.exports, bigMs: n.bigMs, instants: n.instants, cores: n.cores, jspiPlainNs: n.jspiPlainNs, jspiSuspendingNs: n.jspiSuspendingNs };
+});
+
 if (process.env.NATIVE_JOURNAL) {
   await step('agrees with the native example', async () => {
     // The native example prints `<t> ns  <device> <kind> k=v ...` for events and

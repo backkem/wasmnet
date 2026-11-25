@@ -356,6 +356,47 @@ impl<H: JsHost + Clone + Unpin + 'static> Network<H> {
             .map_err(|e| e.to_string())
     }
 
+    /// Calls one of the device's export functions by name ([`wasmnet_core::Network::invoke`]):
+    /// `Ok(None)` if the device does not export the interface, else its answer (`Ok` the value or
+    /// a `result`'s error, `Err` why no backend served it). At the current instant, between
+    /// steps; failures as [`command`](Self::command).
+    pub fn invoke(
+        &mut self,
+        device: DeviceId,
+        invocation: wasmnet_core::Invocation,
+    ) -> Result<Option<Result<wasmnet_core::export::Answered, String>>, String> {
+        if let Some((_, message)) = &self.failure {
+            return Err(message.clone());
+        }
+        let sim = self.sim_mut();
+        match sim.invoke(device, invocation) {
+            Ok(answer) => Ok(answer),
+            Err(e @ (wasmnet_core::Error::Trap { .. } | wasmnet_core::Error::Halted)) => {
+                let at = sim.now();
+                let message = e.to_string();
+                self.failure = Some((at, message.clone()));
+                Err(message)
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    /// Calls `invocation` in the device at the start of instant `at`, as an operator event
+    /// ([`Op::Control`] with a [`wasmnet_core::export::ExportRequest`]); answers the op's index,
+    /// whose state shows a refusal. Refused here if the device does not export the interface.
+    pub fn schedule_invoke(
+        &mut self,
+        device: DeviceId,
+        at: Nanos,
+        invocation: wasmnet_core::Invocation,
+    ) -> Result<usize, String> {
+        let request = wasmnet_core::export::ExportRequest::new(invocation);
+        let op = Op::control(device, request.into_control());
+        self.sim_mut()
+            .add_op(op, Placement::StartOf(at))
+            .map_err(|e| e.to_string())
+    }
+
     /// Executor counters.
     pub fn stats(&self) -> Stats {
         self.sim_ref().stats()

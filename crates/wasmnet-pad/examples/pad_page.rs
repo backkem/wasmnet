@@ -8,6 +8,7 @@
 //!   (`wasmnet_web::install::with_network`), for `Network.callExport`;
 //! - `wn_pad_stamp`: a number the page's own import `pad_page.stamp` answers, for an embedder's
 //!   imports on the module (`NetworkOptions.imports`).
+//! - `wn_pad_run`: an embedder's own run loop, one instant at a time to a deadline.
 
 #[cfg(target_arch = "wasm32")]
 fn install(network: &mut wasmnet_web::install::PageNetwork) {
@@ -45,4 +46,22 @@ wasmnet_web::export!(wn_pad_stamp, |input: &[u8]| {
     #[allow(unsafe_code)]
     let stamped = unsafe { stamp(n) };
     Ok(stamped.to_le_bytes().to_vec())
+});
+
+// An embedder's own run loop: a deadline (a little-endian u64, ns) in; the network runs one
+// instant at a time up to it, then to the deadline itself; the instants it stopped at out (a
+// little-endian u32). JavaScript does not settle between instants here, so this suits stepped
+// devices; the page calls it `promising` (a device's export it reaches may suspend).
+wasmnet_web::export!(wn_pad_run, |input: &[u8]| {
+    let until = u64::from_le_bytes(input.try_into().map_err(|_| "eight bytes".to_owned())?);
+    wasmnet_web::install::with_network(|net| {
+        let mut instants = 0u32;
+        while let Some(t) = net.next_event_time().filter(|t| *t <= until) {
+            net.run_until(t).map_err(|e| e.to_string())?;
+            instants += 1;
+        }
+        net.run_until(until).map_err(|e| e.to_string())?;
+        Ok(instants.to_le_bytes().to_vec())
+    })
+    .ok_or_else(|| "the network is busy".to_owned())?
 });

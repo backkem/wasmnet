@@ -22,14 +22,17 @@
 // `wasmnet_js.*`, who allocates, re-entry) and codec.rs (the encodings). One `Network` per
 // Worker: jco's runtime and the kit's event loop are global, so a fresh run is a fresh Worker.
 
-import { instantiate, type Imports } from './codelib-web/dist/load.js';
-import { settle, touch } from './codelib-web/dist/loop.js';
+import { instantiate, unversioned, type Imports } from './codelib-web/dist/load.js';
+import { settle, touch, until } from './codelib-web/dist/loop.js';
 import { wasiImports } from './codelib-web/dist/wasi/index.js';
 import type { RandomStream, World } from './codelib-web/dist/worlds.js';
 import * as codec from './codec.js';
 import type { CommandAnswer, DeviceCost, DeviceOptions, JournalEntry, LinkOptions, Op, OpState, Outcome, PortInfo } from './codec.js';
 
 export type { CommandAnswer, DeviceCost, DeviceOptions, Impairments, JournalEntry, LinkOptions, Op, OpState, Outcome } from './codec.js';
+
+/** A portable export's answer (`Network.invoke`): its value, a `result`'s error, or why it was refused. */
+export type InvokeAnswer = { value: unknown } | { error: unknown } | { refused: string };
 
 /** Where a component's transpiled glue is, and its core modules if already compiled. */
 export interface ComponentSource {
@@ -70,6 +73,25 @@ export interface NetworkOptions {
    * with `callExport(name, bytes, { promising: true })`.
    */
   imports?: Record<string, Record<string, unknown>>;
+  /**
+   * Extra imports for one device's component, by interface (`example:disk/blocks`, without or
+   * with a version), asked each time the device is instantiated: an embedder's capability served
+   * in JavaScript to the devices it chooses. They are merged over the binding's own, so they can
+   * also replace one (the binding's are what the simulator serves alike on wasmtime; a replaced
+   * one is the embedder's, and runs in this page only).
+   */
+  deviceImports?: (device: { index: number; name: string; component: string }) => Imports | undefined;
+  /**
+   * The kit's hook for compiling a component's core module that `ComponentSource.modules` does not
+   * have (default: fetch it next to the component's JS), passed through.
+   */
+  compile?: (url: URL) => Promise<WebAssembly.Module>;
+  /**
+   * The kit's hook for instantiating a component's core modules, passed through (default:
+   * `WebAssembly.instantiate`). The binding still sees every instance it returns, to count the
+   * device's memories.
+   */
+  instantiateCore?: (module: WebAssembly.Module, imports?: WebAssembly.Imports) => WebAssembly.Instance | Promise<WebAssembly.Instance>;
 }
 
 /** One end of a link: a device's port. */
@@ -113,6 +135,9 @@ interface Exports {
   wn_set_catalog(names: number, len: number): number;
   wn_set_supply_admission(patterns: number, len: number): number;
   wn_schedule_command(dev: number, at: bigint, command: number, commandLen: number, argument: number, argumentLen: number): number;
+  wn_invoke(dev: number, call: number, len: number): Promise<number>;
+  wn_schedule_invoke(dev: number, at: bigint, call: number, len: number): number;
+  wn_exports(dev: number): number;
   wn_args(dev: number): number;
   wn_env(dev: number): number;
   wn_infra(dev: number, call: number, len: number): number;
@@ -209,6 +234,10 @@ interface Instance {
   memories: Set<WebAssembly.Memory>;
   /** A composed node's apps (`app-<name>` exports), sorted by name: their start order. */
   apps: { name: string; run: () => Promise<unknown> }[];
+  /** Every interface it exports, by name without a version, sorted (`js_export` calls them). */
+  exports: string[];
+  /** Its export function `<interface>#<function>`, by WIT name (the kit's lookup). */
+  exportFn(name: string): (...args: unknown[]) => unknown;
 }
 
 const encoder = new TextEncoder();
@@ -228,7 +257,7 @@ function isPromise(v: unknown): v is Promise<unknown> {
 /**
  * WebAssembly JSPI, which the page needs anyway (jco's async runtime does). The simulator's
  * exports that run or add devices (`wn_add_device`, `wn_step`, `wn_finish`, `wn_command`,
- * `wn_counters`) are `promising`, and `js_instantiate` is `Suspending`: a device the network
+ * `wn_invoke`, `wn_counters`) are `promising`, and `js_instantiate` is `Suspending`: a device the network
  * creates while it runs (an operator event, a controller's `apply` or `start`) is instantiated
  * on demand, and the step waits for it. V8 suspends at every `Suspending` call, even one that
  * answers at once, so every export that may reach `js_instantiate` must be `promising`.
@@ -240,11 +269,12 @@ const jspi = WebAssembly as unknown as {
 };
 
 /** The exports that may wait for a `Suspending` import: wrapped with `promising`. */
-const PROMISING = ['wn_add_device', 'wn_step', 'wn_finish', 'wn_command', 'wn_counters'] as const;
+const PROMISING = ['wn_add_device', 'wn_step', 'wn_finish', 'wn_command', 'wn_invoke', 'wn_counters'] as const;
 
 export class Network {
   private readonly x: Exports;
   private readonly sources: Record<string, ComponentSource>;
+  private readonly options: Pick<NetworkOptions, 'deviceImports' | 'compile' | 'instantiateCore'>;
   private readonly supply: NetworkOptions['supply'];
   /** Devices by index; a slot is filled while `wn_add_device` asks for it. */
   private readonly instances: Instance[] = [];
@@ -273,6 +303,7 @@ export class Network {
     for (const name of PROMISING) wrapped[name] = jspi.promising(raw[name]!);
     this.x = wrapped as unknown as Exports;
     this.sources = { ...options.components };
+    this.options = { deviceImports: options.deviceImports, compile: options.compile, instantiateCore: options.instantiateCore };
     this.supply = options.supply;
     this.x.wn_install?.();
     if (this.x.wn_network_new(U64(BigInt(options.seed))) !== 0) throw new Error(this.resultText());
@@ -312,6 +343,18 @@ export class Network {
     w.writeInto(this.view(ptr, len));
     try {
       return f(ptr, len);
+    } finally {
+      this.x.wn_free(ptr, len);
+    }
+  }
+
+  /** `withWriter` for an export that may wait (`promising`): the message lives until it answers. */
+  private async withWriterAsync<T>(w: codec.Writer, f: (ptr: number, len: number) => Promise<T>): Promise<T> {
+    const len = w.length;
+    const ptr = this.x.wn_alloc(len);
+    w.writeInto(this.view(ptr, len));
+    try {
+      return await f(ptr, len);
     } finally {
       this.x.wn_free(ptr, len);
     }
@@ -467,40 +510,34 @@ export class Network {
         self.timers.delete(timer);
         wake?.();
       },
-      js_invoke: (dev: number, now: bigint, cp: number, cl: number, ap: number, al: number) => {
+      // One of the device's export functions by name (commands and configuration changes in
+      // place come this way): its value, a `result`'s error (jco throws `ComponentError`), or a
+      // trap (anything else thrown: the device's fault).
+      // `Suspending`: an export jco made async (or wrapped for JSPI) answers a promise, which the
+      // call waits for while driving the event loop (`until`); a plain one answers at once.
+      js_export: new jspi.Suspending((async (dev: number, _now: bigint, ptr: number, len: number) => {
         const self = n();
         try {
-          const commands = self.instance(dev).root.commands;
-          if (!commands) throw new Error('no commands export');
-          const [command, argument] = [decoder.decode(self.view(cp, cl)), decoder.decode(self.view(ap, al))];
-          let answer: CommandAnswer;
+          const { fn, args } = codec.decodeInfraCall(self.view(ptr, len).slice());
+          let f: (...a: unknown[]) => unknown;
           try {
-            answer = { ok: self.sync(commands.invoke(U64(now), command, argument), 'invoke') };
+            f = self.instance(dev).exportFn(fn);
           } catch (err) {
-            answer = { err: String(errPayload(err)) };
+            // No such function: the call is refused, the device goes on.
+            return self.put(codec.encodeInfraReply({ failed: message(err) }));
           }
-          return self.put(codec.encodeCommandAnswer(answer));
+          let reply: codec.InfraReply;
+          try {
+            const v = f(...args);
+            reply = { value: isPromise(v) ? await until(v) : v };
+          } catch (err) {
+            reply = { error: errPayload(err) };
+          }
+          return self.put(codec.encodeInfraReply(reply));
         } catch (err) {
           return self.fail(err);
         }
-      },
-      js_reconfigure: (dev: number, now: bigint, ptr: number, len: number) => {
-        const self = n();
-        try {
-          const reconfigure = self.instance(dev).root.reconfigure;
-          if (!reconfigure) throw new Error('no reconfigure export');
-          const config = codec.decodeConfig(self.view(ptr, len).slice());
-          try {
-            self.sync(reconfigure.reconfigure(U64(now), config), 'reconfigure');
-            return self.put(codec.encodeReconfigured(0));
-          } catch (err) {
-            const r = errPayload(err) as { tag: string; val: string };
-            return self.put(codec.encodeReconfigured(r.tag === 'restart' ? 1 : 2, r.val));
-          }
-        } catch (err) {
-          return self.fail(err);
-        }
-      },
+      }) as AnyFn),
       js_wait_done: (wait: number, ptr: number, len: number) => {
         const self = n();
         const done = self.waits.get(wait);
@@ -594,12 +631,18 @@ export class Network {
     if (!source) throw new Error(`no component ${component} (known: ${Object.keys(this.sources).join(', ')})`);
     // Every core instance it makes, for its memories: what the simulator counts and bounds.
     const memories = new Set<WebAssembly.Memory>();
+    const own = this.options.instantiateCore;
     const instantiateCore = async (module: WebAssembly.Module, imports?: WebAssembly.Imports) => {
-      const instance = await WebAssembly.instantiate(module, imports);
+      const instance = own ? await own(module, imports) : await WebAssembly.instantiate(module, imports);
       for (const e of Object.values(instance.exports)) if (e instanceof WebAssembly.Memory) memories.add(e);
       return instance;
     };
-    const loaded = await instantiate(source.url, this.imports(dev), { ...(source.modules ? { modules: source.modules } : {}), instantiateCore });
+    const extra = this.options.deviceImports?.({ index: dev, name, component }) ?? {};
+    const imports = { ...this.imports(dev) };
+    // By unversioned name, as the kit keys imports, merged over the binding's own.
+    for (const [k, v] of Object.entries(extra)) imports[unversioned(k)] = { ...(imports[unversioned(k)] ?? {}), ...v };
+    const compile = this.options.compile;
+    const loaded = await instantiate(source.url, imports, { ...(source.modules ? { modules: source.modules } : {}), ...(compile ? { compile } : {}), instantiateCore });
     const root = loaded.exports as unknown as Root;
     // A composed node exports one `app-<name>` instance per app; the kit lists them by WIT name
     // (`app-http-get#run`), whatever jco keys them by.
@@ -608,7 +651,17 @@ export class Network {
       .filter((n) => n.endsWith('#run'))
       .map((n) => ({ name: n.slice('app-'.length, -'#run'.length), run: loaded.exportFn(n) as () => Promise<unknown> }))
       .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
-    return { name, component, root, apps, memories };
+    // Every interface it exports (the kit lists each by its full name, functions as `#`-names).
+    // A call names the interface without its version: look it up by the full name, so two
+    // interfaces of one short name never mix.
+    const full = new Map(loaded.exportNames().filter((e) => !e.includes('#') && e.includes(':')).map((e) => [unversioned(e), e]));
+    const exports = [...full.keys()].sort();
+    const exportFn = (e: string) => {
+      const hash = e.indexOf('#');
+      const iface = full.get(e.slice(0, hash));
+      return loaded.exportFn(iface ? `${iface}${e.slice(hash)}` : e);
+    };
+    return { name, component, root, apps, memories, exports, exportFn };
   }
 
   /** The `instance` message for device `dev`'s instance: its ports and what it exports. */
@@ -627,6 +680,7 @@ export class Network {
             reconfigure: root.reconfigure !== undefined,
           },
           apps.map((a) => a.name),
+          instance.exports,
         ),
       );
     } catch (err) {
@@ -1032,6 +1086,48 @@ export class Network {
       this.withBytes(encoder.encode(argument), (ap, al) => this.x.wn_schedule_command(dev, U64(BigInt(at)), cp, cl, ap, al)),
     );
     if (got < 0) throw new Error(this.resultText());
+  }
+
+  /**
+   * Every interface the device exports, without a version and sorted
+   * (`wasmnet:link/device`, `wasmnet-test:pad/inspect`, ...): what `invoke` can reach. The same
+   * list as on wasmtime (`Network::device_exports`).
+   */
+  exports(device: Device | number): string[] {
+    const dev = typeof device === 'number' ? device : device.index;
+    const len = this.x.wn_exports(dev);
+    if (len < 0) throw new Error(this.resultText());
+    return codec.decodeStrs(this.result(len));
+  }
+
+  /**
+   * Calls one of the device's export functions by name now, between runs (a portable export):
+   * `fn` is `interface#function`, the interface without a version
+   * (`wasmnet:control/commands#invoke`), `args` in jco's shapes. Answers `{ value }` (a
+   * `result`'s `ok` bare), `{ error }` (a `result`'s `err`), `{ refused }` (the device has no
+   * such function, or the call was refused), or null if the device does not export the
+   * interface. Throws if the device trapped (the network failed) or the network refused the call
+   * (a paused device). The same call runs on wasmtime (`Network::invoke`).
+   */
+  async invoke(device: Device | number, fn: string, args: readonly unknown[] = []): Promise<InvokeAnswer | null> {
+    const dev = typeof device === 'number' ? device : device.index;
+    const len = await this.withWriterAsync(codec.infraCallWriter(fn, args), (p, l) => this.x.wn_invoke(dev, p, l));
+    if (len === -2) return null;
+    if (len < 0) throw new Error(this.resultText());
+    const reply = codec.decodeInfraReply(this.result(len));
+    return 'failed' in reply ? { refused: reply.failed } : reply;
+  }
+
+  /**
+   * Calls `fn` with `args` in the device at the start of virtual instant `at` (ns), as an
+   * operator event, during a later `run()`; answers the op's index (its state in `opStates()`
+   * shows a refusal). Throws if the device does not export the interface.
+   */
+  scheduleInvoke(device: Device | number, at: bigint | number, fn: string, args: readonly unknown[] = []): number {
+    const dev = typeof device === 'number' ? device : device.index;
+    const got = this.withWriter(codec.infraCallWriter(fn, args), (p, l) => this.x.wn_schedule_invoke(dev, U64(BigInt(at)), p, l));
+    if (got < 0) throw new Error(this.resultText());
+    return got;
   }
 
 

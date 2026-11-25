@@ -23,7 +23,7 @@ export interface Init {
   seed: string;
   simulator: WebAssembly.Module;
   components: Record<string, ComponentSource>;
-  scenario?: 'example' | 'controls' | 'runtime' | 'portable' | 'portable-cost';
+  scenario?: 'example' | 'controls' | 'runtime' | 'portable' | 'portable-cost' | 'exports';
 }
 
 export interface Done {
@@ -179,13 +179,31 @@ async function runtime(net: Network): Promise<Record<string, string>> {
   return { refused, digest, badOp, memory, clientLink: clientLink.name };
 }
 
+// What `NetworkOptions.deviceImports` and `instantiateCore` were asked (the `exports` scenario reports them).
+const asked: string[] = [];
+const cores = { n: 0 };
+
 serveRun<Init, Done>(async (init, ctx) => {
   // The fixture's simulator imports `pad_page.stamp` (an embedder's own import); other modules ignore it.
   const net = await Network.create(init.simulator, {
     seed: BigInt(init.seed),
     components: init.components,
     imports: { pad_page: { stamp: (n: number) => n + 1 } },
+    // The per-device imports and the kit's core hook, passed through: what they were asked.
+    deviceImports: (d) => {
+      asked.push(`${d.name}:${d.component}`);
+      return undefined;
+    },
+    instantiateCore: async (module, imports) => {
+      cores.n += 1;
+      return WebAssembly.instantiate(module, imports);
+    },
   });
+  if (init.scenario === 'exports') {
+    const t0 = performance.now();
+    const notes = await exportsScenario(net);
+    return { outcome: notes.outcome as Outcome, links: [], ms: Math.round(performance.now() - t0), notes: notes.notes };
+  }
   if (init.scenario === 'portable' || init.scenario === 'portable-cost') {
     const t0 = performance.now();
     const notes = init.scenario === 'portable' ? await portable(net) : await portableCost(net);
@@ -327,4 +345,86 @@ async function portableCost(net: Network): Promise<{ outcome: unknown; notes: Re
   const many = await time('many', 31);
   const outcome = { one, many };
   return { outcome, notes: { oneMs: one.toFixed(1), manyMs: many.toFixed(1), perAppendMs: ((many - one) / 30).toFixed(2) } };
+}
+
+/**
+ * The `exports` scenario: portable exports in the page. The pad's probe exports
+ * `wasmnet-test:pad/inspect`; the binding calls it by name between runs (`invoke`), as an
+ * operator event (`scheduleInvoke`) and with 4 MiB (what it costs). The same calls as
+ * `portable_exports_are_called_alike` (`crates/wasmnet-web/tests/parity.rs`). Also measures
+ * what a JSPI `Suspending` import that answers at once costs against a plain one (`jspi`).
+ */
+async function exportsScenario(net: Network): Promise<{ outcome: unknown; notes: Record<string, string> }> {
+  const ms = (n: number) => BigInt(n) * 1_000_000n;
+  const p = await net.device('p', 'pad_probe', { period: '10ms' });
+  await net.run({ deadline: ms(1) });
+  const show = (a: unknown) =>
+    JSON.stringify(a, (_, v) => (typeof v === 'bigint' ? `${v}n` : v instanceof Uint8Array ? `bytes:${new TextDecoder().decode(v)}` : v === undefined ? null : v));
+  const iface = 'wasmnet-test:pad/inspect';
+  const enc = new TextEncoder();
+  const notes: Record<string, string> = { exports: net.exports(p).join(',') };
+  notes.write = show(await net.invoke(p, `${iface}#write`, ['ext', enc.encode('hello')]));
+  net.scheduleInvoke(p, ms(5), `${iface}#write`, ['ext', enc.encode(' world')]);
+  const entries: JournalEntry[] = [];
+  const outcome = await net.run({ deadline: ms(30), onJournal: (e) => entries.push(...e) });
+  notes.size = show(await net.invoke(p, `${iface}#size`, ['ext']));
+  notes.none = show(await net.invoke(p, `${iface}#size`, ['none']));
+  notes.read = show(await net.invoke(p, `${iface}#read`, ['ext', 0n, 100]));
+  notes.missing = show(await net.invoke(p, `${iface}#missing`, []));
+  notes.nope = show(await net.invoke(p, 'wasmnet-test:pad/nope#x', []));
+  notes.lines = eventLines(entries, /^pad-written/);
+  // A 4 MiB argument, best of five.
+  const big = new Uint8Array(4 << 20).fill(3);
+  let best = Infinity;
+  for (let i = 0; i < 5; i++) {
+    const t = performance.now();
+    await net.invoke(p, `${iface}#write`, [`big${i}`, big]);
+    best = Math.min(best, performance.now() - t);
+  }
+  notes.bigMs = best.toFixed(2);
+  // An embedder's own run loop (the module's `wn_pad_run`): one instant at a time to 60 ms.
+  const until = new Uint8Array(8);
+  new DataView(until.buffer).setBigUint64(0, ms(60), true);
+  const instants = await net.callExport('wn_pad_run', until, { promising: true });
+  notes.instants = String(new DataView(instants.buffer, instants.byteOffset).getUint32(0, true));
+  notes.log = show(await net.invoke(p, `${iface}#size`, ['log']));
+  notes.asked = asked.join(',');
+  notes.cores = String(cores.n);
+  Object.assign(notes, await jspiCost());
+  return { outcome, notes };
+}
+
+/**
+ * What a call through a `Suspending` import that answers at once costs, against a plain import:
+ * a tiny module (`run(n)` calls its import `n` times) instantiated twice, the second time with
+ * the import wrapped in `WebAssembly.Suspending` and `run` in `WebAssembly.promising`.
+ */
+async function jspiCost(): Promise<Record<string, string>> {
+  // (module (import "env" "f" (func)) (func (export "run") (param i32)
+  //   (loop (call 0) (local.set 0 (i32.sub (local.get 0) (i32.const 1))) (br_if 0 (local.get 0)))))
+  const bytes = new Uint8Array([
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+    0x01, 0x08, 0x02, 0x60, 0x00, 0x00, 0x60, 0x01, 0x7f, 0x00,
+    0x02, 0x09, 0x01, 0x03, 0x65, 0x6e, 0x76, 0x01, 0x66, 0x00, 0x00,
+    0x03, 0x02, 0x01, 0x01,
+    0x07, 0x07, 0x01, 0x03, 0x72, 0x75, 0x6e, 0x00, 0x01,
+    0x0a, 0x14, 0x01, 0x12, 0x00, 0x03, 0x40, 0x10, 0x00, 0x20, 0x00, 0x41, 0x01, 0x6b, 0x21, 0x00, 0x20, 0x00, 0x0d, 0x00, 0x0b, 0x0b,
+  ]);
+  const module = new WebAssembly.Module(bytes);
+  const n = 1_000_000;
+  const plain = new WebAssembly.Instance(module, { env: { f: () => {} } }).exports.run as (n: number) => void;
+  const W = WebAssembly as unknown as { Suspending: new (f: () => unknown) => unknown; promising: (f: unknown) => (n: number) => Promise<void> };
+  const suspending = W.promising(new WebAssembly.Instance(module, { env: { f: new W.Suspending(() => {}) } as unknown as WebAssembly.ModuleImports }).exports.run);
+  plain(1000);
+  let t = performance.now();
+  plain(n);
+  const plainNs = ((performance.now() - t) * 1e6) / n;
+  // V8 suspends at every `Suspending` call, even one whose function answers at once: each call
+  // is a round through the microtask queue.
+  const m = 100_000;
+  await suspending(1000);
+  t = performance.now();
+  await suspending(m);
+  const suspendingNs = ((performance.now() - t) * 1e6) / m;
+  return { jspiPlainNs: plainNs.toFixed(1), jspiSuspendingNs: suspendingNs.toFixed(1) };
 }

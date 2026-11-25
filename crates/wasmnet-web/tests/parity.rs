@@ -33,7 +33,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use wasmnet_core::supply::reference_of;
 use wasmnet_core::{
     DeviceCommand, DeviceConfig, DeviceEntropy, DeviceId, DeviceOptions, ImportPolicy,
-    JournalEntry, Nanos, Op, OpState, Placement, Record, Refusal,
+    JournalEntry, Nanos, Op, OpState, Placement, Record,
 };
 use wasmnet_det_cbor::Value as Cbor;
 use wasmnet_host::wasmtime::component::types::{ComponentFunc, ComponentItem, Type};
@@ -357,6 +357,16 @@ fn to_value(v: &Val, t: &Type) -> Value {
                 .map(|((name, v), f)| (name.clone(), to_value(v, &f.ty)))
                 .collect(),
         ),
+        (Val::Variant(tag, payload), Type::Variant(var)) => {
+            let case = var.cases().find(|c| c.name == tag).expect("a case");
+            Value::Variant(
+                tag.clone(),
+                payload
+                    .as_deref()
+                    .zip(case.ty)
+                    .map(|(p, t)| Box::new(to_value(p, &t))),
+            )
+        }
         other => panic!("an argument the page never sends: {other:?}"),
     }
 }
@@ -374,7 +384,7 @@ fn to_val(v: Value, t: &Type) -> Val {
         (Value::List(items), Type::List(l)) => {
             Val::List(items.into_iter().map(|i| to_val(i, &l.ty())).collect())
         }
-        (Value::Tuple(items), Type::Tuple(tt)) => Val::Tuple(
+        (Value::Tuple(items) | Value::List(items), Type::Tuple(tt)) => Val::Tuple(
             items
                 .into_iter()
                 .zip(tt.types())
@@ -504,6 +514,14 @@ impl JsHost for Wasm {
         instance.reconfigure = d
             .func("wasmnet:reconfigure/reconfigure", "reconfigure")
             .is_some();
+        // Every interface it exports, as the kit lists them, without a version.
+        let mut exports: Vec<String> = d
+            .funcs
+            .keys()
+            .map(|(i, _)| wasmnet_core::export::unversioned(i).to_owned())
+            .collect();
+        exports.dedup();
+        instance.exports = exports;
         self.devices.borrow_mut().insert(dev, d);
         // Across the boundary, in its encoding, as the page answers.
         codec::decode_instance(&codec::encode_instance(&instance)).map_err(|e| e.to_string())
@@ -569,71 +587,51 @@ impl JsHost for Wasm {
         Ok(())
     }
 
-    fn invoke(
+    /// As the page calls an export by name: the arguments and the answer cross in the boundary's
+    /// encoding, in jco's shapes (a `result`'s `ok` bare, its `err` a thrown payload).
+    fn export(
         &self,
         dev: u32,
         now: Nanos,
-        command: &str,
-        argument: &str,
-    ) -> Result<Result<String, String>, String> {
-        let answer = self.with(dev, now, |d| {
-            let args = [
-                Val::U64(now),
-                Val::String(command.to_owned()),
-                Val::String(argument.to_owned()),
-            ];
-            match d
-                .call("wasmnet:control/commands", "invoke", &args)?
-                .remove(0)
-            {
-                Val::Result(Ok(Some(v))) => match *v {
-                    Val::String(s) => Ok(Ok(s)),
-                    other => Err(format!("{other:?}")),
-                },
-                Val::Result(Err(Some(v))) => match *v {
-                    Val::String(s) => Ok(Err(s)),
-                    other => Err(format!("{other:?}")),
-                },
-                other => Err(format!("{other:?}")),
-            }
-        })?;
-        // In the boundary's encoding, as the page answers.
-        codec::decode_command_answer(&codec::encode_command_answer(&answer))
-            .map_err(|e| e.to_string())
-    }
-
-    fn reconfigure(
-        &self,
-        dev: u32,
-        now: Nanos,
-        config: &DeviceConfig,
-    ) -> Result<Result<(), Refusal>, String> {
-        let answer = self.with(dev, now, |d| {
-            let list = config
-                .iter()
-                .map(|(k, v)| Val::Tuple(vec![Val::String(k.clone()), Val::String(v.clone())]))
+        invocation: &wasmnet_core::Invocation,
+    ) -> Result<Option<Result<Value, Value>>, String> {
+        let name = format!("{}#{}", invocation.interface, invocation.function);
+        let call = codec::encode_infra_call(&name, &invocation.args);
+        let (_, args) = codec::decode_infra_call(&call).map_err(|e| e.to_string())?;
+        let reply = self.with(dev, now, |d| {
+            let Some(f) = d.func(&invocation.interface, &invocation.function) else {
+                return Ok(Reply::Failed(format!("no export {name}")));
+            };
+            let ty = f.ty(&d.store);
+            let params: Vec<Type> = ty.params().map(|(_, t)| t).collect();
+            let result = ty.results().next();
+            let args: Vec<Val> = args
+                .into_iter()
+                .zip(&params)
+                .map(|(a, t)| to_val(a, t))
                 .collect();
-            match d
-                .call(
-                    "wasmnet:reconfigure/reconfigure",
-                    "reconfigure",
-                    &[Val::U64(now), Val::List(list)],
-                )?
-                .remove(0)
-            {
-                Val::Result(Ok(_)) => Ok(Ok(())),
-                Val::Result(Err(Some(v))) => match *v {
-                    Val::Variant(tag, Some(m)) => match (tag.as_str(), *m) {
-                        ("restart", Val::String(m)) => Ok(Err(Refusal::Restart(m))),
-                        ("invalid", Val::String(m)) => Ok(Err(Refusal::Invalid(m))),
-                        other => Err(format!("{other:?}")),
-                    },
-                    other => Err(format!("{other:?}")),
-                },
-                other => Err(format!("{other:?}")),
-            }
+            let out = d.call(&invocation.interface, &invocation.function, &args)?;
+            let lift = |v: Option<Box<Val>>, t: Option<Type>| {
+                v.zip(t).map_or(Value::None, |(v, t)| to_value(&v, &t))
+            };
+            Ok(match (out.into_iter().next(), result) {
+                (Some(Val::Result(Ok(v))), Some(Type::Result(rt))) => {
+                    Reply::Value(lift(v, rt.ok()))
+                }
+                (Some(Val::Result(Err(v))), Some(Type::Result(rt))) => {
+                    Reply::Error(lift(v, rt.err()))
+                }
+                (Some(v), Some(t)) => Reply::Value(to_value(&v, &t)),
+                _ => Reply::Value(Value::None),
+            })
         })?;
-        codec::decode_reconfigured(&codec::encode_reconfigured(&answer)).map_err(|e| e.to_string())
+        match codec::decode_infra_reply(&codec::encode_infra_reply(&reply))
+            .map_err(|e| e.to_string())?
+        {
+            Reply::Value(v) => Ok(Some(Ok(v))),
+            Reply::Error(v) => Ok(Some(Err(v))),
+            Reply::Failed(_) => Ok(None),
+        }
     }
 }
 
@@ -664,6 +662,14 @@ trait Backend {
     fn extend(&mut self, extension: Box<dyn wasmnet_core::NetworkExtension>);
     /// The network's parse of an extension option.
     fn option(&self, key: &str, value: &Value) -> wasmnet_core::ExtValue;
+    /// A call of one of the device's export functions by name, between runs.
+    fn invoke(
+        &mut self,
+        device: DeviceId,
+        invocation: wasmnet_core::Invocation,
+    ) -> Option<Result<wasmnet_core::export::Answered, String>>;
+    /// The interfaces the device reports it exports.
+    fn exports(&mut self, device: DeviceId) -> Vec<String>;
     fn journal(&self) -> Vec<JournalEntry>;
 }
 
@@ -683,6 +689,16 @@ impl Native {
 }
 
 impl Backend for Native {
+    fn invoke(
+        &mut self,
+        device: DeviceId,
+        invocation: wasmnet_core::Invocation,
+    ) -> Option<Result<wasmnet_core::export::Answered, String>> {
+        self.0.invoke(device, invocation).expect("invoke")
+    }
+    fn exports(&mut self, device: DeviceId) -> Vec<String> {
+        self.0.device_exports(device).to_vec()
+    }
     fn add(
         &mut self,
         name: &str,
@@ -741,6 +757,16 @@ impl Web {
 }
 
 impl Backend for Web {
+    fn invoke(
+        &mut self,
+        device: DeviceId,
+        invocation: wasmnet_core::Invocation,
+    ) -> Option<Result<wasmnet_core::export::Answered, String>> {
+        self.0.invoke(device, invocation).expect("invoke")
+    }
+    fn exports(&mut self, device: DeviceId) -> Vec<String> {
+        self.0.sim_mut().device_exports(device).to_vec()
+    }
     fn add(
         &mut self,
         name: &str,
@@ -1608,6 +1634,119 @@ fn extension_options_and_ops_are_applied_alike() {
             "{s:?}"
         );
         assert_eq!(field(&s, "pad-cleared", "by"), ["operator"], "{s:?}");
+        s
+    });
+}
+
+// ---- portable exports ----------------------------------------------------------------------
+
+fn inspect(function: &str, args: Vec<Value>) -> wasmnet_core::Invocation {
+    wasmnet_core::Invocation::new("wasmnet-test:pad/inspect", function, args)
+}
+
+/// An op that calls the device's export from inside a run.
+#[derive(Debug, PartialEq)]
+struct WriteFromInside;
+
+impl wasmnet_core::ext::ExtOp for WriteFromInside {
+    fn apply(
+        &self,
+        ctx: &mut wasmnet_core::ext::OpContext<'_>,
+    ) -> Result<(), wasmnet_core::ext::OpError> {
+        let device = ctx.device().ok_or("timed at a device")?;
+        let call = wasmnet_core::export::ExportCall::new(inspect(
+            "write",
+            vec![Value::str("ext"), Value::Bytes(b"!".to_vec())],
+        ));
+        ctx.control(device, Box::new(call));
+        Ok(())
+    }
+
+    fn same(&self, other: &dyn wasmnet_core::ext::ExtOp) -> bool {
+        (other as &dyn std::any::Any).downcast_ref::<Self>() == Some(self)
+    }
+}
+
+fn exports(net: &mut dyn Backend) -> Seen {
+    let p = net.add(
+        "p",
+        "pad_probe",
+        config(&[("period", "10ms")]),
+        DeviceOptions::default(),
+    );
+    net.run_to(MS);
+    let mut answers = vec![Some(Ok(net.exports(p).join(",")))];
+    let mut call = |net: &mut dyn Backend, inv| {
+        answers.push(net.invoke(p, inv).map(|a| Ok(format!("{a:?}"))));
+    };
+    call(
+        net,
+        inspect(
+            "write",
+            vec![Value::str("ext"), Value::Bytes(b"hello".to_vec())],
+        ),
+    );
+    // As an operator event, and from inside a run.
+    net.op(
+        Op::control(
+            p,
+            wasmnet_core::export::ExportRequest::new(inspect(
+                "write",
+                vec![Value::str("ext"), Value::Bytes(b" world".to_vec())],
+            ))
+            .into_control(),
+        ),
+        Placement::StartOf(5 * MS),
+    );
+    net.op(
+        Op::extension_at(p, wasmnet_core::ExtensionOp::new(WriteFromInside)),
+        Placement::StartOf(7 * MS),
+    );
+    net.run_to(30 * MS);
+    call(net, inspect("size", vec![Value::str("ext")]));
+    call(net, inspect("size", vec![Value::str("none")]));
+    call(
+        net,
+        inspect(
+            "read",
+            vec![Value::str("ext"), Value::U64(0), Value::U32(100)],
+        ),
+    );
+    // No such function: refused, the device goes on; no such interface: not reported.
+    call(net, inspect("missing", Vec::new()));
+    call(
+        net,
+        wasmnet_core::Invocation::new("wasmnet-test:pad/nope", "x", Vec::new()),
+    );
+    seen(
+        net,
+        answers,
+        &["pad-written", "pad-append", "device-crashed"],
+    )
+}
+
+#[test]
+fn portable_exports_are_called_alike() {
+    on_both(|net| {
+        let s = exports(net);
+        let answer = |i: usize| s.answers[i].clone().map(|a| a.unwrap_or_else(|e| e));
+        let exports = answer(0).unwrap_or_default();
+        assert!(
+            exports.contains("wasmnet-test:pad/inspect") && exports.contains("wasmnet:link/device"),
+            "{exports}"
+        );
+        assert_eq!(answer(1).as_deref(), Some("Ok(Ok(U64(5)))"), "{s:?}");
+        assert_eq!(answer(2).as_deref(), Some("Ok(Ok(U64(12)))"), "{s:?}");
+        assert_eq!(answer(3).as_deref(), Some("Ok(Ok(None))"), "{s:?}");
+        assert_eq!(
+            answer(4).as_deref(),
+            Some(format!("Ok(Ok(Bytes({:?})))", b"hello world!".to_vec()).as_str()),
+            "{s:?}"
+        );
+        assert!(answer(5).is_some_and(|a| a.starts_with("Err(")), "{s:?}");
+        assert_eq!(answer(6), None, "{s:?}");
+        assert_eq!(field(&s, "pad-written", "size"), ["5", "11", "12"], "{s:?}");
+        assert!(field(&s, "device-crashed", "message").is_empty(), "{s:?}");
         s
     });
 }
