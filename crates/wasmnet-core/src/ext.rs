@@ -434,6 +434,49 @@ pub trait ControlCall: Any + Send + fmt::Debug {
     fn answer(&self) -> Arc<dyn ControlAnswer>;
     /// No backend serves it: answer with the extension's own refusal.
     fn unsupported(self: Box<Self>);
+
+    /// The call as a call of one export function by name, with its arguments at `now`: how a
+    /// backend that calls exports by name (a page) serves it ([`Invocation`]). `None` (the
+    /// default): only a backend's own handler serves it.
+    fn invocation(&self, now: Nanos) -> Option<Invocation> {
+        let _ = now;
+        None
+    }
+
+    /// The device answered the [`invocation`](Self::invocation): `Ok` the function's value (a
+    /// `result`'s `ok` value), `Err` a `result`'s `err` value. `config` is what the device's
+    /// `wasi:config/store` serves, which a call may replace (a reconfiguration taken in place).
+    /// A trap in the device is not an answer: the device faults. The default refuses.
+    fn invoked(self: Box<Self>, answer: Result<Value, Value>, config: &mut crate::DeviceConfig) {
+        let _ = (answer, config);
+        self.unsupported();
+    }
+}
+
+/// A call of one export function of a device by name: what a control call is to a backend that
+/// calls exports by name ([`ControlCall::invocation`]). `interface` is the export's name without
+/// a version (`wasmnet:control/commands`), as [`crate::Network::device_exports`] lists it;
+/// `function` its name in the interface (`invoke`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Invocation {
+    pub interface: String,
+    pub function: String,
+    pub args: Vec<Value>,
+}
+
+impl Invocation {
+    pub fn new(
+        interface: impl Into<String>,
+        function: impl Into<String>,
+        args: Vec<Value>,
+    ) -> Self {
+        Self {
+            interface: interface.into(),
+            function: function.into(),
+            args,
+        }
+    }
 }
 
 /// A control call an operator event makes when it applies (each application gets a fresh call).

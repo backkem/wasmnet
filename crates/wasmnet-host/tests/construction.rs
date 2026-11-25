@@ -180,3 +180,20 @@ fn extension_parsers() {
     assert!(op.parse(&Value::None).is_err());
     let _: fn(ExtensionOp) = |_| {};
 }
+
+#[test]
+fn portable_exports() {
+    use wasmnet_host::sim::Invocation;
+    use wasmnet_host::sim::export::{ExportCall, ExportRequest};
+    use wasmnet_host::sim::value::Value;
+    let invocation = Invocation::new("example:pad/inspect", "size", vec![Value::str("log")]);
+    assert_eq!(invocation.function, "size");
+    let call = ExportCall::new(invocation.clone()).reschedule(true);
+    let _answer = call.answer_slot();
+    let _ = Op::control(
+        DeviceId::from_index(0),
+        ExportRequest::new(invocation)
+            .reschedule(true)
+            .into_control(),
+    );
+}

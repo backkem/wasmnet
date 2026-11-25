@@ -82,6 +82,7 @@ mod device;
 mod device_events;
 pub mod digest;
 mod exec;
+pub mod export;
 pub mod ext;
 pub mod infra;
 mod input;
@@ -112,7 +113,7 @@ pub use digest::Digest;
 pub use exec::{ActorFuture, Boundary, OpState, Stalled, Stats, Step, block_on};
 pub use ext::{
     CableKind, Control, DeviceExt, ExtOptions, ExtValue, ExtensionOp, ImportServer, Interface,
-    NetworkExtension, Served,
+    Invocation, NetworkExtension, Served,
 };
 pub use infra::{Infra, InfraEnd};
 pub use input::InputQueue;

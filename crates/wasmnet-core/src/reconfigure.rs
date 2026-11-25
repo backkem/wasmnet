@@ -167,4 +167,46 @@ impl ControlCall for ReconfigureCall {
             "this device's backend does not serve {RECONFIGURE_EXPORT}"
         ))));
     }
+
+    /// `reconfigure(now, config)`, every key of the new config as a `(key, value)` pair.
+    fn invocation(&self, now: crate::Nanos) -> Option<crate::ext::Invocation> {
+        use crate::value::Value;
+        let pairs = self
+            .config
+            .iter()
+            .map(|(k, v)| Value::Tuple(vec![Value::str(k.as_str()), Value::str(v.as_str())]))
+            .collect();
+        Some(crate::ext::Invocation::new(
+            RECONFIGURE_EXPORT,
+            "reconfigure",
+            vec![Value::U64(now), Value::List(pairs)],
+        ))
+    }
+
+    /// `ok`, or the `refusal` variant (`restart(why)`, `invalid(why)`).
+    fn invoked(
+        self: Box<Self>,
+        answer: Result<crate::value::Value, crate::value::Value>,
+        config: &mut DeviceConfig,
+    ) {
+        use crate::value::Value;
+        let answer = match answer {
+            Ok(_) => Ok(()),
+            Err(Value::Variant(tag, why)) => {
+                let why = match why.map(|w| *w) {
+                    Some(Value::Str(s)) => s,
+                    other => format!("{other:?}"),
+                };
+                Err(if tag == "invalid" {
+                    Refusal::Invalid(why)
+                } else {
+                    Refusal::Restart(why)
+                })
+            }
+            Err(other) => Err(Refusal::Restart(format!(
+                "an answer of the wrong shape: {other:?}"
+            ))),
+        };
+        self.finish_serving(answer, config);
+    }
 }

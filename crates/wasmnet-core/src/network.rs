@@ -151,8 +151,10 @@ pub struct DeviceInstance {
     pub actor: ActorFuture,
     /// It exports `wasmnet:link/counters`.
     pub has_counters: bool,
-    /// The optional exports the backend found and serves control calls for
-    /// ([`ControlCall::export`]), by interface name.
+    /// Every interface the device exports, by name without a version
+    /// (`wasmnet:control/commands`), sorted: the exports control calls ([`ControlCall::export`])
+    /// may go to. Whether the backend serves a call for one is its handler's business (a call it
+    /// cannot serve is refused by the call's own words).
     pub exports: Vec<String>,
     /// A composed node's apps (its `app-<name>` exports, by name, in the order they start).
     pub apps: Vec<String>,
@@ -655,24 +657,62 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
     /// sets up, after those of the extensions registered before it. One extension per type: a
     /// second of the same type replaces the first in its place.
     ///
+    /// Panics if another extension already declares one of its option keys or operator event
+    /// kinds ([`try_add_extension`](Self::try_add_extension) refuses instead).
+    ///
     /// Embedder surface, unstable (extension points, [`crate::ext`]).
     pub fn add_extension<T: NetworkExtension>(&mut self, extension: T) {
-        let id = TypeId::of::<T>();
-        match self
-            .extensions
-            .iter_mut()
-            .find(|e| (&***e as &dyn Any).type_id() == id)
-        {
-            Some(slot) => *slot = Box::new(extension),
-            None => self.extensions.push(Box::new(extension)),
+        if let Err(e) = self.try_add_extension(extension) {
+            panic!("{e}");
         }
-        self.refresh_parsers();
+    }
+
+    /// [`add_extension`](Self::add_extension), refusing ([`Error::Refused`], nothing changes) an
+    /// extension that declares an option key or an operator event kind another extension of
+    /// the network declares already.
+    pub fn try_add_extension<T: NetworkExtension>(&mut self, extension: T) -> Result<()> {
+        self.try_add_boxed_extension(Box::new(extension))
     }
 
     /// [`add_extension`](Self::add_extension) for an extension whose type the caller does not
     /// name (an installer that returns boxed extensions): one per type, the same rules.
     pub fn add_boxed_extension(&mut self, extension: Box<dyn NetworkExtension>) {
+        if let Err(e) = self.try_add_boxed_extension(extension) {
+            panic!("{e}");
+        }
+    }
+
+    /// [`try_add_extension`](Self::try_add_extension) for a boxed extension.
+    pub fn try_add_boxed_extension(&mut self, extension: Box<dyn NetworkExtension>) -> Result<()> {
         let id = (&*extension as &dyn Any).type_id();
+        // What the others declare (an extension of the same type is replaced: not an other).
+        let others: Vec<&Box<dyn NetworkExtension>> = self
+            .extensions
+            .iter()
+            .filter(|e| (&***e as &dyn Any).type_id() != id)
+            .collect();
+        for o in extension.options() {
+            if others
+                .iter()
+                .any(|e| e.options().iter().any(|x| x.key() == o.key()))
+            {
+                return Err(Error::Refused(format!(
+                    "another extension already reads the option `{}`",
+                    o.key()
+                )));
+            }
+        }
+        for p in extension.ops() {
+            if others
+                .iter()
+                .any(|e| e.ops().iter().any(|x| x.kind() == p.kind()))
+            {
+                return Err(Error::Refused(format!(
+                    "another extension already builds the operator event `{}`",
+                    p.kind()
+                )));
+            }
+        }
         match self
             .extensions
             .iter_mut()
@@ -682,6 +722,7 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
             None => self.extensions.push(extension),
         }
         self.refresh_parsers();
+        Ok(())
     }
 
     /// The portable interfaces the network's extensions serve, in registration order
@@ -693,8 +734,8 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
             .collect()
     }
 
-    /// Rebuilds the parsers from the extensions, in registration order: a key two extensions
-    /// declare goes to the first.
+    /// Rebuilds the parsers from the extensions (no two declare one key or kind:
+    /// [`try_add_boxed_extension`](Self::try_add_boxed_extension) refuses the second).
     fn refresh_parsers(&mut self) {
         let mut parsers = crate::ext::Parsers::default();
         for e in &self.extensions {
@@ -869,7 +910,25 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
         Ok(answer.get())
     }
 
-    /// The optional exports the device's backend serves control calls for.
+    /// Calls `invocation` (a function of one of the device's exports, by name) and returns its
+    /// answer: `Ok(Ok(value))`, `Ok(Err(value))` for a `result`'s error, `Err(why)` when no
+    /// backend serves it. `Ok(None)`: the device does not report the export. A control call like
+    /// [`command`](Self::command): at the network's current instant, between runs.
+    pub fn invoke(
+        &mut self,
+        device: DeviceId,
+        invocation: crate::ext::Invocation,
+    ) -> Result<Option<std::result::Result<crate::export::Answered, String>>> {
+        let call = crate::export::ExportCall::new(invocation);
+        let answer = call.answer_slot();
+        if !self.control(device, Box::new(call))? {
+            return Ok(None);
+        }
+        Ok(answer.get())
+    }
+
+    /// Every interface the device exports, by name without a version, sorted (both backends
+    /// report the same list): the exports control calls may go to.
     pub fn device_exports(&self, device: DeviceId) -> &[String] {
         &self.devices[device.0].exports
     }

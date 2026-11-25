@@ -190,6 +190,32 @@ impl ControlCall for CommandCall {
             "this device's backend does not serve {COMMANDS_EXPORT}"
         )));
     }
+
+    /// `invoke(now, command, argument)`.
+    fn invocation(&self, now: crate::Nanos) -> Option<crate::ext::Invocation> {
+        use crate::value::Value;
+        Some(crate::ext::Invocation::new(
+            COMMANDS_EXPORT,
+            "invoke",
+            vec![
+                Value::U64(now),
+                Value::str(self.command()),
+                Value::str(self.argument()),
+            ],
+        ))
+    }
+
+    fn invoked(
+        self: Box<Self>,
+        answer: Result<crate::value::Value, crate::value::Value>,
+        _config: &mut crate::DeviceConfig,
+    ) {
+        let text = |v: crate::value::Value| match v {
+            crate::value::Value::Str(s) => s,
+            other => format!("an answer of the wrong shape: {other:?}"),
+        };
+        self.finish(answer.map(text).map_err(text));
+    }
 }
 
 #[cfg(test)]

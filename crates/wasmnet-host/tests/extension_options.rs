@@ -247,3 +247,48 @@ fn a_cable_kind_has_one_model() {
         "{again}"
     );
 }
+
+/// Declares the pad's option key (`same_key`) or its operator event kind.
+struct Rival {
+    same_key: bool,
+}
+
+impl sim::NetworkExtension for Rival {
+    fn options(&self) -> Vec<sim::ext::ExtOption> {
+        let key = if self.same_key {
+            "pad.fault-at"
+        } else {
+            "rival.level"
+        };
+        vec![sim::ext::ExtOption::new(key, |_| Ok(0u32))]
+    }
+
+    fn ops(&self) -> Vec<sim::ext::ExtOpParser> {
+        let kind = if self.same_key {
+            "rival.reset"
+        } else {
+            "pad.clear"
+        };
+        vec![sim::ext::ExtOpParser::new(kind, |_| Err("no".to_owned()))]
+    }
+}
+
+#[test]
+fn a_second_extension_may_not_declare_a_key_or_kind_again() {
+    for same_key in [true, false] {
+        let mut net = network(1);
+        let refused = net.try_add_extension(Rival { same_key }).unwrap_err();
+        let what = if same_key {
+            "option `pad.fault-at`"
+        } else {
+            "operator event `pad.clear`"
+        };
+        assert!(refused.to_string().contains(what), "{refused}");
+        // Nothing changed: the pad still parses its own.
+        assert!(net.parse_op("pad.clear", &Value::None).is_ok());
+    }
+    // A second of the same type replaces the first, keys and all.
+    let mut net = network(1);
+    net.try_add_extension(Pad::default())
+        .expect("the same type again");
+}
