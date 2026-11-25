@@ -35,7 +35,7 @@ Tunnels from the config take their slots in name order.
 **Addresses.** A tunnel's `local` is its transit address with a prefix length, the port's own
 address and connected route (`fd00:ff::a/128`). The far end's transit address is not
 configured: the port is point to point, and a route over it needs no next hop. Either family
-works inside; the outer packets are IPv4.
+works inside, and either outside ([below](#the-outer-family)): all four combinations.
 
 ## The wire format
 
@@ -45,13 +45,16 @@ it, told apart by their id.
 **Data** is [Geneve](https://www.rfc-editor.org/rfc/rfc8926) (RFC 8926):
 
 ```text
-outer IPv4 (20) | UDP (8): from the tunnel's port to the peer's endpoint |
+outer IPv4 (20) or IPv6 (40) | UDP (8): from the tunnel's port to the peer's endpoint |
 Geneve (8): version 0, no options, O=0 C=0 | protocol 0x86DD or 0x0800 | VNI = id | 0 |
 inner packet, as routed (one hop less)
 ```
 
-The outer source is the router's address on the egress port toward the peer (the IPv4 address
-of the port the route to the peer's endpoint leaves by), the TTL the router's `ttl`. Received
+The outer source is the router's address on the egress port toward the peer (the address of the
+peer's family on the port the route to the peer's endpoint leaves by; for IPv6 its configured
+address, never the link-local one), the TTL or hop limit the router's `ttl`; over IPv6 the UDP
+checksum is always computed, and a received datagram with a zero one is malformed (RFC 8200
+§8.1). Received
 packets must be version 0 of a known id with an inner packet of the family the protocol type
 says; options are skipped, a critical option (C bit) or a control packet (O bit) is dropped.
 
@@ -75,7 +78,10 @@ STUN by its heuristic; when a NAT moves a tunnel to another port, "Decode As" Ge
 that port. The end-to-end tests decode every frame between the homes with their own reading of
 both formats.
 
-**Overhead and MTU.** 36 bytes: the default tunnel MTU is 1500 - 36 = **1464**. An inner
+**Overhead and MTU.** 36 bytes over IPv4, 56 over IPv6: the default tunnel MTU is 1500 - 36 =
+**1464** over an IPv4 path and **1444** over an IPv6 one (keyed: 1438 and 1418, below). The
+default follows the outer family of the peer the tunnel is up with (IPv4 while it is down), and
+so do the port's MTU and the MSS clamp; an `mtu` that is given stays as given. An inner
 packet above it gets fragmentation needed or Packet Too Big like on any port; outer packets are
 never fragmented, and an outer packet too big for its egress port is dropped
 (`tunnel-<name>-outer-drops`).
@@ -88,11 +94,46 @@ router lowers the MSS option of every TCP SYN that enters or leaves a tunnel to 
 minus 60 (IPv6) or 40 (IPv4) bytes and recomputes the checksum (`tunnel-<name>-mss-clamped`), as
 home routers and VPNs do.
 
+## The outer family
+
+A tunnel's outer path is IPv4 or IPv6, whichever its peer's endpoint is: `peer`, `reflector`
+and `tunnel-peer` take `203.0.113.2:6081` and `[2001:db8::2]:6081` alike (not link-local, not
+IPv4-mapped: an outer path is routed), and so do the candidates it learns, its peer, its
+reflexive endpoint and the listing.
+
+- **Sending.** The router originates the outer UDP as it originates anything: routed by the
+  table to the peer's address, from the egress port's address of that family (for IPv6 its
+  configured address, never the link-local one), with the router's `ttl` as TTL or hop limit,
+  through ARP or NDP. Over IPv6 the UDP checksum is always computed. A family the router has no
+  address or route for leaves nothing (`tunnel-<name>-outer-drops`).
+- **Receiving.** A UDP datagram to a tunnel port or the `stun-server` port on one of the router's
+  addresses is the tunnel's, over either family; over IPv6 one with a zero UDP checksum is
+  malformed (RFC 8200 §8.1), and link-local addresses are not tunnel endpoints. Anything else to
+  the router gets its usual port unreachable.
+- **STUN** answers carry `XOR-MAPPED-ADDRESS` of the requester's family (RFC 8489's IPv6 form,
+  checked against RFC 5769's vector), from the `stun-server` or any tunnel port.
+- **No translation.** The router has no NAT for IPv6, so a box is reached at its own address
+  and its reflexive endpoint is that address. A home router with a stateful filter on its
+  outside port (`port<N>.allow` with no rule for the tunnel's UDP) lets the other box in only as
+  part of a flow its own box started, which is hole punching as through a filtering NAT:
+  `tests/tunnel6.rs` punches through two such filters.
+- **MTU.** The overhead is 20 bytes larger over IPv6, and the default MTU follows the family of
+  the peer the tunnel is up with: 1464 or 1444 without a key, 1438 or 1418 with one. The port's
+  MTU (Packet Too Big and fragmentation needed for what does not fit) and the MSS clamp follow it
+  when the tunnel comes up or its peer moves to the other family. A given `mtu` stays.
+- **Mixed candidates.** A tunnel may have candidates of both families. Each round checks all of
+  them alike, in order; the first answer brings it up over its family, and a later answer from
+  another candidate does not move it (an answer only says a check got through). Once up, the
+  peer's own checks and data move it, to an endpoint of either family, as after a NAT
+  rebinding (`tunnel-roamed`), and the MTU follows. There is no preference between families
+  and no racing of them (Happy Eyeballs): a controller that wants one family gives candidates of
+  that family only.
+
 ## What the router does
 
 A tunnel is `idle` (nothing to probe), `probing`, `up` or `failed`.
 
-- **Candidates** are endpoints where the peer may be: its `peer` setting, `tunnel-peer`
+- **Candidates** are endpoints where the peer may be, of either family: its `peer` setting, `tunnel-peer`
   commands, and the source of every check it receives (peer-reflexive, as ICE learns them), at
   most 8. One added by a command, or learnt while the tunnel is not up, is journalled as
   `tunnel-candidate {tunnel, endpoint, source}`; the settings' peers and the endpoints a tunnel
@@ -109,10 +150,11 @@ A tunnel is `idle` (nothing to probe), `probing`, `up` or `failed`.
 - **Keepalives**: once up, a check to the peer every `keepalive` (25 s, under every NAT UDP
   timeout RFC 4787 allows). Its answer refreshes the NAT mappings on both sides and reports the
   tunnel's reflexive endpoint.
-- **Roaming**: once up, any check, response or data packet with the tunnel's id from another
-  endpoint moves the peer there (`tunnel-roamed {tunnel, from, to}`). That is how a tunnel
-  survives a NAT that gave the peer a new mapping (`tests/tunnel.rs`, a NAT rebinding). The id
-  is not a credential, so anyone who can send to the tunnel's port can also steer a keyless
+- **Roaming**: once up, any check or data packet with the tunnel's id from another endpoint
+  (of either family) moves the peer there (`tunnel-roamed {tunnel, from, to}`); an answer does
+  not (it only says one of the round's checks got through, [mixed
+  candidates](#the-outer-family)). That is how a tunnel survives a NAT that gave the peer a new
+  mapping (`tests/tunnel.rs`, a NAT rebinding). The id is not a credential, so anyone who can send to the tunnel's port can also steer a keyless
   tunnel; a keyed one moves only for its peer ([below](#keyed-tunnels)).
 - **Liveness**: nothing heard from the peer for `dead` (80 s) takes the tunnel down
   (`tunnel-down {tunnel, peer, silent-ns}`); it probes every candidate again, the old peer
@@ -160,7 +202,7 @@ Data is [ESP](https://www.rfc-editor.org/rfc/rfc4303) (RFC 4303) in UDP
 [ChaCha20-Poly1305](https://www.rfc-editor.org/rfc/rfc7634) (RFC 7634), manually keyed:
 
 ```text
-outer IPv4 (20) | UDP (8): port 4500 by default |
+outer IPv4 (20) or IPv6 (40) | UDP (8): port 4500 by default |
 SPI (4, top bit set) | sequence number (4) | IV (8: the sequence number, zero-extended) |
 encrypted: inner packet | padding 1, 2, 3 (to a multiple of 4) | pad length | next header 4 or 41 |
 ICV (16: the Poly1305 tag)
@@ -171,9 +213,9 @@ number (no extended sequence numbers). The receiver checks the sequence number a
 128-packet anti-replay window before it decrypts and records it only once the tag checked;
 padding and next header must be what RFC 4303 sends. A sequence number is never reused: an SA
 that has sent 2^32 - 1 packets sends no more (`tunnel-key-exhausted`) until the controller
-replaces the key. Overhead: 20 + 8 + 34 = 62 bytes (plus up to 3 bytes of padding), so the
-default MTU is 1500 - 62 = 1438, a length that needs no padding, and the MSS clamp follows it
-(1378 for IPv6 inside, 1398 for IPv4).
+replaces the key. Overhead: 20 + 8 + 34 = 62 bytes over IPv4, 82 over IPv6 (plus up to 3 bytes
+of padding), so the default MTU is 1500 - 62 = 1438 or 1500 - 82 = 1418, lengths that need no
+padding, and the MSS clamp follows it (1378 and 1358 for IPv6 inside, 1398 and 1378 for IPv4).
 
 Checks stay STUN on the same port, signed: a keyed tunnel's check and its answer carry
 `TUNNEL-SA` (a comprehension-optional attribute of this library's own, `0xC0E5`, not registered
@@ -202,17 +244,24 @@ protocols on real bytes that a capture tool decodes. Three choices were weighed:
   checked here against RFC 7634's own example. Its cost: 8 more bytes than WireGuard's header
   and a 4-byte alignment.
 
-So ESP. Wireshark's dissector for UDP 4500 (RFC 3948) takes what is not IKE for ESP, so it
-shows each data packet's SPI and sequence number; it likely shows the STUN checks on that port
-as ESP too, unless "Decode As" says otherwise (not checked here).
+So ESP. **What a capture tool shows**, from Wireshark's source as of 2026-11 (its
+`epan/dissectors/packet-ipsec-udp.c` and `packet-ipsec.c`; not tried on a capture of this
+library): the `udpencap` dissector, registered on UDP 4500, calls a single 0xFF byte a NAT
+keepalive, a payload whose first four bytes are zero IKE (the non-ESP marker), and anything else
+ESP. So every keyed data packet is shown as ESP with its SPI and sequence number, and so are the
+STUN checks on that port (their first four bytes are not zero) unless "Decode As" says STUN. A
+keyed tunnel on another port needs "Decode As" UDPENCAP.
 
-**Decrypting a capture** takes an ESP SA per direction in Wireshark's ESP protocol preferences: the outer addresses, the SPI, the encryption algorithm
-ChaCha20-Poly1305 (RFC 7634) with its 36-byte key (key and salt) and no separate
-authentication. The keys per direction come from the tunnel key (below), and everything else
-they need is in the capture: each signed check's `TUNNEL-SA` (in the clear) gives its sender's
-SPI and epoch, and a direction's 36 bytes are HKDF(tunnel key, `esp`, receiver's SPI, sender's
-epoch). This library prints no key and has no tool that derives them yet. Whether a given
-Wireshark version lists ChaCha20-Poly1305 among its ESP algorithms was not checked here.
+**Decrypting a capture.** Wireshark's ESP protocol preferences have "Attempt to detect/decode
+encrypted ESP payloads" and the "ESP SAs" table (columns Protocol, Src IP, Dest IP, SPI,
+Encryption, Encryption Key, Authentication, Authentication Key, SN, ESN High Bits), whose
+Encryption choices include "ChaCha20 with Poly1305 [RFC7634]": its key is 36 bytes, the key and
+then the 4-byte salt, and its nonce the salt and the packet's 8-byte IV, which is this format.
+One SA row per direction: the outer addresses, the SPI, that algorithm and the 36 bytes, the SN
+32-bit. The keys per direction come from the tunnel key (below), and everything else they need
+is in the capture: each signed check's `TUNNEL-SA` (in the clear) gives its sender's SPI and
+epoch, and a direction's 36 bytes are HKDF(tunnel key, `esp`, receiver's SPI, sender's epoch).
+This library prints no key and has no tool that derives them yet.
 
 ### Keys, directions and epochs
 
@@ -375,9 +424,13 @@ with `run_until`.
 ## Limits and what is not covered
 
 - At most 256 tunnels per router, 8 candidates and 8 reflectors per tunnel.
-- Outer packets are IPv4 only: no IPv6 outer endpoints, no choice between several outer
-  families (Happy Eyeballs).
-- No path MTU discovery for the outer path: the tunnel MTU is configured.
+- No preference between outer families (no Happy Eyeballs): candidates of both are probed alike
+  and the first answer wins ([below](#the-outer-family)).
+- No path MTU discovery for the outer path: the tunnel MTU is configured, or the 1500-byte
+  default of its family; an outer packet too big for a router on the way is lost there (its
+  Packet Too Big or fragmentation needed is not acted on).
+- No IPv6 translation (NAT66 or NPTv6): over IPv6 a box is reached at its own address, through
+  whatever stateful filter its home router has.
 - Commands are native only, like every device command ([known-issues.md](../known-issues.md)).
 - No TURN-style relaying of outer datagrams, no WebRTC data channels.
 
@@ -391,7 +444,11 @@ with `run_until`.
   against RFC 8439's, HKDF against RFC 5869's first test case, STUN integrity against RFC
   5769's HMAC-SHA1 values, the replay window (late packets, the edge of the window, the top of
   the sequence space), and two keyed ends with an attacker between them (replays, reflection,
-  forged and unsigned checks, a wrong key, a keyless peer, a key replaced, a restart), MSS clamping, the state machine (probing, up, keepalive,
+  forged and unsigned checks, a wrong key, a keyless peer, a key replaced, a restart), an outer
+  IPv6 path through the whole router (both inner families in Geneve and in ESP, the MTU and the
+  clamp per family, Packet Too Big at the tunnel port, a zero UDP checksum refused, mixed
+  candidates, the `stun-server` and port unreachable over IPv6, endpoint parsing, arbitrary
+  datagrams), MSS clamping, the state machine (probing, up, keepalive,
   roaming, down, failed, reflectors), and through the whole router: encapsulation and
   decapsulation of IPv4 and IPv6 inner packets, an echo request to a transit address, routes by
   name surviving another tunnel's removal, tunnels from the config, Binding requests, a
@@ -408,4 +465,9 @@ with `run_until`.
   key and with a broken integrity (nothing injected, roamed or answered), two controllers that
   replace a live tunnel's key through `devices.control` (one on a timer, one on its box's
   `tunnel-auth-failed`) while fetches go on, the captures of a keyless tunnel pinned as they were
-  before keys existed, and what the cryptography costs in fuel.
+  before keys existed, and what the cryptography costs in fuel. Over IPv6
+  (`crates/wasmnet-host/tests/tunnel6.rs`, the same way): HTTP for both inner families, keyless
+  and keyed, with the clamp checked on the wire; two stateful home filters punched through; a
+  tunnel whose candidates mix families coming up over the one that works. With
+  `ipv4_inside_over_an_ipv4_tunnel_keyless_and_keyed` all four combinations of inner and outer
+  family are covered.

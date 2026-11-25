@@ -361,9 +361,9 @@ tunnels; their ports follow the cabled ones in name order. `id` and `local` are 
 | `tunnel.<name>.key` | 64 hex digits (32 bytes) | none | The tunnel key, the same at both ends: data becomes ESP in UDP with ChaCha20-Poly1305 and checks are signed ([tunnels.md](tunnels.md#keyed-tunnels)). Never shown again: answers and events give its id. |
 | `tunnel.<name>.local` | `addr/len`, IPv4 or IPv6, not link-local | required | The transit address and its connected route (`fd00:ff::a/128`). |
 | `tunnel.<name>.udp` | integer, 1..=65535 | `6081`, `4500` with a key | The local UDP port, shared with other tunnels of other ids. |
-| `tunnel.<name>.peer` | IPv4 endpoints, comma-separated, at most 8 | none | Candidate endpoints of the peer. |
-| `tunnel.<name>.reflector` | IPv4 endpoints, comma-separated, at most 8 | none | Where to ask for the tunnel's reflexive endpoint (a router's `stun-server` or tunnel port). |
-| `tunnel.<name>.mtu` | integer, 1280..=9000 | `1464`, `1438` with a key | The tunnel port's IP MTU: 1500 minus 36 bytes of outer IPv4, UDP and Geneve, or minus 62 of outer IPv4, UDP and ESP. |
+| `tunnel.<name>.peer` | endpoints (`203.0.113.2:6081` or `[2001:db8::2]:6081`), comma-separated, at most 8 | none | Candidate endpoints of the peer, of either family ([tunnels.md](tunnels.md#the-outer-family)). |
+| `tunnel.<name>.reflector` | endpoints, comma-separated, at most 8 | none | Where to ask for the tunnel's reflexive endpoint (a router's `stun-server` or tunnel port). |
+| `tunnel.<name>.mtu` | integer, 1280..=9000 | by the peer's family: `1464` over IPv4, `1444` over IPv6; with a key `1438` and `1418` | The tunnel port's IP MTU: 1500 minus the outer IPv4 (20) or IPv6 (40) header, UDP (8), and Geneve (8) or ESP (34). Without it the MTU follows the family of the peer the tunnel is up with. |
 | `tunnel.<name>.probe` | duration above zero | `100ms` | Time between two probing rounds. |
 | `tunnel.<name>.rounds` | integer, 1..=1000 | `20` | Probing rounds without an answer before the tunnel is `failed`. |
 | `tunnel.<name>.keepalive` | duration above zero | `25s` | Time between two checks to the peer while up. |
