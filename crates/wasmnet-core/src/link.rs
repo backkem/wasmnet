@@ -917,12 +917,14 @@ impl Panel {
         self
     }
 
-    /// Registers the model of cable kind `kind`.
-    pub(crate) fn register_cable(&self, kind: CableKind, model: Arc<dyn CableModel>) {
-        self.cables
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(kind.code(), model);
+    /// Registers the model of cable kind `kind`; `false` (nothing changed) if the kind has one.
+    pub(crate) fn register_cable(&self, kind: CableKind, model: Arc<dyn CableModel>) -> bool {
+        let mut cables = self.cables.lock().unwrap_or_else(PoisonError::into_inner);
+        if cables.contains_key(&kind.code()) {
+            return false;
+        }
+        cables.insert(kind.code(), model);
+        true
     }
 
     fn cable_model(&self, kind: LinkKind) -> Option<Arc<dyn CableModel>> {

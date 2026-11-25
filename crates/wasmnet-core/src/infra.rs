@@ -328,6 +328,8 @@ struct State {
     event_waiters: BTreeMap<String, Vec<EventWaiter>>,
     /// Each stepped controller's armed wait ([`InfraEnd::arm`]), by controller.
     arms: BTreeMap<String, Arm>,
+    /// The network's extensions' option parsers: a spec's keys of theirs.
+    parsers: Arc<Mutex<crate::ext::Parsers>>,
 }
 
 /// A wait for a device's events: woken by an event matching `kinds` after `since`, by a gap
@@ -413,6 +415,7 @@ impl Infra {
             seqs: BTreeMap::new(),
             event_waiters: BTreeMap::new(),
             arms: BTreeMap::new(),
+            parsers: Arc::default(),
         }));
         // The events of the devices controllers created are kept as they are journalled, in
         // the journalling device's own processing context, so a wake they cause is at the same
@@ -999,6 +1002,21 @@ impl Infra {
     /// The derived request `index` (the network applies it).
     pub(crate) fn request(&self, index: usize) -> Option<Request> {
         self.state().requests.get(index).cloned()
+    }
+
+    /// The network's extensions' parsers, for the spec keys of theirs.
+    pub(crate) fn set_parsers(&self, parsers: Arc<Mutex<crate::ext::Parsers>>) {
+        self.state().parsers = parsers;
+    }
+
+    /// The extensions' parsers as they are now.
+    fn parsers(&self) -> crate::ext::Parsers {
+        let p = self.state().parsers.clone();
+        let p = p
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        p
     }
 
     /// Whether a recreate of `name` is in progress.
@@ -1649,7 +1667,8 @@ impl InfraEnd {
         if labels.windows(2).any(|w| w[0].0 == w[1].0) {
             return Err(InfraError::Invalid("a label key is given twice".into()));
         }
-        let (parsed, canonical) = parse_spec(spec)?;
+        let parsers = self.infra.parsers();
+        let (parsed, canonical) = parse_spec_with(spec, &parsers)?;
         if crate::supply::is_reference(&parsed.component) {
             self.require_supply()?;
             crate::supply::check_reference(&parsed.component).map_err(InfraError::Invalid)?;
@@ -1728,7 +1747,7 @@ impl InfraEnd {
                 }
                 // Only the config changed: the device may take it in place (the network
                 // decides when it applies: a device without the export is recreated).
-                let in_place = parse_spec(&item.spec).is_ok_and(|(old, _)| {
+                let in_place = parse_spec_with(&item.spec, &parsers).is_ok_and(|(old, _)| {
                     old.component == parsed.component
                         && old.options == parsed.options
                         && old.wire == parsed.wire
@@ -2531,7 +2550,18 @@ fn flatten(prefix: &str, v: &Value, config: &mut DeviceConfig) -> Result<(), Inf
 }
 
 /// Validates a derived device spec; returns it parsed and in its canonical CBOR form.
+#[cfg(test)]
 pub(crate) fn parse_spec(bytes: &[u8]) -> Result<(DerivedSpec, Vec<u8>), InfraError> {
+    parse_spec_with(bytes, &crate::ext::Parsers::default())
+}
+
+/// [`parse_spec`], with the keys the network's extensions read ([`crate::ext::ExtOption`]): their
+/// values are parsed into the device's `DeviceOptions::ext` and kept as given in the canonical spec.
+pub(crate) fn parse_spec_with(
+    bytes: &[u8],
+    parsers: &crate::ext::Parsers,
+) -> Result<(DerivedSpec, Vec<u8>), InfraError> {
+    let mut ext_keys: Vec<(String, Value)> = Vec::new();
     let v = det_cbor::decode(bytes).map_err(|e| invalid(format!("spec: not CBOR: {e:?}")))?;
     let Value::Map(entries) = &v else {
         return Err(invalid("a spec is a map: {component, config?, ...}"));
@@ -2590,7 +2620,16 @@ pub(crate) fn parse_spec(bytes: &[u8]) -> Result<(DerivedSpec, Vec<u8>), InfraEr
                     "a controller cannot grant `{k}` (only the embedder can)"
                 )));
             }
-            other => return Err(invalid(format!("spec: unknown key `{other}`"))),
+            other => match parsers.options.get(other) {
+                Some(option) => {
+                    let parsed = option
+                        .parse(&cbor_value(val))
+                        .map_err(|e| invalid(format!("spec: `{other}`: {e}")))?;
+                    options.ext.set_value(parsed);
+                    ext_keys.push((other.to_owned(), val.clone()));
+                }
+                None => return Err(invalid(format!("spec: unknown key `{other}`"))),
+            },
         }
     }
     let component = component.ok_or_else(|| invalid("spec: no component"))?;
@@ -2600,11 +2639,12 @@ pub(crate) fn parse_spec(bytes: &[u8]) -> Result<(DerivedSpec, Vec<u8>), InfraEr
         options,
         wire,
     };
-    let canonical = spec_value(
+    let canonical = spec_value_ext(
         &spec.component,
         &spec.config,
         spec.options.clone(),
         Some(&spec.wire),
+        &ext_keys,
     );
     Ok((spec, canonical))
 }
@@ -2831,6 +2871,17 @@ pub(crate) fn spec_value(
     options: DeviceOptions,
     wire: Option<&[CableReq]>,
 ) -> Vec<u8> {
+    spec_value_ext(component, config, options, wire, &[])
+}
+
+/// [`spec_value`], with the extensions' keys as the spec gave them.
+fn spec_value_ext(
+    component: &str,
+    config: &DeviceConfig,
+    options: DeviceOptions,
+    wire: Option<&[CableReq]>,
+    ext_keys: &[(String, Value)],
+) -> Vec<u8> {
     let mut m = vec![
         (Value::text("component"), Value::text(component)),
         (
@@ -2901,6 +2952,9 @@ pub(crate) fn spec_value(
     if let Some(wire) = wire.filter(|w| !w.is_empty()) {
         let cables = wire.iter().map(cable_value).collect();
         m.push((Value::text("wire"), Value::Array(cables)));
+    }
+    for (k, v) in ext_keys {
+        m.push((Value::text(k.as_str()), v.clone()));
     }
     Value::Map(m).encode()
 }
@@ -3829,5 +3883,26 @@ mod tests {
             panic!("ready")
         };
         assert_eq!(r.devices, ["r1"]);
+    }
+}
+
+/// A spec's CBOR value as the generic value an extension's parser reads: maps with text keys
+/// are records, arrays lists, unsigned integers `U64` (or `U32` when they fit), `null` none.
+fn cbor_value(v: &Value) -> crate::value::Value {
+    use crate::value::Value as V;
+    match v {
+        Value::Uint(n) => u32::try_from(*n).map_or(V::U64(*n), V::U32),
+        Value::Nint(n) => V::Str(format!("-{}", n.saturating_add(1))),
+        Value::Bytes(b) => V::Bytes(b.clone()),
+        Value::Text(s) => V::Str(s.clone()),
+        Value::Array(items) => V::List(items.iter().map(cbor_value).collect()),
+        Value::Map(entries) => V::Record(
+            entries
+                .iter()
+                .map(|(k, v)| (k.as_text().unwrap_or_default().to_owned(), cbor_value(v)))
+                .collect(),
+        ),
+        Value::Bool(b) => V::Bool(*b),
+        Value::Null => V::None,
     }
 }

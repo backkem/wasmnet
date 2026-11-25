@@ -100,6 +100,16 @@ impl ExtOptions {
         }
     }
 
+    /// Sets an option already wrapped (what an [`ExtOption`] parsed), replacing an earlier one
+    /// of its type.
+    pub fn set_value(&mut self, value: ExtValue) {
+        let id = value.type_id();
+        match self.0.binary_search_by(|v| v.type_id().cmp(&id)) {
+            Ok(i) => self.0[i] = value,
+            Err(i) => self.0.insert(i, value),
+        }
+    }
+
     /// With the option of `value`'s type set.
     pub fn with(mut self, value: impl ExtData) -> Self {
         self.set(value);
@@ -282,6 +292,28 @@ pub trait NetworkExtension: Any + Send {
     /// links them for every device; `device_setup` hands each device the servers of those it
     /// is given ([`DeviceExt::serve`]). The default serves none.
     fn interfaces(&self) -> Vec<Interface> {
+        Vec::new()
+    }
+
+    /// The device options this extension reads, each with the key it goes by outside Rust
+    /// and its parser from a generic value: what a controller's spec, the page's plain objects
+    /// and an embedder's own formats set ([`crate::Network::parse_option`]). The default
+    /// declares none.
+    fn options(&self) -> Vec<ExtOption> {
+        Vec::new()
+    }
+
+    /// Checks a device's options before the device is created (by the embedder, an operator
+    /// event or a controller); an `Err` refuses the creation with that reason. Not called when
+    /// a stopped device starts again. The default accepts everything.
+    fn check_options(&self, name: &str, options: &DeviceOptions) -> Result<(), String> {
+        let _ = (name, options);
+        Ok(())
+    }
+
+    /// The operator events this extension builds from generic values (the page's plain
+    /// objects), by kind ([`crate::Network::parse_op`]). The default builds none.
+    fn ops(&self) -> Vec<ExtOpParser> {
         Vec::new()
     }
 }
@@ -532,6 +564,8 @@ impl Eq for ExtensionOp {}
 pub struct OpContext<'a> {
     pub(crate) at: Nanos,
     pub(crate) op: Option<usize>,
+    /// The device an op timed at a device concerns ([`crate::Op::ExtensionAt`]).
+    pub(crate) device: Option<DeviceId>,
     pub(crate) network: &'a mut dyn OpTarget,
 }
 
@@ -568,6 +602,12 @@ impl OpContext<'_> {
     /// The op's virtual instant.
     pub fn at(&self) -> Nanos {
         self.at
+    }
+
+    /// The device an op timed at a device concerns ([`crate::Op::ExtensionAt`]); `None` for
+    /// other ops.
+    pub fn device(&self) -> Option<DeviceId> {
+        self.device
     }
 
     /// The running device called `name` (refused as [`OpError::NoDevice`] or
@@ -688,4 +728,93 @@ pub trait ImportServer: Send + Sync {
     fn drop_resource(&self, interface: &str, resource: &str, handle: u32) {
         let _ = (interface, resource, handle);
     }
+}
+
+// ---- options and ops from generic values -----------------------------------------------------
+
+type ParseOption = dyn Fn(&Value) -> Result<ExtValue, String> + Send + Sync;
+type ParseOp = dyn Fn(&Value) -> Result<ExtensionOp, String> + Send + Sync;
+
+/// A device option an extension reads ([`ExtOptions`]), as it is set from outside Rust: a key
+/// and a parser from a [`Value`] ([`NetworkExtension::options`]). One parser per option type:
+/// a controller's spec (its CBOR read as a `Value`), the page's plain objects and an embedder's
+/// own formats all go through it.
+#[derive(Clone)]
+pub struct ExtOption {
+    key: String,
+    parse: Arc<ParseOption>,
+}
+
+impl ExtOption {
+    /// The option `key` (an extension's own name, say `pad.fault-at`), parsed into a `T` by
+    /// `parse`.
+    pub fn new<T: ExtData>(
+        key: impl Into<String>,
+        parse: impl Fn(&Value) -> Result<T, String> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            key: key.into(),
+            parse: Arc::new(move |v| parse(v).map(ExtValue::new)),
+        }
+    }
+
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    /// Parses `value` into the option.
+    pub fn parse(&self, value: &Value) -> Result<ExtValue, String> {
+        (self.parse)(value)
+    }
+}
+
+impl fmt::Debug for ExtOption {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExtOption").field("key", &self.key).finish()
+    }
+}
+
+/// An operator event an extension builds from a generic value, by its kind (`pad.fault`):
+/// how the page's plain objects reach an extension's ops ([`NetworkExtension::ops`]).
+#[derive(Clone)]
+pub struct ExtOpParser {
+    kind: String,
+    parse: Arc<ParseOp>,
+}
+
+impl ExtOpParser {
+    pub fn new(
+        kind: impl Into<String>,
+        parse: impl Fn(&Value) -> Result<ExtensionOp, String> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            kind: kind.into(),
+            parse: Arc::new(parse),
+        }
+    }
+
+    pub fn kind(&self) -> &str {
+        &self.kind
+    }
+
+    /// Builds the op from `value`.
+    pub fn parse(&self, value: &Value) -> Result<ExtensionOp, String> {
+        (self.parse)(value)
+    }
+}
+
+impl fmt::Debug for ExtOpParser {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExtOpParser")
+            .field("kind", &self.kind)
+            .finish()
+    }
+}
+
+/// The options and op parsers of a network's extensions, by key: shared with the device table,
+/// which reads controllers' specs.
+#[derive(Clone, Default)]
+pub(crate) struct Parsers {
+    pub(crate) options: std::collections::BTreeMap<String, ExtOption>,
+    pub(crate) ops: std::collections::BTreeMap<String, ExtOpParser>,
 }

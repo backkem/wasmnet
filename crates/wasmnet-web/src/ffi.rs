@@ -290,14 +290,14 @@ struct State {
 }
 
 /// Leaves `bytes` in the result buffer; answers their length.
-fn set_result(bytes: Vec<u8>) -> i32 {
+pub(crate) fn set_result(bytes: Vec<u8>) -> i32 {
     let n = i32::try_from(bytes.len()).unwrap_or(i32::MAX);
     STATE.with_borrow_mut(|s| s.result = bytes);
     n
 }
 
 /// Leaves an error message in the result buffer; answers -1.
-fn fail(message: impl Into<String>) -> i32 {
+pub(crate) fn fail(message: impl Into<String>) -> i32 {
     set_result(message.into().into_bytes());
     -1
 }
@@ -319,7 +319,7 @@ fn with_network<T>(f: impl FnOnce(&mut Network<Js>) -> T) -> Result<T, &'static 
 }
 
 /// The bytes JavaScript passed at `(ptr, len)`.
-fn bytes<'a>(ptr: *const u8, len: usize) -> &'a [u8] {
+pub(crate) fn bytes<'a>(ptr: *const u8, len: usize) -> &'a [u8] {
     if len == 0 {
         return &[];
     }
@@ -455,14 +455,19 @@ pub extern "C" fn wn_add_device(
         Ok(c) => c,
         Err(e) => return fail(format!("config: {e}")),
     };
-    let options = match codec::decode_value(bytes(options, options_len))
-        .map_err(|e| e.to_string())
-        .and_then(|v| ops::options(&v))
-    {
-        Ok(o) => o,
+    let options = match codec::decode_value(bytes(options, options_len)) {
+        Ok(v) => v,
         Err(e) => return fail(format!("options: {e}")),
     };
-    match with_network(|n| n.device_with_options(&name, &component, config, options)) {
+    // The network's extensions read options of their own (`NetworkExtension::options`).
+    let added = with_network(|n| {
+        let sim = n.sim();
+        let options =
+            ops::options_with(&options, &sim.option_keys(), &|k, v| sim.parse_option(k, v))
+                .map_err(|e| format!("options: {e}"))?;
+        n.device_with_options(&name, &component, config, options)
+    });
+    match added {
         Ok(Ok(id)) => i32::try_from(id.index()).unwrap_or(i32::MAX),
         Ok(Err(e)) => fail(e),
         Err(e) => fail(e),
@@ -516,14 +521,23 @@ pub extern "C" fn wn_link_with(
 /// malformed event, or one the network refuses when added). Never calls JavaScript.
 #[unsafe(no_mangle)]
 pub extern "C" fn wn_add_op(op: *const u8, len: usize) -> i32 {
-    let parsed = codec::decode_value(bytes(op, len))
-        .map_err(|e| e.to_string())
-        .and_then(|v| ops::op(&v));
-    let (op, placement) = match parsed {
-        Ok(p) => p,
+    let value = match codec::decode_value(bytes(op, len)) {
+        Ok(v) => v,
         Err(e) => return fail(format!("operator event: {e}")),
     };
-    match with_network(|n| n.sim_mut().add_op(op, placement).map_err(|e| e.to_string())) {
+    // An extension's operator event at a device is built by the extension (`NetworkExtension::ops`).
+    let added = with_network(|n| {
+        let sim = n.sim();
+        let (op, placement) = ops::op_with(&value, &|device, kind, v| {
+            let id = sim
+                .live_device(device)
+                .ok_or_else(|| format!("no device `{device}`"))?;
+            Ok(wasmnet_core::Op::extension_at(id, sim.parse_op(kind, v)?))
+        })
+        .map_err(|e| format!("operator event: {e}"))?;
+        n.sim_mut().add_op(op, placement).map_err(|e| e.to_string())
+    });
+    match added {
         Ok(Ok(i)) => i32::try_from(i).unwrap_or(i32::MAX),
         Ok(Err(e)) => fail(e),
         Err(e) => fail(e),
@@ -979,4 +993,10 @@ pub extern "C" fn wn_call_done(dev: u32, call: u32, end: u32, msg: *const u8, le
     if let Some(r) = registry() {
         r.call_done(dev, call, end);
     }
+}
+
+/// Runs `f` on the page's simulator, if a network exists and no network export is running
+/// ([`crate::install::with_network`]).
+pub(crate) fn with_sim<R>(f: impl FnOnce(&mut crate::install::PageNetwork) -> R) -> Option<R> {
+    NETWORK.with(|n| n.try_borrow_mut().ok()?.as_mut().map(|n| f(n.sim_mut())))
 }

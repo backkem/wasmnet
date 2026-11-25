@@ -62,3 +62,62 @@ macro_rules! install {
         }
     };
 }
+
+/// Runs `f` on the network the page's module created, between the page's calls into it (from
+/// an embedder's own export: to read its extensions' state, or to add an operator event).
+/// `None` when there is no network yet, or when a network export is running (inside a step,
+/// where an extension reaches its own state through the servers it handed devices, never
+/// through the network).
+#[cfg(target_arch = "wasm32")]
+pub fn with_network<R>(f: impl FnOnce(&mut PageNetwork) -> R) -> Option<R> {
+    crate::ffi::with_sim(f)
+}
+
+/// What an embedder's export answers ([`export!`](crate::export!)): bytes in the module's result
+/// buffer, which the page reads with `Network.callExport`.
+#[cfg(target_arch = "wasm32")]
+#[doc(hidden)]
+pub fn answer(result: Result<Vec<u8>, String>) -> i32 {
+    match result {
+        Ok(bytes) => crate::ffi::set_result(bytes),
+        Err(message) => crate::ffi::fail(message),
+    }
+}
+
+/// The bytes the page passed an embedder's export.
+///
+/// # Safety
+///
+/// `(ptr, len)` must be the buffer the page passed the export, live for the call.
+#[cfg(target_arch = "wasm32")]
+#[doc(hidden)]
+#[allow(unsafe_code)]
+pub unsafe fn input(ptr: *const u8, len: usize) -> Vec<u8> {
+    crate::ffi::bytes(ptr, len).to_vec()
+}
+
+/// Defines an export of an embedder's own page module that the page calls with
+/// `Network.callExport(name, bytes)`: `$body` takes the bytes and answers bytes, or an error
+/// the page throws.
+///
+/// ```ignore
+/// wasmnet_web::export!(wn_my_state, |input: &[u8]| -> Result<Vec<u8>, String> {
+///     wasmnet_web::install::with_network(|net| state_of(net, input)).ok_or("busy".into())
+/// });
+/// ```
+#[macro_export]
+macro_rules! export {
+    ($name:ident, $body:expr) => {
+        #[cfg(target_arch = "wasm32")]
+        #[allow(unsafe_code)]
+        #[unsafe(no_mangle)]
+        pub extern "C" fn $name(ptr: *const u8, len: usize) -> i32 {
+            // SAFETY: the page passes a buffer it allocated in this module, live for the call.
+            let input = unsafe { $crate::install::input(ptr, len) };
+            let body: fn(
+                &[u8],
+            ) -> ::std::result::Result<::std::vec::Vec<u8>, ::std::string::String> = $body;
+            $crate::install::answer(body(&input))
+        }
+    };
+}

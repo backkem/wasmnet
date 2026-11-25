@@ -18,10 +18,13 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use wasmnet_core::ext::{DeviceExt, DeviceLife, DeviceSetup, LifeEvent, NetworkExtension};
+use wasmnet_core::ext::{
+    DeviceExt, DeviceLife, DeviceSetup, ExtOp, ExtOpParser, ExtOption, ExtensionOp, LifeEvent,
+    NetworkExtension, OpContext, OpError,
+};
 use wasmnet_core::journal::{JournalEnd, Record};
 use wasmnet_core::value::Value;
-use wasmnet_core::{ImportServer, Interface, Served, VirtualClock};
+use wasmnet_core::{DeviceOptions, ImportServer, Interface, Served, VirtualClock};
 
 /// The interface, as devices import it.
 pub const NOTES: &str = "wasmnet-test:pad/notes@0.1.0";
@@ -81,6 +84,8 @@ pub struct Pad {
     devices: BTreeMap<String, Shared>,
     /// Faults armed by device name ([`Pad::fault_at`]), for devices whose options cannot say.
     faults: BTreeMap<String, u32>,
+    /// Devices given no server ([`Pad::without`]).
+    without: Vec<String>,
 }
 
 impl Pad {
@@ -88,6 +93,13 @@ impl Pad {
     /// [`PadOptions::fault_at`], which wins when both are set).
     pub fn fault_at(mut self, name: impl Into<String>, n: u32) -> Self {
         self.faults.insert(name.into(), n);
+        self
+    }
+
+    /// Gives the device called `name` no server: its first call faults it, as a device whose
+    /// import no extension serves.
+    pub fn without(mut self, name: impl Into<String>) -> Self {
+        self.without.push(name.into());
         self
     }
 
@@ -150,6 +162,9 @@ impl NetworkExtension for Pad {
                 .and_then(|o| o.fault_at)
                 .or_else(|| self.faults.get(setup.name).copied());
         }
+        if self.without.iter().any(|w| w == setup.name) {
+            return;
+        }
         ext.serve(
             NOTES,
             Arc::new(Server {
@@ -192,6 +207,35 @@ impl NetworkExtension for Pad {
 
     fn interfaces(&self) -> Vec<Interface> {
         Self::interfaces()
+    }
+
+    /// `pad.fault-at`: [`PadOptions::fault_at`] from a number (a controller's spec, the page's
+    /// device options).
+    fn options(&self) -> Vec<ExtOption> {
+        vec![ExtOption::new("pad.fault-at", |v| match v {
+            Value::U32(n) => Ok(PadOptions::default().fault_at(*n)),
+            Value::U64(n) => u32::try_from(*n)
+                .map(|n| PadOptions::default().fault_at(n))
+                .map_err(|_| "a u32".to_owned()),
+            other => Err(format!("want a number, got {other:?}")),
+        })]
+    }
+
+    /// An append counted from 1: `fault_at` 0 never happens, and is refused.
+    fn check_options(&self, _name: &str, options: &DeviceOptions) -> Result<(), String> {
+        match options.ext.get::<PadOptions>() {
+            Some(PadOptions {
+                fault_at: Some(0), ..
+            }) => Err("pad.fault-at counts appends from 1".to_owned()),
+            _ => Ok(()),
+        }
+    }
+
+    /// `pad.clear`: [`PadOp::Clear`], at the device it is timed at.
+    fn ops(&self) -> Vec<ExtOpParser> {
+        vec![ExtOpParser::new("pad.clear", |_| {
+            Ok(ExtensionOp::new(PadOp::Clear))
+        })]
     }
 }
 
@@ -299,5 +343,42 @@ impl ImportServer for Server {
         if let Some(slot) = lock(&self.notes).handles.get_mut(handle as usize) {
             *slot = None;
         }
+    }
+}
+
+/// The fixture's operator events.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PadOp {
+    /// Clears the notes of the device the op is timed at (`Op::ExtensionAt`), journalled as
+    /// `pad-cleared {notes, by: operator}`.
+    Clear,
+}
+
+impl ExtOp for PadOp {
+    fn apply(&self, ctx: &mut OpContext<'_>) -> Result<(), OpError> {
+        let device = ctx
+            .device()
+            .ok_or_else(|| OpError::from("pad.clear is timed at a device"))?;
+        let name = ctx.device_name(device).to_owned();
+        let pad = ctx
+            .extension_mut::<Pad>()
+            .ok_or_else(|| OpError::from("this network has no pad"))?;
+        let count = pad.devices.get(&name).map_or(0, |n| {
+            let mut n = lock(n);
+            let count = n.notes.len();
+            n.notes.clear();
+            count
+        });
+        ctx.journal_event(
+            &name,
+            "pad-cleared",
+            vec![("notes", count.to_string()), ("by", "operator".to_owned())],
+        );
+        Ok(())
+    }
+
+    fn same(&self, other: &dyn ExtOp) -> bool {
+        (other as &dyn std::any::Any).downcast_ref::<Self>() == Some(self)
     }
 }

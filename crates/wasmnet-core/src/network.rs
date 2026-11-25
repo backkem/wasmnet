@@ -585,6 +585,8 @@ pub struct Network<'r, R: Runtime + ?Sized> {
     >,
     /// How many components were compiled from supplied bytes.
     supplied_compiles: u64,
+    /// The extensions' option and op parsers, by key (shared with the device table).
+    parsers: Arc<std::sync::Mutex<crate::ext::Parsers>>,
 }
 
 /// The size of each creator's range of device numbers: a creator can create this many devices
@@ -642,7 +644,9 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
             embedder_actions: std::collections::BTreeMap::new(),
             supplied: std::collections::BTreeMap::new(),
             supplied_compiles: 0,
+            parsers: Arc::default(),
         };
+        network.infra.set_parsers(network.parsers.clone());
         runtime.install(&mut network);
         network
     }
@@ -662,6 +666,7 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
             Some(slot) => *slot = Box::new(extension),
             None => self.extensions.push(Box::new(extension)),
         }
+        self.refresh_parsers();
     }
 
     /// [`add_extension`](Self::add_extension) for an extension whose type the caller does not
@@ -676,6 +681,7 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
             Some(slot) => *slot = extension,
             None => self.extensions.push(extension),
         }
+        self.refresh_parsers();
     }
 
     /// The portable interfaces the network's extensions serve, in registration order
@@ -685,6 +691,80 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
             .iter()
             .flat_map(|e| e.interfaces())
             .collect()
+    }
+
+    /// Rebuilds the parsers from the extensions, in registration order: a key two extensions
+    /// declare goes to the first.
+    fn refresh_parsers(&mut self) {
+        let mut parsers = crate::ext::Parsers::default();
+        for e in &self.extensions {
+            for o in e.options() {
+                parsers.options.entry(o.key().to_owned()).or_insert(o);
+            }
+            for p in e.ops() {
+                parsers.ops.entry(p.kind().to_owned()).or_insert(p);
+            }
+        }
+        *self
+            .parsers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = parsers;
+    }
+
+    /// Parses the extension option `key` from a generic value ([`crate::ext::ExtOption`]): what
+    /// a controller's spec, the page's plain objects and an embedder's own formats set.
+    pub fn parse_option(
+        &self,
+        key: &str,
+        value: &crate::value::Value,
+    ) -> std::result::Result<crate::ext::ExtValue, String> {
+        let parsers = self
+            .parsers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match parsers.options.get(key) {
+            Some(o) => o.parse(value).map_err(|e| format!("option `{key}`: {e}")),
+            None => Err(format!("no extension reads an option `{key}`")),
+        }
+    }
+
+    /// Sets the extension option `key` in `options`, parsed from `value` ([`parse_option`](Self::parse_option)).
+    pub fn set_option(
+        &self,
+        options: &mut DeviceOptions,
+        key: &str,
+        value: &crate::value::Value,
+    ) -> std::result::Result<(), String> {
+        options.ext.set_value(self.parse_option(key, value)?);
+        Ok(())
+    }
+
+    /// The keys of the extension options the network's extensions read, sorted.
+    pub fn option_keys(&self) -> Vec<String> {
+        let parsers = self
+            .parsers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        parsers.options.keys().cloned().collect()
+    }
+
+    /// Builds the extension operator event `kind` from a generic value
+    /// ([`crate::ext::ExtOpParser`]): what the page's plain objects ask for.
+    pub fn parse_op(
+        &self,
+        kind: &str,
+        value: &crate::value::Value,
+    ) -> std::result::Result<crate::ext::ExtensionOp, String> {
+        let parsers = self
+            .parsers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match parsers.ops.get(kind) {
+            Some(p) => p
+                .parse(value)
+                .map_err(|e| format!("operator event `{kind}`: {e}")),
+            None => Err(format!("no extension builds an operator event `{kind}`")),
+        }
     }
 
     /// The network's extension of type `T`, if registered.
@@ -701,12 +781,21 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
             .find_map(|e| (&mut **e as &mut dyn Any).downcast_mut())
     }
 
-    /// Registers what links of cable kind `kind` carry ([`LinkMut::kind`]`(LinkKind::Cable)`),
-    /// replacing an earlier model of that kind.
+    /// Registers what links of cable kind `kind` carry ([`LinkMut::kind`]`(LinkKind::Cable)`).
+    /// A kind has one model: registering a second one is refused ([`Error::Refused`], nothing
+    /// changes), so two extensions cannot share a code by accident.
     ///
     /// Embedder surface, unstable (extension points, [`crate::ext`]).
-    pub fn register_cable(&mut self, kind: CableKind, model: Arc<dyn CableModel>) {
-        self.panel.register_cable(kind, model);
+    pub fn register_cable(&mut self, kind: CableKind, model: Arc<dyn CableModel>) -> Result<()> {
+        if self.panel.register_cable(kind, model) {
+            Ok(())
+        } else {
+            Err(Error::Refused(format!(
+                "cable kind {} already has a model ({})",
+                kind.code(),
+                self.panel.kind_name(LinkKind::Cable(kind))
+            )))
+        }
     }
 
     /// The name of a link kind: `ethernet`, or its cable model's name (`cable` for a kind
@@ -839,6 +928,8 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
         }
         self.check_grant(name, &options, false)
             .map_err(Error::Refused)?;
+        self.check_extensions(name, &options)
+            .map_err(Error::Refused)?;
         let idx = self.devices.len();
         let (rank, number) = self.builder_number().map_err(Error::Refused)?;
         // Everything queued while creating the device is in the setup slot of its number (its
@@ -939,6 +1030,20 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
     /// `infra_prefix` is malformed, given without `infra`, or overlaps another controller's;
     /// and a controller that puts controllers on more than one site of a split network while
     /// one of them has no prefix.
+    /// The network's extensions' checks of a new device's options
+    /// ([`NetworkExtension::check_options`]), in registration order.
+    fn check_extensions(
+        &self,
+        name: &str,
+        options: &DeviceOptions,
+    ) -> std::result::Result<(), String> {
+        for e in &self.extensions {
+            e.check_options(name, options)
+                .map_err(|why| format!("`{name}`: {why}"))?;
+        }
+        Ok(())
+    }
+
     fn check_grant(
         &self,
         name: &str,
@@ -1795,6 +1900,7 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
                     return Err(format!("a device `{name}` exists"));
                 }
                 self.check_grant(&name, &options, false)?;
+                self.check_extensions(&name, &options)?;
                 // The far ends must exist before anything is created.
                 let mut ends = Vec::new();
                 for c in &wire {
@@ -1932,6 +2038,7 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
                     &mut OpContext {
                         at,
                         op,
+                        device: None,
                         network: self,
                     },
                     &call,
@@ -2080,6 +2187,19 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
                 ext.apply(&mut OpContext {
                     at,
                     op,
+                    device: None,
+                    network: self,
+                })
+                .map_err(|e| e.to_string())?;
+            }
+            Op::ExtensionAt { device, op: ext } => {
+                if self.devices[device.0].phase == DevicePhase::Removed {
+                    return Err(format!("`{}` was removed", self.devices[device.0].name));
+                }
+                ext.apply(&mut OpContext {
+                    at,
+                    op,
+                    device: Some(device),
                     network: self,
                 })
                 .map_err(|e| e.to_string())?;
@@ -2849,7 +2969,9 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
     pub fn add_op(&mut self, op: Op, placement: Placement) -> Result<usize> {
         let elsewhere = if self.devices.iter().any(|d| d.remote) {
             let device = match &op {
-                Op::Stdin { device, .. } | Op::Control { device, .. } => Some(*device),
+                Op::Stdin { device, .. }
+                | Op::Control { device, .. }
+                | Op::ExtensionAt { device, .. } => Some(*device),
                 Op::Inject { from, .. } => Some(from.device),
                 _ => None,
             };
@@ -2858,7 +2980,7 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
                 _ => {
                     return Err(Error::Refused(
                         "a split (multi-site) network takes only timed operator events at a \
-                         device (stdin, a control call, an injected frame)"
+                         device (stdin, a control call, an injected frame, an extension's op at a device)"
                             .to_owned(),
                     ));
                 }
@@ -3240,6 +3362,11 @@ pub enum Op {
     /// An extension's op ([`crate::ext::ExtOp`]), applied by the network in the op's own
     /// processing context.
     Extension(ExtensionOp),
+    /// An extension's op that concerns one device, applied at its instant like
+    /// [`Op::Extension`]: timed at a device, it is accepted in a split network, where only the
+    /// device's own site applies it.
+    #[non_exhaustive]
+    ExtensionAt { device: DeviceId, op: ExtensionOp },
 }
 
 /// Constructors, one per variant with fields, taking what the op cannot do without; the rest
@@ -3319,6 +3446,11 @@ impl Op {
         Op::ResumeDevice {
             device: device.into(),
         }
+    }
+
+    /// [`Op::ExtensionAt`].
+    pub fn extension_at(device: DeviceId, op: ExtensionOp) -> Self {
+        Op::ExtensionAt { device, op }
     }
 
     /// [`Op::CrashDevice`].
@@ -3583,6 +3715,7 @@ impl Op {
                 | Op::StdinNamed { .. }
                 | Op::ControlNamed { .. }
                 | Op::Extension(_)
+                | Op::ExtensionAt { .. }
         )
     }
 }

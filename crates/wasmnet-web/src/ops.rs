@@ -164,7 +164,25 @@ const OPTIONS: &[&str] = &[
 /// optional. `infra-supply` is `true` (the core's default limits) or
 /// `{ max-bytes, max-components, max-total }`; `env` is a list of `[name, value]` pairs.
 pub fn options(v: &Value) -> Result<DeviceOptions, String> {
-    let f = Fields::new("device options", v, OPTIONS)?;
+    options_with(v, &[], &|k, _| {
+        Err(format!("no extension reads an option `{k}`"))
+    })
+}
+
+/// [`options`], with the options the network's extensions read: `ext_keys` are accepted as
+/// fields beside the core's, and each one given is parsed by `parse` (the network's
+/// `parse_option`) into `DeviceOptions::ext`.
+pub fn options_with(
+    v: &Value,
+    ext_keys: &[String],
+    parse: &dyn Fn(&str, &Value) -> Result<wasmnet_core::ExtValue, String>,
+) -> Result<DeviceOptions, String> {
+    let known: Vec<&str> = OPTIONS
+        .iter()
+        .copied()
+        .chain(ext_keys.iter().map(String::as_str))
+        .collect();
+    let f = Fields::new("device options", v, &known)?;
     let mut o = DeviceOptions::default();
     o.journal_stdio = f.bool("journal-stdio")?;
     o.infra = f.bool("infra")?;
@@ -198,6 +216,11 @@ pub fn options(v: &Value) -> Result<DeviceOptions, String> {
     o.crash_alone = f.bool("crash-alone")?;
     o.args = f.strs("args")?;
     o.env = f.pairs("env")?;
+    for k in ext_keys {
+        if let Some(value) = f.get(k) {
+            o.ext.set_value(parse(k, value)?);
+        }
+    }
     Ok(o)
 }
 
@@ -294,6 +317,18 @@ pub fn link(v: &Value) -> Result<LinkSetup, String> {
 ///
 /// Embedder actions and extensions' ops take Rust closures and values: they are not here.
 pub fn op(v: &Value) -> Result<(Op, Placement), String> {
+    op_with(v, &|_, kind, _| {
+        Err(format!("no extension builds an operator event `{kind}`"))
+    })
+}
+
+/// [`op`], with the operator events of the network's extensions: `{ kind: 'extension',
+/// device, op, value, at }` is built by `extension(device, op, value)` (the network's
+/// `parse_op`, timed at the device: `Op::extension_at`).
+pub fn op_with(
+    v: &Value,
+    extension: &dyn Fn(&str, &str, &Value) -> Result<Op, String>,
+) -> Result<(Op, Placement), String> {
     let kind = match v {
         Value::Record(fields) => fields
             .iter()
@@ -318,6 +353,7 @@ pub fn op(v: &Value) -> Result<(Op, Placement), String> {
         "crash-device" => &["device", "message"],
         "wire" => &["a", "b", "latency", "mtu"],
         "unwire" => &["link"],
+        "extension" => &["device", "op", "value"],
         other => return Err(format!("no operator event `{other}`")),
     };
     let mut all = vec!["kind", "at", "end"];
@@ -399,6 +435,11 @@ pub fn op(v: &Value) -> Result<(Op, Placement), String> {
             op
         }
         "unwire" => Op::unwire(f.str("link")?),
+        "extension" => extension(
+            &f.str("device")?,
+            &f.str("op")?,
+            f.get("value").unwrap_or(&Value::None),
+        )?,
         _ => unreachable!("every kind above is matched"),
     };
     Ok((op, placement))
