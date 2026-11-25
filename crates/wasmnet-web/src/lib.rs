@@ -64,6 +64,7 @@ pub mod codec;
 pub mod host;
 pub mod infra;
 pub mod network;
+pub mod ops;
 pub mod runtime;
 
 #[cfg(target_arch = "wasm32")]

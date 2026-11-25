@@ -24,9 +24,9 @@ use wasmnet_core::ext::ControlCall;
 use wasmnet_core::infra::Calls;
 use wasmnet_core::{
     COMMANDS_EXPORT, Command, CommandCall, DeviceConfig, DeviceContext, DeviceEntropy,
-    DeviceInstance, Fault, Inbox, InfraEnd, JournalEnd, Level, Nanos, OutputCapture,
-    RECONFIGURE_EXPORT, ReconfigureCall, Result as SimResult, Runtime, Sleep, Status, VirtualClock,
-    Wire,
+    DeviceInstance, Fault, Inbox, InfraEnd, InputQueue, JournalEnd, Level, MemoryBudget, Nanos,
+    OutputCapture, RECONFIGURE_EXPORT, ReconfigureCall, Result as SimResult, Runtime, Sleep,
+    Status, VirtualClock, Wire,
 };
 
 use crate::codec::Value;
@@ -61,6 +61,8 @@ struct DeviceState {
     stdout: OutputCapture,
     stderr: OutputCapture,
     entropy: DeviceEntropy,
+    /// Its stdin: what `Op::Stdin` wrote and the guest has not read yet.
+    stdin: InputQueue,
     /// The actor's waker, for completions and timers that arrive from JavaScript between polls.
     waker: Option<Waker>,
     completions: VecDeque<(u32, CallEnd)>,
@@ -198,6 +200,13 @@ impl Registry {
     /// unknown device).
     pub fn args(&self, dev: u32) -> Vec<String> {
         self.with_device(dev, |d| d.argv.clone())
+            .unwrap_or_default()
+    }
+
+    /// The device's stdin read now: everything queued, empty when nothing is (then
+    /// [`JsHost::stdin_ready`] says when more comes).
+    pub fn stdin(&self, dev: u32) -> Vec<u8> {
+        self.with_device(dev, |d| d.stdin.take(usize::MAX))
             .unwrap_or_default()
     }
 
@@ -376,6 +385,7 @@ impl<H: JsHost + Clone + Unpin + 'static> Runtime for JsRuntime<H> {
                     stdout: ctx.stdout.clone(),
                     stderr: ctx.stderr.clone(),
                     entropy: DeviceEntropy::new(ctx.seed, &ctx.name),
+                    stdin: InputQueue::new(),
                     waker: None,
                     completions: VecDeque::new(),
                     new_timers: Vec::new(),
@@ -397,6 +407,19 @@ impl<H: JsHost + Clone + Unpin + 'static> Runtime for JsRuntime<H> {
                 });
             }
         };
+        // Its memory at the start: counted, and a limit too small for it fails the creation, as
+        // natively.
+        let mut memory = MemoryBudget::new(ctx.memory, ctx.inbox.cost().clone());
+        if let Some(total) = self.host.memory(dev)
+            && let Err(message) = memory.observe(total)
+        {
+            self.registry.remove(dev);
+            self.host.release(dev);
+            return Err(wasmnet_core::Error::Runtime {
+                message,
+                detail: None,
+            });
+        }
         // Optional exports control calls go to, in the wasmtime backend's order.
         let mut exports = Vec::new();
         if instance.commands {
@@ -406,6 +429,7 @@ impl<H: JsHost + Clone + Unpin + 'static> Runtime for JsRuntime<H> {
             exports.push(RECONFIGURE_EXPORT.to_owned());
         }
         let actor = Actor {
+            memory,
             host: self.host.clone(),
             registry: self.registry.clone(),
             dev,
@@ -487,6 +511,8 @@ struct Actor<H: JsHost> {
     calls: BTreeMap<u32, (u64, CallKind)>,
     timers: Vec<(u32, Pin<Box<Sleep>>)>,
     waits: Vec<(u32, infra::Wait)>,
+    /// Its linear memory: measured after every poll ([`JsHost::memory`]), bounded by the core.
+    memory: MemoryBudget,
 }
 
 impl<H: JsHost> Actor<H> {
@@ -656,8 +682,13 @@ impl<H: JsHost> Actor<H> {
                         self.clock.poll_by(idx, now);
                     }
                 }
-                // Not served yet: JavaScript has no stdin for its devices.
-                Command::Stdin(_) => {}
+                // The bytes wait in the device's queue (the core's, as natively) until its guest
+                // reads them; JavaScript hears that there is something to read.
+                Command::Stdin(bytes) => {
+                    self.registry
+                        .with_device(self.dev, |d| d.stdin.push(&bytes));
+                    self.host.stdin_ready(self.dev);
+                }
             }
         }
         Ok(progress)
@@ -675,6 +706,14 @@ impl<H: JsHost + Unpin> Future for Actor<H> {
                 Ok(false) => break,
                 Err(fault) => return Poll::Ready(Err(fault)),
             }
+        }
+        // What its memories hold now (grown by this poll's calls, or by work JavaScript ran since
+        // the last one): counted, and the device's fault if that passed its limit. The growth
+        // happened already: jco grows memories itself, so this is as close as the page gets.
+        if let Some(total) = this.host.memory(this.dev)
+            && let Err(message) = this.memory.observe(total)
+        {
+            return Poll::Ready(Err(Fault::new(message)));
         }
         this.status.set_guest_tasks_alive(
             !this.timers.is_empty() || !this.calls.is_empty() || !this.waits.is_empty(),

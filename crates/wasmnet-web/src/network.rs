@@ -13,6 +13,7 @@ use wasmnet_core::{
 };
 
 use crate::host::JsHost;
+use crate::ops::LinkSetup;
 use crate::runtime::{JsRuntime, Registry};
 
 /// How a run ended, as [`Network::finish`] reports it.
@@ -131,16 +132,38 @@ impl<H: JsHost + Clone + Unpin + 'static> Network<H> {
         latency: Nanos,
         impairments: [Impairments; 2],
     ) -> Result<LinkId, String> {
+        let setup = LinkSetup {
+            latency,
+            impairments,
+            ..LinkSetup::default()
+        };
+        self.link_with(a, b, &setup)
+    }
+
+    /// [`link`](Self::link) with all of a link's setup: latency, MTU, impairments by
+    /// direction (`[a -> b, b -> a]`) and capture options ([`LinkSetup`]).
+    pub fn link_with(
+        &mut self,
+        a: PortRef,
+        b: PortRef,
+        setup: &LinkSetup,
+    ) -> Result<LinkId, String> {
         let count = self.sim_ref().devices().len();
         if let Some(end) = [a, b].into_iter().find(|p| p.device.index() >= count) {
             return Err(format!("no device {}", end.device.index()));
         }
         let mut link = self.sim_mut().link(a, b).map_err(|e| e.to_string())?;
-        link = link.latency(latency);
-        if impairments != [Impairments::default(); 2] {
+        link = link.latency(setup.latency);
+        if let Some(mtu) = setup.mtu {
+            link = link.mtu(mtu);
+        }
+        if setup.impairments != [Impairments::default(); 2] {
             link = link
-                .impair_from(a, impairments[0])
-                .impair_from(b, impairments[1]);
+                .impair_from(a, setup.impairments[0])
+                .impair_from(b, setup.impairments[1]);
+        }
+        if let Some(capture) = setup.capture {
+            link = link.capture(capture);
         }
         Ok(link.id())
     }

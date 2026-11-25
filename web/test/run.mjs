@@ -180,7 +180,7 @@ await step('what an embedder controls: commands, arguments and environment', asy
   return { answers: a, switchEvents: unblocked.map((e) => `${e.at} ${e.kind}`), body: fieldsOf(responses[0])['body-fnv'] };
 });
 
-await step('devices created while the network runs: controllers, a restart, device events, changes.wait-any, a supplied component', async () => {
+await step('devices created while the network runs: controllers, a restart, device events, changes.wait-any, stdin, generic ops, memory, a supplied component', async () => {
   const r = await page.evaluate(() => window.wasmnetScenario('runtime', '42'));
   if (r.outcome.kind !== 'deadline') throw new Error(`outcome ${JSON.stringify(r.outcome)}`);
   // An ungranted importer of wasmnet:infra is refused before it is instantiated.
@@ -211,6 +211,17 @@ await step('devices created while the network runs: controllers, a restart, devi
   if (running.length < 2) throw new Error(`replicas-observed running: ${JSON.stringify(running)}`);
   const done = events(r, 'http-get-done', 'client');
   if (done.length !== 1 || fieldsOf(done[0]).status !== '200') throw new Error(`http-get-done ${JSON.stringify(done)}`);
+  // Stdin, an operator event through the generic path: the controller read `replicas=3` from
+  // its console (it makes the third instance at its next reconcile, after this run).
+  const desired = events(r, 'replicas-desired', 'rep').map(fieldsOf);
+  if (!desired.some((f) => f.from === 'stdin' && f.replicas === '3')) throw new Error(`replicas-desired ${JSON.stringify(desired)}`);
+  // The other generic paths: both operator events applied, a malformed one refused, the
+  // capture's snap length, the memory measured and a limit too small refused.
+  if (r.notes.opStates !== JSON.stringify(['applied', 'applied'])) throw new Error(`op states ${r.notes.opStates}`);
+  if (!r.notes.badOp.includes('`device` is required')) throw new Error(`bad op: ${r.notes.badOp}`);
+  if (r.notes.snapLen !== '64') throw new Error(`snap length ${r.notes.snapLen}`);
+  if (!(BigInt(r.notes.peakMemory) > 0n)) throw new Error(`peak memory ${r.notes.peakMemory}`);
+  if (!r.notes.memory.includes('memory limit: growing a linear memory by')) throw new Error(`memory: ${r.notes.memory}`);
   // The supplied component: kept by the controller's store, and two instances made from its digest.
   const supplied = events(r, 'infra-supply', 'sup');
   if (supplied.length !== 1 || fieldsOf(supplied[0]).digest !== r.notes.digest) throw new Error(`infra-supply ${JSON.stringify(supplied)}, want ${r.notes.digest}`);
@@ -219,7 +230,7 @@ await step('devices created while the network runs: controllers, a restart, devi
   }
   const supRunning = events(r, 'replicas-observed', 'sup').filter((e) => fieldsOf(e).phase === 'running');
   if (supRunning.length < 2) throw new Error(`sup replicas-observed running: ${JSON.stringify(supRunning)}`);
-  return { refused: r.notes.refused, events: steps[7].kinds, rule: `${steps['on.0'].event} seq ${steps['on.0'].seq}`, running: running.map((e) => `${e.at} ${fieldsOf(e).name}`), supplied: supRunning.map((e) => `${e.at} ${fieldsOf(e).name}`), routes: steps[2].text, fetched: done[0].at };
+  return { refused: r.notes.refused, memory: r.notes.memory, peakMemory: r.notes.peakMemory, badOp: r.notes.badOp, events: steps[7].kinds, rule: `${steps['on.0'].event} seq ${steps['on.0'].seq}`, running: running.map((e) => `${e.at} ${fieldsOf(e).name}`), supplied: supRunning.map((e) => `${e.at} ${fieldsOf(e).name}`), routes: steps[2].text, fetched: done[0].at };
 });
 
 if (process.env.NATIVE_JOURNAL) {

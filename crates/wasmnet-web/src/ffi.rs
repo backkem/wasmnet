@@ -21,13 +21,13 @@
 //! # Re-entrancy
 //!
 //! The network exports (`wn_network_new`, `wn_add_device`, `wn_link`, `wn_step`, `wn_finish`,
-//! `wn_journal`, `wn_link_*`, `wn_pcap`, `wn_counters`, `wn_command`, `wn_schedule_command`,
-//! `wn_stdout`) hold the network for their whole call, and several call into JavaScript while
-//! they do (`wn_add_device` instantiates, `wn_step`, `wn_finish`, `wn_counters` and
+//! `wn_journal`, `wn_link_*`, `wn_add_op`, `wn_op_states`, `wn_costs`, `wn_pcap`, `wn_counters`,
+//! `wn_command`, `wn_schedule_command`, `wn_stdout`) hold the network for their whole call, and
+//! several call into JavaScript while they do (`wn_add_device` instantiates, `wn_step`, `wn_finish`, `wn_counters` and
 //! `wn_command` run devices). JavaScript must not call a network export from inside one of
 //! those imports, also not while a JSPI-suspended import waits: it is refused (an error, never
 //! a corrupted network). The device-side exports (`wn_transmit`, `wn_log`, `wn_event`,
-//! `wn_output`, `wn_now`, `wn_wall_now`, `wn_config_*`, `wn_args`, `wn_env`, `wn_random_*`,
+//! `wn_output`, `wn_now`, `wn_wall_now`, `wn_config_*`, `wn_args`, `wn_env`, `wn_stdin`, `wn_random_*`,
 //! `wn_insecure_seed`, `wn_timer`, `wn_infra`, `wn_infra_wait`, `wn_call_done`,
 //! `wn_take_dirty`) touch only the per-device [`Registry`] (and, for `wasmnet:infra`, the
 //! network's device table, which only records and queues) and may be called at any time, also
@@ -53,6 +53,8 @@
 //! | `js_wait_done(wait, reply, len)` | the waiting call `wait` (`changes.wait`, `changes.wait-any`; from `wn_infra_wait`) is answered with an `infra reply`: resolve (or reject) the guest's call |
 //! | `js_imports(component, len) -> i32` | the component's import names, if known: answers an `imports` message (asked before it is instantiated, for the grant check) |
 //! | `js_release(dev)` | device `dev`'s instance is gone (stopped, crashed, removed): drop it |
+//! | `js_memory(dev) -> i64` | the bytes device `dev`'s linear memories hold now, all together; -1 unknown |
+//! | `js_stdin_ready(dev)` | bytes for device `dev`'s stdin arrived (`wn_stdin` has them): a waiting read may go on |
 //! | `js_compile(digest, len, bytes, len) -> i32` | make a supplied component instantiable as `digest` (the core checked it already); 0, or a negative error. May suspend (JSPI) |
 //! | `js_panic(msg, len)` | a panic's message, before the module traps |
 
@@ -61,12 +63,13 @@
 use std::cell::RefCell;
 use std::sync::Once;
 
-use wasmnet_core::{DeviceConfig, DeviceId, Impairments, LinkId, Nanos, Refusal};
+use wasmnet_core::{DeviceConfig, DeviceId, LinkId, Nanos, Refusal};
 
 use crate::codec;
 use crate::host::{CallEnd, Instance, JsHost};
 use crate::infra::Reply;
 use crate::network::Network;
+use crate::ops;
 use crate::runtime::{Entropy, Registry};
 
 mod js {
@@ -94,6 +97,8 @@ mod js {
         pub fn js_wait_done(wait: u32, reply: *const u8, reply_len: usize);
         pub fn js_imports(component: *const u8, component_len: usize) -> i32;
         pub fn js_release(dev: u32);
+        pub fn js_memory(dev: u32) -> i64;
+        pub fn js_stdin_ready(dev: u32);
         pub fn js_compile(
             digest: *const u8,
             digest_len: usize,
@@ -249,6 +254,16 @@ impl JsHost for Js {
     fn release(&self, dev: u32) {
         // SAFETY: a plain value.
         unsafe { js::js_release(dev) }
+    }
+
+    fn memory(&self, dev: u32) -> Option<u64> {
+        // SAFETY: a plain value.
+        u64::try_from(unsafe { js::js_memory(dev) }).ok()
+    }
+
+    fn stdin_ready(&self, dev: u32) {
+        // SAFETY: a plain value.
+        unsafe { js::js_stdin_ready(dev) }
     }
 
     fn compile(&self, digest: &str, bytes: &[u8]) -> Result<(), String> {
@@ -417,8 +432,7 @@ pub extern "C" fn wn_network_new(seed: u64) -> i32 {
 }
 
 /// Adds a device called `name` (UTF-8 at `name`), made from `component` (a key JavaScript
-/// understands), with `config` (a `config` message) and `options` (an `options` message: its
-/// arguments and environment, a `wasmnet:infra` grant, journalled stdio, ...). Calls
+/// understands), with `config` (a `config` message) and `options` (a `value`: the device's options as a plain object, read by `crate::ops::options`). Calls
 /// `js_instantiate` once, during which the device-side exports already serve it. Answers the
 /// device's index, or -1 with the message in the result (JavaScript then drops whatever it made
 /// for that index: the next device gets it). All inputs are JavaScript's to free.
@@ -439,7 +453,10 @@ pub extern "C" fn wn_add_device(
         Ok(c) => c,
         Err(e) => return fail(format!("config: {e}")),
     };
-    let options = match codec::decode_options(bytes(options, options_len)) {
+    let options = match codec::decode_value(bytes(options, options_len))
+        .map_err(|e| e.to_string())
+        .and_then(|v| ops::options(&v))
+    {
         Ok(o) => o,
         Err(e) => return fail(format!("options: {e}")),
     };
@@ -464,49 +481,71 @@ pub extern "C" fn wn_link(dev_a: u32, port_a: u32, dev_b: u32, port_b: u32, late
     }
 }
 
-/// [`wn_link`] with each direction's impairments (`docs/design/links.md`): `imp` holds two
-/// 24-byte records, `a -> b` then `b -> a`, each `rate` (u64, bits per second, 0: unlimited),
-/// `queue` (u32, frames), `loss_ppm` (u32, parts per million) and `jitter` (u64, ns), little
-/// endian. Answers the link's index, or -1 with the message in the result. Never calls
-/// JavaScript.
+/// [`wn_link`] with its options as a `value` (`crate::ops::link`: `latency`, `mtu`,
+/// impairments by direction, capture options). Answers the link's index, or -1 with the message
+/// in the result. Never calls JavaScript.
 #[unsafe(no_mangle)]
-pub extern "C" fn wn_link_impaired(
+pub extern "C" fn wn_link_with(
     dev_a: u32,
     port_a: u32,
     dev_b: u32,
     port_b: u32,
-    latency: u64,
-    imp: *const u8,
-    imp_len: usize,
+    options: *const u8,
+    options_len: usize,
 ) -> i32 {
-    let Some(impairments) = decode_impairments(bytes(imp, imp_len)) else {
-        return fail(format!(
-            "impairments: want 48 bytes (two 24-byte records), got {imp_len}"
-        ));
+    let setup = match codec::decode_value(bytes(options, options_len))
+        .map_err(|e| e.to_string())
+        .and_then(|v| ops::link(&v))
+    {
+        Ok(s) => s,
+        Err(e) => return fail(format!("link options: {e}")),
     };
     let a = DeviceId::from_index(dev_a as usize).port(port_a);
     let b = DeviceId::from_index(dev_b as usize).port(port_b);
-    match with_network(|n| n.link_impaired(a, b, latency, impairments)) {
+    match with_network(|n| n.link_with(a, b, &setup)) {
         Ok(Ok(id)) => i32::try_from(id.index()).unwrap_or(i32::MAX),
         Ok(Err(e)) => fail(e),
         Err(e) => fail(e),
     }
 }
 
-/// Two directions' impairments from [`wn_link_impaired`]'s 48 bytes.
-fn decode_impairments(b: &[u8]) -> Option<[Impairments; 2]> {
-    if b.len() != 48 {
-        return None;
+/// Adds an operator event (a `value`: `crate::ops::op`, its kind, fields and placement). Answers
+/// its index (its state is in `wn_op_states`), or -1 with the message in the result (a
+/// malformed event, or one the network refuses when added). Never calls JavaScript.
+#[unsafe(no_mangle)]
+pub extern "C" fn wn_add_op(op: *const u8, len: usize) -> i32 {
+    let parsed = codec::decode_value(bytes(op, len))
+        .map_err(|e| e.to_string())
+        .and_then(|v| ops::op(&v));
+    let (op, placement) = match parsed {
+        Ok(p) => p,
+        Err(e) => return fail(format!("operator event: {e}")),
+    };
+    match with_network(|n| n.sim_mut().add_op(op, placement).map_err(|e| e.to_string())) {
+        Ok(Ok(i)) => i32::try_from(i).unwrap_or(i32::MAX),
+        Ok(Err(e)) => fail(e),
+        Err(e) => fail(e),
     }
-    let u64_at = |i: usize| u64::from_le_bytes(b[i..i + 8].try_into().expect("8 bytes"));
-    let u32_at = |i: usize| u32::from_le_bytes(b[i..i + 4].try_into().expect("4 bytes"));
-    Some([0, 24].map(|o| {
-        Impairments::default()
-            .rate(u64_at(o))
-            .queue(u32_at(o + 8))
-            .loss_ppm(u32_at(o + 12))
-            .jitter(u64_at(o + 16))
-    }))
+}
+
+/// The operator events' states, in the order they were added, as a `value` in the result;
+/// answers its length, or -1.
+#[unsafe(no_mangle)]
+pub extern "C" fn wn_op_states() -> i32 {
+    match with_network(|n| ops::op_states(&n.sim().op_states())) {
+        Ok(v) => set_result(codec::encode_value(&v)),
+        Err(e) => fail(e),
+    }
+}
+
+/// Every device's cost (its memory and peak memory, calls, polls, ...) as a `value` in the
+/// result; answers its length, or -1.
+#[unsafe(no_mangle)]
+pub extern "C" fn wn_costs() -> i32 {
+    match with_network(|n| ops::costs(&n.sim().costs())) {
+        Ok(v) => set_result(codec::encode_value(&v)),
+        Err(e) => fail(e),
+    }
 }
 
 /// Runs every event at or before `until` (and every device JavaScript woke, first). Answers 1;
@@ -731,6 +770,13 @@ pub extern "C" fn wn_schedule_command(
 pub extern "C" fn wn_args(dev: u32) -> i32 {
     let args = registry().map(|r| r.args(dev)).unwrap_or_default();
     set_result(codec::encode_strs(&args))
+}
+
+/// Device `dev`'s stdin: everything queued for it (by `Op::Stdin`) in the result, which is
+/// empty when nothing is; answers its length. `js_stdin_ready` says when more comes.
+#[unsafe(no_mangle)]
+pub extern "C" fn wn_stdin(dev: u32) -> i32 {
+    set_result(registry().map(|r| r.stdin(dev)).unwrap_or_default())
 }
 
 /// `wasi:cli/environment.get-environment` of device `dev`, as a `pairs` message in the result;

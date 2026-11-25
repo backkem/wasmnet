@@ -156,6 +156,18 @@ pub trait JsHost {
     fn release(&self, dev: u32) {
         let _ = dev;
     }
+    /// The device's linear memories' size now, all of them together, in bytes, if JavaScript can
+    /// read it (the core counts it and applies [`wasmnet_core::DeviceOptions::memory`]). Asked
+    /// after the device is instantiated and after every poll of its actor. The default: unknown.
+    fn memory(&self, dev: u32) -> Option<u64> {
+        let _ = dev;
+        None
+    }
+    /// Bytes for device `dev`'s stdin arrived ([`crate::Registry::stdin`] has them): a guest
+    /// read that waits for input may go on. The default does nothing.
+    fn stdin_ready(&self, dev: u32) {
+        let _ = dev;
+    }
     /// Makes the component a controller supplied as `bytes` (with digest reference `digest`,
     /// `sha256:<hex>`) instantiable by its digest: [`JsHost::instantiate`] gets `digest` as its
     /// component from then on. The core has checked the digest, the embedder's admission and

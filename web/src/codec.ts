@@ -240,13 +240,19 @@ export function decodeOutcome(bytes: Uint8Array): Outcome {
 
 // ---- device options, commands, reconfiguration ------------------------------------------------
 
+/**
+ * The plain objects the simulator reads as `value` messages (crates/wasmnet-web/src/ops.rs
+ * decides their fields and refuses unknown ones; these types are only a guide). Field names are
+ * camel case here and kebab case there.
+ */
+
 /** A device's options (`DeviceOptions`): what `Network.device` takes besides its config. */
 export interface DeviceOptions {
   /** Journal its stdout and stderr lines. */
   journalStdio?: boolean;
   /** Its arguments after `argv[0]` (its name), for `wasi:cli/environment`. */
   args?: readonly string[];
-  /** Its environment variables, in order. */
+  /** Its environment variables, in order (an object's entries in their order). */
   env?: readonly (readonly [string, string])[] | Record<string, string>;
   /** It may use `wasmnet:infra` (an in-world controller). */
   infra?: boolean;
@@ -256,40 +262,83 @@ export interface DeviceOptions {
   infraCascade?: 'keep' | 'stop' | 'remove';
   /** With `infra`: the most devices it may have at once. */
   infraMaxDevices?: number;
+  /** With `infra`: it may supply components as bytes (`true`: the simulator's default limits). */
+  infraSupply?: true | { maxBytes?: number | bigint; maxComponents?: number; maxTotal?: number | bigint };
+  /** The most linear memory it may use, in bytes (checked after each call, see the docs). */
+  memory?: number | bigint;
+  /** Its fuel per virtual instant (the browser meters no fuel: kept for the same options). */
+  fuelPerInstant?: number | bigint;
   /** A fault of this device crashes it alone, not the network. */
   crashAlone?: boolean;
-  /**
-   * With `infra`: it may supply components as bytes (`wasmnet:infra/components`), within these
-   * bounds (`true`: the simulator's defaults, 16 MiB each, 8 at once, 64 MiB in all).
-   */
-  infraSupply?: true | { maxBytes: number | bigint; maxComponents: number; maxTotal: number | bigint };
 }
 
-const CASCADES = ['keep', 'stop', 'remove'] as const;
-
-function optU64(w: Writer, v: bigint | number | undefined): void {
-  if (v === undefined) w.u8(0);
-  else w.u8(1).u64(BigInt(v));
+/** One direction's impairments of a link (`docs/design/links.md`). */
+export interface Impairments {
+  rate?: number | bigint;
+  queue?: number;
+  lossPpm?: number;
+  jitter?: number | bigint;
 }
 
-/** The `options` message (into `wn_add_device`). Memory and fuel are not set from here. */
-export function encodeOptions(o: DeviceOptions): Uint8Array {
-  const flags = (o.journalStdio ? 1 : 0) | (o.infra ? 2 : 0) | (o.crashAlone ? 4 : 0);
-  const env = Array.isArray(o.env) ? o.env : Object.entries(o.env ?? {});
-  const w = new Writer()
-    .u32(flags)
-    .strs(o.args ?? [])
-    .pairs(env as readonly (readonly [string, string])[])
-    .str(o.infraPrefix ?? '')
-    .u8(CASCADES.indexOf(o.infraCascade ?? 'keep'));
-  optU64(w, o.infraMaxDevices);
-  optU64(w, undefined); // memory
-  optU64(w, undefined); // fuel per instant
-  const s = o.infraSupply;
-  if (s === undefined) w.u8(0);
-  else if (s === true) w.u8(2); // the simulator's defaults
-  else w.u8(1).u64(BigInt(s.maxBytes)).u32(s.maxComponents).u64(BigInt(s.maxTotal));
+/** A link's options besides its latency. */
+export interface LinkOptions {
+  mtu?: number;
+  /** Both directions' impairments, or each one's. */
+  impair?: Impairments;
+  impairAb?: Impairments;
+  impairBa?: Impairments;
+  /** What the link records. */
+  capture?: { record?: boolean; snapLen?: number; nameEnds?: boolean };
+}
+
+/**
+ * An operator event (`Op`) at virtual instant `at` (ns; `end`: after that instant's events): its
+ * `kind` and the fields the simulator documents for it (`link-state`, `latency`, `impair`,
+ * `inject`, `stdin`, `command`, `add-device`, `stop-device`, `pause-device`, `resume-device`,
+ * `crash-device`, `start-device`, `remove-device`, `wire`, `unwire`).
+ */
+export interface Op {
+  kind: string;
+  at: bigint | number;
+  end?: boolean;
+  [field: string]: unknown;
+}
+
+/** An operator event's state. */
+export interface OpState {
+  state: 'pending' | 'applied' | 'unreached' | 'failed' | 'other';
+  at?: bigint;
+  events?: bigint;
+  message?: string;
+}
+
+/** A device's cost: what the simulator counted for it (memory in bytes). */
+export interface DeviceCost {
+  name: string;
+  memory: bigint;
+  peakMemory: bigint;
+  fuel: bigint;
+  peakFuel: bigint;
+  calls: bigint;
+  polls: bigint;
+  idlePolls: bigint;
+}
+
+/** Device options as the simulator reads them: the environment as pairs. */
+export function plainOptions(o: DeviceOptions): Record<string, unknown> {
+  const env = o.env === undefined || Array.isArray(o.env) ? o.env : Object.entries(o.env);
+  return { ...o, ...(env === undefined ? {} : { env }) };
+}
+
+/** The `value` message: one plain object, array or value (see `writeValue`). */
+export function encodeValue(v: unknown): Uint8Array {
+  const w = new Writer();
+  writeValue(w, v);
   return w.finish();
+}
+
+export function decodeValue(bytes: Uint8Array): unknown {
+  return whole(bytes, (r) => readValue(r));
 }
 
 /** A command's answer: `ok` text or the device's refusal. */
@@ -320,7 +369,11 @@ const camel = (s: string) => s.replace(/-([a-z0-9])/g, (_, c: string) => c.toUpp
 export function writeValue(w: Writer, v: unknown): void {
   if (v === undefined || v === null) w.u8(0);
   else if (typeof v === 'boolean') w.u8(2).u8(v ? 1 : 0);
-  else if (typeof v === 'number') w.u8(3).u32(v);
+  else if (typeof v === 'number') {
+    if (!Number.isInteger(v) || v < 0) throw new Error(`only whole numbers cross: ${v}`);
+    if (v <= 0xffffffff) w.u8(3).u32(v);
+    else w.u8(4).u64(BigInt(v));
+  }
   else if (typeof v === 'bigint') w.u8(4).u64(v);
   else if (typeof v === 'string') w.u8(5).str(v);
   else if (v instanceof Uint8Array) w.u8(6).raw(v);

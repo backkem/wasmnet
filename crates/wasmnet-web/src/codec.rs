@@ -29,12 +29,8 @@
 //! counters   (from js_counters, out of wn_counters)   list<(str name, u64 value)>
 //! event      (into wn_event)        str kind, pairs fields
 //! config     (into wn_add_device and js_reconfigure, out of wn_config_all)   pairs
-//! options    (into wn_add_device)   u32 flags (bit 0 journal stdio, 1 infra, 2 crash alone),
-//!            list<str> args, pairs env, str infra prefix (empty: none), u8 cascade (0 keep,
-//!            1 stop, 2 remove), opt infra max devices, opt memory, opt fuel per instant
-//!            (opt = u8 0, or u8 1 then u64), then the supply limits: u8 0 (no grant to supply
-//!            components), u8 1 then u64 max bytes, u32 max components, u64 max total, or u8 2
-//!            (the core's default limits)
+//! value      (into wn_add_device as its options, wn_link_with, wn_add_op; out of wn_op_states,
+//!            wn_costs)   one `value` (below): plain JavaScript objects, read by `crate::ops`
 //! strs       (out of wn_args; into wn_set_catalog)   list<str>: argv, the device's name first;
 //!            the catalog's component names
 //! imports    (from js_imports)      u8 0 unknown, or u8 1 then list<str>: a component's import names
@@ -60,8 +56,7 @@
 //! ```
 
 use wasmnet_core::{
-    Cascade, DeclaredPort, DeviceConfig, DeviceOptions, JournalEntry, Level, Outcome, Record,
-    Refusal, Stream, SupplyLimits,
+    DeclaredPort, DeviceConfig, JournalEntry, Level, Outcome, Record, Refusal, Stream,
 };
 
 use crate::host::Instance;
@@ -556,121 +551,6 @@ pub fn decode_outcome(bytes: &[u8]) -> Result<RunOutcome, DecodeError> {
     })
 }
 
-// ---- options -------------------------------------------------------------------------------
-
-const OPT_JOURNAL_STDIO: u32 = 1;
-const OPT_INFRA: u32 = 2;
-const OPT_CRASH_ALONE: u32 = 4;
-
-fn opt_u64(w: &mut Writer, v: Option<u64>) {
-    match v {
-        Some(v) => w.u8(1).u64(v),
-        None => w.u8(0),
-    };
-}
-
-fn read_opt_u64(r: &mut Reader<'_>) -> Result<Option<u64>, DecodeError> {
-    let at = r.at;
-    match r.u8()? {
-        0 => Ok(None),
-        1 => Ok(Some(r.u64()?)),
-        _ => Err(DecodeError { at, what: "option" }),
-    }
-}
-
-/// The `options` message: the [`DeviceOptions`] this boundary carries (everything but the
-/// supply limits and extension options).
-pub fn encode_options(options: &DeviceOptions) -> Vec<u8> {
-    let mut w = Writer::new();
-    let flags = u32::from(options.journal_stdio) * OPT_JOURNAL_STDIO
-        + u32::from(options.infra) * OPT_INFRA
-        + u32::from(options.crash_alone) * OPT_CRASH_ALONE;
-    w.u32(flags)
-        .strs(&options.args)
-        .pairs(options.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-        .str(options.infra_prefix.as_deref().unwrap_or_default())
-        .u8(match options.infra_cascade {
-            Cascade::Keep => 0,
-            Cascade::Stop => 1,
-            Cascade::Remove => 2,
-            // A cascade newer than this encoding: the reader refuses it.
-            _ => u8::MAX,
-        });
-    opt_u64(&mut w, options.infra_max_devices.map(u64::from));
-    opt_u64(&mut w, options.memory);
-    opt_u64(&mut w, options.fuel_per_instant);
-    match options.infra_supply {
-        Some(l) => w
-            .u8(1)
-            .u64(l.max_bytes)
-            .u32(l.max_components)
-            .u64(l.max_total),
-        None => w.u8(0),
-    };
-    w.finish()
-}
-
-/// Reads an `options` message (unknown flag bits are ignored; an empty prefix is none).
-// Field by field rather than a struct literal: the options struct may grow fields this crate
-// does not set.
-#[allow(clippy::field_reassign_with_default)]
-pub fn decode_options(bytes: &[u8]) -> Result<DeviceOptions, DecodeError> {
-    whole(bytes, |r| {
-        let flags = r.u32()?;
-        let args = r.strs()?;
-        let env = r.pairs()?;
-        let prefix = r.str()?;
-        let at = r.at;
-        let cascade = match r.u8()? {
-            0 => Cascade::Keep,
-            1 => Cascade::Stop,
-            2 => Cascade::Remove,
-            _ => {
-                return Err(DecodeError {
-                    at,
-                    what: "cascade",
-                });
-            }
-        };
-        let at = r.at;
-        let max = read_opt_u64(r)?
-            .map(|n| u32::try_from(n).map_err(|_| DecodeError { at, what: "u32" }))
-            .transpose()?;
-        let memory = read_opt_u64(r)?;
-        let fuel = read_opt_u64(r)?;
-        let at = r.at;
-        let supply = match r.u8()? {
-            0 => None,
-            1 => Some(
-                SupplyLimits::default()
-                    .max_bytes(r.u64()?)
-                    .max_components(r.u32()?)
-                    .max_total(r.u64()?),
-            ),
-            2 => Some(SupplyLimits::default()),
-            _ => {
-                return Err(DecodeError {
-                    at,
-                    what: "supply limits",
-                });
-            }
-        };
-        let mut o = DeviceOptions::default();
-        o.journal_stdio = flags & OPT_JOURNAL_STDIO != 0;
-        o.infra = flags & OPT_INFRA != 0;
-        o.crash_alone = flags & OPT_CRASH_ALONE != 0;
-        o.args = args;
-        o.env = env;
-        o.infra_prefix = (!prefix.is_empty()).then_some(prefix);
-        o.infra_cascade = cascade;
-        o.infra_max_devices = max;
-        o.memory = memory;
-        o.fuel_per_instant = fuel;
-        o.infra_supply = supply;
-        Ok(o)
-    })
-}
-
 // ---- device commands and reconfiguration ---------------------------------------------------
 
 /// The `command` message (into `js_invoke`, out of `wn_command`): the device's answer.
@@ -896,6 +776,17 @@ impl Reader<'_> {
     }
 }
 
+/// The `value` message: one value (into `wn_add_device`'s options, `wn_link_with`, `wn_add_op`;
+/// out of `wn_op_states`, `wn_costs`).
+pub fn encode_value(v: &Value) -> Vec<u8> {
+    Writer::new().value(v).finish()
+}
+
+/// Reads a `value` message.
+pub fn decode_value(bytes: &[u8]) -> Result<Value, DecodeError> {
+    whole(bytes, |r| r.value())
+}
+
 /// The `infra call` message (into `wn_infra`, `wn_infra_wait`): the function
 /// (`devices.apply`, `components.list`, `changes.wait`) and its arguments, in order.
 pub fn encode_infra_call(function: &str, args: &[Value]) -> Vec<u8> {
@@ -1057,18 +948,7 @@ mod tests {
     }
 
     #[test]
-    fn options_values_and_infra_messages_round_trip() {
-        let o = DeviceOptions::default()
-            .journal_stdio(true)
-            .infra(true)
-            .infra_prefix("web".to_owned())
-            .infra_max_devices(3)
-            .memory(1 << 20)
-            .infra_supply(SupplyLimits::default().max_components(2));
-        let mut o = o;
-        o.args = vec!["-v".to_owned()];
-        o.env = vec![("A".to_owned(), "1".to_owned())];
-        assert_eq!(decode_options(&encode_options(&o)), Ok(o));
+    fn values_and_infra_messages_round_trip() {
         let args = vec![
             Value::None,
             Value::str("r1"),

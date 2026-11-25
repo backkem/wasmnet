@@ -78,7 +78,7 @@ async function runtime(net: Network): Promise<Record<string, string>> {
     refused = err instanceof Error ? err.message : String(err);
   }
   net.setCatalog(['router', 'node-http-server']);
-  const sw = await net.device('sw', 'switch', { ports: '12' });
+  const sw = await net.device('sw', 'switch', { ports: '16' });
   const r1 = hex(cbor({ component: 'router', config: { mac: '02:00:00:00:fe:10', 'port0.ipv4': '10.0.1.1/24', 'port1.ipv4': '10.0.2.1/24' } }));
   const steps = [
     `0ms apply r1 ${r1}`,
@@ -121,7 +121,26 @@ async function runtime(net: Network): Promise<Record<string, string>> {
     'app.http-get.start': '500ms',
   });
   net.link(rep.port(0), sw.port(0), 50_000n);
-  net.link(client.port(0), sw.port(1), 50_000n);
+  // A link with capture options (64 bytes of each frame), set through the generic path.
+  const clientLink = net.link(client.port(0), sw.port(1), 50_000n, { capture: { snapLen: 64 } });
+
+  // Operator events through the generic path: a line on the replicas controller's stdin (its
+  // console: `replicas=3`), and the client's link going down; and one the simulator refuses.
+  net.op({ kind: 'stdin', device: 'rep', bytes: 'replicas=3\n', at: 1_000_000_000n });
+  net.op({ kind: 'link-state', link: clientLink.name, up: false, at: 2_500_000_000n });
+  let badOp = '';
+  try {
+    net.op({ kind: 'stop-device', at: 0n });
+  } catch (err) {
+    badOp = err instanceof Error ? err.message : String(err);
+  }
+  // A memory limit the device does not start within: refused, as natively.
+  let memory = '';
+  try {
+    await net.device('tiny', 'switch', { ports: '1' }, { memory: 1024 });
+  } catch (err) {
+    memory = err instanceof Error ? err.message : String(err);
+  }
 
   // A component supplied as bytes: a store node serves the switch's component, a second
   // replicas controller fetches it, supplies it (`wasmnet:infra/components`) and runs two
@@ -151,13 +170,13 @@ async function runtime(net: Network): Promise<Record<string, string>> {
       'app.replicas.template.digest': digest,
       'app.replicas.template.config.ports': '2',
       'app.replicas.template.wire.0.port': '0',
-      'app.replicas.template.wire.0.to': 'sw:{n+7}',
+      'app.replicas.template.wire.0.to': 'sw:{n+10}',
     },
     { infra: true, infraPrefix: 'sup', infraSupply: true },
   );
-  net.link(store.port(0), sw.port(5), 50_000n);
-  net.link(sup.port(0), sw.port(6), 50_000n);
-  return { refused, digest };
+  net.link(store.port(0), sw.port(9), 50_000n);
+  net.link(sup.port(0), sw.port(10), 50_000n);
+  return { refused, digest, badOp, memory, clientLink: clientLink.name };
 }
 
 serveRun<Init, Done>(async (init, ctx) => {
@@ -168,6 +187,14 @@ serveRun<Init, Done>(async (init, ctx) => {
     const t0 = performance.now();
     // The replicas controller never rests: run to a deadline.
     const outcome = await net.run({ deadline: 3_000_000_000n, onJournal: (entries) => ctx.post({ type: 'journal', entries } satisfies Progress) });
+    // What the run measured: the operator events' states, the devices' peak memory, and the
+    // snap length the client's capture recorded (its interface description block).
+    notes.opStates = JSON.stringify(net.opStates().map((s) => s.state));
+    notes.peakMemory = String(net.costs().find((c) => c.name === 'sw')?.peakMemory ?? 0n);
+    const pcap = net.pcap(net.links().find((l) => l.name === notes.clientLink)!);
+    const view = new DataView(pcap.buffer, pcap.byteOffset, pcap.byteLength);
+    const shb = view.getUint32(4, true);
+    notes.snapLen = String(view.getUint32(shb + 12, true));
     return { outcome, links: net.links().map((l) => ({ name: l.name, pcap: net.pcap(l) })), ms: Math.round(performance.now() - t0), notes };
   }
   const controls = init.scenario === 'controls';

@@ -27,9 +27,9 @@ import { settle, touch } from './codelib-web/dist/loop.js';
 import { wasiImports } from './codelib-web/dist/wasi/index.js';
 import type { RandomStream, World } from './codelib-web/dist/worlds.js';
 import * as codec from './codec.js';
-import type { CommandAnswer, DeviceOptions, JournalEntry, Outcome, PortInfo } from './codec.js';
+import type { CommandAnswer, DeviceCost, DeviceOptions, JournalEntry, LinkOptions, Op, OpState, Outcome, PortInfo } from './codec.js';
 
-export type { CommandAnswer, DeviceOptions, JournalEntry, Outcome } from './codec.js';
+export type { CommandAnswer, DeviceCost, DeviceOptions, Impairments, JournalEntry, LinkOptions, Op, OpState, Outcome } from './codec.js';
 
 /** Where a component's transpiled glue is, and its core modules if already compiled. */
 export interface ComponentSource {
@@ -111,6 +111,11 @@ interface Exports {
   wn_infra(dev: number, call: number, len: number): number;
   wn_infra_wait(dev: number, call: number, len: number): number;
   wn_link(devA: number, portA: number, devB: number, portB: number, latency: bigint): number;
+  wn_link_with(devA: number, portA: number, devB: number, portB: number, options: number, len: number): number;
+  wn_add_op(op: number, len: number): number;
+  wn_op_states(): number;
+  wn_costs(): number;
+  wn_stdin(dev: number): number;
   wn_step(until: bigint): Promise<number>;
   wn_take_dirty(): number;
   wn_next_event(): bigint;
@@ -176,6 +181,8 @@ interface Instance {
   name: string;
   component: string;
   root: Root;
+  /** Its core instances' memories (each once), measured for the simulator (`js_memory`). */
+  memories: Set<WebAssembly.Memory>;
   /** A composed node's apps (`app-<name>` exports), sorted by name: their start order. */
   apps: { name: string; run: () => Promise<unknown> }[];
 }
@@ -225,6 +232,8 @@ export class Network {
   private readonly timers = new Map<number, () => void>();
   /** `changes.wait` calls by the simulator's id: their promise's resolution. */
   private readonly waits = new Map<number, (reply: codec.InfraReply) => void>();
+  /** Guest stdin reads waiting for bytes, by device. */
+  private readonly stdinWaiters = new Map<number, () => void>();
   private journalNext = 0;
   private panicked: string | null = null;
 
@@ -326,6 +335,20 @@ export class Network {
         const self = n();
         const key = decoder.decode(self.view(ptr, len));
         return self.put(codec.encodeImports(self.sources[key]?.imports));
+      },
+      js_memory: (dev: number) => {
+        const d = n().instances[dev];
+        if (!d) return -1n;
+        let total = 0;
+        for (const m of d.memories) total += m.buffer.byteLength;
+        return BigInt(total);
+      },
+      js_stdin_ready: (dev: number) => {
+        const self = n();
+        const wake = self.stdinWaiters.get(dev);
+        self.stdinWaiters.delete(dev);
+        touch();
+        wake?.();
       },
       js_release: (dev: number) => {
         delete n().instances[dev];
@@ -522,7 +545,14 @@ export class Network {
   private async load(dev: number, name: string, component: string): Promise<Instance> {
     const source = this.sources[component];
     if (!source) throw new Error(`no component ${component} (known: ${Object.keys(this.sources).join(', ')})`);
-    const loaded = await instantiate(source.url, this.imports(dev), source.modules ? { modules: source.modules } : {});
+    // Every core instance it makes, for its memories: what the simulator counts and bounds.
+    const memories = new Set<WebAssembly.Memory>();
+    const instantiateCore = async (module: WebAssembly.Module, imports?: WebAssembly.Imports) => {
+      const instance = await WebAssembly.instantiate(module, imports);
+      for (const e of Object.values(instance.exports)) if (e instanceof WebAssembly.Memory) memories.add(e);
+      return instance;
+    };
+    const loaded = await instantiate(source.url, this.imports(dev), { ...(source.modules ? { modules: source.modules } : {}), instantiateCore });
     const root = loaded.exports as unknown as Root;
     // A composed node exports one `app-<name>` instance per app; the kit lists them by WIT name
     // (`app-http-get#run`), whatever jco keys them by.
@@ -531,7 +561,7 @@ export class Network {
       .filter((n) => n.endsWith('#run'))
       .map((n) => ({ name: n.slice('app-'.length, -'#run'.length), run: loaded.exportFn(n) as () => Promise<unknown> }))
       .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
-    return { name, component, root, apps };
+    return { name, component, root, apps, memories };
   }
 
   /** The `instance` message for device `dev`'s instance: its ports and what it exports. */
@@ -614,6 +644,15 @@ export class Network {
       get env() {
         return codec.decodeConfig(self.result(x.wn_env(dev)));
       },
+      // What `Op::Stdin` wrote, queued by the simulator; a read with nothing queued waits for
+      // more (the kit treats that promise as patient: under a virtual clock input may never come).
+      stdin: () => {
+        const read = (): Uint8Array | Promise<Uint8Array> => {
+          const chunk = self.result(x.wn_stdin(dev));
+          return chunk.length > 0 ? chunk : new Promise<void>((wake) => self.stdinWaiters.set(dev, wake)).then(read);
+        };
+        return read();
+      },
     };
   }
 
@@ -692,7 +731,7 @@ export class Network {
     const got = await this.withBytesAsync(n, (np, nl) =>
       this.withBytesAsync(c, (cp, cl) =>
         this.withBytesAsync(codec.encodeConfig(pairs), (gp, gl) =>
-          this.withBytesAsync(codec.encodeOptions(options), (op, ol) => this.x.wn_add_device(np, nl, cp, cl, gp, gl, op, ol)),
+          this.withBytesAsync(codec.encodeValue(codec.plainOptions(options)), (op, ol) => this.x.wn_add_device(np, nl, cp, cl, gp, gl, op, ol)),
         ),
       ),
     );
@@ -724,9 +763,12 @@ export class Network {
     if (got < 0) throw new Error(this.resultText());
   }
 
-  /** Wires two ports with a point-to-point link of one-way `latency` (virtual ns). */
-  link(a: PortRef, b: PortRef, latency: bigint | number): Link {
-    const got = this.x.wn_link(a.device, a.port, b.device, b.port, U64(BigInt(latency)));
+  /**
+   * Wires two ports with a point-to-point link of one-way `latency` (virtual ns), with `options`
+   * (MTU, impairments by direction, capture options: `LinkOptions`, read by the simulator).
+   */
+  link(a: PortRef, b: PortRef, latency: bigint | number, options: LinkOptions = {}): Link {
+    const got = this.withBytes(codec.encodeValue({ ...options, latency: BigInt(latency) }), (p, l) => this.x.wn_link_with(a.device, a.port, b.device, b.port, p, l));
     if (got < 0) throw new Error(this.resultText());
     return { index: got, name: this.linkName(got) };
   }
@@ -843,6 +885,31 @@ export class Network {
       this.withBytes(encoder.encode(argument), (ap, al) => this.x.wn_schedule_command(dev, U64(BigInt(at)), cp, cl, ap, al)),
     );
     if (got < 0) throw new Error(this.resultText());
+  }
+
+
+  /**
+   * Adds an operator event (`Op`: its `kind`, `at` and fields, read by the simulator, which
+   * refuses an unknown kind or field); answers its index in `opStates()`.
+   */
+  op(op: Op): number {
+    const got = this.withBytes(codec.encodeValue(op), (p, l) => this.x.wn_add_op(p, l));
+    if (got < 0) throw new Error(this.resultText());
+    return got;
+  }
+
+  /** The operator events' states, in the order they were added. */
+  opStates(): OpState[] {
+    const len = this.x.wn_op_states();
+    if (len < 0) throw new Error(this.resultText());
+    return codec.decodeValue(this.result(len)) as OpState[];
+  }
+
+  /** Every device's cost so far: its memory and peak memory (bytes), calls and polls. */
+  costs(): DeviceCost[] {
+    const len = this.x.wn_costs();
+    if (len < 0) throw new Error(this.resultText());
+    return codec.decodeValue(this.result(len)) as DeviceCost[];
   }
 
   /** Everything the device wrote to stdout (or stderr) so far. */
