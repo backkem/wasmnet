@@ -19,6 +19,7 @@ const LINKTYPE_ETHERNET: u16 = 1;
 const OPT_ENDOFOPT: u16 = 0;
 const OPT_SHB_USERAPPL: u16 = 4;
 const OPT_IF_NAME: u16 = 2;
+const OPT_IF_DESCRIPTION: u16 = 3;
 const OPT_IF_TSRESOL: u16 = 9;
 const OPT_EPB_FLAGS: u16 = 2;
 /// `if_tsresol` value: high bit clear, so the resolution is 10^-9 s.
@@ -98,6 +99,18 @@ impl PcapNgEncoder {
         name: &str,
         snaplen: u32,
     ) -> Result<InterfaceId, PcapNgError> {
+        self.add_described_interface(name, snaplen, "")
+    }
+
+    /// Like [`add_ethernet_interface`](Self::add_ethernet_interface), and also records
+    /// `description` as `if_description`, after `if_name`. An empty description is omitted, so
+    /// it writes exactly the bytes `add_ethernet_interface` does.
+    pub fn add_described_interface(
+        &mut self,
+        name: &str,
+        snaplen: u32,
+        description: &str,
+    ) -> Result<InterfaceId, PcapNgError> {
         let id = u32::try_from(self.snaplens.len()).map_err(|_| PcapNgError::TooManyInterfaces)?;
         self.block(IDB_TYPE, |b| {
             put_u16(b, LINKTYPE_ETHERNET);
@@ -105,6 +118,7 @@ impl PcapNgEncoder {
             put_u32(b, snaplen);
             let mut opts = Options::new(b);
             opts.add_str(OPT_IF_NAME, name)?;
+            opts.add_str(OPT_IF_DESCRIPTION, description)?;
             opts.add(OPT_IF_TSRESOL, &[TSRESOL_NANOS])?;
             opts.finish();
             Ok(())
@@ -121,7 +135,7 @@ impl PcapNgEncoder {
         timestamp_ns: u64,
         frame: &[u8],
     ) -> Result<(), PcapNgError> {
-        self.write_epb(iface, timestamp_ns, frame, None)
+        self.write_epb(iface, timestamp_ns, frame, frame.len(), None)
     }
 
     /// Like [`write_packet`](Self::write_packet), and also records the packet's [`Direction`]
@@ -133,7 +147,22 @@ impl PcapNgEncoder {
         frame: &[u8],
         direction: Direction,
     ) -> Result<(), PcapNgError> {
-        self.write_epb(iface, timestamp_ns, frame, Some(direction))
+        self.write_epb(iface, timestamp_ns, frame, frame.len(), Some(direction))
+    }
+
+    /// Like [`write_packet_directed`](Self::write_packet_directed) for a packet of which only
+    /// the first bytes are at hand (`data`, already cut by an earlier capture): `original_len`
+    /// is the packet's full length (taken as `data.len()` if shorter). The data is cut to the
+    /// interface's snap length as well.
+    pub fn write_packet_prefix(
+        &mut self,
+        iface: InterfaceId,
+        timestamp_ns: u64,
+        data: &[u8],
+        original_len: usize,
+        direction: Direction,
+    ) -> Result<(), PcapNgError> {
+        self.write_epb(iface, timestamp_ns, data, original_len, Some(direction))
     }
 
     fn write_epb(
@@ -141,18 +170,22 @@ impl PcapNgEncoder {
         iface: InterfaceId,
         timestamp_ns: u64,
         frame: &[u8],
+        original_len: usize,
         direction: Option<Direction>,
     ) -> Result<(), PcapNgError> {
         let snaplen = *self
             .snaplens
             .get(iface.0 as usize)
             .ok_or(PcapNgError::UnknownInterface(iface.0))?;
+        let original = original_len.max(frame.len());
         let original_len =
-            u32::try_from(frame.len()).map_err(|_| PcapNgError::BlockTooLarge(frame.len()))?;
+            u32::try_from(original).map_err(|_| PcapNgError::BlockTooLarge(original))?;
+        // `frame.len() <= original_len`, so it fits in a u32 too.
+        let have = frame.len() as u32;
         let captured_len = if snaplen == 0 {
-            original_len
+            have
         } else {
-            original_len.min(snaplen)
+            have.min(snaplen)
         };
         let data = frame.get(..captured_len as usize).unwrap_or(frame);
         self.block(EPB_TYPE, |b| {
@@ -372,6 +405,47 @@ mod tests {
         assert_eq!(&epb[24..28], &6u32.to_le_bytes()); // original
         assert_eq!(&epb[28..32], &[1, 2, 3, 4]);
         assert_eq!(epb.len(), 36);
+    }
+
+    #[test]
+    fn a_prefix_keeps_the_original_length_and_still_obeys_the_snap_length() {
+        let mut enc = PcapNgEncoder::new("").expect("shb");
+        let whole = enc.add_ethernet_interface("", 0).expect("idb");
+        let snapped = enc.add_ethernet_interface("", 2).expect("idb");
+        let start = enc.bytes().len();
+        enc.write_packet_prefix(whole, 7, &[1, 2, 3, 4], 1514, Direction::Inbound)
+            .expect("epb");
+        let epb = &enc.bytes()[start..];
+        assert_eq!(&epb[20..24], &4u32.to_le_bytes()); // captured
+        assert_eq!(&epb[24..28], &1514u32.to_le_bytes()); // original
+        let start = enc.bytes().len();
+        enc.write_packet_prefix(snapped, 7, &[1, 2, 3, 4], 0, Direction::Inbound)
+            .expect("epb");
+        let epb = &enc.bytes()[start..];
+        assert_eq!(&epb[20..24], &2u32.to_le_bytes());
+        assert_eq!(
+            &epb[24..28],
+            &4u32.to_le_bytes(),
+            "never shorter than the data"
+        );
+    }
+
+    #[test]
+    fn a_description_follows_the_name_and_an_empty_one_changes_nothing() {
+        let mut plain = PcapNgEncoder::new("").expect("shb");
+        plain.add_ethernet_interface("a-b", 0).expect("idb");
+        let mut empty = PcapNgEncoder::new("").expect("shb");
+        empty.add_described_interface("a-b", 0, "").expect("idb");
+        assert_eq!(plain.bytes(), empty.bytes());
+
+        let mut enc = PcapNgEncoder::new("").expect("shb");
+        let start = enc.bytes().len();
+        enc.add_described_interface("a-b", 64, "end").expect("idb");
+        let idb = &enc.bytes()[start..];
+        // 16 header + 8 if_name + 8 if_description + 8 if_tsresol + 4 endofopt + 4 trailer.
+        assert_eq!(idb.len(), 48);
+        assert_eq!(&idb[12..16], &64u32.to_le_bytes());
+        assert_eq!(&idb[24..32], &[3, 0, 3, 0, b'e', b'n', b'd', 0]);
     }
 
     #[test]
