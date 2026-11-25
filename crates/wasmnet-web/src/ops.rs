@@ -160,7 +160,7 @@ const OPTIONS: &[&str] = &[
     "env",
 ];
 
-/// A device's options (`DeviceOptions`) from a value: the fields of [`OPTIONS`], every one
+/// A device's options (`DeviceOptions`) from a value: the fields of `OPTIONS`, every one
 /// optional. `infra-supply` is `true` (the core's default limits) or
 /// `{ max-bytes, max-components, max-total }`; `env` is a list of `[name, value]` pairs.
 pub fn options(v: &Value) -> Result<DeviceOptions, String> {
