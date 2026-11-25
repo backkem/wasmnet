@@ -17,6 +17,8 @@
 //!   `control <name> <command> [<argument>]` (the argument is the rest of the line, trimmed),
 //!   `start <name>`, `stop <name>` (no grace period), `remove <name>`, or
 //!   `wire <name> <cable>` (the cable's CBOR as hex), `unwire <name> <port>`,
+//!   `supply <digest> <bytes>` (a component's bytes as hex, checked against `<digest>` unless it
+//!   is `-`; the result adds `digest`: `components.supply`),
 //!   `logs <name> [stdout|stderr] [<tail>]` (the device's journalled output lines, default
 //!   `stderr` and every line), `answer <request-id>` (the answer to the command sent with
 //!   that request id: `devices.control-answer`), or `events <name> [<kinds>|-] [<since>]` (the
@@ -111,6 +113,11 @@ pub enum Verb {
         kinds: Vec<String>,
         since: u64,
     },
+    /// `components.supply` of a component's bytes, checked against the step's name as a digest
+    /// reference unless the name is `-`.
+    Supply {
+        bytes: Vec<u8>,
+    },
 }
 
 impl Verb {
@@ -126,6 +133,7 @@ impl Verb {
             Verb::Wire { .. } => "wire",
             Verb::Unwire { .. } => "unwire",
             Verb::Events { .. } => "events",
+            Verb::Supply { .. } => "supply",
         }
     }
 }
@@ -211,7 +219,7 @@ fn hex(text: &str) -> Option<Vec<u8>> {
 /// Parses one step's value.
 pub fn parse_step(n: u32, text: &str) -> Result<Step, String> {
     let syntax = "`<at> [id=<id>] [when=<id>~|!<text>|when=<id>.<key>=<value>] \
-                  apply|control|start|stop|remove|logs|answer|wire|unwire|events <name> [<rest>]`";
+                  apply|control|start|stop|remove|logs|answer|wire|unwire|events|supply <name> [<rest>]`";
     let text = text.trim();
     let (at, rest) = text.split_once(char::is_whitespace).ok_or(syntax)?;
     let at = parse_duration(at).ok_or_else(|| format!("`{at}` is not a duration"))?;
@@ -286,6 +294,9 @@ pub fn parse_step(n: u32, text: &str) -> Result<Step, String> {
         "remove" => Verb::Remove,
         "wire" => Verb::Wire {
             cable: hex(rest).ok_or("wire: the cable must be hex")?,
+        },
+        "supply" => Verb::Supply {
+            bytes: hex(rest).ok_or("supply: the bytes must be hex")?,
         },
         "unwire" => Verb::Unwire {
             port: rest

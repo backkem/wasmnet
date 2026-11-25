@@ -1,7 +1,7 @@
 //! wit-bindgen glue: a stepped device with no ports that exports `wasmnet:link/device` and
 //! `wasmnet:control/commands` (`set`, `variables`, `args`, `env`) and makes the script's calls
-//! through `wasmnet:infra/devices` and `events` (its rules: read the followed devices' events,
-//! then arm a wake on them).
+//! through `wasmnet:infra/devices`, `components` and `events` (its rules: read the followed
+//! devices' events, then arm a wake on them).
 
 // Generated bindings and `export!` need unsafe (raw ABI glue); our own code here does not.
 #![allow(unsafe_code)]
@@ -17,6 +17,7 @@ wit_bindgen::generate!({
             include wasmnet:link/stepped-device@0.1.0;
             import wasmnet:infra/devices@0.1.2;
             import wasmnet:infra/events@0.1.2;
+            import wasmnet:infra/components@0.1.2;
             export wasmnet:control/commands@0.1.0;
         }
     ",
@@ -33,7 +34,7 @@ wit_bindgen::generate!({
 use exports::wasmnet::control::commands;
 use exports::wasmnet::link::device;
 use wasi::config::store;
-use wasmnet::infra::{devices, events};
+use wasmnet::infra::{components, devices, events};
 use wasmnet::link::log::{self, Level};
 use wasmnet::link::types::PortInfo;
 
@@ -123,6 +124,13 @@ fn run(step: &Step) -> (String, Vec<(String, String)>) {
                     ];
                     ("ok".to_owned(), fields)
                 }
+                Err(e) => (format!("{e:?}"), Vec::new()),
+            };
+        }
+        Verb::Supply { bytes } => {
+            let digest = (name != "-").then_some(name);
+            return match components::supply(digest, bytes) {
+                Ok(d) => ("ok".to_owned(), vec![("digest".to_owned(), d)]),
                 Err(e) => (format!("{e:?}"), Vec::new()),
             };
         }
