@@ -66,7 +66,10 @@ versions without notice. Rustdoc and the design notes mark it **embedder surface
 Other parts of the tree, for reference: `crates/wasmnet-wire` (`no_std` wire helpers: MAC
 addresses, Ethernet, pcap-ng, DHCP and DNS codecs, DNS-SD's helpers), `crates/wasmnet-app-kit` (what an app needs: its
 bindings, and what the apps here share), and four test fixtures among the components
-(`blaster`, `reflector`, `clock-probe`, `infra-script`).
+(`blaster`, `reflector`, `clock-probe`, `infra-script`). `crates/wasmnet-artifacts` reads and
+writes the artifact manifest (its format is versioned by its `format` key, `wasmnet-artifacts/1`)
+and fetches a pinned set; its Rust API is new and may still change
+([design/artifacts.md](design/artifacts.md)).
 
 ## Building public types
 

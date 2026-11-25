@@ -183,3 +183,19 @@ here so that nobody has to find these the hard way. Each entry names where the c
 ## Tooling
 
 - **The compile cache's stale-lock handling** is only exercised on Linux and Windows.
+- **Component bytes may differ between Linux and Windows.** `cargo xtask build` maps every
+  source path out of the components, so a rebuild in another checkout on the same operating
+  system gives the same bytes, but whether a Linux and a Windows build agree has not been
+  observed: cargo likely derives the symbol hashes of the workspace's own crates from their
+  relative paths with the platform's separator. CI's `platforms` job compares the two and does
+  not fail the workflow; until it passes, a published set is built on Linux
+  ([design/artifacts.md](design/artifacts.md#reproducible-bytes)).
+- **No set of artifacts is published yet.** The workflow that would push each commit's set to
+  the container registry is a proposal
+  ([design/artifacts-workflow.yml.example](design/artifacts-workflow.yml.example)); until it
+  runs, `Source::Oci` has nothing to fetch, and an embedder fetches from a directory built with
+  `cargo xtask artifacts`.
+- **The commit check reads a range.** `cargo xtask check-tree --commits BASE..HEAD` reads the
+  messages and added lines of the commits in the range only; history before the base is not
+  checked (the repository's first commits carry trailers it would report). A push whose base
+  is not in the clone's history (a force push) fails the CI job.

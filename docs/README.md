@@ -26,6 +26,9 @@ For embedders:
 
 - [../components/README.md](../components/README.md): every component and node by name, its
   package and artifact, and how to build a few of them into a directory.
+- [design/artifacts.md](design/artifacts.md): a revision's components as a set of files with
+  hashes and a manifest, what makes a rebuild give the same bytes, where a set is meant to be
+  published, and how another repository's build fetches and checks one.
 - [design/runtime-and-extensions.md](design/runtime-and-extensions.md): the `Runtime` backend
   contract, what `wasmnet-host` adds, and the extension points.
 - [design/links.md](design/links.md): the link model: latency, MTU, carrier, and per-direction

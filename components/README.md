@@ -15,6 +15,11 @@ components it is composed from. `--out-dir` copies what was asked for (everythin
 `--only`) into a directory, each file under the name in the artifact column. That is all
 another repository needs to run a network: the files load with `Host::load`.
 
+Rather than build them, another repository can fetch a revision's published set and check it
+against hashes it pins: `cargo xtask artifacts` writes the set (everything below except the
+test fixtures) with a manifest of each file's SHA-256 and interfaces, and
+`crates/wasmnet-artifacts` fetches and checks it ([docs/design/artifacts.md](../docs/design/artifacts.md)).
+
 In `target/wasm32-wasip2/release/` cargo names a library's artifact after its library target,
 with underscores (`udp_echo_server.wasm`, `wan_port.wasm`). `--out-dir` uses the component's
 name, as a composition does: `wac` knows a fabric device as `wasmnet:<name>` and an app as

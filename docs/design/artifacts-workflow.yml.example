@@ -1,0 +1,81 @@
+# A proposal, not a workflow: GitHub runs only files in .github/workflows/, and this one stays
+# here until the maintainer decides to publish (docs/design/artifacts.md, "Publishing").
+#
+# On every push to main it builds the published set twice, on two fresh runners, and pushes it
+# to the repository's container registry only when both builds give the same bytes:
+#
+#   ghcr.io/<owner>/<repository>/components:<full commit hash>
+#
+# one OCI artifact per commit, every file a layer named by its SHA-256 (what an embedder pins),
+# plus manifest.toml and SHA256SUMS. It needs `packages: write` for the push and nothing else.
+
+name: artifacts
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    # Two independent builds: the published hashes are the ones a second build reproduced.
+    strategy:
+      matrix:
+        build: [first, second]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # rustup reads rust-toolchain.toml: the pinned compiler and the wasm targets.
+      - run: rustup show
+      # No build cache: each build starts from nothing.
+      - uses: cargo-bins/cargo-binstall@v1.27.0
+      # The pinned versions are in tools.toml; `cargo xtask tools` prints them as package@version.
+      - name: Install wasm-tools and wac (pinned)
+        run: cargo binstall --no-confirm --locked $(cargo xtask tools wasm-tools wac-cli)
+      - name: Build the set
+        run: cargo xtask artifacts --out target/artifacts
+      - name: A clean tree only
+        run: grep -qx 'dirty = false' target/artifacts/manifest.toml
+      - uses: actions/upload-artifact@v4
+        with:
+          name: set-${{ matrix.build }}
+          path: target/artifacts
+          retention-days: 1
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - uses: actions/download-artifact@v4
+        with:
+          path: sets
+      - name: Both builds gave the same bytes
+        run: |
+          cargo xtask artifacts --verify sets/set-first
+          cargo xtask artifacts --compare sets/set-first/manifest.toml sets/set-second/manifest.toml
+      - uses: oras-project/setup-oras@v1
+        with:
+          version: 1.2.0
+      - name: Push the set, tagged with its commit
+        working-directory: sets/set-first
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$TOKEN" | oras login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          files=(manifest.toml:application/toml SHA256SUMS:text/plain)
+          for f in *.wasm; do files+=("$f:application/wasm"); done
+          oras push "ghcr.io/${GITHUB_REPOSITORY,,}/components:$GITHUB_SHA" \
+            --artifact-type application/vnd.wasmnet.artifacts.v1 \
+            --annotation "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --annotation "org.opencontainers.image.revision=$GITHUB_SHA" \
+            "${files[@]}"

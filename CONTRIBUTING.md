@@ -21,7 +21,12 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo xtask build          # every component and node builds and validates
 cargo test --workspace     # native tests, including end-to-end runs of real nodes
 cargo xtask test-guest     # component tests, inside wasmtime
+cargo xtask check-tree     # no local path, AI tool session link or conflict marker in the tree
 ```
+
+CI also runs `cargo xtask check-tree --commits <base>..<head>` on the commits a pull request
+brings: their messages and added lines must be free of the same. A placeholder path that must
+stay (in an example) carries `tree-check: allow` on its line.
 
 ## What we look for
 
