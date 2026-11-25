@@ -1,8 +1,8 @@
 <h1 align="center">wasmnet</h1>
 
 <p align="center">
-  <b>A whole IP network in one process.</b><br>
-  Hosts, switches and routers as WebAssembly components, on virtual time.<br>
+  <b>A deterministic simulator for fleets of WebAssembly devices.</b><br>
+  A whole IP network in one process: hosts, switches and routers as components, on virtual time.<br>
   <a href="https://backkem.github.io/wasmnet/">Try it in your browser</a>
 </p>
 
@@ -13,6 +13,11 @@ network would give you: ARP, SYN, SYN-ACK, `GET / HTTP/1.1`, in a capture Wiresh
 Except that this network lives in one process, touches nothing on your machine, and does
 exactly the same thing every time.
 
+The network is the largest part, not the whole. Underneath is a simulator for a fleet of
+devices: it creates, stops, crashes and limits them while the run goes on, lets a device that
+is granted it manage the others, and serves each one its time, its entropy and its wires from
+one seed. A network is what the components here build on that.
+
 - 🔁 **Same seed, same bytes.** Time is virtual and entropy is seeded. A run repeats exactly,
   captures and logs included, on every machine.
 - 📡 **Real protocols on real frames.** Ethernet, ARP and NDP, IPv4 and IPv6, TCP and UDP, DHCP,
@@ -21,6 +26,9 @@ exactly the same thing every time.
   they are simulated.
 - 🧱 **Nothing leaks.** No TAP device, no host sockets, no wall clock. Components have no
   ambient authority, so the sandbox keeps the promise.
+- 🎛️ **A fleet you can operate.** Add, stop, restart, crash and limit devices mid-run, by hand
+  or from a controller inside the simulation (`wasmnet:infra`). Every change is an event at a
+  virtual instant, so it replays.
 - 🌐 **In a tab too.** The same simulator and devices run in a browser, live.
 
 ```text
@@ -62,7 +70,7 @@ The full version is [`crates/wasmnet-host/examples/http.rs`](crates/wasmnet-host
 | Path | What it does |
 |---|---|
 | [`crates/wasmnet-host`](crates/wasmnet-host) | Runs a network on wasmtime: one store per device, deterministic WASI. Start here. |
-| [`crates/wasmnet-core`](crates/wasmnet-core) | The simulator itself: virtual clock, event queue, patch panel, link model, pcap taps. No wasmtime. |
+| [`crates/wasmnet-core`](crates/wasmnet-core) | The simulator itself: devices and their lifecycle, virtual clock, event queue, patch panel, link model, pcap taps. No wasmtime. |
 | [`crates/wasmnet-web`](crates/wasmnet-web) | The simulator for a browser, with [`web/`](web): a TypeScript binding and the page behind the link above. |
 | [`crates/wasmnet-artifacts`](crates/wasmnet-artifacts) | A revision's components as files with hashes: their manifest, and fetching a pinned set from a directory or a registry. |
 | [`components/`](components) | `netstack` (smoltcp behind `wasi:sockets@0.3`), `switch`, `router`, `wan-port`. [All of them by name](components/README.md). |

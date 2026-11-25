@@ -30,6 +30,11 @@ stay (in an example) carries `tree-check: allow` on its line.
 
 ## What we look for
 
+- **A small core, and crates with a purpose.** `wasmnet-core` is the device model: devices and
+  their lifecycle, the cables between them, virtual time, the journal, and the points an
+  extension hooks into. A capability that can be built on those points is a crate or a
+  component of its own, using only the public API, so that it could as well live in another
+  repository. If it cannot be built that way, the extension point is what to improve first.
 - **Determinism is a feature, flakiness is a bug.** Never fix a failing seed with a retry.
   Use `BTreeMap` or a sorted `Vec` wherever order can reach the output.
 - **A component never traps on data off the wire.** A malformed frame is dropped and
