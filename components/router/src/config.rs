@@ -23,13 +23,31 @@
 //! | `neighbor.lifetime` | how long a learned neighbor is trusted (checked when used) | `300s` |
 //! | `trace.route-lookup` | `route-lookup` events: `first` (once per destination), `all` or `none` | `first` |
 //! | `trace.ttl-decrement` | `ttl-decrement` events: `first` (once per flow), `all` or `none` | `first` |
+//!
+//! Address translation and the filter (`docs/design/nat.md`), all optional:
+//!
+//! | key | value | default |
+//! |---|---|---|
+//! | `port<N>.nat` | `masquerade`: port N is an outside port (needs `port<N>.ipv4`) | none |
+//! | `port<N>.allow` | allow rules for packets forwarded from port N, a list (see [`crate::filter::parse_rule`]) | none: everything |
+//! | `nat.mapping`, `nat.filtering` | `endpoint-independent`, `address-dependent` or `address-and-port-dependent` | EIM, APDF |
+//! | `nat.hairpin` | `true` or `false` | `true` |
+//! | `nat.port-allocation` | `preserve` or `sequential` | `preserve` |
+//! | `nat.port-range` | `<low>-<high>`, 1..=65535 | `1024-65535` |
+//! | `nat.forwards` | port forwards, a list (see [`crate::nat::parse_forward`]) | none |
+//! | `conntrack.udp-timeout`, `conntrack.tcp-established-timeout`, `conntrack.tcp-transitory-timeout`, `conntrack.icmp-timeout` | idle timeouts | `300s`, `7440s`, `240s`, `60s` |
+//! | `conntrack.max-entries` | NAT sessions, and filter flows, 1..=65536 each | `4096` |
+//! | `trace.nat-filtered`, `trace.filter-drop` | `first` (once per flow), `all` or `none` | `first` |
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use wasmnet_wire::{MacAddr, parse_duration};
 
+use crate::filter::{Rule, parse_rule};
+use crate::nat::{Allocation, Dependence, NatConfig, parse_forward};
 use crate::route::Prefix;
+use crate::track::Timeouts;
 
 /// Most ports a router may have.
 pub const MAX_PORTS: u32 = 16;
@@ -72,6 +90,10 @@ pub struct PortConfig {
     pub ra: bool,
     /// DHCP servers this port relays client broadcasts to (RFC 1542); empty: no relay.
     pub dhcp_relay: Vec<Ipv4Addr>,
+    /// An outside port of address translation (`masquerade`).
+    pub nat: bool,
+    /// Allow rules for packets forwarded from this port; empty: everything.
+    pub allow: Vec<Rule>,
 }
 
 /// A static route: `10.0.3.0/24 via 10.0.2.2`, `default via 10.0.2.2`,
@@ -105,6 +127,13 @@ pub struct Config {
     pub neighbor: NeighborConfig,
     pub trace_route_lookup: Trace,
     pub trace_ttl_decrement: Trace,
+    /// Translation settings, when a port has `nat`.
+    pub nat: Option<NatConfig>,
+    /// Connection tracking's idle timeouts and table size (NAT sessions, filter flows).
+    pub conntrack: Timeouts,
+    pub conntrack_max: usize,
+    pub trace_nat_filtered: Trace,
+    pub trace_filter_drop: Trace,
 }
 
 /// The default base MAC (`R` = 0x52).
@@ -118,6 +147,17 @@ const PORT_KEYS: &[&str] = &[
     "ipv6-link-local",
     "ra",
     "dhcp-relay",
+    "nat",
+    "allow",
+];
+/// Keys that only mean something when a port translates.
+const NAT_KEYS: &[&str] = &[
+    "nat.mapping",
+    "nat.filtering",
+    "nat.hairpin",
+    "nat.port-allocation",
+    "nat.port-range",
+    "nat.forwards",
 ];
 const TOP_KEYS: &[&str] = &[
     "ports",
@@ -130,6 +170,19 @@ const TOP_KEYS: &[&str] = &[
     "neighbor.lifetime",
     "trace.route-lookup",
     "trace.ttl-decrement",
+    "nat.mapping",
+    "nat.filtering",
+    "nat.hairpin",
+    "nat.port-allocation",
+    "nat.port-range",
+    "nat.forwards",
+    "conntrack.udp-timeout",
+    "conntrack.tcp-established-timeout",
+    "conntrack.tcp-transitory-timeout",
+    "conntrack.icmp-timeout",
+    "conntrack.max-entries",
+    "trace.nat-filtered",
+    "trace.filter-drop",
 ];
 
 /// The link-local address of `mac` (RFC 4291 modified EUI-64).
@@ -329,6 +382,37 @@ impl Config {
                     "port{n}.dhcp-relay needs port{n}.ipv4 (it becomes the relayed giaddr)"
                 )));
             }
+            let nat = r
+                .get(&key("nat"), "masquerade", |v| {
+                    (v == "masquerade").then_some(true)
+                })?
+                .unwrap_or(false);
+            if nat && ipv4.is_none() {
+                return Err(ConfigError::Other(format!(
+                    "port{n}.nat needs port{n}.ipv4 (the address it translates to)"
+                )));
+            }
+            let allow = match map.get(&key("allow")) {
+                None => Vec::new(),
+                Some(list) => list
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty())
+                    .map(|t| {
+                        parse_rule(t).map_err(|why| ConfigError::Invalid {
+                            key: key("allow"),
+                            value: t.to_owned(),
+                            expected: why,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            };
+            if allow.len() > crate::filter::MAX_RULES {
+                return Err(ConfigError::Other(format!(
+                    "port{n}.allow has more than {} rules",
+                    crate::filter::MAX_RULES
+                )));
+            }
             port_configs.push(PortConfig {
                 mac,
                 mtu,
@@ -337,6 +421,8 @@ impl Config {
                 link_local,
                 ra,
                 dhcp_relay,
+                nat,
+                allow,
             });
         }
 
@@ -390,6 +476,47 @@ impl Config {
         let trace_ttl_decrement = r
             .get("trace.ttl-decrement", "first, all or none", trace)?
             .unwrap_or(Trace::First);
+        let timeout = |key: &str, default_s: u64| {
+            r.get(key, "a duration above zero like 300s", |v| {
+                parse_duration(v).filter(|&ns| ns > 0)
+            })
+            .map(|v| v.unwrap_or(default_s * 1_000_000_000))
+        };
+        let conntrack = Timeouts {
+            udp: timeout("conntrack.udp-timeout", 300)?,
+            tcp_established: timeout("conntrack.tcp-established-timeout", 7440)?,
+            tcp_transitory: timeout("conntrack.tcp-transitory-timeout", 240)?,
+            icmp: timeout("conntrack.icmp-timeout", 60)?,
+        };
+        let conntrack_max = r
+            .get(
+                "conntrack.max-entries",
+                "an integer from 1 to 65536",
+                int(1usize, 65536),
+            )?
+            .unwrap_or(4096);
+        let trace_nat_filtered = r
+            .get("trace.nat-filtered", "first, all or none", trace)?
+            .unwrap_or(Trace::First);
+        let trace_filter_drop = r
+            .get("trace.filter-drop", "first, all or none", trace)?
+            .unwrap_or(Trace::First);
+        let nat_ports: Vec<u32> = port_configs
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.nat)
+            .map(|(n, _)| n as u32)
+            .collect();
+        let nat = if nat_ports.is_empty() {
+            if let Some(k) = NAT_KEYS.iter().find(|k| map.contains_key(**k)) {
+                return Err(ConfigError::Other(format!(
+                    "{k} needs a port that translates (port<N>.nat = masquerade)"
+                )));
+            }
+            None
+        } else {
+            Some(nat_config(&r, &map, &nat_ports)?)
+        };
         Ok(Self {
             ports: port_configs,
             routes,
@@ -397,8 +524,94 @@ impl Config {
             neighbor,
             trace_route_lookup,
             trace_ttl_decrement,
+            nat,
+            conntrack,
+            conntrack_max,
+            trace_nat_filtered,
+            trace_filter_drop,
         })
     }
+}
+
+/// The `nat.*` keys, for a router whose ports `nat_ports` translate.
+fn nat_config(
+    r: &Reader<'_>,
+    map: &BTreeMap<String, String>,
+    nat_ports: &[u32],
+) -> Result<NatConfig, ConfigError> {
+    let behaviour = "endpoint-independent, address-dependent or address-and-port-dependent";
+    let d = NatConfig::default();
+    let mapping = r
+        .get("nat.mapping", behaviour, Dependence::parse)?
+        .unwrap_or(d.mapping);
+    let filtering = r
+        .get("nat.filtering", behaviour, Dependence::parse)?
+        .unwrap_or(d.filtering);
+    let hairpin = r
+        .get("nat.hairpin", "true or false", |v| v.parse::<bool>().ok())?
+        .unwrap_or(d.hairpin);
+    let allocation = r
+        .get(
+            "nat.port-allocation",
+            "preserve or sequential",
+            |v| match v {
+                "preserve" => Some(Allocation::Preserve),
+                "sequential" => Some(Allocation::Sequential),
+                _ => None,
+            },
+        )?
+        .unwrap_or(d.allocation);
+    let port_range = r
+        .get(
+            "nat.port-range",
+            "a range like 1024-65535 (1..=65535, low first)",
+            |v| {
+                let (a, b) = v.split_once('-')?;
+                let (a, b): (u16, u16) = (a.trim().parse().ok()?, b.trim().parse().ok()?);
+                (a >= 1 && a <= b).then_some((a, b))
+            },
+        )?
+        .unwrap_or(d.port_range);
+    let mut forwards: Vec<crate::nat::Forward> = Vec::new();
+    if let Some(list) = map.get("nat.forwards") {
+        for text in list.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+            let invalid = |why: String| ConfigError::Invalid {
+                key: "nat.forwards".to_owned(),
+                value: text.to_owned(),
+                expected: why,
+            };
+            let f = parse_forward(text, nat_ports).map_err(invalid)?;
+            if forwards
+                .iter()
+                .any(|g| (g.proto, g.port, g.external) == (f.proto, f.port, f.external))
+            {
+                return Err(invalid("an external port forwarded only once".to_owned()));
+            }
+            if forwards
+                .iter()
+                .any(|g| (g.proto, g.port, g.internal) == (f.proto, f.port, f.internal))
+            {
+                return Err(invalid(
+                    "one forward per inside endpoint and port".to_owned(),
+                ));
+            }
+            forwards.push(f);
+        }
+    }
+    if forwards.len() > crate::nat::MAX_FORWARDS {
+        return Err(ConfigError::Other(format!(
+            "nat.forwards has more than {} forwards",
+            crate::nat::MAX_FORWARDS
+        )));
+    }
+    Ok(NatConfig {
+        mapping,
+        filtering,
+        hairpin,
+        allocation,
+        port_range,
+        forwards,
+    })
 }
 
 /// Parses one static route against the ports (see [`StaticRoute`]).

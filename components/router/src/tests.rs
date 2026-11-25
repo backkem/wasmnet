@@ -1531,3 +1531,5 @@ fn a_relay_needs_an_ipv4_port_and_server_addresses() {
     .unwrap_err();
     assert!(err.contains("dhcp-relay"), "{err}");
 }
+
+mod nat;

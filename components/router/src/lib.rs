@@ -38,9 +38,12 @@
 mod component;
 
 pub mod config;
+pub mod filter;
+pub mod nat;
 pub mod neighbor;
 pub mod route;
 pub mod router;
+pub mod track;
 pub mod wire;
 
 #[cfg(test)]

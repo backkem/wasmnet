@@ -21,7 +21,7 @@
 //! fits 576 (IPv4) or 1280 (IPv6) bytes, and are routed like any packet the router originates.
 //! There is no ICMP rate limiting: every error is counted and reported.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use etherparse::{
@@ -30,11 +30,14 @@ use etherparse::{
 use wasmnet_wire::{MacAddr, dhcp};
 
 use crate::config::{Config, PortConfig, Trace, is_link_local_v6, usable_v4};
+use crate::filter::{Filter, parse_rule};
+use crate::nat::{Nat, Proto, Refusal, parse_forward};
 use crate::neighbor::{Due, Enqueued, NeighborTable, Queued, Resolved};
 use crate::route::{Prefix, Route, RouteKind, RouteTable};
+use crate::track::{self, Kind};
 use crate::wire::{
     self, ETHERTYPE_ARP, ETHERTYPE_IPV4, ETHERTYPE_IPV6, PROTO_ICMP, PROTO_ICMPV6, PROTO_TCP,
-    PROTO_UDP,
+    PROTO_UDP, Side,
 };
 use crate::{Event, Sink};
 
@@ -138,9 +141,13 @@ pub struct Router {
     traced_dsts: BTreeSet<IpAddr>,
     traced_flows: BTreeSet<FlowKey>,
     pub counters: Counters,
+    /// Address translation, when a port has `nat` (`docs/design/nat.md`).
+    nat: Option<Nat>,
+    /// The allow lists and the flows they let through (inactive without rules).
+    filter: Filter,
 }
 
-fn proto_name(p: u8) -> String {
+pub(crate) fn proto_name(p: u8) -> String {
     match p {
         PROTO_ICMP => "icmp".to_owned(),
         PROTO_TCP => "tcp".to_owned(),
@@ -189,6 +196,44 @@ fn v4_dst(p: &[u8]) -> Ipv4Addr {
 fn v6_at(p: &[u8], at: usize) -> Ipv6Addr {
     let o: [u8; 16] = p[at..at + 16].try_into().expect("16 bytes");
     Ipv6Addr::from(o)
+}
+
+/// The earlier of two optional deadlines.
+fn earliest(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x.min(y)),
+        (x, None) => x,
+        (None, y) => y,
+    }
+}
+
+/// Recomputes the ICMP checksum of an IPv4 packet carrying ICMP (after its quote changed).
+fn refresh_icmp_checksum(p: &mut [u8]) {
+    let at = ihl(p);
+    p[at + 2..at + 4].copy_from_slice(&[0, 0]);
+    let c = wire::checksum(&p[at..]);
+    p[at + 2..at + 4].copy_from_slice(&c.to_be_bytes());
+}
+
+/// An IPv4 address from a tuple's `IpAddr` (NAT only sees IPv4).
+fn v4_of(a: IpAddr) -> Option<Ipv4Addr> {
+    match a {
+        IpAddr::V4(a) => Some(a),
+        IpAddr::V6(_) => None,
+    }
+}
+
+/// `nat-forward-added` / `nat-forward-removed {proto, external, internal, port}`.
+fn forward_event(kind: &'static str, f: &crate::nat::Forward) -> Event {
+    Event::new(
+        kind,
+        vec![
+            kv("proto", f.proto),
+            kv("external", f.external),
+            kv("internal", format!("{}:{}", f.internal.0, f.internal.1)),
+            kv("port", f.port),
+        ],
+    )
 }
 
 /// A command's refusal to touch a connected route.
@@ -259,6 +304,34 @@ impl Router {
                 c: PortCounters::default(),
             })
             .collect();
+        let nat = cfg.nat.clone().map(|n| {
+            let addrs: BTreeMap<u32, Ipv4Addr> = cfg
+                .ports
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| p.nat)
+                .filter_map(|(i, p)| Some((i as u32, p.ipv4?.0)))
+                .collect();
+            Nat::new(
+                n,
+                addrs,
+                cfg.conntrack,
+                cfg.conntrack_max,
+                cfg.trace_nat_filtered,
+            )
+        });
+        let rules = cfg
+            .ports
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (i as u32, p.allow.clone()))
+            .collect();
+        let filter = Filter::new(
+            rules,
+            cfg.conntrack,
+            cfg.conntrack_max,
+            cfg.trace_filter_drop,
+        );
         Self {
             cfg,
             ports,
@@ -268,7 +341,22 @@ impl Router {
             traced_dsts: BTreeSet::new(),
             traced_flows: BTreeSet::new(),
             counters: Counters::default(),
+            nat,
+            filter,
         }
+    }
+
+    /// The translation table, if a port translates.
+    pub fn nat(&self) -> Option<&Nat> {
+        self.nat.as_ref()
+    }
+
+    pub fn filter(&self) -> &Filter {
+        &self.filter
+    }
+
+    fn is_outside(&self, port: u32) -> bool {
+        self.nat.as_ref().is_some_and(|n| n.is_outside(port))
     }
 
     pub fn config(&self) -> &Config {
@@ -303,7 +391,29 @@ impl Router {
             if p.cfg.ra {
                 s.push_str(" ra");
             }
+            if p.cfg.nat {
+                s.push_str(" nat");
+            }
+            if !p.cfg.allow.is_empty() {
+                s.push_str(&format!(" allow {}", p.cfg.allow.len()));
+            }
             lines.push(s);
+        }
+        if let Some(n) = &self.nat {
+            let c = n.config();
+            lines.push(format!(
+                "  nat: mapping {}, filtering {}, hairpin {}, {} ports {}-{}, {} forward(s)",
+                c.mapping.name(),
+                c.filtering.name(),
+                if c.hairpin { "on" } else { "off" },
+                match c.allocation {
+                    crate::nat::Allocation::Preserve => "preserved",
+                    crate::nat::Allocation::Sequential => "sequential",
+                },
+                c.port_range.0,
+                c.port_range.1,
+                n.forwards().len()
+            ));
         }
         for r in self.routes.routes() {
             lines.push(format!("  route {r}"));
@@ -382,14 +492,24 @@ impl Router {
                         if v6 {
                             self.icmp_error_v6(now, from, &q.packet, 1, 3, [0; 4], out);
                         } else {
-                            self.icmp_error_v4(now, from, &q.packet, 3, 1, [0; 4], out);
+                            // A packet translated on its way out is reported as it came in.
+                            let packet = self.restore_source(port, from, q.packet);
+                            self.icmp_error_v4(now, from, &packet, 3, 1, [0; 4], out);
+                            self.drop_event("neighbor-unreachable", from, &packet, out);
+                            continue;
                         }
                         self.drop_event("neighbor-unreachable", from, &q.packet, out);
                     }
                 }
             }
         }
-        self.neigh.next_deadline()
+        let mut next = self.neigh.next_deadline();
+        if let Some(nat) = self.nat.as_mut() {
+            nat.expire(now, out);
+            next = earliest(next, nat.next_deadline());
+        }
+        self.filter.expire(now);
+        earliest(next, self.filter.next_deadline())
     }
 
     /// A port's carrier changed.
@@ -627,6 +747,12 @@ impl Router {
         if !self.is_up(route.port) {
             self.counters.port_down_drops += 1;
             return;
+        }
+        let mut packet = packet;
+        if self.is_outside(route.port) && packet.first().is_some_and(|b| b >> 4 == 4) {
+            // An ICMP error about a packet the router translated on its way in leaves with the
+            // quote as the remote sent it. Anything else it originates leaves as it is.
+            let _ = self.translate_error_out(route.port, &mut packet);
         }
         self.send_ip(now, route.port, route.next_hop(dst), packet, None, out);
     }
@@ -973,7 +1099,15 @@ impl Router {
             return;
         }
         if self.is_mine_v4(dst) {
-            self.local_v4(now, port, packet, out);
+            let outside = self.nat.as_ref().and_then(|n| n.port_with_addr(dst));
+            let taken = match outside {
+                Some(w) if w == port => self.nat_in(now, port, packet, out),
+                Some(w) if !self.is_outside(port) => self.hairpin(now, port, w, packet, out),
+                _ => false,
+            };
+            if !taken {
+                self.local_v4(now, port, packet, out);
+            }
         } else if dst.is_broadcast()
             || dst.is_multicast()
             || dst.is_unspecified()
@@ -1021,9 +1155,19 @@ impl Router {
             }
             return;
         }
-        wire::decrement_ttl_v4(&mut packet);
+        if !self.filter_ok(now, from, &packet, out) {
+            return;
+        }
         let l4 = &packet[ihl(&packet)..];
         let l4 = l4.get(..4).unwrap_or(l4).to_vec();
+        if self.is_outside(route.port)
+            && !self.is_outside(from)
+            && let Err(reason) = self.translate_out(now, route.port, &mut packet, out)
+        {
+            self.drop_event(reason, from, &packet, out);
+            return;
+        }
+        wire::decrement_ttl_v4(&mut packet);
         self.trace_ttl(
             proto,
             (IpAddr::V4(src), IpAddr::V4(dst)),
@@ -1254,6 +1398,9 @@ impl Router {
             let rest = u32::from(mtu).to_be_bytes();
             self.icmp_error_v6(now, from, &packet, 2, 0, rest, out);
             self.drop_event("packet-too-big", from, &packet, out);
+            return;
+        }
+        if !self.filter_ok(now, from, &packet, out) {
             return;
         }
         packet[7] -= 1;
@@ -1499,6 +1646,293 @@ impl Router {
     }
 
     // ------------------------------------------------------------------------------------------
+    // The packet filter and address translation (`docs/design/nat.md`)
+
+    /// Whether the filter lets a packet that arrived on `from` be forwarded. Always true on a
+    /// router without rules.
+    fn filter_ok(&mut self, now: u64, from: u32, packet: &[u8], out: &mut impl Sink) -> bool {
+        if !self.filter.active() {
+            return true;
+        }
+        let Some(t) = track::tuple(packet) else {
+            // A transport header too short to read: nothing a rule or a flow could match.
+            self.filter.counters.dropped += 1;
+            return false;
+        };
+        self.filter.check(now, from, &t, out)
+    }
+
+    /// Translates the source of a packet leaving through outside port `port` (from an inside
+    /// port): a TCP, UDP or ICMP echo packet gets its mapping's external endpoint, an ICMP error
+    /// about a packet that came in through a mapping gets its quote translated back. `Err` is
+    /// the `forward-drop` reason.
+    fn translate_out(
+        &mut self,
+        now: u64,
+        port: u32,
+        packet: &mut [u8],
+        out: &mut impl Sink,
+    ) -> Result<(), &'static str> {
+        let Some(nat) = self.nat.as_mut() else {
+            return Ok(());
+        };
+        let addr = nat.addr(port).ok_or("nat-no-mapping")?;
+        let l4 = packet.len() - ihl(packet);
+        let Some(t) = track::tuple(packet) else {
+            nat.counters.malformed += 1;
+            return Err("nat-malformed");
+        };
+        match t.kind {
+            Kind::Fragment => {
+                nat.counters.fragments += 1;
+                Err("nat-fragment")
+            }
+            Kind::Error(_) => self.translate_error_out(port, packet).map_err(|r| {
+                if let Some(n) = self.nat.as_mut() {
+                    n.counters.no_mapping += 1;
+                }
+                r.reason()
+            }),
+            Kind::Plain => {
+                let (p, src, sport, dst, dport) = t.key;
+                let (Some(src), Some(dst)) = (v4_of(src), v4_of(dst)) else {
+                    return Err("nat-unsupported");
+                };
+                let (proto, internal, remote) = match p {
+                    PROTO_UDP | PROTO_TCP if l4 < if p == PROTO_UDP { 8 } else { 20 } => {
+                        nat.counters.malformed += 1;
+                        return Err("nat-malformed");
+                    }
+                    PROTO_UDP => (Proto::Udp, (src, sport), (dst, dport)),
+                    PROTO_TCP => (Proto::Tcp, (src, sport), (dst, dport)),
+                    PROTO_ICMP if packet[ihl(packet)] == 8 => (Proto::Icmp, (src, sport), (dst, 0)),
+                    _ => {
+                        nat.counters.unsupported += 1;
+                        return Err("nat-unsupported");
+                    }
+                };
+                let ext = nat
+                    .outbound(now, port, proto, internal, remote, t.flags, out)
+                    .map_err(Refusal::reason)?;
+                wire::rewrite_v4(packet, Side::Src, addr, ext);
+                Ok(())
+            }
+        }
+    }
+
+    /// An ICMPv4 error leaving through outside port `port` about a packet a remote sent through
+    /// a mapping (its quote's destination is the inside endpoint): the quote's destination and
+    /// the error's source become the outside address and the external port. `Err` when no
+    /// mapping talked to that remote (the packet is left as it is).
+    fn translate_error_out(&mut self, port: u32, packet: &mut [u8]) -> Result<(), Refusal> {
+        let nat = self.nat.as_mut().ok_or(Refusal::NoMapping)?;
+        let addr = nat.addr(port).ok_or(Refusal::NoMapping)?;
+        let Some(Kind::Error((p, rsrc, rport, idst, iport))) = track::tuple(packet).map(|t| t.kind)
+        else {
+            return Err(Refusal::NoMapping);
+        };
+        let (Some(proto), Some(remote), Some(internal)) =
+            (Proto::from_number(p), v4_of(rsrc), v4_of(idst))
+        else {
+            return Err(Refusal::NoMapping);
+        };
+        if proto == Proto::Icmp {
+            return Err(Refusal::NoMapping);
+        }
+        let ext = nat
+            .error_out(port, proto, (internal, iport), (remote, rport))
+            .ok_or(Refusal::NoMapping)?;
+        let quote = ihl(packet) + 8;
+        wire::rewrite_v4(&mut packet[quote..], Side::Dst, addr, ext);
+        wire::rewrite_v4(packet, Side::Src, addr, 0);
+        refresh_icmp_checksum(packet);
+        nat.counters.icmp_errors_translated += 1;
+        Ok(())
+    }
+
+    /// A packet from the outside to outside port `port`'s own address: translated to the inside
+    /// endpoint of its mapping and forwarded, or dropped. Returns `false` for what stays the
+    /// router's own (echo requests, other protocols, ICMP errors about no mapping).
+    fn nat_in(&mut self, now: u64, port: u32, packet: &[u8], out: &mut impl Sink) -> bool {
+        let Some(nat) = self.nat.as_mut() else {
+            return false;
+        };
+        let at = ihl(packet);
+        let l4 = packet.len() - at;
+        let Some(t) = track::tuple(packet) else {
+            nat.counters.malformed += 1;
+            return true;
+        };
+        let (p, src, sport, _, dport) = t.key;
+        let Some(src) = v4_of(src) else {
+            return false;
+        };
+        let (proto, ext, remote) = match t.kind {
+            Kind::Fragment => {
+                nat.counters.fragments += 1;
+                return true;
+            }
+            Kind::Error(inner) => return self.nat_error_in(now, port, packet, inner, out),
+            Kind::Plain => match p {
+                PROTO_UDP | PROTO_TCP if l4 < if p == PROTO_UDP { 8 } else { 20 } => {
+                    nat.counters.malformed += 1;
+                    return true;
+                }
+                PROTO_UDP => (Proto::Udp, dport, (src, sport)),
+                PROTO_TCP => (Proto::Tcp, dport, (src, sport)),
+                PROTO_ICMP if packet[at] == 0 => (Proto::Icmp, dport, (src, 0)),
+                _ => return false,
+            },
+        };
+        if nat.peek(proto, port, ext).is_none() {
+            // Unsolicited: dropped without an answer (RFC 5382 REQ-4 for TCP).
+            nat.counters.no_mapping += 1;
+            return true;
+        }
+        if packet[8] <= 1 {
+            self.counters.ttl_expired += 1;
+            self.icmp_error_v4(now, port, packet, 11, 0, [0; 4], out);
+            self.drop_event("ttl-exceeded", port, packet, out);
+            return true;
+        }
+        match nat.inbound(now, port, proto, ext, remote, t.flags, out) {
+            Ok(internal) => {
+                let mut p = packet.to_vec();
+                wire::rewrite_v4(&mut p, Side::Dst, internal.0, internal.1);
+                self.forward_v4(now, port, p, out);
+            }
+            Err(Refusal::Filtered) => {}
+            Err(r) => self.drop_event(r.reason(), port, packet, out),
+        }
+        true
+    }
+
+    /// An ICMP error to the outside address about a packet that left through a mapping: it goes
+    /// to the inside endpoint, its quote and destination rewritten.
+    fn nat_error_in(
+        &mut self,
+        now: u64,
+        port: u32,
+        packet: &[u8],
+        (p, isrc, isport, idst, idport): track::FlowKey,
+        out: &mut impl Sink,
+    ) -> bool {
+        let Some(nat) = self.nat.as_mut() else {
+            return false;
+        };
+        let (Some(proto), Some(isrc), Some(idst)) =
+            (Proto::from_number(p), v4_of(isrc), v4_of(idst))
+        else {
+            return false;
+        };
+        if Some(isrc) != nat.addr(port) {
+            return false;
+        }
+        let remote = (idst, if proto == Proto::Icmp { 0 } else { idport });
+        let Some(internal) = nat.error_in(port, proto, isport, remote) else {
+            return false;
+        };
+        let mut pkt = packet.to_vec();
+        let quote = ihl(&pkt) + 8;
+        wire::rewrite_v4(&mut pkt[quote..], Side::Src, internal.0, internal.1);
+        wire::rewrite_v4(&mut pkt, Side::Dst, internal.0, 0);
+        refresh_icmp_checksum(&mut pkt);
+        nat.counters.icmp_errors_translated += 1;
+        self.forward_v4(now, port, pkt, out);
+        true
+    }
+
+    /// A packet from inside port `from` to outside port `w`'s address: when a mapping holds its
+    /// destination port it is hairpinned to that mapping's inside endpoint, from the sender's
+    /// own external endpoint (or refused, with `nat.hairpin = false`). Returns `false` for the
+    /// router's own traffic.
+    fn hairpin(&mut self, now: u64, from: u32, w: u32, packet: &[u8], out: &mut impl Sink) -> bool {
+        let Some(nat) = self.nat.as_mut() else {
+            return false;
+        };
+        let l4 = packet.len() - ihl(packet);
+        let Some(t) = track::tuple(packet).filter(|t| t.kind == Kind::Plain) else {
+            return false;
+        };
+        let (p, src, sport, _, dport) = t.key;
+        let (proto, Some(src), Some(addr)) = (
+            match p {
+                PROTO_UDP if l4 >= 8 => Proto::Udp,
+                PROTO_TCP if l4 >= 20 => Proto::Tcp,
+                _ => return false,
+            },
+            v4_of(src),
+            nat.addr(w),
+        ) else {
+            return false;
+        };
+        if nat.peek(proto, w, dport).is_none() {
+            return false;
+        }
+        if !nat.config().hairpin {
+            nat.counters.hairpin_refused += 1;
+            self.drop_event("nat-hairpin-refused", from, packet, out);
+            return true;
+        }
+        if packet[8] <= 1 {
+            self.counters.ttl_expired += 1;
+            self.icmp_error_v4(now, from, packet, 11, 0, [0; 4], out);
+            self.drop_event("ttl-exceeded", from, packet, out);
+            return true;
+        }
+        let ext = match nat.outbound(now, w, proto, (src, sport), (addr, dport), t.flags, out) {
+            Ok(e) => e,
+            Err(r) => {
+                self.drop_event(r.reason(), from, packet, out);
+                return true;
+            }
+        };
+        let internal = match nat.inbound(now, w, proto, dport, (addr, ext), t.flags, out) {
+            Ok(i) => i,
+            Err(Refusal::Filtered) => return true,
+            Err(r) => {
+                self.drop_event(r.reason(), from, packet, out);
+                return true;
+            }
+        };
+        nat.counters.hairpinned += 1;
+        let mut pkt = packet.to_vec();
+        wire::rewrite_v4(&mut pkt, Side::Src, addr, ext);
+        wire::rewrite_v4(&mut pkt, Side::Dst, internal.0, internal.1);
+        self.forward_v4(now, from, pkt, out);
+        true
+    }
+
+    /// A packet queued on outside port `port` after its source was translated, as it was before
+    /// (for the ICMP error its inside sender gets when the next hop never answers).
+    fn restore_source(&self, port: u32, from: u32, packet: Vec<u8>) -> Vec<u8> {
+        let Some(nat) = self.nat.as_ref() else {
+            return packet;
+        };
+        if !nat.is_outside(port) || nat.is_outside(from) {
+            return packet;
+        }
+        let Some(t) = track::tuple(&packet).filter(|t| t.kind == Kind::Plain) else {
+            return packet;
+        };
+        let (p, src, sport, _, _) = t.key;
+        let proto = match (p, packet.get(ihl(&packet))) {
+            (PROTO_UDP, _) => Proto::Udp,
+            (PROTO_TCP, _) => Proto::Tcp,
+            (PROTO_ICMP, Some(8)) => Proto::Icmp,
+            _ => return packet,
+        };
+        match nat.internal_of(port, proto, sport) {
+            Some(internal) if v4_of(src) == nat.addr(port) => {
+                let mut p = packet;
+                wire::rewrite_v4(&mut p, Side::Src, internal.0, internal.1);
+                p
+            }
+            _ => packet,
+        }
+    }
+
+    // ------------------------------------------------------------------------------------------
     // Commands (`wasmnet:control/commands`, documented in `wit/router/router.wit`)
 
     /// Runs one command at `now`: `route-add`, `route-replace` and `route-remove` change the
@@ -1507,7 +1941,7 @@ impl Router {
     /// ports and the counters other than the route ones are untouched.
     pub fn command(
         &mut self,
-        _now: u64,
+        now: u64,
         command: &str,
         argument: &str,
         out: &mut impl Sink,
@@ -1524,11 +1958,112 @@ impl Router {
                 .map(Route::to_string)
                 .collect::<Vec<_>>()
                 .join("\n")),
+            "forward-add" => self.forward_add(now, argument, out),
+            "forward-remove" => self.forward_remove(argument, out),
+            "allow-add" => self.allow_change(argument, true, out),
+            "allow-remove" => self.allow_change(argument, false, out),
+            "forwards" | "rules" | "mappings" if !argument.is_empty() => {
+                Err(format!("`{command}` takes no argument"))
+            }
+            "forwards" => Ok(self
+                .nat_ref()?
+                .forwards()
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")),
+            "mappings" => Ok(self.nat_ref()?.listing()),
+            "rules" => Ok(self.filter.listing()),
             "routes" => Err("`routes` takes no argument".to_owned()),
             other => Err(format!(
-                "unknown command `{other}` (route-add, route-replace, route-remove, routes)"
+                "unknown command `{other}` (route-add, route-replace, route-remove, routes, \
+                 forward-add, forward-remove, forwards, mappings, allow-add, allow-remove, rules)"
             )),
         }
+    }
+
+    fn nat_ref(&self) -> Result<&Nat, String> {
+        self.nat
+            .as_ref()
+            .ok_or_else(|| "no port translates (port<N>.nat = masquerade)".to_owned())
+    }
+
+    fn forward_add(&mut self, now: u64, text: &str, out: &mut impl Sink) -> Result<String, String> {
+        let ports = self.nat_ref()?.ports();
+        let f = parse_forward(text, &ports).map_err(|why| format!("forward `{text}`: {why}"))?;
+        let nat = self.nat.as_mut().ok_or("no port translates")?;
+        let done = nat.add_forward(f, now)?;
+        if done == "added" {
+            out.event(forward_event("nat-forward-added", &f));
+        }
+        Ok(done.to_owned())
+    }
+
+    /// `forward-remove <forward>` or `forward-remove <proto> <external-port> [port <n>]`.
+    fn forward_remove(&mut self, text: &str, out: &mut impl Sink) -> Result<String, String> {
+        let ports = self.nat_ref()?.ports();
+        let words: Vec<&str> = text.split_whitespace().collect();
+        let (proto, external, port, exact) = if words.contains(&"to") {
+            let f =
+                parse_forward(text, &ports).map_err(|why| format!("forward `{text}`: {why}"))?;
+            (f.proto, f.external, f.port, Some(f))
+        } else {
+            let (proto, external, rest) = match words.as_slice() {
+                [p, e, rest @ ..] => (*p, *e, rest),
+                _ => {
+                    return Err(
+                        "forward-remove needs a forward or `<proto> <external-port> [port <n>]`"
+                            .to_owned(),
+                    );
+                }
+            };
+            // Reuse the forward parser for the protocol, the port and the router port.
+            let probe = format!("{proto} {external} to 0.0.0.1:1 {}", rest.join(" "));
+            let f = parse_forward(probe.trim(), &ports)
+                .map_err(|why| format!("forward-remove `{text}`: {why}"))?;
+            (f.proto, f.external, f.port, None)
+        };
+        let nat = self.nat.as_mut().ok_or("no port translates")?;
+        let before = nat.forwards().to_vec();
+        let done = nat.remove_forward(proto, port, external, exact)?;
+        if done == "removed"
+            && let Some(f) = before
+                .iter()
+                .find(|f| (f.proto, f.port, f.external) == (proto, port, external))
+        {
+            out.event(forward_event("nat-forward-removed", f));
+        }
+        Ok(done.to_owned())
+    }
+
+    /// `allow-add <port> <rule>` and `allow-remove <port> <rule>`.
+    fn allow_change(
+        &mut self,
+        text: &str,
+        add: bool,
+        out: &mut impl Sink,
+    ) -> Result<String, String> {
+        let (port, rule) = text
+            .split_once(char::is_whitespace)
+            .ok_or("allow-add and allow-remove need `<port> <rule>`, like `1 tcp dport 80`")?;
+        let port: u32 = port
+            .parse()
+            .ok()
+            .filter(|&p| (p as usize) < self.ports.len())
+            .ok_or_else(|| format!("port `{port}` does not exist"))?;
+        let rule = parse_rule(rule.trim())?;
+        let done = if add {
+            self.filter.add(port, rule)?
+        } else {
+            self.filter.remove(port, rule)
+        };
+        if matches!(done, "added" | "removed") {
+            out.event(Event::new(
+                if add { "allow-added" } else { "allow-removed" },
+                vec![kv("port", port), kv("rule", rule)],
+            ));
+        }
+        Ok(done.to_owned())
     }
 
     /// A static route from a command's argument, checked against the ports like the config's.
@@ -1688,6 +2223,47 @@ impl Router {
                 ("dhcp-relayed-to-server", c.dhcp_relayed_to_server),
                 ("dhcp-relayed-to-client", c.dhcp_relayed_to_client),
                 ("dhcp-relay-dropped", c.dhcp_relay_dropped),
+            ] {
+                v.push((k.to_owned(), val));
+            }
+        }
+        // Only routers that translate list these.
+        if let Some(n) = &self.nat {
+            let nc = n.counters;
+            for (k, val) in [
+                ("nat-mappings", n.mapping_count() as u64),
+                ("nat-sessions", n.session_count() as u64),
+                ("nat-forwards", n.forwards().len() as u64),
+                ("nat-mappings-created", nc.mappings_created),
+                ("nat-mappings-expired", nc.mappings_expired),
+                ("nat-translated-out", nc.translated_out),
+                ("nat-translated-in", nc.translated_in),
+                ("nat-icmp-errors-translated", nc.icmp_errors_translated),
+                ("nat-hairpinned", nc.hairpinned),
+                ("nat-hairpin-refused", nc.hairpin_refused),
+                ("nat-filtered", nc.filtered),
+                ("nat-no-mapping", nc.no_mapping),
+                ("nat-table-full", nc.table_full),
+                ("nat-ports-exhausted", nc.ports_exhausted),
+                ("nat-fragments", nc.fragments),
+                ("nat-unsupported", nc.unsupported),
+                ("nat-malformed", nc.malformed),
+                ("nat-trace-suppressed", n.trace_suppressed),
+            ] {
+                v.push((k.to_owned(), val));
+            }
+        }
+        // Only routers that filter (or did) list these.
+        if self.filter.active() {
+            let fc = self.filter.counters;
+            for (k, val) in [
+                ("filter-rules", self.filter.rule_count() as u64),
+                ("filter-flows", self.filter.flow_count() as u64),
+                ("filter-new-flows", fc.new_flows),
+                ("filter-tracked", fc.tracked),
+                ("filter-dropped", fc.dropped),
+                ("filter-table-full", fc.table_full),
+                ("filter-trace-suppressed", self.filter.trace_suppressed),
             ] {
                 v.push((k.to_owned(), val));
             }

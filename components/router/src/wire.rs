@@ -222,6 +222,74 @@ pub fn decrement_ttl_v4(packet: &mut [u8]) {
     packet[10..12].copy_from_slice(&(!(acc as u16)).to_be_bytes());
 }
 
+/// RFC 1624 eqn. 3 over several 16-bit words: the checksum field `hc` after the bytes `old`
+/// (an even number, word-aligned in the checksummed data) became `new` (as many).
+pub fn adjust_checksum(hc: u16, old: &[u8], new: &[u8]) -> u16 {
+    let mut acc = u32::from(!hc);
+    for w in old.as_chunks::<2>().0 {
+        acc += u32::from(!u16::from_be_bytes(*w));
+    }
+    for w in new.as_chunks::<2>().0 {
+        acc += u32::from(u16::from_be_bytes(*w));
+    }
+    while acc > 0xffff {
+        acc = (acc & 0xffff) + (acc >> 16);
+    }
+    !(acc as u16)
+}
+
+/// Which end of a packet [`rewrite_v4`] changes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Side {
+    Src,
+    Dst,
+}
+
+/// Rewrites one end of the IPv4 packet `p`: its address, and its TCP/UDP port (for an ICMP
+/// echo request or reply, the identifier, whichever the side). The header checksum and the
+/// transport checksum (TCP/UDP: pseudo-header and port; ICMP: identifier) are patched
+/// incrementally. `p` may be a truncated quote inside an ICMP error: a port or checksum outside
+/// it is left alone. A UDP checksum of zero (none) stays zero; a computed zero becomes `0xffff`.
+/// The caller made sure `p` holds a whole IPv4 header and is not a non-initial fragment.
+pub fn rewrite_v4(p: &mut [u8], side: Side, addr: Ipv4Addr, port: u16) {
+    let ihl = usize::from(p[0] & 0x0f) * 4;
+    let at = if side == Side::Src { 12 } else { 16 };
+    let old_addr: [u8; 4] = [p[at], p[at + 1], p[at + 2], p[at + 3]];
+    let new_addr = addr.octets();
+    let hc = u16::from_be_bytes([p[10], p[11]]);
+    p[10..12].copy_from_slice(&adjust_checksum(hc, &old_addr, &new_addr).to_be_bytes());
+    p[at..at + 4].copy_from_slice(&new_addr);
+    let proto = p[9];
+    let (port_at, sum_at) = match proto {
+        PROTO_UDP => (ihl + if side == Side::Src { 0 } else { 2 }, ihl + 6),
+        PROTO_TCP => (ihl + if side == Side::Src { 0 } else { 2 }, ihl + 16),
+        PROTO_ICMP if matches!(p.get(ihl), Some(0 | 8)) => (ihl + 4, ihl + 2),
+        _ => return,
+    };
+    let new_port = port.to_be_bytes();
+    let old_port = p.get(port_at..port_at + 2).map(|b| [b[0], b[1]]);
+    if let Some(c) = p
+        .get(sum_at..sum_at + 2)
+        .map(|b| u16::from_be_bytes([b[0], b[1]]))
+        && !(proto == PROTO_UDP && c == 0)
+    {
+        let mut c = c;
+        if proto != PROTO_ICMP {
+            c = adjust_checksum(c, &old_addr, &new_addr);
+        }
+        if let Some(old) = old_port {
+            c = adjust_checksum(c, &old, &new_port);
+        }
+        if proto == PROTO_UDP && c == 0 {
+            c = 0xffff;
+        }
+        p[sum_at..sum_at + 2].copy_from_slice(&c.to_be_bytes());
+    }
+    if old_port.is_some() {
+        p[port_at..port_at + 2].copy_from_slice(&new_port);
+    }
+}
+
 /// `ff02::1:ffXX:XXXX`, the solicited-node group of `a` (RFC 4291 §2.7.1).
 pub fn solicited_node(a: Ipv6Addr) -> Ipv6Addr {
     let o = a.octets();
@@ -374,5 +442,96 @@ mod tests {
             let full = checksum(&fresh);
             prop_assert_eq!(u16::from_be_bytes([p[10], p[11]]), full);
         }
+
+        /// `rewrite_v4` patches every checksum exactly as a full recomputation would: the IPv4
+        /// header, TCP and UDP over the pseudo-header, ICMP echo, for either side.
+        #[test]
+        fn rewrite_keeps_every_checksum_equal_to_a_full_recomputation(
+            kind in 0u8..4,
+            src in any::<u32>(),
+            dst in any::<u32>(),
+            sport in any::<u16>(),
+            dport in any::<u16>(),
+            payload in proptest::collection::vec(any::<u8>(), 0..64),
+            to_src in any::<bool>(),
+            addr in any::<u32>(),
+            port in any::<u16>(),
+            udp_sum in any::<bool>(),
+        ) {
+            let (s, d) = (Ipv4Addr::from(src), Ipv4Addr::from(dst));
+            let (proto, l4) = match kind {
+                0 => {
+                    let mut u = udp_v4(s, d, sport, dport, &payload);
+                    if !udp_sum {
+                        u[6..8].copy_from_slice(&[0, 0]);
+                    }
+                    (PROTO_UDP, u)
+                }
+                1 => {
+                    let mut t = tcp_segment(sport, dport, 7, 9, TCP_ACK, 0);
+                    t.extend_from_slice(&payload);
+                    t[16..18].copy_from_slice(&[0, 0]);
+                    let c = finish(sum16(&t, pseudo_v4(s, d, PROTO_TCP, t.len())));
+                    t[16..18].copy_from_slice(&c.to_be_bytes());
+                    (PROTO_TCP, t)
+                }
+                2 => (PROTO_ICMP, icmpv4(8, 0, [(sport >> 8) as u8, sport as u8, 0, 1], &payload)),
+                _ => (PROTO_ICMP, icmpv4(0, 0, [(dport >> 8) as u8, dport as u8, 0, 1], &payload)),
+            };
+            let mut p = ipv4(s, d, proto, 64, 1, &l4);
+            let side = if to_src { Side::Src } else { Side::Dst };
+            rewrite_v4(&mut p, side, Ipv4Addr::from(addr), port);
+            prop_assert_eq!(checksum(&p[..20]), 0, "IPv4 header");
+            let (ns, nd) = (v4(&p, 12), v4(&p, 16));
+            prop_assert_eq!(if to_src { ns } else { nd }, Ipv4Addr::from(addr));
+            let body = p[20..].to_vec();
+            match proto {
+                PROTO_UDP if !udp_sum => prop_assert_eq!(&body[6..8], &[0, 0]),
+                PROTO_UDP => {
+                    let mut z = body.clone();
+                    z[6..8].copy_from_slice(&[0, 0]);
+                    let full = match finish(sum16(&z, pseudo_v4(ns, nd, PROTO_UDP, z.len()))) {
+                        0 => 0xffff,
+                        c => c,
+                    };
+                    prop_assert_eq!(u16::from_be_bytes([body[6], body[7]]), full);
+                }
+                PROTO_TCP => {
+                    let mut z = body.clone();
+                    z[16..18].copy_from_slice(&[0, 0]);
+                    let full = finish(sum16(&z, pseudo_v4(ns, nd, PROTO_TCP, z.len())));
+                    prop_assert_eq!(u16::from_be_bytes([body[16], body[17]]), full);
+                }
+                _ => {
+                    let mut z = body.clone();
+                    z[2..4].copy_from_slice(&[0, 0]);
+                    prop_assert_eq!(u16::from_be_bytes([body[2], body[3]]), checksum(&z));
+                    prop_assert_eq!(&body[4..6], &port.to_be_bytes());
+                }
+            }
+            if proto != PROTO_ICMP {
+                let at = if to_src { 0 } else { 2 };
+                prop_assert_eq!(&body[at..at + 2], &port.to_be_bytes());
+            }
+        }
+    }
+
+    fn v4(p: &[u8], at: usize) -> Ipv4Addr {
+        Ipv4Addr::new(p[at], p[at + 1], p[at + 2], p[at + 3])
+    }
+
+    #[test]
+    fn rewrite_of_a_truncated_quote_leaves_what_is_missing() {
+        // 20-byte header plus 4 bytes of UDP: the ports are there, the checksum is not.
+        let s: Ipv4Addr = "10.0.0.1".parse().unwrap();
+        let d: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let full = ipv4(s, d, PROTO_UDP, 64, 1, &udp_v4(s, d, 1000, 53, b"hello"));
+        let mut quote = full[..24].to_vec();
+        rewrite_v4(&mut quote, Side::Src, "192.0.2.1".parse().unwrap(), 4000);
+        assert_eq!(checksum(&quote[..20]), 0);
+        assert_eq!(&quote[20..22], &4000u16.to_be_bytes());
+        let mut short = full[..21].to_vec();
+        rewrite_v4(&mut short, Side::Dst, "192.0.2.2".parse().unwrap(), 9);
+        assert_eq!(checksum(&short[..20]), 0);
     }
 }
