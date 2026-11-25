@@ -244,6 +244,12 @@ pub struct DeviceOptions {
     /// `docs/design/topology-and-infra.md`): it gets an [`InfraEnd`] over the network's device
     /// table.
     pub infra: bool,
+    /// With `infra`: the device may create only devices whose names start with this prefix
+    /// (1-63 letters, digits, `-` or `_`). No two controllers' prefixes may overlap (one a
+    /// prefix of the other). A split network whose controllers run on more than one site
+    /// needs one on every controller, so that names their devices take on different sites
+    /// cannot collide (`docs/design/sites.md`).
+    pub infra_prefix: Option<String>,
     /// Options of the network's extensions, by type: where an embedder's grant of a capability
     /// its extension serves goes (embedder surface, unstable).
     pub ext: ExtOptions,
@@ -251,6 +257,11 @@ pub struct DeviceOptions {
 
 struct DeviceRecord {
     name: String,
+    /// Its number in event keys and record tags ([`Network::device_number`]).
+    number: u32,
+    /// Created while the network ran (an operator event or a controller): the tag of the
+    /// processing context that created it (a split network's records are merged by it).
+    created: Option<Tag>,
     inbox: Inbox,
     /// The component exports `wasmnet:link/counters`.
     has_counters: bool,
@@ -323,6 +334,30 @@ pub struct Network<'r, R: Runtime + ?Sized> {
     infra: Infra,
     /// The derived request being applied (its creation adopts the pending device).
     applying: Option<usize>,
+    /// How devices created while the network runs are numbered; fixed at the first creation.
+    numbering: Option<Numbering>,
+    /// The links created while the network ran (operator events, controllers' cables), with
+    /// the tag of the processing context that created each, in creation order.
+    created_links: Vec<(usize, Tag)>,
+}
+
+/// The size of each creator's range of device numbers: a creator can create this many devices
+/// in one run (recreations included).
+pub const CREATOR_RANGE: u32 = 1 << 20;
+
+/// How devices created while a network runs are numbered (`docs/design/event-order.md`).
+/// Creator `c`'s `n`-th creation gets number `setup + c * CREATOR_RANGE + n`, so a device's
+/// number depends only on its creator's own history: the same on every site of a split
+/// network and in the unsplit one.
+struct Numbering {
+    /// The devices the network had when the first device was created while it ran.
+    setup: u32,
+    /// Creators by rank: the devices granted `infra` among those, in order, then the embedder
+    /// (`None`: operator events and devices added with the builder API from then on), then
+    /// controllers added later, in the order they first create.
+    creators: Vec<Option<String>>,
+    /// Each creator's creations so far.
+    created: Vec<u32>,
 }
 
 impl<'r, R: Runtime + ?Sized> Network<'r, R> {
@@ -355,6 +390,8 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
             incarnations: std::collections::BTreeMap::new(),
             infra,
             applying: None,
+            numbering: None,
+            created_links: Vec::new(),
         };
         runtime.install(&mut network);
         network
@@ -431,7 +468,7 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
         let answer = call.answer();
         let what = call.name().to_owned();
         record.inbox.push(Command::Control(call));
-        let settled = self.exec.settle(device.0 as u64);
+        let settled = self.exec.settle(u64::from(self.devices[device.0].number));
         self.failed = settled.is_err();
         settled?;
         let out = if answer.answered() {
@@ -526,9 +563,13 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
         if self.live_device(name).is_some() {
             return Err(Error::DuplicateDevice(name.to_owned()));
         }
+        self.check_grant(name, &options, false)
+            .map_err(Error::Refused)?;
         let idx = self.devices.len();
-        // Everything queued while creating device `idx` is in setup slot `idx`.
-        self.clock.set_setup(idx as u64, idx as u32);
+        let (rank, number) = self.builder_number().map_err(Error::Refused)?;
+        // Everything queued while creating the device is in the setup slot of its number (its
+        // index, unless devices were created while the network ran).
+        self.clock.set_setup(u64::from(number), number);
         let (context, handles) = self.context(
             idx,
             name,
@@ -538,9 +579,140 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
             SetupOrigin::Created,
         );
         let instance = self.runtime.instantiate(context, component)?;
-        self.register(idx, name, config, options, instance, handles, false)?;
+        self.register(idx, number, name, config, options, instance, handles, false)?;
+        if let Some(rank) = rank {
+            self.take_number(rank);
+        }
         self.infra_added(idx, None);
         Ok(DeviceId(idx))
+    }
+
+    /// The number of a device added with the builder API: its index, or once devices were
+    /// created while the network ran, the embedder's next number (with its rank, to
+    /// [`take_number`](Self::take_number) once the device exists).
+    fn builder_number(&mut self) -> std::result::Result<(Option<usize>, u32), String> {
+        if self.numbering.is_none() {
+            let number = u32::try_from(self.devices.len())
+                .ok()
+                .filter(|&n| n < HOST_DEVICE)
+                .ok_or_else(|| "too many devices".to_owned())?;
+            return Ok((None, number));
+        }
+        let (rank, number) = self.peek_number(None)?;
+        Ok((Some(rank), number))
+    }
+
+    /// Creator `rank` created the device [`peek_number`](Self::peek_number) numbered.
+    fn take_number(&mut self, rank: usize) {
+        if let Some(n) = self.numbering.as_mut() {
+            n.created[rank] += 1;
+        }
+    }
+
+    /// The rank of `creator` (`None`: the embedder) and the number of the next device it
+    /// creates while the network runs; [`take_number`](Self::take_number) once it exists (a
+    /// creation that fails takes none). The first call fixes the numbering: the devices so
+    /// far are the setup devices, and the creators are the ones granted `infra` among them,
+    /// then the embedder.
+    fn peek_number(&mut self, creator: Option<&str>) -> std::result::Result<(usize, u32), String> {
+        let devices = &self.devices;
+        let numbering = self.numbering.get_or_insert_with(|| {
+            let mut creators: Vec<Option<String>> = devices
+                .iter()
+                .filter(|d| d.options.infra)
+                .map(|d| Some(d.name.clone()))
+                .collect();
+            creators.push(None);
+            Numbering {
+                setup: u32::try_from(devices.len()).unwrap_or(u32::MAX),
+                created: vec![0; creators.len()],
+                creators,
+            }
+        });
+        let rank = match numbering
+            .creators
+            .iter()
+            .position(|c| c.as_deref() == creator)
+        {
+            Some(rank) => rank,
+            None => {
+                numbering.creators.push(creator.map(str::to_owned));
+                numbering.created.push(0);
+                numbering.creators.len() - 1
+            }
+        };
+        let n = numbering.created[rank];
+        let who = creator.map_or("the embedder".to_owned(), |c| format!("`{c}`"));
+        if n >= CREATOR_RANGE {
+            return Err(format!(
+                "{who} has created {CREATOR_RANGE} devices in this run: it has no device \
+                 numbers left"
+            ));
+        }
+        let number =
+            u64::from(numbering.setup) + rank as u64 * u64::from(CREATOR_RANGE) + u64::from(n);
+        let number = u32::try_from(number)
+            .ok()
+            .filter(|&n| n < HOST_DEVICE)
+            .ok_or_else(|| format!("{who} has no device numbers left (too many creators)"))?;
+        Ok((rank, number))
+    }
+
+    /// Refuses `options` for a new device `name` (on another site with `remote`) when its
+    /// `infra_prefix` is malformed, given without `infra`, or overlaps another controller's;
+    /// and a controller that puts controllers on more than one site of a split network while
+    /// one of them has no prefix.
+    fn check_grant(
+        &self,
+        name: &str,
+        options: &DeviceOptions,
+        remote: bool,
+    ) -> std::result::Result<(), String> {
+        if !options.infra {
+            return match options.infra_prefix {
+                Some(_) => Err(format!("`{name}`: `infra_prefix` needs `infra`")),
+                None => Ok(()),
+            };
+        }
+        let controllers = || {
+            self.devices
+                .iter()
+                .filter(|d| d.options.infra && d.phase != DevicePhase::Removed)
+        };
+        if let Some(prefix) = &options.infra_prefix {
+            if !crate::infra::valid_name(prefix) {
+                return Err(format!(
+                    "`{name}`: infra prefix `{prefix}`: 1-63 letters, digits, `-` or `_`"
+                ));
+            }
+            if let Some((d, other)) = controllers().find_map(|d| {
+                let other = d.options.infra_prefix.as_deref()?;
+                (prefix.starts_with(other) || other.starts_with(prefix.as_str()))
+                    .then_some((d, other))
+            }) {
+                return Err(format!(
+                    "`{name}`: infra prefix `{prefix}` overlaps `{}`'s `{other}`",
+                    d.name
+                ));
+            }
+        }
+        let (mut local, mut far) = (!remote, remote);
+        let mut unprefixed = options.infra_prefix.is_none();
+        for d in controllers() {
+            if d.remote {
+                far = true;
+            } else {
+                local = true;
+            }
+            unprefixed |= d.options.infra_prefix.is_none();
+        }
+        if local && far && unprefixed {
+            return Err(format!(
+                "`{name}`: controllers on more than one site of a split network each need an \
+                 `infra_prefix`, so that the names of the devices they create cannot collide"
+            ));
+        }
+        Ok(())
     }
 
     /// Tells the device table that device `idx` was created (by derived request `request`).
@@ -629,10 +801,9 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
             fuel_per_instant: options
                 .fuel_per_instant
                 .unwrap_or(self.guard.fuel_per_instant),
-            infra: options.infra.then(|| InfraEnd {
-                infra: self.infra.clone(),
-                device: name.to_owned(),
-            }),
+            infra: options
+                .infra
+                .then(|| self.infra.end(name, options.infra_prefix.clone())),
             ext,
         };
         let handles = Handles {
@@ -644,12 +815,14 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
         (context, handles)
     }
 
-    /// Registers a freshly instantiated device as device `idx`: a new one (the next index),
-    /// or with `restart` the stopped device `idx` started again (its ports must not change).
+    /// Registers a freshly instantiated device as device `idx` with `number`: a new one (the
+    /// next index), or with `restart` the stopped device `idx` started again (its ports must
+    /// not change; it keeps its number).
     #[allow(clippy::too_many_arguments)]
     fn register(
         &mut self,
         idx: usize,
+        number: u32,
         name: &str,
         config: DeviceConfig,
         options: DeviceOptions,
@@ -675,11 +848,13 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
             d.phase = DevicePhase::Running;
         } else {
             self.exec
-                .add(name, h.inbox.clone(), h.status, instance.actor);
+                .add(name, number, h.inbox.clone(), h.status, instance.actor);
             let registered = self.panel.add_device(name, ports, false);
             debug_assert_eq!(registered, idx);
             self.devices.push(DeviceRecord {
                 name: name.to_owned(),
+                number,
+                created: None,
                 inbox: h.inbox,
                 has_counters: instance.has_counters,
                 exports: instance.exports,
@@ -705,6 +880,14 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
             .iter()
             .rposition(|d| d.name == name && d.phase != DevicePhase::Removed)
             .map(DeviceId)
+    }
+
+    /// The device's number in event keys and record tags (`docs/design/event-order.md`): its
+    /// index for a device the network was built with; for one created while the network ran,
+    /// its creator's next number (`setup + rank * CREATOR_RANGE + n`), which equals its index
+    /// while only one creator creates.
+    pub fn device_number(&self, device: DeviceId) -> u32 {
+        self.devices[device.0].number
     }
 
     /// Whether the device runs, is stopped, or was removed.
@@ -838,7 +1021,7 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
                 }
                 Flow::Derived(n) => {
                     let at = self.clock.now();
-                    self.apply_derived(n, at);
+                    self.apply_derived(n, at)?;
                 }
                 Flow::Crashed(i, message) => {
                     let at = self.clock.now();
@@ -873,13 +1056,25 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
     /// Applies derived request `n` of an in-world controller (`wasmnet:infra`), in the event's
     /// own processing context, like an operator event. A refusal is journalled on
     /// the controller (`infra-failed`) and shown on the device, never the network's failure.
-    fn apply_derived(&mut self, n: usize, at: Nanos) {
+    ///
+    /// In a split network a creation whose cable reaches a device on another site fails the
+    /// run instead ([`Error::Refused`]): the unsplit network would have wired it, so no answer
+    /// on this site could match. It fails at this event, so at the same instant and with the
+    /// same message on every rerun.
+    fn apply_derived(&mut self, n: usize, at: Nanos) -> Result<()> {
         let Some(req) = self.infra.request(n) else {
-            return;
+            return Ok(());
         };
         // The device it was asked for may have been removed (or replaced) meanwhile.
         let current = self.infra.get(&req.name).ok().map(|d| d.uid);
         let result = if current.as_deref() == Some(req.uid.as_str()) {
+            if let Some(far) = self.cable_to_another_site(&req) {
+                return Err(Error::Refused(format!(
+                    "`{}` asked for a cable from `{}` to `{far}`, which runs on another site: \
+                     a controller's devices and cables stay on its own site",
+                    req.caller, req.name
+                )));
+            }
             self.apply_request(n, &req, at)
         } else {
             Err(format!(
@@ -889,6 +1084,31 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
         };
         let error = result.err().map(|e| self.runtime.summarize(&e));
         self.infra.applied(n, error, at);
+        Ok(())
+    }
+
+    /// The far device of a cable in creation `req` that runs on another site: a placeholder,
+    /// or a name only a controller on another site may create (its `infra_prefix`).
+    fn cable_to_another_site(&self, req: &crate::infra::Request) -> Option<String> {
+        use crate::infra::Verb;
+        let (Verb::Create(spec) | Verb::Recreate(spec)) = &req.verb else {
+            return None;
+        };
+        spec.wire
+            .iter()
+            .find(|c| match self.live_device(&c.device) {
+                Some(d) => self.devices[d.0].remote,
+                None => self.devices.iter().any(|d| {
+                    d.remote
+                        && d.options.infra
+                        && d.phase != DevicePhase::Removed
+                        && d.options
+                            .infra_prefix
+                            .as_deref()
+                            .is_some_and(|p| c.device.starts_with(p))
+                }),
+            })
+            .map(|c| c.device.clone())
     }
 
     fn apply_request(
@@ -1029,6 +1249,7 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
                 if self.live_device(&name).is_some() {
                     return Err(format!("a device `{name}` exists"));
                 }
+                self.check_grant(&name, &options, false)?;
                 // The far ends must exist before anything is created.
                 let mut ends = Vec::new();
                 for c in &wire {
@@ -1037,6 +1258,13 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
                         .ok_or_else(|| format!("wire: no device `{}`", c.to_device))?;
                     ends.push((c.port, d.port(c.to_port), c.latency, c.mtu));
                 }
+                // Its creator: the controller whose request this is, or the embedder.
+                let creator = self
+                    .applying
+                    .and_then(|n| self.infra.request(n))
+                    .map(|r| r.caller);
+                let (rank, number) = self.peek_number(creator.as_deref())?;
+                let created = self.clock.peek_tag();
                 let idx = self.devices.len();
                 let (context, handles) = self.context(
                     idx,
@@ -1047,8 +1275,12 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
                     SetupOrigin::Added,
                 );
                 let instance = self.resolve_instantiate(&component, context)?;
-                self.register(idx, &name, config, options, instance, handles, false)
-                    .map_err(|e| e.to_string())?;
+                self.register(
+                    idx, number, &name, config, options, instance, handles, false,
+                )
+                .map_err(|e| e.to_string())?;
+                self.take_number(rank);
+                self.devices[idx].created = Some(created);
                 self.devices[idx].component = Some(component.clone());
                 self.infra_added(idx, self.applying);
                 // A controller's device crashes alone: a trap stops it, not the network.
@@ -1058,9 +1290,11 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
                 self.journal_event(&name, at, "device-added", vec![("component", component)]);
                 // Its cables, before it first runs (this op's rounds come after).
                 for (port, far, latency, mtu) in ends {
+                    let tag = self.clock.peek_tag();
                     let link = self
                         .connect(DeviceId(idx).port(port), far)
                         .map_err(|e| format!("`{name}` was added, but: {e}"))?;
+                    self.created_links.push((link.0, tag));
                     self.panel.set_latency(link.0, latency);
                     if let Some(mtu) = mtu {
                         self.panel.set_mtu(link.0, mtu);
@@ -1099,8 +1333,17 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
                     SetupOrigin::Restarted,
                 );
                 let instance = self.resolve_instantiate(&component, context)?;
-                self.register(idx, &device, config, options, instance, handles, true)
-                    .map_err(|e| e.to_string())?;
+                self.register(
+                    idx,
+                    self.devices[idx].number,
+                    &device,
+                    config,
+                    options,
+                    instance,
+                    handles,
+                    true,
+                )
+                .map_err(|e| e.to_string())?;
                 for l in std::mem::take(&mut self.devices[idx].downed) {
                     self.carrier(l, at, true);
                 }
@@ -1136,7 +1379,9 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
                         .ok_or_else(|| format!("no device `{name}`"))
                 };
                 let (pa, pb) = (end(self, &a)?, end(self, &b)?);
+                let tag = self.clock.peek_tag();
                 let link = self.connect(pa, pb).map_err(|e| e.to_string())?;
+                self.created_links.push((link.0, tag));
                 self.panel.set_latency(link.0, latency);
                 if let Some(mtu) = mtu {
                     self.panel.set_mtu(link.0, mtu);
@@ -1444,7 +1689,7 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
         }
         let reply = CountersReply::default();
         record.inbox.push(Command::Counters(reply.clone()));
-        let settled = self.exec.settle(device.0 as u64);
+        let settled = self.exec.settle(u64::from(self.devices[device.0].number));
         self.failed = settled.is_err();
         settled?;
         let values = reply
@@ -1473,19 +1718,48 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
     /// site ([`set_remote_ports`](Self::set_remote_ports)). Create devices in the same order on
     /// every site, local and remote alike.
     ///
+    /// The placeholder has an empty description: a network whose controllers read the device
+    /// table (`wasmnet:infra`) describes it with
+    /// [`remote_device_with`](Self::remote_device_with) instead, so that every site's table
+    /// lists it as its own site does.
+    ///
     /// Embedder surface, unstable (multi-site runs, [`crate::sites`]).
     pub fn remote_device(&mut self, name: &str) -> Result<DeviceId> {
-        self.infra.set_split();
+        self.remote_device_with(name, DeviceConfig::new(), DeviceOptions::default())
+    }
+
+    /// [`remote_device`](Self::remote_device) with the device's description: the config and
+    /// options its own site creates it with (and, with
+    /// [`set_device_component`](Self::set_device_component), its component). The device
+    /// table lists the placeholder with them, exactly as the unsplit network's table lists the
+    /// device; its options also tell this site where the network's controllers run
+    /// ([`DeviceOptions::infra_prefix`]).
+    ///
+    /// Embedder surface, unstable (multi-site runs, [`crate::sites`]).
+    pub fn remote_device_with(
+        &mut self,
+        name: &str,
+        config: DeviceConfig,
+        options: DeviceOptions,
+    ) -> Result<DeviceId> {
         if self.devices.iter().any(|d| d.name == name) {
             return Err(Error::DuplicateDevice(name.to_owned()));
         }
+        self.check_grant(name, &options, true)
+            .map_err(Error::Refused)?;
         let idx = self.devices.len();
+        let (rank, number) = self.builder_number().map_err(Error::Refused)?;
+        if let Some(rank) = rank {
+            self.take_number(rank);
+        }
         let (inbox, status) = (Inbox::default(), Status::default());
-        self.exec.add_remote(name, inbox.clone(), status);
+        self.exec.add_remote(name, number, inbox.clone(), status);
         let registered = self.panel.add_device(name, Vec::new(), true);
         debug_assert_eq!(registered, idx);
         self.devices.push(DeviceRecord {
             name: name.to_owned(),
+            number,
+            created: None,
             inbox,
             has_counters: false,
             exports: Vec::new(),
@@ -1494,11 +1768,12 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
             stderr: OutputCapture::new(),
             remote: true,
             component: None,
-            config: DeviceConfig::new(),
-            options: DeviceOptions::default(),
+            config,
+            options,
             phase: DevicePhase::Running,
             downed: Vec::new(),
         });
+        self.infra_added(idx, None);
         Ok(DeviceId(idx))
     }
 
@@ -1656,6 +1931,30 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
         self.panel.frame_tags()
     }
 
+    /// The devices created while the network ran (operator events, controllers), each with the
+    /// tag of the processing context that created it, in creation order.
+    ///
+    /// Embedder surface, unstable (multi-site runs, [`crate::sites`]).
+    pub fn created_devices(&self) -> Vec<(DeviceId, Tag)> {
+        self.devices
+            .iter()
+            .enumerate()
+            .filter_map(|(i, d)| Some((DeviceId(i), d.created.clone()?)))
+            .collect()
+    }
+
+    /// The links created while the network ran (operator events, controllers' cables), each
+    /// with the tag of the processing context that created it, in creation order. The others
+    /// are the links the network was built with.
+    ///
+    /// Embedder surface, unstable (multi-site runs, [`crate::sites`]).
+    pub fn created_links(&self) -> Vec<(LinkId, Tag)> {
+        self.created_links
+            .iter()
+            .map(|(l, t)| (LinkId(*l), t.clone()))
+            .collect()
+    }
+
     /// The tag of every link transition ([`link_transitions`](Self::link_transitions) order).
     ///
     /// Embedder surface, unstable (multi-site runs, [`crate::sites`]).
@@ -1728,16 +2027,35 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
         }
     }
 
-    /// Places an operator event and returns its index. Refused in a split network:
-    /// the site-sync wire has no pre bit yet.
+    /// Places an operator event and returns its index.
+    ///
+    /// A split network takes only timed ones ([`Placement::StartOf`], [`Placement::EndOf`])
+    /// at a device: [`Op::Stdin`], [`Op::Control`] and [`Op::Inject`]. Every site must add the
+    /// same operator events in the same order: an op at a device of another site is counted
+    /// (so indices and keys agree) but not queued here, and stays [`OpState::Pending`] on this
+    /// site.
     ///
     /// Embedder surface, unstable (operator events).
     pub fn add_op(&mut self, op: Op, placement: Placement) -> Result<usize> {
-        if self.devices.iter().any(|d| d.remote) {
-            return Err(Error::Refused(
-                "operator events are not supported in split (multi-site) networks yet".to_owned(),
-            ));
-        }
+        let elsewhere = if self.devices.iter().any(|d| d.remote) {
+            let device = match &op {
+                Op::Stdin { device, .. } | Op::Control { device, .. } => Some(*device),
+                Op::Inject { from, .. } => Some(from.device),
+                _ => None,
+            };
+            match (device, &placement) {
+                (Some(d), Placement::StartOf(_) | Placement::EndOf(_)) => self.devices[d.0].remote,
+                _ => {
+                    return Err(Error::Refused(
+                        "a split (multi-site) network takes only timed operator events at a \
+                         device (stdin, a control call, an injected frame)"
+                            .to_owned(),
+                    ));
+                }
+            }
+        } else {
+            false
+        };
         let core = match op {
             Op::LinkState { link, up } => CoreOp::LinkState { link: link.0, up },
             Op::Latency { link, ns } => CoreOp::Latency { link: link.0, ns },
@@ -1763,7 +2081,10 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
                 bytes,
             },
             Op::Control { device, call } => {
-                self.require_export(device, call.export())?;
+                // Another site's device: that site checks.
+                if !elsewhere {
+                    self.require_export(device, call.export())?;
+                }
                 CoreOp::Control {
                     device: device.0,
                     call,
@@ -1805,6 +2126,9 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
             )));
         }
         let idx = self.exec.add_op(core, anchor);
+        if elsewhere {
+            return Ok(idx);
+        }
         if !self.clock.schedule_op(key, idx) {
             return Err(Error::Refused("two operator events at one key".to_owned()));
         }

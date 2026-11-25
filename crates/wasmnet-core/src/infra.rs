@@ -17,8 +17,10 @@
 //!   [`crate::Op`] in that event's processing context. So the world is a deterministic function
 //!   of the network's description and seed: a replay re-runs the controller, which makes the
 //!   same calls.
-//! * **Reads** answer from the table at the call; `app-exit` events are folded in from the
-//!   journal as they appear.
+//! * **Reads** answer from the table at the call, in the caller's view: the network's own
+//!   devices and the ones the caller created, its resource versions counting only those
+//!   changes. The `app-exit` events of devices controllers created are folded in from the
+//!   journal as they appear. The view is the same when the network is split over sites.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -226,10 +228,13 @@ struct State {
     changes: Vec<Change>,
     requests: Vec<Request>,
     answers: BTreeMap<String, VecDeque<(String, String, Answer)>>,
+    /// Who each change is visible to, by index: `None` for a device of the network's own (every
+    /// controller sees it), or the controller that created the device.
+    scopes: Vec<Option<String>>,
+    /// Each controller's view: the indices of the changes it sees, in order.
+    views: BTreeMap<String, Vec<usize>>,
     /// Journal entries already folded in (`app-exit`).
     journal_seen: usize,
-    /// The network is split across sites: mutations are refused.
-    split: bool,
     /// The components controllers may create ([`crate::Network::set_infra_catalog`]); `None`: any.
     catalog: Option<std::collections::BTreeSet<String>>,
 }
@@ -269,8 +274,9 @@ impl Infra {
                 changes: Vec::new(),
                 requests: Vec::new(),
                 answers: BTreeMap::new(),
+                scopes: Vec::new(),
+                views: BTreeMap::new(),
                 journal_seen: 0,
-                split: false,
                 catalog: None,
             })),
             clock,
@@ -282,20 +288,31 @@ impl Infra {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Records a change of `name` (its item as it is now).
+    /// Records a change of `name` (its item as it is now), visible to every controller if the
+    /// device is the network's own, otherwise to the controller that created it.
     fn change(s: &mut State, kind: ChangeKind, name: &str) {
         let rv = s.changes.len() as u64 + 1;
-        let view = match s.items.get_mut(name) {
+        let (view, scope) = match s.items.get_mut(name) {
             Some(item) => {
                 item.rv = rv;
-                item.view(name)
+                (item.view(name), item.owner.clone())
             }
             None => return,
         };
+        let index = s.changes.len();
         s.changes.push(Change { kind, device: view });
+        for (viewer, seen) in s.views.iter_mut() {
+            if scope.as_ref().is_none_or(|o| o == viewer) {
+                seen.push(index);
+            }
+        }
+        s.scopes.push(scope);
     }
 
-    /// Folds the journal's new `app-exit` events into the devices' `apps`.
+    /// Folds the journal's new `app-exit` events into the `apps` of the devices controllers
+    /// created. The devices the network was built with keep none: in a split network a
+    /// site's journal holds only its own devices' exits, so following them would make the
+    /// table differ from site to site.
     fn refresh(&self, s: &mut State) {
         let new = self.journal.entries_from(s.journal_seen);
         s.journal_seen += new.len();
@@ -303,7 +320,7 @@ impl Infra {
             let Record::Event { kind, fields } = &e.record else {
                 continue;
             };
-            if kind != "app-exit" || !s.items.contains_key(&e.device) {
+            if kind != "app-exit" || s.items.get(&e.device).is_none_or(|i| i.owner.is_none()) {
                 continue;
             }
             let field = |k: &str| {
@@ -329,9 +346,27 @@ impl Infra {
         self.state().catalog = Some(components.into_iter().collect());
     }
 
-    /// The network is split across sites: mutations are refused from now on.
-    pub(crate) fn set_split(&self) {
-        self.state().split = true;
+    /// The `wasmnet:infra` end of controller `device`, which may create only names starting
+    /// with `prefix` (if given). Its view of the table starts here: the network's own devices
+    /// and the devices it created, with resource versions counting the changes it sees.
+    pub(crate) fn end(&self, device: &str, prefix: Option<String>) -> InfraEnd {
+        self.add_view(device);
+        InfraEnd {
+            infra: self.clone(),
+            device: device.to_owned(),
+            prefix,
+        }
+    }
+
+    /// The resource version, in a view whose changes are `seen`, of global version `rv`: how
+    /// many of the changes up to `rv` it sees.
+    fn view_rv(seen: &[usize], rv: u64) -> u64 {
+        seen.partition_point(|&i| (i as u64) < rv) as u64
+    }
+
+    /// Whether controller `viewer` sees `item` (the network's own devices and its own).
+    fn sees(item: &Item, viewer: &str) -> bool {
+        item.owner.as_deref().is_none_or(|o| o == viewer)
     }
 
     /// Device `name` was created (at setup, by an operator event, or by derived request
@@ -539,37 +574,120 @@ impl Infra {
 
     // ---- reads (also for tools and tests) ---------------------------------------------------
 
-    /// One device.
+    /// One device. Tools read the whole table; a controller reads its view of it
+    /// ([`InfraEnd::get`]).
     pub fn get(&self, name: &str) -> Result<DeviceView, InfraError> {
-        let mut s = self.state();
-        self.refresh(&mut s);
-        s.items
-            .get(name)
-            .map(|i| i.view(name))
-            .ok_or_else(|| InfraError::NotFound(format!("no device `{name}`")))
+        self.get_as(None, name)
     }
 
     /// Every device matching `selector`, by name, and the latest resource version.
     pub fn list(&self, selector: &[(String, String)]) -> (u64, Vec<DeviceView>) {
+        self.list_as(None, selector)
+    }
+
+    /// Changes after `since` matching `selector`, at most `max`, and the version to resume from.
+    pub fn watch(&self, selector: &[(String, String)], since: u64, max: u32) -> (u64, Vec<Change>) {
+        self.watch_as(None, selector, since, max)
+    }
+
+    /// What controller `controller` reads from [`list`](Self::list): the network's own
+    /// devices and the ones it created, with the resource version of its view.
+    pub fn list_for(
+        &self,
+        controller: &str,
+        selector: &[(String, String)],
+    ) -> (u64, Vec<DeviceView>) {
+        self.add_view(controller);
+        self.list_as(Some(controller), selector)
+    }
+
+    /// What controller `controller` reads from [`watch`](Self::watch): the changes it sees,
+    /// its resource versions counting them.
+    pub fn watch_for(
+        &self,
+        controller: &str,
+        selector: &[(String, String)],
+        since: u64,
+        max: u32,
+    ) -> (u64, Vec<Change>) {
+        self.add_view(controller);
+        self.watch_as(Some(controller), selector, since, max)
+    }
+
+    /// Starts `controller`'s view (if it has none yet) with every change it sees so far.
+    fn add_view(&self, controller: &str) {
+        let mut s = self.state();
+        if !s.views.contains_key(controller) {
+            let seen = (0..s.changes.len())
+                .filter(|&i| s.scopes[i].as_deref().is_none_or(|o| o == controller))
+                .collect();
+            s.views.insert(controller.to_owned(), seen);
+        }
+    }
+
+    /// `view` with its resource version as `viewer` counts them (`None`: the whole table).
+    fn seen_by(s: &State, viewer: Option<&str>, mut view: DeviceView) -> DeviceView {
+        if let Some(seen) = viewer.and_then(|v| s.views.get(v)) {
+            view.rv = Self::view_rv(seen, view.rv);
+        }
+        view
+    }
+
+    fn get_as(&self, viewer: Option<&str>, name: &str) -> Result<DeviceView, InfraError> {
+        let mut s = self.state();
+        self.refresh(&mut s);
+        let view = s
+            .items
+            .get(name)
+            .filter(|i| viewer.is_none_or(|v| Self::sees(i, v)))
+            .map(|i| i.view(name))
+            .ok_or_else(|| InfraError::NotFound(format!("no device `{name}`")))?;
+        Ok(Self::seen_by(&s, viewer, view))
+    }
+
+    fn list_as(
+        &self,
+        viewer: Option<&str>,
+        selector: &[(String, String)],
+    ) -> (u64, Vec<DeviceView>) {
         let mut s = self.state();
         self.refresh(&mut s);
         let items = s
             .items
             .iter()
             .filter(|(_, i)| matches(&i.labels, selector))
-            .map(|(n, i)| i.view(n))
+            .filter(|(_, i)| viewer.is_none_or(|v| Self::sees(i, v)))
+            .map(|(n, i)| Self::seen_by(&s, viewer, i.view(n)))
             .collect();
-        (s.changes.len() as u64, items)
+        let latest = match viewer.and_then(|v| s.views.get(v)) {
+            Some(seen) => seen.len() as u64,
+            None => s.changes.len() as u64,
+        };
+        (latest, items)
     }
 
-    /// Changes after `since` matching `selector`, at most `max`, and the version to resume from.
-    pub fn watch(&self, selector: &[(String, String)], since: u64, max: u32) -> (u64, Vec<Change>) {
+    fn watch_as(
+        &self,
+        viewer: Option<&str>,
+        selector: &[(String, String)],
+        since: u64,
+        max: u32,
+    ) -> (u64, Vec<Change>) {
         let mut s = self.state();
         self.refresh(&mut s);
+        let all: Vec<usize>;
+        let seen = match viewer.and_then(|v| s.views.get(v)) {
+            Some(seen) => seen.as_slice(),
+            None => {
+                all = (0..s.changes.len()).collect();
+                &all
+            }
+        };
         let mut out = Vec::new();
-        let latest = s.changes.len() as u64;
+        let latest = seen.len() as u64;
         let from = usize::try_from(since).unwrap_or(usize::MAX);
-        for c in s.changes.iter().skip(from) {
+        for (k, &i) in seen.iter().enumerate().skip(from) {
+            let c = &s.changes[i];
             if !matches(&c.device.labels, selector) {
                 continue;
             }
@@ -577,7 +695,9 @@ impl Infra {
                 let resume = out.last().map_or(since, |c: &Change| c.device.rv);
                 return (resume, out);
             }
-            out.push(c.clone());
+            let mut c = c.clone();
+            c.device.rv = k as u64 + 1;
+            out.push(c);
         }
         (latest, out)
     }
@@ -624,6 +744,8 @@ pub struct InfraEnd {
     pub(crate) infra: Infra,
     /// The caller's device name.
     pub(crate) device: String,
+    /// The names it may create, if limited ([`crate::DeviceOptions::infra_prefix`]).
+    pub(crate) prefix: Option<String>,
 }
 
 impl InfraEnd {
@@ -671,13 +793,19 @@ impl InfraEnd {
         q.push_back((id.clone(), args, answer));
     }
 
-    fn mutable(&self) -> Result<(), InfraError> {
-        if self.infra.state().split {
-            return Err(InfraError::Denied(
-                "operator events are not supported in split (multi-site) networks yet".to_owned(),
-            ));
+    /// Refuses a mutation of `name` outside this controller's names (its `infra_prefix`).
+    fn mutable(&self, name: &str) -> Result<(), InfraError> {
+        match &self.prefix {
+            Some(p) if !name.starts_with(p.as_str()) => Err(InfraError::Denied(format!(
+                "`{name}` is outside this controller's names (`{p}...`)"
+            ))),
+            _ => Ok(()),
         }
-        Ok(())
+    }
+
+    /// Device `name` as this controller sees it (its resource version counted in its view).
+    fn view(&self, s: &State, name: &str) -> DeviceView {
+        Infra::seen_by(s, Some(&self.device), s.items[name].view(name))
     }
 
     /// Queues derived request `req` for `name` at `at` (or after what is queued for it).
@@ -748,7 +876,7 @@ impl InfraEnd {
         mut labels: Vec<(String, String)>,
         spec: &[u8],
     ) -> Result<(DeviceView, bool), InfraError> {
-        self.mutable()?;
+        self.mutable(name)?;
         check_name(name)?;
         labels.sort();
         if labels.windows(2).any(|w| w[0].0 == w[1].0) {
@@ -788,16 +916,16 @@ impl InfraEnd {
                     uid: item.uid.clone(),
                 };
                 self.queue(&mut s, req, now, Phase::Running);
-                Ok((s.items[name].view(name), true))
+                Ok((self.view(&s, name), true))
             }
             Some(item) if item.spec == canonical => {
-                let i = s.items.get_mut(name).expect("present");
-                if i.labels == labels {
-                    return Ok((i.view(name), false));
+                if item.labels == labels {
+                    return Ok((self.view(&s, name), false));
                 }
+                let i = s.items.get_mut(name).expect("present");
                 i.labels = labels;
                 Self::modified(&mut s, name);
-                Ok((s.items[name].view(name), true))
+                Ok((self.view(&s, name), true))
             }
             Some(item) => {
                 let i = s.items.get_mut(name).expect("present");
@@ -813,7 +941,7 @@ impl InfraEnd {
                     {
                         r.verb = Verb::Create(parsed);
                     }
-                    return Ok((s.items[name].view(name), true));
+                    return Ok((self.view(&s, name), true));
                 }
                 let verb = Verb::Recreate(parsed);
                 let req = Request {
@@ -823,7 +951,7 @@ impl InfraEnd {
                     uid: item.uid.clone(),
                 };
                 self.queue(&mut s, req, now, Phase::Running);
-                Ok((s.items[name].view(name), true))
+                Ok((self.view(&s, name), true))
             }
             None => {
                 // The uid: the digest of the derived event that will create it.
@@ -856,7 +984,7 @@ impl InfraEnd {
                     uid,
                 };
                 self.queue(&mut s, req, now, Phase::Running);
-                Ok((s.items[name].view(name), true))
+                Ok((self.view(&s, name), true))
             }
         }
     }
@@ -919,7 +1047,7 @@ impl InfraEnd {
         grace: u64,
     ) -> (Result<DeviceView, InfraError>, bool) {
         let r = (|| {
-            self.mutable()?;
+            self.mutable(name)?;
             let now = self.infra.clock.now();
             let mut s = self.infra.state();
             self.infra.refresh(&mut s);
@@ -932,7 +1060,7 @@ impl InfraEnd {
             let target = match verb {
                 Verb::Start if matches!(heading, Phase::Stopped | Phase::Crashed) => Phase::Running,
                 Verb::Stop if matches!(heading, Phase::Running | Phase::Pending) => Phase::Stopped,
-                _ => return Ok((item.view(name), false)),
+                _ => return Ok((self.view(&s, name), false)),
             };
             let req = Request {
                 caller: self.device.clone(),
@@ -941,7 +1069,7 @@ impl InfraEnd {
                 uid: item.uid.clone(),
             };
             self.queue(&mut s, req, now.saturating_add(grace), target);
-            Ok((s.items[name].view(name), true))
+            Ok((self.view(&s, name), true))
         })();
         match r {
             Ok((v, q)) => (Ok(v), q),
@@ -976,7 +1104,7 @@ impl InfraEnd {
     }
 
     fn remove_now(&self, name: &str) -> Result<(bool, bool), InfraError> {
-        self.mutable()?;
+        self.mutable(name)?;
         let now = self.infra.clock.now();
         let mut s = self.infra.state();
         self.infra.refresh(&mut s);
@@ -1042,7 +1170,7 @@ impl InfraEnd {
         command: &str,
         argument: &str,
     ) -> Result<DeviceView, InfraError> {
-        self.mutable()?;
+        self.mutable(name)?;
         if !valid_command(command) {
             return Err(InfraError::Invalid(format!(
                 "command `{command}`: 1-63 lowercase letters, digits and `-`, from a letter"
@@ -1073,25 +1201,28 @@ impl InfraEnd {
             uid: item.uid.clone(),
         };
         self.queue(&mut s, req, now, Phase::Running);
-        Ok(s.items[name].view(name))
+        Ok(self.view(&s, name))
     }
 
-    /// `devices.get`.
+    /// `devices.get`: a device this controller sees (the network's own, or one it created).
     pub fn get(&self, name: &str) -> Result<DeviceView, InfraError> {
-        self.infra.get(name)
+        self.infra.get_as(Some(&self.device), name)
     }
 
-    /// `devices.list`.
+    /// `devices.list`: the devices this controller sees, and the latest resource version of
+    /// its view.
     pub fn list(&self, selector: &[(String, String)]) -> (u64, Vec<DeviceView>) {
-        self.infra.list(selector)
+        self.infra.list_as(Some(&self.device), selector)
     }
 
-    /// `devices.watch`.
+    /// `devices.watch`: the changes this controller sees, its resource versions counting them.
     pub fn watch(&self, selector: &[(String, String)], since: u64, max: u32) -> (u64, Vec<Change>) {
-        self.infra.watch(selector, since, max)
+        self.infra
+            .watch_as(Some(&self.device), selector, since, max)
     }
 
-    /// `devices.logs`.
+    /// `devices.logs`: only of a device this controller created (in a split network the
+    /// others' lines may be on another site); `denied` for the network's own devices.
     pub fn logs(
         &self,
         name: &str,
@@ -1099,6 +1230,12 @@ impl InfraEnd {
         since: Nanos,
         tail: u32,
     ) -> Result<Vec<LogLine>, InfraError> {
+        let owner = self.get(name)?.owner;
+        if owner.as_deref() != Some(self.device.as_str()) {
+            return Err(InfraError::Denied(format!(
+                "`{name}` was not created by this controller: logs are for the devices it created"
+            )));
+        }
         self.infra.logs(name, stream, since, tail)
     }
 }
@@ -1222,7 +1359,7 @@ pub(crate) fn parse_spec(bytes: &[u8]) -> Result<(DerivedSpec, Vec<u8>), InfraEr
                     wire.push(parse_cable(c)?);
                 }
             }
-            "infra" => {
+            "infra" | "infra_prefix" => {
                 return Err(InfraError::Denied(format!(
                     "a controller cannot grant `{k}` (only the embedder can)"
                 )));
@@ -1327,6 +1464,9 @@ pub(crate) fn spec_value(
     if options.infra {
         m.push((Value::text("infra"), Value::Bool(true)));
     }
+    if let Some(prefix) = &options.infra_prefix {
+        m.push((Value::text("infra_prefix"), Value::text(prefix.as_str())));
+    }
     if let Some(wire) = wire.filter(|w| !w.is_empty()) {
         let cables = wire
             .iter()
@@ -1409,14 +1549,8 @@ mod tests {
     fn calls_queue_requests_and_the_table_follows_the_network() {
         let clock = VirtualClock::new(std::time::Duration::ZERO);
         let infra = Infra::new(clock.clone(), Journal::new(clock.clone()));
-        let ctl = InfraEnd {
-            infra: infra.clone(),
-            device: "ctl".to_owned(),
-        };
-        let other = InfraEnd {
-            infra: infra.clone(),
-            device: "other".to_owned(),
-        };
+        let ctl = infra.end("ctl", None);
+        let other = infra.end("other", None);
         infra.added(
             "ctl",
             spec_value(
@@ -1519,10 +1653,7 @@ mod tests {
     fn commands_queue_for_the_callers_running_devices() {
         let clock = VirtualClock::new(std::time::Duration::ZERO);
         let infra = Infra::new(clock.clone(), Journal::new(clock.clone()));
-        let end = |device: &str| InfraEnd {
-            infra: infra.clone(),
-            device: device.to_owned(),
-        };
+        let end = |device: &str| infra.end(device, None);
         let (ctl, other) = (end("ctl"), end("other"));
         let spec_of = |c: &str| spec_value(c, &DeviceConfig::new(), DeviceOptions::default(), None);
         infra.added("ctl", spec_of("node:ctl"), 0, None);
@@ -1624,5 +1755,85 @@ mod tests {
             .filter(|e| matches!(&e.record, Record::Event { kind, .. } if kind == "infra-control"))
             .count();
         assert_eq!(controls, 2, "the retry was not journalled again");
+    }
+
+    /// Each controller sees the network's own devices and the ones it created, with resource
+    /// versions counting what it sees; only created devices follow their app exits; logs are
+    /// for the caller's own devices; a prefix bounds the names a controller may create.
+    #[test]
+    fn controllers_see_their_own_view_of_the_table() {
+        let clock = VirtualClock::new(std::time::Duration::ZERO);
+        let journal = Journal::new(clock.clone());
+        let infra = Infra::new(clock.clone(), journal.clone());
+        let spec_of = |c: &str| spec_value(c, &DeviceConfig::new(), DeviceOptions::default(), None);
+        infra.added("sw", spec_of("switch"), 0, None);
+        infra.added("ctl-a", spec_of("node:ctl"), 0, None);
+        infra.added("ctl-b", spec_of("node:ctl"), 0, None);
+        let a = infra.end("ctl-a", Some("a-".to_owned()));
+        let b = infra.end("ctl-b", None);
+        b.apply(None, "b-1", vec![], &spec("node:web")).unwrap();
+        a.apply(None, "a-1", vec![], &spec("node:web")).unwrap();
+        infra.added("b-1", vec![], 0, Some(0));
+        infra.applied(0, None, 0);
+        infra.added("a-1", vec![], 0, Some(1));
+        infra.applied(1, None, 0);
+        // The whole table: 5 changes; `ctl-a` sees 4 of them (not `b-1`'s), `ctl-b` 4.
+        assert_eq!(infra.list(&[]).0, 5);
+        let (rv, items) = a.list(&[]);
+        let names: Vec<&str> = items.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!((rv, names), (4, vec!["a-1", "ctl-a", "ctl-b", "sw"]));
+        assert_eq!(a.get("a-1").unwrap().rv, 4, "its own fourth change");
+        assert_eq!(infra.get("a-1").unwrap().rv, 5, "the table's fifth");
+        assert!(matches!(a.get("b-1"), Err(InfraError::NotFound(_))));
+        let (rv, changes) = a.watch(&[], 3, 10);
+        assert_eq!(rv, 4);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(
+            (changes[0].device.name.as_str(), changes[0].device.rv),
+            ("a-1", 4)
+        );
+        assert_eq!(infra.watch_for("ctl-b", &[], 0, 10).0, 4);
+        assert_eq!(infra.list_for("ctl-a", &[]), a.list(&[]));
+        // App exits: only a created device's are folded in.
+        for device in ["sw", "a-1"] {
+            JournalEnd {
+                journal: journal.clone(),
+                device: device.to_owned(),
+            }
+            .push(
+                0,
+                Record::Event {
+                    kind: "app-exit".to_owned(),
+                    fields: vec![
+                        ("app".to_owned(), "x".to_owned()),
+                        ("status".to_owned(), "ok".to_owned()),
+                    ],
+                },
+            );
+        }
+        assert!(a.get("sw").unwrap().apps.is_empty());
+        assert_eq!(
+            a.get("a-1").unwrap().apps,
+            [("x".to_owned(), "ok".to_owned())]
+        );
+        assert_eq!(a.list(&[]).0, 5);
+        assert_eq!(b.list(&[]).0, 4, "ctl-b does not see a-1's exit");
+        // Logs: the caller's own devices only.
+        assert!(a.logs("a-1", Stream::Stdout, 0, 0).is_ok());
+        assert!(matches!(
+            a.logs("sw", Stream::Stdout, 0, 0),
+            Err(InfraError::Denied(_))
+        ));
+        assert!(matches!(
+            a.logs("b-1", Stream::Stdout, 0, 0),
+            Err(InfraError::NotFound(_))
+        ));
+        // The prefix: `ctl-a` may change only `a-...` names.
+        assert!(matches!(
+            a.apply(None, "web", vec![], &spec("node:web")),
+            Err(InfraError::Denied(_))
+        ));
+        assert!(matches!(a.stop(None, "b-1", 0), Err(InfraError::Denied(_))));
+        assert!(a.stop(None, "a-1", 0).is_ok());
     }
 }

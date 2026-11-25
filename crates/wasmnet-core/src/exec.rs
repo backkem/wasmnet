@@ -4,7 +4,7 @@
 //! * [`block_on`] drives **one** future (a `wasi:cli/run` command): poll it, and when it is idle,
 //!   fire the next timer.
 //! * [`Executor`] drives **many** device actors, one per store. It runs in rounds: phase 1 polls
-//!   every woken actor, in device order, until a full round wakes nobody. Only then does phase 2
+//!   every woken actor, in device-number order, until a full round wakes nobody. Only then does phase 2
 //!   pop **exactly one** event, advance virtual time to it and dispatch it (wake a timer, or hand
 //!   a frame or poll to a device's inbox). Same-instant events are therefore each processed to
 //!   quiescence, in key order (`docs/design/event-order.md`).
@@ -90,6 +90,10 @@ pub type ActorFuture = Pin<Box<dyn Future<Output = Result<(), Fault>>>>;
 
 struct Slot {
     name: String,
+    /// Its number in event keys and record tags (`docs/design/event-order.md`): its index for a
+    /// device the network was built with, its creator's next number for a device created while
+    /// the network runs.
+    number: u32,
     /// `None` once the actor finished (it never should) or failed.
     future: Option<ActorFuture>,
     flag: Arc<WokenFlag>,
@@ -236,6 +240,8 @@ pub(crate) struct Executor {
     panel: Panel,
     guard: Guard,
     actors: Vec<Slot>,
+    /// Actor indices by number: the order phase-1 rounds poll them in.
+    order: Vec<usize>,
     /// The instant whose per-actor poll counts are being tallied.
     instant: Nanos,
     stats: Stats,
@@ -266,6 +272,7 @@ impl Executor {
             panel,
             guard,
             actors: Vec::new(),
+            order: Vec::new(),
             stats: Stats::default(),
             initialised: false,
             round: 0,
@@ -392,12 +399,21 @@ impl Executor {
         self.at_boundary = false;
     }
 
-    /// Adds an actor. It starts out woken, so its first poll happens in the next round.
-    pub(crate) fn add(&mut self, name: &str, inbox: Inbox, status: Status, future: ActorFuture) {
+    /// Adds an actor with `number`. It starts out woken, so its first poll happens in the next
+    /// round.
+    pub(crate) fn add(
+        &mut self,
+        name: &str,
+        number: u32,
+        inbox: Inbox,
+        status: Status,
+        future: ActorFuture,
+    ) {
         self.at_boundary = false;
         let flag = WokenFlag::new(true);
-        self.actors.push(Slot {
+        self.push(Slot {
             name: name.to_owned(),
+            number,
             future: Some(future),
             waker: Waker::from(flag.clone()),
             flag,
@@ -411,10 +427,11 @@ impl Executor {
 
     /// Adds a placeholder for a device that runs on another site: it keeps device indices the
     /// same on every site, and it is never polled.
-    pub(crate) fn add_remote(&mut self, name: &str, inbox: Inbox, status: Status) {
+    pub(crate) fn add_remote(&mut self, name: &str, number: u32, inbox: Inbox, status: Status) {
         let flag = WokenFlag::new(false);
-        self.actors.push(Slot {
+        self.push(Slot {
             name: name.to_owned(),
+            number,
             future: None,
             waker: Waker::from(flag.clone()),
             flag,
@@ -424,6 +441,16 @@ impl Executor {
             stopped: false,
             contain: false,
         });
+    }
+
+    /// Appends `slot`, keeping the poll order sorted by number.
+    fn push(&mut self, slot: Slot) {
+        let i = self.actors.len();
+        let at = self
+            .order
+            .partition_point(|&j| self.actors[j].number <= slot.number);
+        self.actors.push(slot);
+        self.order.insert(at, i);
     }
 
     /// Enters the first round's context (`init`) if no round has run yet.
@@ -549,17 +576,18 @@ impl Executor {
         Ok(())
     }
 
-    /// Phase 1: polls woken actors in device order until a full round polls nobody.
+    /// Phase 1: polls woken actors in number order until a full round polls nobody.
     fn run_round(&mut self) -> Result<(), Error> {
         loop {
             let mut polled_any = false;
             self.round += 1;
-            for i in 0..self.actors.len() {
+            for k in 0..self.order.len() {
+                let i = self.order[k];
                 if !self.actors[i].flag.take() || self.actors[i].stopped {
                     continue;
                 }
                 polled_any = true;
-                self.clock.set_actor(self.round, i as u32);
+                self.clock.set_actor(self.round, self.actors[i].number);
                 self.stats.actor_polls += 1;
                 let slot = &mut self.actors[i];
                 slot.polls_this_instant += 1;
@@ -583,7 +611,8 @@ impl Executor {
     /// actor bug that would otherwise show up as early quiescence or a false deadlock).
     fn paranoid_round(&mut self) -> Result<(), Error> {
         let queued = self.clock.pending_events();
-        for i in 0..self.actors.len() {
+        for k in 0..self.order.len() {
+            let i = self.order[k];
             // A quiet actor (no command, nothing in flight, no live guest task) has no wake to
             // miss: polling it would only cost time (most of a stepped device's polls).
             let slot = &self.actors[i];
@@ -816,7 +845,8 @@ mod tests {
         status: Status,
         fut: impl Future<Output = Result<(), Fault>> + 'static,
     ) {
-        exec.add(name, Inbox::default(), status, Box::pin(fut));
+        let number = exec.actors.len() as u32;
+        exec.add(name, number, Inbox::default(), status, Box::pin(fut));
     }
 
     /// An actor that logs `name@t` after each of its sleeps, then idles forever.
