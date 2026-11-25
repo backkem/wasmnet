@@ -8,8 +8,8 @@
 //! [`Network::finish`] reads the outcome at the end.
 
 use wasmnet_core::{
-    DeviceConfig, DeviceId, DeviceOptions, FrameRecord, Guard, JournalEntry, LinkId, Nanos,
-    Outcome, PortRef, SimConfig, Stats,
+    DeviceConfig, DeviceId, DeviceOptions, FrameRecord, Guard, Impairments, JournalEntry, LinkId,
+    Nanos, Outcome, PortRef, SimConfig, Stats,
 };
 
 use crate::host::JsHost;
@@ -112,12 +112,31 @@ impl<H: JsHost + Clone + Unpin + 'static> Network<H> {
     /// Wires two ports with a point-to-point link of one-way `latency` (ns). Both ports must be
     /// declared by their device, and each port can be on one link only.
     pub fn link(&mut self, a: PortRef, b: PortRef, latency: Nanos) -> Result<LinkId, String> {
+        self.link_impaired(a, b, latency, [Impairments::default(); 2])
+    }
+
+    /// [`link`](Self::link) with each direction's impairments (a rate with a bounded transmit
+    /// queue, seeded loss and jitter; `docs/design/links.md`), indexed by the sending end:
+    /// `[a -> b, b -> a]`.
+    pub fn link_impaired(
+        &mut self,
+        a: PortRef,
+        b: PortRef,
+        latency: Nanos,
+        impairments: [Impairments; 2],
+    ) -> Result<LinkId, String> {
         let count = self.sim_ref().devices().len();
         if let Some(end) = [a, b].into_iter().find(|p| p.device.index() >= count) {
             return Err(format!("no device {}", end.device.index()));
         }
-        let link = self.sim_mut().link(a, b).map_err(|e| e.to_string())?;
-        Ok(link.latency(latency).id())
+        let mut link = self.sim_mut().link(a, b).map_err(|e| e.to_string())?;
+        link = link.latency(latency);
+        if impairments != [Impairments::default(); 2] {
+            link = link
+                .impair_from(a, impairments[0])
+                .impair_from(b, impairments[1]);
+        }
+        Ok(link.id())
     }
 
     /// Runs every event at or before `until`, and every device JavaScript woke, first. `false`

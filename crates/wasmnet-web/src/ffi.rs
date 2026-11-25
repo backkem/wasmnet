@@ -52,7 +52,7 @@
 use std::cell::RefCell;
 use std::sync::Once;
 
-use wasmnet_core::{DeviceConfig, DeviceId, DeviceOptions, LinkId, Nanos};
+use wasmnet_core::{DeviceConfig, DeviceId, DeviceOptions, Impairments, LinkId, Nanos};
 
 use crate::codec;
 use crate::host::{CallEnd, Instance, JsHost};
@@ -371,6 +371,50 @@ pub extern "C" fn wn_link(dev_a: u32, port_a: u32, dev_b: u32, port_b: u32, late
         Ok(Err(e)) => fail(e),
         Err(e) => fail(e),
     }
+}
+
+/// [`wn_link`] with each direction's impairments (`docs/design/links.md`): `imp` holds two
+/// 24-byte records, `a -> b` then `b -> a`, each `rate` (u64, bits per second, 0: unlimited),
+/// `queue` (u32, frames), `loss_ppm` (u32, parts per million) and `jitter` (u64, ns), little
+/// endian. Answers the link's index, or -1 with the message in the result. Never calls
+/// JavaScript.
+#[unsafe(no_mangle)]
+pub extern "C" fn wn_link_impaired(
+    dev_a: u32,
+    port_a: u32,
+    dev_b: u32,
+    port_b: u32,
+    latency: u64,
+    imp: *const u8,
+    imp_len: usize,
+) -> i32 {
+    let Some(impairments) = decode_impairments(bytes(imp, imp_len)) else {
+        return fail(format!(
+            "impairments: want 48 bytes (two 24-byte records), got {imp_len}"
+        ));
+    };
+    let a = DeviceId::from_index(dev_a as usize).port(port_a);
+    let b = DeviceId::from_index(dev_b as usize).port(port_b);
+    match with_network(|n| n.link_impaired(a, b, latency, impairments)) {
+        Ok(Ok(id)) => i32::try_from(id.index()).unwrap_or(i32::MAX),
+        Ok(Err(e)) => fail(e),
+        Err(e) => fail(e),
+    }
+}
+
+/// Two directions' impairments from [`wn_link_impaired`]'s 48 bytes.
+fn decode_impairments(b: &[u8]) -> Option<[Impairments; 2]> {
+    if b.len() != 48 {
+        return None;
+    }
+    let u64_at = |i: usize| u64::from_le_bytes(b[i..i + 8].try_into().expect("8 bytes"));
+    let u32_at = |i: usize| u32::from_le_bytes(b[i..i + 4].try_into().expect("4 bytes"));
+    Some([0, 24].map(|o| Impairments {
+        rate: u64_at(o),
+        queue: u32_at(o + 8),
+        loss_ppm: u32_at(o + 12),
+        jitter: u64_at(o + 16),
+    }))
 }
 
 /// Runs every event at or before `until` (and every device JavaScript woke, first). Answers 1;
