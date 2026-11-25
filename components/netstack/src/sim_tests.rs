@@ -2772,24 +2772,33 @@ fn a_fin_past_the_receive_window_waits_for_the_bytes_before_it() {
 }
 
 #[test]
-fn reno_loses_no_byte_to_a_loss_while_the_reader_has_stopped() {
+fn no_loss_ends_a_stream_short_or_hangs_it_while_the_reader_has_stopped() {
     // The receive buffer holds the whole stream but its scaled window counts in steps of 4
     // bytes, so with the app not reading the window's right edge moves back and forth by a few
-    // bytes as data arrives. A segment sent against an older, larger window is then cut at the
-    // edge; when it carries the FIN, the FIN must be dropped with the cut bytes. Every loss
-    // position, each run read only from 10 s on. (Without congestion control one position
-    // hangs instead, with only the FIN unacknowledged: smoltcp issue #34 in
-    // `docs/upstream/smoltcp.md`, not fixed; so this covers Reno.)
-    let mut short = Vec::new();
-    for n in 1..=142 {
-        let t = transfer(&[], BULK, lose_data_segment(n), 10_000 * MS);
-        if t.end != Some(Ok(())) || t.got != t.data {
-            short.push((n, t.got.len(), t.end));
+    // bytes as data arrives, and closes at the end. Two things can go wrong there. A segment
+    // sent against an older, larger window is cut at the edge; when it carries the FIN, the
+    // FIN must be dropped with the cut bytes (or the stream ends short). And a retransmitted
+    // last segment whose data the receiver already has is dropped whole at the closed window,
+    // FIN included; the receiver's ACKs of all the data then count as duplicate ACKs, and the
+    // fast retransmit they start must send the FIN alone (or the stream never ends). Every
+    // loss position, each run read only from 10 s on, under both controllers.
+    let mut bad = Vec::new();
+    for c in ["reno", "none"] {
+        for n in 1..=142 {
+            let t = transfer(
+                &[("tcp.congestion", c)],
+                BULK,
+                lose_data_segment(n),
+                10_000 * MS,
+            );
+            if t.end != Some(Ok(())) || t.got != t.data {
+                bad.push((c, n, t.got.len(), t.end));
+            }
         }
     }
     assert!(
-        short.is_empty(),
-        "(lost segment, bytes read, end) of the transfers that ended short of {BULK} bytes: \
-         {short:?}"
+        bad.is_empty(),
+        "(controller, lost segment, bytes read, end) of the transfers that ended short of \
+         {BULK} bytes or did not end: {bad:?}"
     );
 }

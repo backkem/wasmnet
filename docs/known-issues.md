@@ -61,12 +61,6 @@ here so that nobody has to find these the hard way. Each entry names where the c
   ([design/netstack.md](design/netstack.md#tcp-congestion-control)).
   In `crates/wasmnet-host/tests/congestion.rs`, 1 MB at 10 Mbit/s through a 4-frame queue
   takes 1.85 s (0.83 s of it serialisation), and with 1 % loss 0.85 s to 5.8 s.
-- **A TCP connection can hang with only its FIN unacknowledged**: when the peer has every
-  byte but dropped the FIN (its window was zero), its repeated ACKs start a fast retransmit
-  that has nothing to send and leaves no timer armed, so the FIN never goes again and the
-  peer's app never sees the end of the stream. Seen with `tcp.congestion = "none"`, a
-  receiving app that stops reading and a loss near the end. In smoltcp, not fixed
-  ([upstream/smoltcp.md](upstream/smoltcp.md), #34).
 - **Colliding query ids in the resolver** (an A and an AAAA query drawing the same id) cost one
   timeout before the retry.
 
