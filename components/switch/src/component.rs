@@ -1,27 +1,32 @@
-//! wit-bindgen glue: exports `wasmnet:link/device` and `wasmnet:reconfigure/reconfigure` over
-//! [`crate::Switch`].
+//! wit-bindgen glue: exports `wasmnet:link/device`, `wasmnet:link/counters`,
+//! `wasmnet:control/commands` and `wasmnet:reconfigure/reconfigure` over [`crate::Switch`]
+//! (world `wasmnet:switch/switch`).
 
 // Generated bindings and `export!` need unsafe (raw ABI glue); our own code here does not.
 #![allow(unsafe_code)]
 
 use std::cell::RefCell;
 
-use crate::{Config, Event, Sink, Switch};
+use crate::{Config, Event, Paths, Sink, Switch};
 
 wit_bindgen::generate!({
-    inline: "
-        package wasmnet:switch-device;
-        world switch {
-            include wasmnet:link/stepped-device@0.1.0;
-            export wasmnet:reconfigure/reconfigure@0.1.0;
-        }
-    ",
-    path: ["../../wit/deps/config", "../../wit/link", "../../wit/reconfigure"],
+    world: "wasmnet:switch/switch",
+    path: [
+        "../../wit/deps/config",
+        "../../wit/link",
+        "../../wit/control",
+        "../../wit/reconfigure",
+        "../../wit/switch",
+    ],
+    // The world lives in its own package, so the `wasmnet:link`, `wasmnet:control` and
+    // `wasmnet:reconfigure` interfaces are dependencies.
     generate_all,
     // Not covered by any WASI binding crate: generate our own bindings for the vendored WIT.
     with: { "wasi:config/store@0.2.0-rc.1": generate },
 });
 
+use exports::wasmnet::control::commands;
+use exports::wasmnet::link::counters;
 use exports::wasmnet::link::device::Guest;
 use exports::wasmnet::reconfigure::reconfigure::{self, Refusal};
 use wasi::config::store;
@@ -41,7 +46,17 @@ fn create() -> Switch {
         log::log(Level::Error, &e.to_string());
         panic!("switch: {e}")
     });
-    let switch = Switch::new(config);
+    let get = |key: &str| store::get(key).ok().flatten();
+    let paths = Paths::from_config(
+        get("blocks").as_deref(),
+        get("delays").as_deref(),
+        config.ports,
+    )
+    .unwrap_or_else(|e| {
+        log::log(Level::Error, &format!("switch: config {e}"));
+        panic!("switch: {e}")
+    });
+    let switch = Switch::new(config).with_paths(paths);
     log::log(Level::Info, &format!("switch: {}", switch.describe()));
     switch
 }
@@ -96,16 +111,35 @@ impl Guest for Component {
 }
 
 impl reconfigure::Guest for Component {
-    /// A new aging time or table size in place; other ports or another MTU need a restart.
+    /// A new aging time or table size, and new `blocks` or `delays`, in place; other ports or
+    /// another MTU need a restart. Nothing changes unless everything can.
     fn reconfigure(_now: u64, config: Vec<(String, String)>) -> Result<(), Refusal> {
-        let new = Config::from_lookup(|key| {
+        let get = |key: &str| {
             config
                 .iter()
                 .find(|(k, _)| k == key)
                 .map(|(_, v)| v.clone())
-        })
-        .map_err(|e| Refusal::Invalid(e.to_string()))?;
-        with(|sw| sw.reconfigure(new, &mut Host)).map_err(Refusal::Restart)
+        };
+        let new = Config::from_lookup(get).map_err(|e| Refusal::Invalid(e.to_string()))?;
+        let paths = Paths::from_config(
+            get("blocks").as_deref(),
+            get("delays").as_deref(),
+            new.ports,
+        )
+        .map_err(|e| Refusal::Invalid(format!("config {e}")))?;
+        with(|sw| sw.reconfigure_all(new, paths, &mut Host)).map_err(Refusal::Restart)
+    }
+}
+
+impl counters::Guest for Component {
+    fn counters() -> Vec<(String, u64)> {
+        with(|sw| sw.counter_list())
+    }
+}
+
+impl commands::Guest for Component {
+    fn invoke(now: u64, command: String, argument: String) -> Result<String, String> {
+        with(|sw| sw.command(now, &command, &argument, &mut Host))
     }
 }
 

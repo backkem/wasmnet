@@ -183,6 +183,30 @@ Source of truth: `Config::from_lookup` in
 | `aging` | duration above zero | `300s` | A MAC entry expires this long after the last frame from that MAC. |
 | `max-entries` | integer, 1..=65536 | `1024` | MAC table capacity. When it is full, new MACs are not learned. |
 | `mtu` | integer, 68..=65535 | `1500` | The MTU reported for every port. |
+| `blocks` | a comma-separated list of `<set> <set>` (see below) | none | Pairs of ports kept apart: a frame from one never leaves by the other, forwarded or flooded. |
+| `delays` | a comma-separated list of `<set> <set> <duration>` | none | Pairs of ports whose frames are held for that long, both ways. |
+
+A port set is `<n>`, `<lo>-<hi>`, or several joined with `+` (`0`, `0-2`, `0-1+4`); an item
+names every pair of ports between its two sets. Example: `blocks = "0+1 2, 3 4"`,
+`delays = "0 1-2 20ms"`.
+
+**Changing reachability while it runs.** The switch takes commands
+(`wasmnet:control/commands`, world `wasmnet:switch/switch`): `block <set> <set>`,
+`unblock <set> <set>`, `partition <set> <set> [<set>...]` (blocks every pair across two groups),
+`heal` (lifts every block), `delay <set> <set> <duration>` (`0` removes it) and `paths` (the
+list). Their semantics are in [wit/switch/switch.wit](../../wit/switch/switch.wit). A switch
+without blocks or delays forwards, counts and journals exactly as before; its counters (the
+`counters` export: per port `p<N>-rx-frames` and the rest, `table-entries`, `table-full`) gain
+`p<N>-blocked`, `p<N>-delayed`, `blocked-pairs`, `delayed-pairs`, `held` and `held-dropped`
+once a block or a delay has existed.
+
+In a configuration applied in place (`wasmnet:reconfigure`), `blocks` and `delays` with the
+values in force change nothing, so blocks and delays set by commands since stay; a changed
+value of either replaces every block and delay, those set by commands too (journalled as
+`ports-reconfigured {blocks, delays}`, the pairs of each now). Frames held for a delay keep
+their release time: they leave then if their egress port is up and not blocked from their
+ingress port, and are counted as `held-dropped` if not. A configuration with other `ports` or
+another `mtu` is answered `restart` and changes nothing, blocks and delays included.
 
 ### Router
 
@@ -321,8 +345,8 @@ and `tunnels`, the list a controller reads ([router.wit](../../wit/router/router
 
 Port forwards and allow rules change the same way: `forward-add <forward>`,
 `forward-remove <forward or proto and external port>`, `forwards`, `allow-add <port> <rule>`,
-`allow-remove <port> <rule>` (a tunnel's port by the tunnel's name) and `rules`, in the syntax above; `mappings` lists the translation
-table. The behaviours (`nat.mapping` and the rest), the timeouts and which ports translate are
+`allow-remove <port> <rule>` (a tunnel's port by the tunnel's name) and `rules`, in the syntax
+above; `mappings` lists the translation table. The behaviours (`nat.mapping` and the rest), the timeouts and which ports translate are
 fixed when the router starts.
 
 ### WAN port

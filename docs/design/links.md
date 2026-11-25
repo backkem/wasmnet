@@ -16,7 +16,9 @@ as one without the feature: same deliveries, same keys, same captures, no random
 In order, for a frame transmitted on a wired Ethernet port at virtual time `now`:
 
 1. **Operator rules and the transmit hook** may drop, replace or delay it
-   ([event-order.md](event-order.md)).
+   ([event-order.md](event-order.md)). To keep two devices on one switch apart, or cut a
+   segment into groups, the switch's own blocks are the simpler tool: a frame they stop never
+   leaves the switch ([wit/switch/switch.wit](../../wit/switch/switch.wit)).
 2. **Carrier and MTU.** On a down link it is dropped (`dropped_down`); with a payload over the
    link MTU it is dropped (`oversize`). Neither enters the wire.
 3. **The transmit queue** (only while the direction's transmitter is busy). The transmitter

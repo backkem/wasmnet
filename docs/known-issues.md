@@ -96,6 +96,10 @@ here so that nobody has to find these the hard way. Each entry names where the c
   translating router, an inside host's mapping on a tunnel's UDP port loses its inbound
   datagrams to the tunnel
   ([design/tunnels.md](design/tunnels.md)).
+- **A switch's delay holds frames in the switch.** At most 4096 at once (more are dropped and
+  counted, `held-dropped`); frames held for different pairs of ports may overtake each other.
+  For a delay on one cable, a link's latency and jitter are the better tool
+  ([design/links.md](design/links.md)).
 - **The switch scans its whole MAC table on every frame** to age entries: fine for tens of
   hosts, slow for thousands.
 

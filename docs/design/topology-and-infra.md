@@ -229,7 +229,9 @@ its connections, and its cables come back under new names (`-2`). When only the 
 - A device without the export, or one that is stopped, is recreated, exactly as before.
 
 The switch takes a new `aging` or `max-entries` in place (it keeps its table and counters;
-journalled as `reconfigured`); a new `ports` or `mtu` needs a restart.
+journalled as `reconfigured`); a new `ports` or `mtu` needs a restart. A changed `blocks` or
+`delays` replaces the switch's blocks and delays in place, and an unchanged one keeps those its
+commands set ([configuration.md](configuration.md#switch)).
 
 ## Commands into a running device
 

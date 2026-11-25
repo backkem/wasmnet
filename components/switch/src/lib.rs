@@ -12,6 +12,14 @@
 //!    IEEE 802.1D reserved group address (`01:80:c2:00:00:00` to `0f`: STP, LACP, LLDP, ...) is
 //!    link-local: filtered, never forwarded.
 //!
+//! **Blocks and delays between port sets** ([`paths`]): a block keeps two ports apart (a frame
+//! from one never leaves by the other, forwarded or flooded), a delay holds the frames between
+//! two ports for a while and releases them on the switch's own `poll` deadline. They come from
+//! the config (`blocks`, `delays`) or from commands (`wasmnet:control/commands`,
+//! [`Switch::command`]: `block`, `unblock`, `partition`, `heal`, `delay`, `paths`) and are
+//! journalled as `ports-blocked`, `ports-unblocked`, `ports-healed` and `ports-delayed`. A
+//! switch that never had one forwards, counts and journals as before.
+//!
 //! A port that goes down has its MAC entries flushed. Everything is counted per port
 //! ([`PortCounters`]), and table changes are reported as [`Event`]s (`mac-learned`, `mac-moved`,
 //! `mac-aged`, `mac-flushed`, `port-up`, `port-down`, `reconfigured`), which the component forwards to the
@@ -24,6 +32,10 @@
 
 #[cfg(not(test))]
 mod component;
+
+pub mod paths;
+
+pub use paths::{Change, Paths, PortSet};
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -146,11 +158,18 @@ pub struct PortCounters {
     pub malformed: u64,
     /// Frames received while the switch considered the port down.
     pub rx_down: u64,
+    /// Frames received here not sent to a port this one is blocked from (one per port a flood
+    /// left out).
+    pub blocked: u64,
+    /// Frames received here held for a delay before they left.
+    pub delayed: u64,
 }
 
 /// A change of the MAC table or of a port, reported to the host as a structured event.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Event {
+    /// A command or the config changed the blocks or delays.
+    Paths(Change),
     MacLearned {
         mac: MacAddr,
         port: u32,
@@ -192,6 +211,11 @@ impl Event {
             Event::PortUp { .. } => "port-up",
             Event::PortDown { .. } => "port-down",
             Event::Reconfigured { .. } => "reconfigured",
+            Event::Paths(Change::Blocked { .. }) => "ports-blocked",
+            Event::Paths(Change::Unblocked { .. }) => "ports-unblocked",
+            Event::Paths(Change::Healed { .. }) => "ports-healed",
+            Event::Paths(Change::Delayed { .. }) => "ports-delayed",
+            Event::Paths(Change::Replaced { .. }) => "ports-reconfigured",
         }
     }
 
@@ -217,6 +241,22 @@ impl Event {
                 kv("aging", format_duration(aging_ns)),
                 kv("max-entries", max_entries.to_string()),
             ],
+            Event::Paths(Change::Blocked { from, to, pairs })
+            | Event::Paths(Change::Unblocked { from, to, pairs }) => vec![
+                kv("from", from.to_string()),
+                kv("to", to.to_string()),
+                kv("pairs", pairs.to_string()),
+            ],
+            Event::Paths(Change::Healed { pairs }) => vec![kv("pairs", pairs.to_string())],
+            Event::Paths(Change::Replaced { blocks, delays }) => vec![
+                kv("blocks", blocks.to_string()),
+                kv("delays", delays.to_string()),
+            ],
+            Event::Paths(Change::Delayed { from, to, delay_ns }) => vec![
+                kv("from", from.to_string()),
+                kv("to", to.to_string()),
+                kv("delay", format_duration(delay_ns)),
+            ],
         }
     }
 }
@@ -232,6 +272,8 @@ pub enum DropReason {
     Malformed,
     /// The source address is broadcast or multicast.
     GroupSource,
+    /// The destination is learned on a port the ingress port is blocked from.
+    Blocked,
 }
 
 /// What the switch did with one frame.
@@ -272,6 +314,8 @@ pub struct Switch {
     table: BTreeMap<MacAddr, Entry>,
     /// Source MACs that could not be learned because the table was full.
     table_full: u64,
+    /// Blocks and delays between ports.
+    paths: Paths,
 }
 
 impl Switch {
@@ -282,7 +326,14 @@ impl Switch {
             ports: vec![Port::default(); config.ports as usize],
             table: BTreeMap::new(),
             table_full: 0,
+            paths: Paths::default(),
         }
+    }
+
+    /// Sets the blocks and delays (the config's `blocks` and `delays`, [`Paths::from_config`]).
+    pub fn with_paths(mut self, paths: Paths) -> Self {
+        self.paths = paths;
+        self
     }
 
     pub fn config(&self) -> &Config {
@@ -305,6 +356,30 @@ impl Switch {
                 max_entries: new.max_entries,
             });
         }
+        Ok(())
+    }
+
+    /// Takes the `blocks` and `delays` of a configuration applied in place ([`Paths::reconfigure`]):
+    /// unchanged values keep the blocks and delays as they are (commands' included), changed ones
+    /// replace them all, journalled as `ports-reconfigured {blocks, delays}`. Held frames keep
+    /// their release time.
+    pub fn reconfigure_paths(&mut self, paths: Paths, out: &mut impl Sink) {
+        if let Some(c) = self.paths.reconfigure(paths) {
+            out.event(Event::Paths(c));
+        }
+    }
+
+    /// A whole configuration in place (`wasmnet:reconfigure`): [`Switch::reconfigure`] and then
+    /// [`Switch::reconfigure_paths`]. `Err` (other ports or another MTU) changes nothing, the
+    /// blocks and delays included.
+    pub fn reconfigure_all(
+        &mut self,
+        new: Config,
+        paths: Paths,
+        out: &mut impl Sink,
+    ) -> Result<(), String> {
+        self.reconfigure(new, out)?;
+        self.reconfigure_paths(paths, out);
         Ok(())
     }
 
@@ -356,16 +431,26 @@ impl Switch {
                 self.ports[port as usize].counters.filtered += 1;
                 Forwarding::Filtered
             }
+            Some(egress) if self.paths.blocked(port, egress) => {
+                self.ports[port as usize].counters.blocked += 1;
+                Forwarding::Dropped(DropReason::Blocked)
+            }
             Some(egress) => {
-                self.send(egress, frame, false, sink);
+                self.forward(now, port, egress, frame, false, sink);
                 Forwarding::Unicast(egress)
             }
             None => {
-                let egress: Vec<u32> = (0..self.config.ports)
+                let up: Vec<u32> = (0..self.config.ports)
                     .filter(|&p| p != port && self.ports[p as usize].up)
                     .collect();
+                let egress: Vec<u32> = up
+                    .iter()
+                    .copied()
+                    .filter(|&p| !self.paths.blocked(port, p))
+                    .collect();
+                self.ports[port as usize].counters.blocked += (up.len() - egress.len()) as u64;
                 for &p in &egress {
-                    self.send(p, frame, true, sink);
+                    self.forward(now, port, p, frame, true, sink);
                 }
                 Forwarding::Flooded(egress)
             }
@@ -399,13 +484,112 @@ impl Switch {
         sink.event(Event::PortDown { port });
     }
 
-    /// Ages the table to `now` and returns when the next entry expires.
+    /// Ages the table to `now`, sends the held frames that are due, and returns when the next
+    /// entry expires or the next held frame is due.
     pub fn poll(&mut self, now: u64, sink: &mut impl Sink) -> Option<u64> {
         self.age(now, sink);
-        self.table
+        for h in self.paths.due(now) {
+            // A port that went down (or a block set meanwhile) loses the frame.
+            if self.is_up(h.egress) && !self.paths.blocked(h.ingress, h.egress) {
+                self.send(h.egress, &h.frame, h.flooded, sink);
+            } else {
+                self.paths.held_dropped += 1;
+            }
+        }
+        let aging = self
+            .table
             .values()
             .map(|e| e.last_seen.saturating_add(self.config.aging_ns))
-            .min()
+            .min();
+        match (aging, self.paths.next_release()) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    /// Runs one command (`wasmnet:control/commands`): `block <set> <set>`, `unblock <set>
+    /// <set>`, `partition <set> <set> [<set>...]`, `heal`, `delay <set> <set> <duration>` and
+    /// `paths`. `Ok` says what it did (`unchanged` when nothing changed); `Err` changed nothing.
+    pub fn command(
+        &mut self,
+        _now: u64,
+        command: &str,
+        argument: &str,
+        sink: &mut impl Sink,
+    ) -> Result<String, String> {
+        let ports = self.config.ports;
+        let arg = argument.trim();
+        let (changes, done) = match command {
+            "block" => (
+                self.paths.block(arg, ports, true)?.into_iter().collect(),
+                "blocked",
+            ),
+            "unblock" => (
+                self.paths.block(arg, ports, false)?.into_iter().collect(),
+                "unblocked",
+            ),
+            "partition" => (self.paths.partition(arg, ports)?, "partitioned"),
+            "heal" if arg.is_empty() => (self.paths.heal().into_iter().collect(), "healed"),
+            "delay" => (
+                self.paths.delay(arg, ports)?.into_iter().collect(),
+                "delayed",
+            ),
+            "paths" if arg.is_empty() => return Ok(self.paths.listing()),
+            "heal" | "paths" => return Err(format!("`{command}` takes no argument")),
+            other => {
+                return Err(format!(
+                    "unknown command `{other}` (block, unblock, partition, heal, delay, paths)"
+                ));
+            }
+        };
+        let changes: Vec<Change> = changes;
+        if changes.is_empty() {
+            return Ok("unchanged".to_owned());
+        }
+        for c in changes {
+            sink.event(Event::Paths(c));
+        }
+        Ok(done.to_owned())
+    }
+
+    /// Every counter, in a stable order (the `counters` export): per port `p<N>-*`, the table's,
+    /// and, once a block or a delay existed, `p<N>-blocked`, `p<N>-delayed`, `blocked-pairs`,
+    /// `delayed-pairs`, `held` and `held-dropped`.
+    pub fn counter_list(&self) -> Vec<(String, u64)> {
+        let mut v = vec![
+            ("table-entries".to_owned(), self.table.len() as u64),
+            ("table-full".to_owned(), self.table_full),
+        ];
+        let used = self.paths.used;
+        for (n, p) in self.ports.iter().enumerate() {
+            let c = p.counters;
+            let mut list = vec![
+                ("rx-frames", c.rx_frames),
+                ("rx-bytes", c.rx_bytes),
+                ("tx-frames", c.tx_frames),
+                ("tx-bytes", c.tx_bytes),
+                ("tx-flooded", c.tx_flooded),
+                ("filtered", c.filtered),
+                ("malformed", c.malformed),
+                ("rx-down", c.rx_down),
+            ];
+            if used {
+                list.push(("blocked", c.blocked));
+                list.push(("delayed", c.delayed));
+            }
+            v.extend(list.into_iter().map(|(k, val)| (format!("p{n}-{k}"), val)));
+        }
+        if used {
+            for (k, val) in [
+                ("blocked-pairs", self.paths.blocked_pairs() as u64),
+                ("delayed-pairs", self.paths.delayed_pairs() as u64),
+                ("held", self.paths.held() as u64),
+                ("held-dropped", self.paths.held_dropped),
+            ] {
+                v.push((k.to_owned(), val));
+            }
+        }
+        v
     }
 
     /// The port `mac` is learned on, if any.
@@ -439,6 +623,33 @@ impl Switch {
             format_duration(self.config.aging_ns),
             self.config.max_entries
         )
+    }
+
+    /// Sends a frame from `ingress` out of `egress` now, or holds it for their delay.
+    fn forward(
+        &mut self,
+        now: u64,
+        ingress: u32,
+        egress: u32,
+        frame: &[u8],
+        flooded: bool,
+        sink: &mut impl Sink,
+    ) {
+        let delay = self.paths.delay_of(ingress, egress);
+        if delay == 0 {
+            self.send(egress, frame, flooded, sink);
+            return;
+        }
+        self.ports[ingress as usize].counters.delayed += 1;
+        self.paths.hold(
+            now.saturating_add(delay),
+            paths::Held {
+                ingress,
+                egress,
+                flooded,
+                frame: frame.to_vec(),
+            },
+        );
     }
 
     fn send(&mut self, port: u32, frame: &[u8], flooded: bool, sink: &mut impl Sink) {
@@ -813,6 +1024,202 @@ mod tests {
     }
 
     #[test]
+    fn blocked_ports_exchange_nothing_and_heal() {
+        let mut sw = switch();
+        let mut out = Out::default();
+        // Ports 0 and 1 against 2: a partition into two groups; 3 reaches everyone.
+        assert_eq!(
+            sw.command(0, "partition", "0+1 2", &mut out).as_deref(),
+            Ok("partitioned")
+        );
+        assert_eq!(out.events[0].kind(), "ports-blocked");
+        assert_eq!(
+            out.events[0].fields(),
+            [
+                ("from".to_owned(), "0+1".to_owned()),
+                ("to".to_owned(), "2".to_owned()),
+                ("pairs".to_owned(), "2".to_owned()),
+            ]
+        );
+        assert_eq!(
+            sw.command(0, "block", "2 1", &mut out).as_deref(),
+            Ok("unchanged")
+        );
+        assert_eq!(
+            sw.command(0, "paths", "", &mut out).as_deref(),
+            Ok("block 0 2\nblock 1 2")
+        );
+        // A broadcast from 0 floods to 1 and 3 only; one from 2 reaches 3 only.
+        let (fwd, o) = rx(&mut sw, 1, 0, &frame(MacAddr::BROADCAST, mac(1)));
+        assert_eq!(
+            (fwd, o.ports()),
+            (Forwarding::Flooded(vec![1, 3]), vec![1, 3])
+        );
+        let (_, o) = rx(&mut sw, 2, 2, &frame(MacAddr::BROADCAST, mac(3)));
+        assert_eq!(o.ports(), [3]);
+        // A learned station across the block is unreachable, and the drop is counted.
+        let (fwd, o) = rx(&mut sw, 3, 2, &frame(mac(1), mac(3)));
+        assert_eq!(fwd, Forwarding::Dropped(DropReason::Blocked));
+        assert!(o.ports().is_empty());
+        assert_eq!(
+            sw.counters(2).unwrap().blocked,
+            3,
+            "two flood copies and one unicast"
+        );
+        let counters = sw.counter_list();
+        let get = |k: &str| counters.iter().find(|(n, _)| n == k).map(|(_, v)| *v);
+        assert_eq!(get("blocked-pairs"), Some(2));
+        assert_eq!(get("p2-blocked"), Some(3));
+        // Healed: everything as before.
+        let mut out = Out::default();
+        assert_eq!(sw.command(4, "heal", "", &mut out).as_deref(), Ok("healed"));
+        assert_eq!(out.events[0].kind(), "ports-healed");
+        let (fwd, _) = rx(&mut sw, 5, 2, &frame(mac(1), mac(3)));
+        assert_eq!(fwd, Forwarding::Unicast(0));
+        assert_eq!(
+            sw.command(5, "heal", "", &mut out).as_deref(),
+            Ok("unchanged")
+        );
+        for (c, a) in [
+            ("block", "0"),
+            ("block", "0 9"),
+            ("heal", "now"),
+            ("fly", ""),
+            ("partition", "0"),
+        ] {
+            assert!(sw.command(5, c, a, &mut out).is_err(), "{c} {a}");
+        }
+    }
+
+    #[test]
+    fn a_switch_without_blocks_lists_no_block_counters() {
+        let sw = switch();
+        assert!(
+            sw.counter_list().iter().all(|(k, _)| !k.contains("blocked")
+                && !k.contains("held")
+                && !k.contains("delayed"))
+        );
+    }
+
+    #[test]
+    fn delayed_frames_leave_on_the_poll_deadline() {
+        let mut sw = switch();
+        let mut out = Out::default();
+        assert_eq!(
+            sw.command(0, "delay", "0 1 20ms", &mut out).as_deref(),
+            Ok("delayed")
+        );
+        assert_eq!(out.events[0].kind(), "ports-delayed");
+        // A broadcast from 0: to 1 held, to the others at once.
+        let f = frame(MacAddr::BROADCAST, mac(1));
+        let (_, o) = rx(&mut sw, 1_000, 0, &f);
+        assert_eq!(o.ports(), [2, 3]);
+        // The next deadline: the learned MAC's expiry first, then the held frame's release.
+        assert_eq!(sw.poll(1_000, &mut Out::default()), Some(2_000));
+        assert_eq!(sw.poll(2_000, &mut Out::default()), Some(20_001_000));
+        let mut o = Out::default();
+        sw.poll(20_000_999, &mut o);
+        assert!(o.tx.is_empty());
+        sw.poll(20_001_000, &mut o);
+        assert_eq!(o.ports(), [1]);
+        assert_eq!(o.tx[0].1, f);
+        assert_eq!(sw.counters(0).unwrap().delayed, 1);
+        // A frame held for a port that goes down meanwhile is lost, and counted.
+        let (_, _) = rx(&mut sw, 30_000_000, 0, &f);
+        sw.link_state(31_000_000, 1, false, &mut Out::default());
+        let mut o = Out::default();
+        sw.poll(50_000_000, &mut o);
+        assert!(o.tx.is_empty());
+        let counters = sw.counter_list();
+        assert!(counters.contains(&("held-dropped".to_owned(), 1)));
+        assert_eq!(
+            sw.command(0, "delay", "0 1 0", &mut Out::default())
+                .as_deref(),
+            Ok("delayed")
+        );
+        assert_eq!(
+            sw.command(0, "paths", "", &mut Out::default()).as_deref(),
+            Ok("")
+        );
+    }
+
+    #[test]
+    fn a_configuration_in_place_keeps_or_replaces_blocks_and_delays() {
+        let cfg = |b: Option<&str>, d: Option<&str>| Paths::from_config(b, d, 4).unwrap();
+        let mut sw = switch().with_paths(cfg(Some("0 1"), Some("0 2 20ms")));
+        let same = *sw.config();
+        // A command adds a block; a frame from 0 to 2 is held for 20 ms.
+        sw.command(0, "block", "2 3", &mut Out::default()).unwrap();
+        let f = frame(MacAddr::BROADCAST, mac(1));
+        let (_, o) = rx(&mut sw, 1_000, 0, &f);
+        assert_eq!(o.ports(), [3], "1 blocked, 2 held");
+        // The same blocks and delays in a new configuration (a longer aging time): the command's
+        // block stays.
+        let mut out = Out::default();
+        let longer = Config {
+            aging_ns: 10 * AGING,
+            ..same
+        };
+        sw.reconfigure_all(longer, cfg(Some("0 1"), Some("0 2 20ms")), &mut out)
+            .unwrap();
+        assert_eq!(out.events.len(), 1, "only `reconfigured`");
+        assert_eq!(
+            sw.command(0, "paths", "", &mut Out::default()).as_deref(),
+            Ok("block 0 1\nblock 2 3\ndelay 0 2 20ms")
+        );
+        // Other ports with other blocks: a restart, and nothing changed.
+        let more_ports = Config { ports: 8, ..longer };
+        assert!(
+            sw.reconfigure_all(more_ports, cfg(Some("0 3"), None), &mut out)
+                .is_err()
+        );
+        assert_eq!(
+            sw.command(0, "paths", "", &mut Out::default()).as_deref(),
+            Ok("block 0 1\nblock 2 3\ndelay 0 2 20ms")
+        );
+        // New blocks and no delay: every block and delay is replaced, the command's too.
+        let mut out = Out::default();
+        sw.reconfigure_all(longer, cfg(Some("0 2"), None), &mut out)
+            .unwrap();
+        assert_eq!(out.events[0].kind(), "ports-reconfigured");
+        assert_eq!(
+            out.events[0].fields(),
+            [
+                ("blocks".to_owned(), "1".to_owned()),
+                ("delays".to_owned(), "0".to_owned())
+            ]
+        );
+        assert_eq!(
+            sw.command(0, "paths", "", &mut Out::default()).as_deref(),
+            Ok("block 0 2")
+        );
+        // The frame held from 0 for 2 is now across a block: at its release it is dropped and
+        // counted, not sent.
+        let mut o = Out::default();
+        sw.poll(20_001_000, &mut o);
+        assert!(o.tx.is_empty());
+        assert!(sw.counter_list().contains(&("held-dropped".to_owned(), 1)));
+        // And 0 reaches 1 again.
+        let (_, o) = rx(&mut sw, 20_002_000, 0, &f);
+        assert_eq!(o.ports(), [1, 3]);
+    }
+
+    #[test]
+    fn blocks_and_delays_from_the_config() {
+        let p = Paths::from_config(Some("0+1 2, 3 0"), Some("1 3 5ms"), 4).unwrap();
+        let sw = Switch::new(Config {
+            ports: 4,
+            ..Config::default()
+        })
+        .with_paths(p);
+        let mut sw = sw;
+        assert_eq!(
+            sw.command(0, "paths", "", &mut Out::default()).as_deref(),
+            Ok("block 0 2\nblock 0 3\nblock 1 2\ndelay 1 3 5ms")
+        );
+    }
+
+    #[test]
     fn event_kinds_and_fields_are_stable() {
         let e = Event::MacMoved {
             mac: mac(1),
@@ -851,10 +1258,17 @@ mod tests {
 
         #[derive(Clone, Debug)]
         enum Op {
-            Frame { port: u32, src: u8, dst: u8 },
+            Frame {
+                port: u32,
+                src: u8,
+                dst: u8,
+            },
             Down(u32),
             Up(u32),
             Advance(u64),
+            /// Block (or unblock) every pair between two port sets (bit masks).
+            Block(u8, u8, bool),
+            Heal,
         }
 
         fn op() -> impl Strategy<Value = Op> {
@@ -863,16 +1277,24 @@ mod tests {
                 1 => (0..PORTS).prop_map(Op::Down),
                 1 => (0..PORTS).prop_map(Op::Up),
                 2 => (0u64..40).prop_map(Op::Advance),
+                1 => (1u8..32, 1u8..32, any::<bool>()).prop_map(|(a, b, add)| Op::Block(a, b, add)),
+                1 => Just(Op::Heal),
             ]
         }
 
-        /// The reference: a list of `(mac, port, last_seen)` and the up ports.
+        /// The reference: a list of `(mac, port, last_seen)`, the up ports and the blocked
+        /// pairs (`(a, b)` with `a < b`).
         struct Model {
             entries: Vec<(MacAddr, u32, u64)>,
             up: Vec<bool>,
+            blocked: Vec<(u32, u32)>,
         }
 
         impl Model {
+            fn blocks(&self, a: u32, b: u32) -> bool {
+                self.blocked.contains(&(a.min(b), a.max(b)))
+            }
+
             fn age(&mut self, now: u64) {
                 self.entries.retain(|&(_, _, seen)| now < seen + PROP_AGING);
             }
@@ -890,9 +1312,10 @@ mod tests {
                 let known = self.entries.iter().find(|e| e.0 == dst && dst.is_unicast());
                 match known {
                     Some(&(_, p, _)) if p == port => vec![],
+                    Some(&(_, p, _)) if self.blocks(port, p) => vec![],
                     Some(&(_, p, _)) => vec![p],
                     None => (0..PORTS)
-                        .filter(|&p| p != port && self.up[p as usize])
+                        .filter(|&p| p != port && self.up[p as usize] && !self.blocks(port, p))
                         .collect(),
                 }
             }
@@ -912,7 +1335,7 @@ mod tests {
             #[test]
             fn frames_go_to_the_right_ports_exactly_once(ops in proptest::collection::vec(op(), 1..200)) {
                 let mut sw = Switch::new(Config { ports: PORTS, aging_ns: PROP_AGING, ..Config::default() });
-                let mut model = Model { entries: vec![], up: vec![true; PORTS as usize] };
+                let mut model = Model { entries: vec![], up: vec![true; PORTS as usize], blocked: vec![] };
                 for p in 0..PORTS {
                     sw.link_state(0, p, true, &mut Out::default());
                 }
@@ -932,6 +1355,24 @@ mod tests {
                             }
                             model.up[p as usize] = up;
                         }
+                        Op::Block(a, b, add) => {
+                            let set = |m: u8| (0..PORTS).filter(|p| m & (1 << p) != 0).map(|p| p.to_string()).collect::<Vec<_>>().join("+");
+                            let cmd = if add { "block" } else { "unblock" };
+                            sw.command(now, cmd, &format!("{} {}", set(a), set(b)), &mut Out::default()).unwrap();
+                            for x in (0..PORTS).filter(|p| a & (1 << p) != 0) {
+                                for y in (0..PORTS).filter(|p| b & (1 << p) != 0 && *p != x) {
+                                    let k = (x.min(y), x.max(y));
+                                    model.blocked.retain(|e| *e != k);
+                                    if add {
+                                        model.blocked.push(k);
+                                    }
+                                }
+                            }
+                        }
+                        Op::Heal => {
+                            sw.command(now, "heal", "", &mut Out::default()).unwrap();
+                            model.blocked.clear();
+                        }
                         Op::Frame { port, src, dst } => {
                             let f = frame(pool(dst), pool(src));
                             let mut out = Out::default();
@@ -941,6 +1382,7 @@ mod tests {
                             prop_assert!(!got.contains(&port), "sent back out of ingress {port}: {got:?}");
                             prop_assert!(got.iter().all(|&p| sw.is_up(p)), "sent out of a down port: {got:?}");
                             prop_assert!(out.tx.iter().all(|(_, b)| *b == f), "frame bytes changed");
+                            prop_assert!(got.iter().all(|&p| !model.blocks(port, p)), "a blocked pair exchanged a frame: {port} -> {got:?}");
                             prop_assert_eq!(got, model.expect(now, port, pool(src), pool(dst)));
                         }
                     }

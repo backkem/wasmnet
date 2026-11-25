@@ -9,6 +9,7 @@ by what it exports here.
 | `wasmnet:netstack` | The netstack's world: `wasmnet:link` below, `wasi:sockets@0.3.0` and `wasmnet:sockets-ext` above. |
 | `wasmnet:sockets-ext` | What `wasi:sockets` lacks: TCP abort and no-delay, ICMP errors on UDP sockets, multicast, interfaces, ICMP echo sockets. Shaped to be upstreamed or dropped. |
 | `wasmnet:app` | An app: a WASI 0.3 program that exports `wasi:cli/run` and imports sockets, clocks, config and the log. |
+| `wasmnet:switch` | The switch's world: a stepped device with counters, commands (blocks and delays between its ports change while it runs) and `wasmnet:reconfigure` (its aging time, table size, blocks and delays change in place). |
 | `wasmnet:router` | The router's world: a stepped device with counters and commands (its routes, port forwards, allow rules and tunnels change while it runs). |
 | `wasmnet:control` | Commands into a live device: one export, `commands.invoke(now, command, argument)`, text in and text out. The host and the infra API carry commands without knowing any device. |
 | `wasmnet:wan` | The carrier that moves frames between the sites of a network split over several processes. |

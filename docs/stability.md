@@ -13,7 +13,8 @@ are part of it ([design/links.md](design/links.md)). So are device commands: the
 `wasmnet:infra/devices.control` (`crates/wasmnet-host/tests/routes.rs`), and the router's
 address translation and packet filter with their keys and commands (`tests/nat.rs`,
 `tests/filter.rs`), and its tunnel ports with their keys and commands
-(`tests/tunnel.rs`). Sending them as
+(`tests/tunnel.rs`), and the switch's blocks and delays between ports
+(`tests/partition.rs`). Sending them as
 operator events (`Op::Control` with a `DeviceCommand`) is embedder surface like every
 operator event, though that test exercises it too. So are a device's arguments and
 environment (`DeviceOptions::args` and `env`, the spec keys `args` and `env`), a controller's

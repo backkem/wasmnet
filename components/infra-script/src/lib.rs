@@ -179,7 +179,7 @@ fn hex(text: &str) -> Option<Vec<u8>> {
 
 /// Parses one step's value.
 pub fn parse_step(n: u32, text: &str) -> Result<Step, String> {
-    let syntax = "`<at> [id=<id>] [when=<id>~|!<text>] \
+    let syntax = "`<at> [id=<id>] [when=<id>~|!<text>|when=<id>.<key>=<value>] \
                   apply|control|start|stop|remove|logs|answer|wire|unwire <name> [<rest>]`";
     let text = text.trim();
     let (at, rest) = text.split_once(char::is_whitespace).ok_or(syntax)?;

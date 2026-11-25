@@ -1,0 +1,67 @@
+/// The switch component's world.
+///
+/// A switch is a stepped device (`wasmnet:link/stepped-device`: `ports`, `receive`, `poll`,
+/// `link-state`; config through `wasi:config/store`; events through `wasmnet:link/log`), a
+/// learning Ethernet bridge, that also exports `wasmnet:link/counters` (its per-port and table
+/// counters), `wasmnet:control/commands`, so the reachability between its ports can change
+/// while it runs, and `wasmnet:reconfigure/reconfigure`, so its configuration can. It needs no
+/// clock and no randomness: time arrives as `now` arguments, and its next deadline (a MAC
+/// entry's expiry, or a held frame's release) is `poll`'s answer.
+///
+/// # Commands
+///
+/// `wasmnet:control/commands.invoke(now, command, argument)` takes these commands. A port set is
+/// written `<n>`, `<lo>-<hi>`, joined with `+` (`0`, `0-2`, `0-1+4`); a command that names two
+/// sets changes every pair of ports between them, in both directions (a port is never paired
+/// with itself).
+///
+/// - `block <set> <set>`: a frame that arrives on a port of one set never leaves by a port of
+///   the other, whether it would be forwarded to a learned port or flooded. `ok("blocked")`, or
+///   `ok("unchanged")` when every pair was blocked already. Journalled as
+///   `ports-blocked {from, to, pairs}` (`pairs`: how many were new).
+/// - `unblock <set> <set>`: lifts those blocks. `ok("unblocked")` or `ok("unchanged")`;
+///   journalled as `ports-unblocked {from, to, pairs}`.
+/// - `partition <set> <set> [<set>...]`: blocks every pair of ports in two different sets (a
+///   segment cut into groups); ports in no set keep reaching everyone. `ok("partitioned")` or
+///   `ok("unchanged")`; journalled as one `ports-blocked` per pair of sets that changed.
+/// - `heal` (no argument): lifts every block (delays stay). `ok("healed")` or `ok("unchanged")`;
+///   journalled as `ports-healed {pairs}`.
+/// - `delay <set> <set> <duration>`: every frame between two such ports is held for
+///   `<duration>` (`20ms`; `0` removes the delay) and leaves at the switch's `poll` at that
+///   instant, if its egress port is still up and not blocked from its ingress port by then
+///   (otherwise it is dropped and counted as `held-dropped`). Frames held for different pairs
+///   may overtake each other, as on different paths. At most 4096 frames are held; more are
+///   dropped. `ok("delayed")` or `ok("unchanged")`; journalled as
+///   `ports-delayed {from, to, delay}`.
+/// - `paths` (no argument): `block <a> <b>` and `delay <a> <b> <duration>`, one pair per line,
+///   in port order.
+///
+/// Timing: a change applies at `now`, to every frame received from then on, and a `poll(now)`
+/// follows the call; frames already held keep their release time. The MAC table, the ports and
+/// their carriers are untouched: a blocked station stays learned. An unknown command, a
+/// malformed set or a port that does not exist is an `err` that changes nothing.
+///
+/// The config's `blocks` (`"0+1 2, 3 4"`) and `delays` (`"0 1-2 20ms"`) set the same at start.
+/// The `p<N>-blocked`, `p<N>-delayed`, `blocked-pairs`, `delayed-pairs`, `held` and
+/// `held-dropped` counters are listed once a block or a delay has existed; before that the switch
+/// lists its per-port and table counters only.
+///
+/// # Configuration in place
+///
+/// The switch also exports `wasmnet:reconfigure/reconfigure`: a new `aging` or `max-entries`
+/// applies in place (journalled as `reconfigured`), and so do `blocks` and `delays`. Values equal
+/// to those in force change nothing, so blocks and delays set by commands stay; a changed value
+/// of either replaces every block and delay, commands' included (`ports-reconfigured {blocks,
+/// delays}`). Held frames keep their release time and leave then if their egress port is up and
+/// not blocked from their ingress port (else they count as `held-dropped`). Another `ports` or
+/// `mtu` is a `restart` refusal that changes nothing, blocks and delays included.
+///
+/// This package names that combination; it adds no interface of its own.
+package wasmnet:switch@0.1.0;
+
+world switch {
+    include wasmnet:link/stepped-device@0.1.0;
+    export wasmnet:link/counters@0.1.0;
+    export wasmnet:control/commands@0.1.0;
+    export wasmnet:reconfigure/reconfigure@0.1.0;
+}
