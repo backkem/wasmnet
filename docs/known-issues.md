@@ -54,11 +54,19 @@ here so that nobody has to find these the hard way. Each entry names where the c
 
 - **An IGMP or MLD query makes the driver poll every millisecond** for the length of the
   response window. It costs processor time only: results and captures are the same.
-- **No TCP congestion control.** smoltcp's congestion controllers are not enabled
-  (`components/netstack/Cargo.toml`), so TCP sends its whole window at once. Over a link with a
-  rate and a small transmit queue it loses most of each burst and recovers through
-  retransmission timeouts: in `crates/wasmnet-host/tests/impairments.rs`, 1 MB at 10 Mbit/s
-  takes 0.83 s with the default queue and about 54 virtual minutes with a queue of 4 frames.
+- **TCP loss recovery still ends in a timeout where duplicate ACKs cannot help** (a loss
+  among a transfer's last segments, while the window is under four segments, or of a
+  retransmission): smoltcp has no SACK-based recovery, Limited Transmit or tail-loss probe,
+  and its smallest retransmission timeout is 1 s
+  ([design/netstack.md](design/netstack.md#tcp-congestion-control)).
+  In `crates/wasmnet-host/tests/congestion.rs`, 1 MB at 10 Mbit/s through a 4-frame queue
+  takes 1.85 s (0.83 s of it serialisation), and with 1 % loss 0.85 s to 5.8 s.
+- **A FIN on a segment cut at the receive window's right edge is accepted** without the bytes
+  that were cut, so the receiving app sees the stream end early, as if complete. A sender only
+  overshoots the window with a fast retransmission (smoltcp sends a full segment from the first
+  unacknowledged byte whatever the window), so it takes a loss near the end of a stream while
+  the receiving app has stopped reading. In smoltcp, not fixed
+  ([upstream/smoltcp.md](upstream/smoltcp.md), #32).
 - **Colliding query ids in the resolver** (an A and an AAAA query drawing the same id) cost one
   timeout before the retry.
 

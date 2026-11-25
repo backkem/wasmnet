@@ -144,20 +144,23 @@ fn a_bulk_transfer_takes_its_serialisation_time() {
         elapsed >= busy + LATENCY,
         "elapsed {elapsed} < busy {busy} + latency"
     );
-    // The receive window is far larger than the bandwidth-delay product (about 2.5 kB) and
-    // the netstack has no congestion control, so once the first data segment is queued the
-    // transmitter never idles: elapsed = busy + latency. Allow one full frame's time.
+    // The receive window is far larger than the bandwidth-delay product (about 2.5 kB), so
+    // the transmitter idles only while TCP's slow start opens the congestion window: the
+    // initial window (2048 bytes: a full segment and 588 bytes) is less than two full
+    // segments, so the receiver holds its ACK for its delayed-ACK time (10 ms); the next
+    // window already exceeds the bandwidth-delay product, and from then on the transmitter
+    // never idles. Allow that delay and one full frame's time.
     let idle = elapsed - busy - LATENCY;
     assert!(
-        idle <= imp.serialisation(1514),
+        idle <= 10_000 * US + imp.serialisation(1514),
         "the transmitter idled {idle} ns"
     );
     // Against size / rate: the payload alone, plus the Ethernet, IP and TCP headers (54 of
-    // every 1514 bytes, 3.7 %) and the HTTP head.
+    // every 1514 bytes, 3.7 %), the HTTP head and the slow start (1.3 %).
     let ideal = BULK * 8 * 1_000_000_000 / RATE;
     let ratio = elapsed as f64 / ideal as f64;
     assert!(
-        (1.0..1.05).contains(&ratio),
+        (1.0..1.06).contains(&ratio),
         "elapsed {elapsed} ns for size / rate {ideal} ns: ratio {ratio:.4}"
     );
     println!(

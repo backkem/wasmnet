@@ -180,7 +180,7 @@ impl Stack {
             mcast,
             carrier: false,
             udp: UdpSockets::default(),
-            tcp: TcpSockets::default(),
+            tcp: TcpSockets::new(config.tcp_congestion),
             hosts: config.hosts.clone(),
             hop_limit: config.hop_limit,
             gateway_v4: config.ipv4_gateway.is_some(),

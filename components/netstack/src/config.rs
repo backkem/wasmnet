@@ -39,6 +39,12 @@
 //! | `resolver.mdns-timeout` | how long one mDNS query for a `.local` name waits | `1s` |
 //! | `resolver.mdns-attempts` | mDNS queries before a `.local` name is unresolvable, 1..=5 | `3` |
 //! | `multicast-hop-limit` | also the default of `wasmnet:sockets-ext/multicast` hop limits | `1` |
+//!
+//! TCP:
+//!
+//! | key | value | default |
+//! |---|---|---|
+//! | `tcp.congestion` | the congestion controller of every TCP connection: `reno`, or `none` (the whole send window at once) | `reno` |
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -97,6 +103,8 @@ pub struct Config {
     /// One-shot mDNS queries for `.local` names.
     pub mdns_timeout_ns: u64,
     pub mdns_attempts: u32,
+    /// `tcp.congestion`: the congestion controller of every TCP connection.
+    pub tcp_congestion: crate::tcp::Congestion,
     /// `snapshot.paused`: the node waits for a `wasmnet:netstack/state`
     /// restore before it does anything (set by an embedder that restores the stack before it
     /// starts).
@@ -124,6 +132,7 @@ impl Default for Config {
             resolver_attempts: crate::resolver::DEFAULT_ATTEMPTS,
             mdns_timeout_ns: crate::resolver::DEFAULT_MDNS_TIMEOUT_NS,
             mdns_attempts: crate::resolver::DEFAULT_MDNS_ATTEMPTS,
+            tcp_congestion: crate::tcp::Congestion::default(),
             paused: false,
         }
     }
@@ -146,6 +155,7 @@ const TOP_KEYS: &[&str] = &[
     "resolver.attempts",
     "resolver.mdns-timeout",
     "resolver.mdns-attempts",
+    "tcp.congestion",
 ];
 /// Keys under this prefix belong to the node's apps (`app.<app>.<key>`).
 pub const APP_PREFIX: &str = "app.";
@@ -412,6 +422,13 @@ impl Config {
             resolver_attempts,
             mdns_timeout_ns,
             mdns_attempts,
+            tcp_congestion: r
+                .get(
+                    "tcp.congestion",
+                    "reno or none",
+                    crate::tcp::Congestion::parse,
+                )?
+                .unwrap_or(d.tcp_congestion),
             paused: r
                 .get("snapshot.paused", "true or false", |v| {
                     v.parse::<bool>().ok()
@@ -453,6 +470,25 @@ mod tests {
         );
         assert_eq!(c.ipv6.unwrap().prefix, 64);
         assert_eq!((c.hop_limit, c.multicast_hop_limit), (32, 255));
+    }
+
+    #[test]
+    fn tcp_congestion_names_a_controller() {
+        use crate::tcp::Congestion;
+        assert_eq!(parse(&[]).unwrap().tcp_congestion, Congestion::Reno);
+        for (v, want) in [("reno", Congestion::Reno), ("none", Congestion::None)] {
+            let c = parse(&[("tcp.congestion", v)]).unwrap();
+            assert_eq!(c.tcp_congestion, want);
+            assert_eq!(want.name(), v);
+        }
+        assert!(matches!(
+            parse(&[("tcp.congestion", "Reno")]),
+            Err(ConfigError::Invalid { .. })
+        ));
+        assert!(matches!(
+            parse(&[("tcp.congestion", "cubic")]),
+            Err(ConfigError::Invalid { .. })
+        ));
     }
 
     #[test]

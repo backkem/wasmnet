@@ -48,7 +48,10 @@ arrival of its last bit at the far end.
   serialised, so a frame that finds the transmitter idle is never dropped, whatever its size;
   `queue = 0` keeps no backlog at all. The default is `DEFAULT_QUEUE` (1000 frames, Linux's
   default `txqueuelen`). The queue matters only with a rate: without one the transmitter is never
-  busy.
+  busy. A small queue is what TCP's congestion control has to live with: the netstack's Reno
+  probes until the queue drops a frame and then halves its window, so a bulk transfer through
+  a 4-frame queue at 10 Mbit/s keeps the link busy up to its last window
+  ([netstack.md](netstack.md#tcp-congestion-control)).
 - **Loss is Bernoulli per frame**, in parts per million (`loss_ppm`, 0 ..= 1 000 000), drawn
   for frames that passed the queue. Probability 0 and 1 draw nothing: 0 never loses, 1 always
   does.

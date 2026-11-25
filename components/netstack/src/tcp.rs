@@ -90,6 +90,52 @@ fn smol_duration(ns: u64) -> Duration {
     Duration::from_micros(ns / 1_000)
 }
 
+/// The congestion controller of the node's TCP connections (the `tcp.congestion` key): one of
+/// smoltcp's. Every connection has a controller of its own, created with its smoltcp socket.
+///
+/// * **Reno** (the default, RFC 5681): slow start from smoltcp's initial window of 2048
+///   bytes, growing by up to one segment per ACK below `ssthresh` and by about one segment
+///   per round trip above it; three duplicate ACKs halve it (fast retransmit and fast
+///   recovery, with NewReno's retransmission on partial ACKs from our smoltcp patch), a
+///   retransmission timeout drops it to one segment. Integer arithmetic only.
+/// * **None**: no congestion window, only the peer's receive window: a sender puts the whole
+///   window on the wire at once, and has no fast recovery.
+///
+/// smoltcp's Cubic is not offered: it calls `f64::powi` and `f64::mul_add`, which only std
+/// has, and the netstack builds smoltcp without std.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Congestion {
+    #[default]
+    Reno,
+    None,
+}
+
+impl Congestion {
+    /// Parses the config value: `reno` or `none`.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "reno" => Some(Self::Reno),
+            "none" => Some(Self::None),
+            _ => None,
+        }
+    }
+
+    /// The config value that names it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Reno => "reno",
+            Self::None => "none",
+        }
+    }
+
+    fn smoltcp(self) -> tcp::CongestionControl {
+        match self {
+            Self::Reno => tcp::CongestionControl::Reno,
+            Self::None => tcp::CongestionControl::None,
+        }
+    }
+}
+
 /// Per-socket options. A listener's options are inherited by the sockets it accepts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Options {
@@ -104,6 +150,9 @@ pub struct Options {
     /// `TCP_NODELAY` (`wasmnet:sockets-ext/tcp.set-no-delay`): Nagle off.
     pub no_delay: bool,
     pub backlog: u64,
+    /// The node's `tcp.congestion`, copied in at `create` (no socket option changes it, so a
+    /// snapshot does not store it: a restore takes the restoring node's).
+    pub congestion: Congestion,
 }
 
 impl Default for Options {
@@ -118,6 +167,7 @@ impl Default for Options {
             keep_count: KEEP_COUNT,
             no_delay: false,
             backlog: DEFAULT_BACKLOG,
+            congestion: Congestion::default(),
         }
     }
 }
@@ -142,12 +192,14 @@ impl Options {
         sock.set_keep_alive(self.keep_alive.then(|| smol_duration(self.keep_idle_ns)));
     }
 
-    /// A new smoltcp socket with these buffers and options.
+    /// A new smoltcp socket with these buffers, options and congestion controller. The
+    /// controller is only ever set here: setting it again would restart its state.
     fn socket(&self, default_hops: u8) -> tcp::Socket<'static> {
         let mut sock = tcp::Socket::new(
             tcp::SocketBuffer::new(vec![0u8; self.rx_buffer as usize]),
             tcp::SocketBuffer::new(vec![0u8; self.tx_buffer as usize]),
         );
+        sock.set_congestion_control(self.congestion.smoltcp());
         self.apply(&mut sock, default_hops);
         sock
     }
@@ -323,6 +375,8 @@ pub struct TcpSockets {
     next_port: u16,
     orphans: Vec<Orphan>,
     pub counters: TcpCounters,
+    /// The node's `tcp.congestion`, for every socket it creates.
+    congestion: Congestion,
 }
 
 impl Default for TcpSockets {
@@ -333,7 +387,23 @@ impl Default for TcpSockets {
             next_port: FIRST_EPHEMERAL,
             orphans: Vec::new(),
             counters: TcpCounters::default(),
+            congestion: Congestion::default(),
         }
+    }
+}
+
+impl TcpSockets {
+    /// An empty table whose sockets use `congestion` (the node's `tcp.congestion`).
+    pub fn new(congestion: Congestion) -> Self {
+        Self {
+            congestion,
+            ..Self::default()
+        }
+    }
+
+    /// The node's congestion controller.
+    pub fn congestion(&self) -> Congestion {
+        self.congestion
     }
 }
 
@@ -466,6 +536,7 @@ impl TcpSockets {
                 keep_count: r.u32()?,
                 no_delay: r.bool()?,
                 backlog: r.u64()?,
+                congestion: self.congestion,
             };
             let phase = match r.u8()? {
                 0 => Phase::Unbound,
@@ -615,7 +686,10 @@ impl TcpSockets {
             family,
             local: None,
             remote: None,
-            opts: Options::default(),
+            opts: Options {
+                congestion: self.congestion,
+                ..Options::default()
+            },
             phase: Phase::Unbound,
             dropped: false,
             jobs: 0,

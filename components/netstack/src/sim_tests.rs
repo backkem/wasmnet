@@ -33,6 +33,9 @@ struct Sim {
     /// Deliver every frame due for a node at one instant before polling it once (so two SYNs
     /// can meet in one `Interface::poll`), instead of one poll per frame.
     batch: bool,
+    /// Decides, per transmitted frame `(sender, frame)`, whether the hub loses it: a lost frame
+    /// is still recorded in `frames`, but nobody receives it.
+    lose: Lose,
 }
 
 fn node(pairs: &[(&str, &str)], seed: u64) -> Stack {
@@ -57,6 +60,7 @@ impl Sim {
             now: 0,
             active: 0,
             batch: false,
+            lose: None,
         };
         for i in 0..n {
             sim.step(i);
@@ -74,7 +78,8 @@ impl Sim {
         self.active = now;
         let out = self.nodes[i].poll(now);
         for frame in out.frames {
-            for to in (0..self.nodes.len()).filter(|&j| j != i) {
+            let lost = self.lose.as_mut().is_some_and(|lose| lose(i, &frame));
+            for to in (0..self.nodes.len()).filter(|&j| j != i && !lost) {
                 self.push(
                     now + self.latency,
                     Ev::Deliver {
@@ -693,7 +698,7 @@ fn names_resolve_from_the_hosts_table() {
 
 // ---- TCP sockets for apps ----
 
-use crate::tcp::{Accept, RecvStep};
+use crate::tcp::{Accept, Congestion, RecvStep};
 
 /// A TCP segment on the wire: `(time, sender, flags byte, payload length)`.
 type Seg = (u64, usize, u8, usize);
@@ -2357,4 +2362,278 @@ fn a_socket_closed_when_a_lookup_changes_family_lingers_from_then() {
     sim.run(t0 + 150 * MS);
     let (udp, _) = sim.nodes[0].udp();
     assert_eq!(udp.next_deadline(), Some(t0 + 100 * MS + LINGER_NS));
+}
+
+// ---- TCP congestion control (`tcp.congestion`) ----
+
+/// One IPv4 TCP segment on the hub.
+#[derive(Clone, Copy, Debug)]
+struct TcpSeg {
+    at: u64,
+    from: usize,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    len: u32,
+}
+
+type Lose = Option<Box<dyn FnMut(usize, &[u8]) -> bool>>;
+
+impl Sim {
+    /// Every IPv4 TCP segment with its sequence and acknowledgment numbers, in transmit order
+    /// (lost ones included).
+    fn tcp_segs(&self) -> Vec<TcpSeg> {
+        self.frames
+            .iter()
+            .filter(|(_, _, f)| f.get(12..14) == Some(&[8, 0]) && f.get(23) == Some(&6))
+            .map(|(at, from, f)| {
+                let ip_header = usize::from(f[14] & 0x0f) * 4;
+                let total = usize::from(u16::from_be_bytes([f[16], f[17]]));
+                let t = &f[14 + ip_header..];
+                let word = |i: usize| u32::from_be_bytes([t[i], t[i + 1], t[i + 2], t[i + 3]]);
+                TcpSeg {
+                    at: *at,
+                    from: *from,
+                    seq: word(4),
+                    ack: word(8),
+                    flags: t[13],
+                    len: (total - ip_header - usize::from(t[12] >> 4) * 4) as u32,
+                }
+            })
+            .collect()
+    }
+
+    /// Node 0's data segments as `(time, bytes in flight just after it left, retransmission)`.
+    /// Bytes in flight are the highest byte node 0 sent minus the highest acknowledgment of
+    /// node 1's that had reached node 0 by then (one hub latency after node 1 sent it).
+    fn flights(&self) -> Vec<(u64, u32, bool)> {
+        let segs = self.tcp_segs();
+        let isn = segs
+            .iter()
+            .find(|s| s.from == 0 && s.flags & SYN != 0)
+            .expect("node 0's SYN-ACK")
+            .seq;
+        let mut sent = 0u32;
+        let mut out = Vec::new();
+        for s in segs.iter().filter(|s| s.from == 0 && s.len > 0) {
+            let end = s.seq.wrapping_sub(isn) + s.len;
+            let retransmit = end <= sent;
+            sent = sent.max(end);
+            let acked = segs
+                .iter()
+                .filter(|a| a.from == 1 && a.flags & ACK != 0 && a.at + self.latency <= s.at)
+                .map(|a| a.ack.wrapping_sub(isn))
+                .max()
+                .unwrap_or(0);
+            out.push((s.at, sent - acked, retransmit));
+        }
+        out
+    }
+}
+
+/// Node 0 (with `extra` config) sends `len` bytes to node 1 over a connection whose send
+/// buffer holds them all and whose receive buffer twice that (so the receive window never
+/// closes and only the congestion window limits the flight; node 1 reads at the end), with the hub losing what
+/// `lose` picks. Returns the finished simulation; node 1 got every byte, in order.
+fn bulk_send(extra: &[(&'static str, &'static str)], len: usize, lose: Lose) -> Sim {
+    let mut sim = two(extra, 3);
+    sim.lose = lose;
+    let (t, mut net) = sim.tcp(0);
+    let l = t.create(Family::Ipv4);
+    t.set_buffer_size(l, false, len as u64).unwrap();
+    t.bind(l, sa("0.0.0.0:80"), &mut net).unwrap();
+    t.listen(l, &mut net).unwrap();
+    let now = sim.now;
+    let (t, mut net) = sim.tcp(1);
+    let cl = t.create(Family::Ipv4);
+    t.set_buffer_size(cl, true, 2 * len as u64).unwrap();
+    t.connect(cl, sa("10.0.0.1:80"), now, &mut net).unwrap();
+    sim.kick(1);
+    sim.run(MS);
+    sim.now = MS;
+    established(&mut sim, 1, cl);
+    let sv = accept(&mut sim, 0, l);
+    sim.tcp(0).0.start_send(sv).unwrap();
+    let data: Vec<u8> = (0..len).map(|n| (n % 251) as u8).collect();
+    write(&mut sim, 0, sv, &data, true);
+    sim.run(10_000 * MS);
+    sim.tcp(1).0.start_recv(cl).unwrap();
+    let (got, end) = drain(&mut sim, 1, cl);
+    assert_eq!(end, Some(Ok(())));
+    assert!(
+        got == data,
+        "node 1 got {} of {len} bytes, in order",
+        got.len()
+    );
+    sim
+}
+
+/// Bulk data: 200 kB, about 140 full segments.
+const BULK: usize = 200_000;
+/// A full segment at the 1500-byte MTU (smoltcp sends no TCP options on data segments).
+const SEG: u32 = 1460;
+
+/// Loses node 0's `n`th data segment (counting from 1), once.
+fn lose_data_segment(n: usize) -> Lose {
+    lose_data_segments(&[n])
+}
+
+/// Loses each of node 0's data segments numbered in `ns` (counting from 1, retransmissions
+/// included), once.
+fn lose_data_segments(ns: &[usize]) -> Lose {
+    let ns = ns.to_vec();
+    let mut seen = 0;
+    Some(Box::new(move |from, f: &[u8]| {
+        let data = from == 0
+            && f.get(12..14) == Some(&[8, 0])
+            && f.get(23) == Some(&6)
+            && usize::from(u16::from_be_bytes([f[16], f[17]])) > 40;
+        if data {
+            seen += 1;
+        }
+        data && ns.contains(&seen)
+    }))
+}
+
+#[test]
+fn reno_is_the_default_and_none_can_be_chosen() {
+    for (extra, want) in [
+        (&[][..], Congestion::Reno),
+        (&[("tcp.congestion", "none")][..], Congestion::None),
+    ] {
+        let mut sim = two(extra, 1);
+        assert_eq!(sim.tcp(0).0.congestion(), want);
+    }
+}
+
+#[test]
+fn reno_starts_slow_and_grows_the_flight_every_round_trip() {
+    let sim = bulk_send(&[], BULK, None);
+    let flights = sim.flights();
+    assert!(
+        flights.iter().all(|f| !f.2),
+        "nothing was lost: {flights:?}"
+    );
+    // On the hub every segment of a round trip leaves at one instant, one round trip
+    // (200 us) after the ACKs that opened the window left the receiver: the largest flight
+    // of each instant is that round trip's congestion window in use.
+    let mut rounds: Vec<(u64, u32)> = Vec::new();
+    for &(at, flight, _) in &flights {
+        match rounds.last_mut() {
+            Some((t, peak)) if *t == at => *peak = (*peak).max(flight),
+            _ => rounds.push((at, flight)),
+        }
+    }
+    let peaks: Vec<u32> = rounds.iter().map(|r| r.1).collect();
+    println!(
+        "reno: {} data segments, flight per round trip {peaks:?}",
+        flights.len()
+    );
+    assert!(
+        rounds.windows(2).all(|w| w[1].0 - w[0].0 == 200 * US),
+        "{rounds:?}"
+    );
+    // The first round trip: smoltcp's initial window, 2048 bytes (a full segment and 588).
+    assert_eq!(peaks[0], 2048);
+    // Slow start: one segment more per ACK, and the receiver acknowledges every second full
+    // segment, so the window grows by half each round trip, up to the last round (the rest).
+    let (last, growing) = peaks.split_last().unwrap();
+    for w in growing.windows(2) {
+        assert!(w[1] >= w[0] + w[0] / 3, "{peaks:?}");
+    }
+    assert!(*last <= growing.last().unwrap() * 2, "{peaks:?}");
+}
+
+#[test]
+fn none_puts_the_whole_window_on_the_wire_at_once() {
+    let sim = bulk_send(&[("tcp.congestion", "none")], BULK, None);
+    let flights = sim.flights();
+    let first = flights[0].0;
+    // No congestion window: everything the peer's window takes (here: all of it) leaves at
+    // the first instant, as it did before the stack had congestion control.
+    let burst: Vec<_> = flights.iter().filter(|f| f.0 == first).collect();
+    assert_eq!(burst.len(), flights.len(), "{flights:?}");
+    assert_eq!(burst.last().unwrap().1, BULK as u32);
+}
+
+#[test]
+fn reno_recovers_a_lost_segment_by_fast_retransmit_and_halves_the_flight() {
+    let sim = bulk_send(&[], BULK, lose_data_segment(60));
+    let flights = sim.flights();
+    let lost_at = flights[59].0;
+    let retransmits: Vec<_> = flights.iter().filter(|f| f.2).collect();
+    // One retransmission, on the third duplicate ACK: within two round trips, never after a
+    // retransmission timeout (at least 1 s).
+    assert_eq!(retransmits.len(), 1, "{retransmits:?}");
+    let retx_at = retransmits[0].0;
+    assert!(
+        retx_at - lost_at <= 2 * MS,
+        "retransmitted {} ns after the loss",
+        retx_at - lost_at
+    );
+    // The largest flight before the loss, against the largest in the round trip after the
+    // retransmission was acknowledged (200 us after it left): about half.
+    let before = flights
+        .iter()
+        .filter(|f| f.0 <= lost_at)
+        .map(|f| f.1)
+        .max()
+        .unwrap();
+    let recovered = retx_at + 200 * US;
+    let after = flights
+        .iter()
+        .filter(|f| f.0 > recovered && f.0 <= recovered + 200 * US)
+        .map(|f| f.1)
+        .max()
+        .unwrap_or(0);
+    println!("reno loss: flight {before} before, {after} after the recovery");
+    assert!(
+        after > 0 && after <= before / 2 + 3 * SEG && after < before,
+        "{before} -> {after}"
+    );
+}
+
+#[test]
+fn reno_repairs_two_losses_in_one_window_without_a_timeout() {
+    // Segments 138 and 140 of 142 leave in the last round trip and are both lost. The three
+    // segments behind the first hole bring three duplicate ACKs that retransmit it; no new
+    // data follows, so nothing else would reveal the second hole. The ACK of the first
+    // retransmission stops at the second hole (a partial ACK), which is retransmitted at once (NewReno, RFC 6582), instead of after a
+    // retransmission timeout of at least 1 s.
+    let sim = bulk_send(&[], BULK, lose_data_segments(&[138, 140]));
+    let flights = sim.flights();
+    assert_eq!(flights.len(), 142 + 2);
+    let lost_at = flights[137].0;
+    assert_eq!(flights[139].0, lost_at, "both left in one round trip");
+    let retransmits: Vec<_> = flights.iter().filter(|f| f.2).collect();
+    assert_eq!(retransmits.len(), 2, "{retransmits:?}");
+    // The first on the duplicate ACKs, the second one round trip later on the partial ACK.
+    assert!(retransmits[0].0 - lost_at <= 2 * MS, "{retransmits:?}");
+    assert_eq!(
+        retransmits[1].0 - retransmits[0].0,
+        200 * US,
+        "{retransmits:?}"
+    );
+}
+
+#[test]
+fn none_retransmits_on_duplicate_acks_too_with_everything_already_sent() {
+    // Fast retransmit is smoltcp's, whatever the controller: without one, every segment left
+    // at the first instant, and the lost one goes again one round trip later, on the
+    // duplicate ACKs of the segments behind it.
+    let sim = bulk_send(&[("tcp.congestion", "none")], BULK, lose_data_segment(60));
+    let flights = sim.flights();
+    let retransmits: Vec<_> = flights.iter().filter(|f| f.2).collect();
+    assert_eq!(retransmits.len(), 1, "{retransmits:?}");
+    assert_eq!(retransmits[0].0, flights[0].0 + 200 * US);
+}
+
+#[test]
+fn the_same_seed_gives_the_same_segments_under_every_controller() {
+    for c in ["reno", "none"] {
+        let extra: &[(&str, &str)] = &[("tcp.congestion", c)];
+        let a = bulk_send(extra, 50_000, lose_data_segment(10));
+        let b = bulk_send(extra, 50_000, lose_data_segment(10));
+        assert!(a.frames == b.frames, "{c}: the frames differ");
+    }
 }

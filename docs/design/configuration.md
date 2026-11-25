@@ -151,6 +151,12 @@ under `app.`.
 `hosts.<name>`, then resolves a `.local` name with one-shot mDNS queries and any other name
 through the DNS servers (if the node has any).
 
+### TCP
+
+| Key | Value | Default | Meaning |
+|---|---|---|---|
+| `tcp.congestion` | `reno` or `none` | `reno` | The congestion controller of every TCP connection the node opens or accepts: Reno with NewReno's fast recovery, or none (only the peer's receive window limits a sender, which puts it all on the wire at once). See [netstack.md](netstack.md#tcp-congestion-control). |
+
 ### Test and embedding keys
 
 | Key | Value | Default | Meaning |

@@ -81,7 +81,8 @@ finish, park until the driver's next pass.
 - **TCP** ([src/tcp.rs](../../components/netstack/src/tcp.rs)). `connect` and `listen` create
   smoltcp sockets with the buffer sizes set so far (64 KiB per direction by default, clamped to
   536 B to 1 MiB). The listen backlog is N smoltcp sockets in LISTEN (default 8, at most 64),
-  since smoltcp has no backlog. A connect waits at most 75 s for the handshake.
+  since smoltcp has no backlog. A connect waits at most 75 s for the handshake. Every
+  connection has a congestion controller, Reno by default (below).
 - **ICMP echo** ([src/icmp.rs](../../components/netstack/src/icmp.rs)): Linux-style ping
   sockets. The stack picks each identifier from a rover that starts at an identifier drawn
   from the seeded `wasi:random`.
@@ -99,6 +100,51 @@ window follows the app's reading speed. Dropping the send stream queues a FIN af
 accepted data; the peer's FIN ends the receive stream; an RST (from `sockets-ext/tcp.abort` or
 the peer) resolves both futures to `connection-reset`; dropping the receive stream is
 `SHUT_RD`: later data is acknowledged and discarded.
+
+## TCP congestion control
+
+Every TCP connection gets the congestion controller the node's `tcp.congestion` names
+([configuration.md](configuration.md)) when its smoltcp socket is created, and keeps it.
+
+- **`reno`** (the default): smoltcp's Reno (RFC 5681) with NewReno's partial-ACK handling
+  (RFC 6582, our third smoltcp patch). Slow start begins at smoltcp's initial window of
+  2048 bytes, a full segment and 588 bytes at a 1500-byte MTU. Each ACK of new data adds up
+  to one segment; the receiver acknowledges every second full segment, so the window grows by
+  about half per round trip, not double. Above `ssthresh` it grows by at most one segment per
+  round trip. Three duplicate ACKs retransmit the first unacknowledged segment and halve the
+  window (fast recovery: `ssthresh` = flight / 2, the window `ssthresh` + 3 segments, one more
+  per further duplicate ACK). A partial ACK, one that stops short of everything sent before the
+  loss was detected, retransmits the next hole at once and keeps fast recovery; the ACK of
+  everything ends it with the window at `ssthresh`. A retransmission timeout drops the window
+  to one segment and resends everything from the last ACK (go-back-N) in slow start.
+- **`none`**: no congestion window, only the peer's receive window: a sender puts the whole
+  window on the wire at once, and each loss waits for three duplicate ACKs of its own. This is
+  the netstack's timing from before it had congestion control, byte for byte.
+
+Why Reno: its arithmetic is integer only, so its decisions are the same on every target, and it
+is the controller that builds here: smoltcp 0.14's Cubic calls `f64::powi` and `f64::mul_add`,
+which only std has, and the netstack builds smoltcp without std. On the short round trips of a
+simulated LAN, Cubic would mostly run in its Reno-friendly region anyway (RFC 9438 §4.3).
+
+What recovery depends on besides the controller, all smoltcp's and unchanged:
+
+- **The retransmission timer** (RFC 6298): 1 s before the first RTT sample, at least 1 s and at
+  most 60 s, doubled on every timeout; after three timeouts in a row the RTT estimate is
+  discarded. RTT is sampled once per window, in whole milliseconds of virtual time.
+- **Fast retransmit** on the third duplicate ACK, with every controller.
+- **Delayed ACKs**: an ACK waits up to 10 ms, except for every second full segment, an
+  out-of-order segment or one that fills a hole, which are acknowledged at once.
+- **Nagle** is on unless the app sets `TCP_NODELAY`.
+- **No SACK-based recovery, Limited Transmit, early retransmit or tail-loss probe**: smoltcp
+  sends SACK blocks as a receiver but never uses the peer's. A loss that no three duplicate
+  ACKs reveal (among the last segments of a transfer, while the window is under four segments,
+  or of a retransmission) costs a timeout, at least 1 s.
+
+Measured with real nodes (`crates/wasmnet-host/tests/congestion.rs`): 1 MB over 10 Mbit/s
+through a 4-frame transmit queue takes 1.85 s with Reno (the serialisation alone is 0.83 s; one
+timeout at the end of the transfer), against 54 virtual minutes with `none`; with 1 % loss each
+way it takes 0.85 s to 5.8 s over eight seeds, one timeout or more where duplicate ACKs could not
+help. A snapshot never holds a controller's state: it is only taken with no connection open.
 
 ## ICMP errors
 
@@ -132,11 +178,14 @@ with one-shot mDNS queries, DNS servers or not. The keys are in
 
 ## smoltcp, patched
 
-smoltcp is vendored in [third_party/smoltcp](../../third_party/smoltcp) with two patches, kept
-as files in [docs/upstream](../upstream): neighbor discovery rate-limited per address instead
-of per interface (`smoltcp-0001-neighbor-rate-limit-per-address.patch`), so a host resolves
-several neighbors within a second; and a `snapshot` feature that reads and restores interface
-state (`smoltcp-0002-snapshot-state.patch`), which `wasmnet:netstack/state` uses.
+smoltcp is vendored in [third_party/smoltcp](../../third_party/smoltcp) with three patches,
+kept as files in [docs/upstream](../upstream): neighbor discovery rate-limited per address
+instead of per interface (`smoltcp-0001-neighbor-rate-limit-per-address.patch`), so a host
+resolves several neighbors within a second; a `snapshot` feature that reads and restores
+interface state (`smoltcp-0002-snapshot-state.patch`), which `wasmnet:netstack/state` uses;
+and NewReno's partial-ACK retransmission in TCP fast recovery
+(`smoltcp-0003-newreno-partial-acks.patch`), so several losses in one window are repaired
+without a retransmission timeout.
 [docs/upstream/smoltcp.md](../upstream/smoltcp.md) lists every smoltcp issue found and the
 workaround in use.
 
