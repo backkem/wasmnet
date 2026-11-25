@@ -2431,11 +2431,46 @@ impl Sim {
     }
 }
 
-/// Node 0 (with `extra` config) sends `len` bytes to node 1 over a connection whose send
-/// buffer holds them all and whose receive buffer twice that (so the receive window never
-/// closes and only the congestion window limits the flight; node 1 reads at the end), with the hub losing what
-/// `lose` picks. Returns the finished simulation; node 1 got every byte, in order.
-fn bulk_send(extra: &[(&'static str, &'static str)], len: usize, lose: Lose) -> Sim {
+/// Node 1's app reads its socket `cl` from `from` on, every millisecond, until the stream ends
+/// (or 60 s); then the simulation runs one more second (the ACK of node 0's FIN and whatever
+/// else is left). Returns what it read and how the stream ended.
+fn read_stream(sim: &mut Sim, cl: u32, from: u64) -> (Vec<u8>, Option<Result<(), SockError>>) {
+    sim.tcp(1).0.start_recv(cl).unwrap();
+    let mut got = Vec::new();
+    let mut at = from.max(sim.now);
+    let end = loop {
+        sim.run(at);
+        sim.now = sim.now.max(at);
+        let (bytes, end) = drain(sim, 1, cl);
+        got.extend(bytes);
+        if end.is_some() || at >= 60_000 * MS {
+            break end;
+        }
+        at += MS;
+    };
+    sim.run(at + 1_000 * MS);
+    (got, end)
+}
+
+/// A finished bulk transfer: the simulation, what node 1's app read, and how its stream ended
+/// (`None`: it had not ended by 60 s).
+struct Transfer {
+    sim: Sim,
+    data: Vec<u8>,
+    got: Vec<u8>,
+    end: Option<Result<(), SockError>>,
+}
+
+/// Node 0 (with `extra` config) sends `len` bytes to node 1, with the hub losing what `lose`
+/// picks. Node 0's send buffer and node 1's receive buffer hold the whole transfer, so while
+/// node 1 reads only the congestion window limits the flight. Node 1's app starts reading at
+/// `read_from` and from then on reads every millisecond, until its stream ends.
+fn transfer(
+    extra: &[(&'static str, &'static str)],
+    len: usize,
+    lose: Lose,
+    read_from: u64,
+) -> Transfer {
     let mut sim = two(extra, 3);
     sim.lose = lose;
     let (t, mut net) = sim.tcp(0);
@@ -2446,7 +2481,7 @@ fn bulk_send(extra: &[(&'static str, &'static str)], len: usize, lose: Lose) -> 
     let now = sim.now;
     let (t, mut net) = sim.tcp(1);
     let cl = t.create(Family::Ipv4);
-    t.set_buffer_size(cl, true, 2 * len as u64).unwrap();
+    t.set_buffer_size(cl, true, len as u64).unwrap();
     t.connect(cl, sa("10.0.0.1:80"), now, &mut net).unwrap();
     sim.kick(1);
     sim.run(MS);
@@ -2456,16 +2491,31 @@ fn bulk_send(extra: &[(&'static str, &'static str)], len: usize, lose: Lose) -> 
     sim.tcp(0).0.start_send(sv).unwrap();
     let data: Vec<u8> = (0..len).map(|n| (n % 251) as u8).collect();
     write(&mut sim, 0, sv, &data, true);
-    sim.run(10_000 * MS);
-    sim.tcp(1).0.start_recv(cl).unwrap();
-    let (got, end) = drain(&mut sim, 1, cl);
-    assert_eq!(end, Some(Ok(())));
-    assert!(
-        got == data,
-        "node 1 got {} of {len} bytes, in order",
-        got.len()
+    let (got, end) = read_stream(&mut sim, cl, read_from);
+    Transfer {
+        sim,
+        data,
+        got,
+        end,
+    }
+}
+
+/// [`transfer`] with node 1 reading from the start; node 1 got every byte, in order, and then
+/// the end of the stream.
+fn bulk_send(extra: &[(&'static str, &'static str)], len: usize, lose: Lose) -> Sim {
+    let t = transfer(extra, len, lose, 0);
+    assert_eq!(
+        t.end,
+        Some(Ok(())),
+        "node 1 got {} of {len} bytes",
+        t.got.len()
     );
-    sim
+    assert!(
+        t.got == t.data,
+        "node 1 got {} of {len} bytes, in order",
+        t.got.len()
+    );
+    t.sim
 }
 
 /// Bulk data: 200 kB, about 140 full segments.
@@ -2484,10 +2534,14 @@ fn lose_data_segments(ns: &[usize]) -> Lose {
     let ns = ns.to_vec();
     let mut seen = 0;
     Some(Box::new(move |from, f: &[u8]| {
+        // An IPv4 TCP segment with a payload (not the SYN-ACK, whose options also make it
+        // longer than 40 bytes).
         let data = from == 0
             && f.get(12..14) == Some(&[8, 0])
             && f.get(23) == Some(&6)
-            && usize::from(u16::from_be_bytes([f[16], f[17]])) > 40;
+            && f.len() >= 54
+            && usize::from(u16::from_be_bytes([f[16], f[17]]))
+                > usize::from(f[14] & 0x0f) * 4 + usize::from(f[46] >> 4) * 4;
         if data {
             seen += 1;
         }
@@ -2595,16 +2649,16 @@ fn reno_recovers_a_lost_segment_by_fast_retransmit_and_halves_the_flight() {
 
 #[test]
 fn reno_repairs_two_losses_in_one_window_without_a_timeout() {
-    // Segments 138 and 140 of 142 leave in the last round trip and are both lost. The three
+    // Segments 137 and 139 of 142 leave in the last round trip and are both lost. The three
     // segments behind the first hole bring three duplicate ACKs that retransmit it; no new
     // data follows, so nothing else would reveal the second hole. The ACK of the first
     // retransmission stops at the second hole (a partial ACK), which is retransmitted at once (NewReno, RFC 6582), instead of after a
     // retransmission timeout of at least 1 s.
-    let sim = bulk_send(&[], BULK, lose_data_segments(&[138, 140]));
+    let sim = bulk_send(&[], BULK, lose_data_segments(&[137, 139]));
     let flights = sim.flights();
     assert_eq!(flights.len(), 142 + 2);
-    let lost_at = flights[137].0;
-    assert_eq!(flights[139].0, lost_at, "both left in one round trip");
+    let lost_at = flights[136].0;
+    assert_eq!(flights[138].0, lost_at, "both left in one round trip");
     let retransmits: Vec<_> = flights.iter().filter(|f| f.2).collect();
     assert_eq!(retransmits.len(), 2, "{retransmits:?}");
     // The first on the duplicate ACKs, the second one round trip later on the partial ACK.
@@ -2636,4 +2690,106 @@ fn the_same_seed_gives_the_same_segments_under_every_controller() {
         let b = bulk_send(extra, 50_000, lose_data_segment(10));
         assert!(a.frames == b.frames, "{c}: the frames differ");
     }
+}
+
+/// Loses node 0's first data segment with exactly `len` bytes of payload.
+fn lose_first_segment_of(len: usize) -> Lose {
+    let mut done = false;
+    Some(Box::new(move |from, f: &[u8]| {
+        let payload =
+            (from == 0 && f.get(12..14) == Some(&[8, 0]) && f.get(23) == Some(&6) && f.len() >= 54)
+                .then(|| {
+                    usize::from(u16::from_be_bytes([f[16], f[17]]))
+                        - usize::from(f[14] & 0x0f) * 4
+                        - usize::from(f[46] >> 4) * 4
+                });
+        let hit = !done && payload == Some(len);
+        done |= hit;
+        hit
+    }))
+}
+
+#[test]
+fn a_fin_past_the_receive_window_waits_for_the_bytes_before_it() {
+    // Node 1's receive buffer is 2 bytes smaller than the stream, and its app reads nothing
+    // until 10 s. Node 0 (Nagle off) sends 18 800 bytes, then four chunks of 300 bytes, the
+    // last with its FIN; the window cuts the last chunk 2 bytes short, so it leaves without
+    // the FIN. The first chunk is lost: the three after it bring three duplicate ACKs, and the
+    // fast retransmission (all 1200 bytes from the hole, whatever the window) carries the FIN
+    // past the window's right edge. Node 1 must keep the 1198 bytes that fit and drop the FIN;
+    // once its app reads, the last 2 bytes and the FIN come again, and the stream ends
+    // complete. The same under both controllers.
+    const LEN: usize = 20_000;
+    const CHUNK: usize = 300;
+    let mut short = Vec::new();
+    for c in ["reno", "none"] {
+        let mut sim = two(&[("tcp.congestion", c)], 3);
+        sim.lose = lose_first_segment_of(CHUNK);
+        let (t, mut net) = sim.tcp(0);
+        let l = t.create(Family::Ipv4);
+        t.set_buffer_size(l, false, LEN as u64).unwrap();
+        t.bind(l, sa("0.0.0.0:80"), &mut net).unwrap();
+        t.listen(l, &mut net).unwrap();
+        let now = sim.now;
+        let (t, mut net) = sim.tcp(1);
+        let cl = t.create(Family::Ipv4);
+        t.set_buffer_size(cl, true, LEN as u64 - 2).unwrap();
+        t.connect(cl, sa("10.0.0.1:80"), now, &mut net).unwrap();
+        sim.kick(1);
+        sim.run(MS);
+        sim.now = MS;
+        established(&mut sim, 1, cl);
+        let sv = accept(&mut sim, 0, l);
+        let (t, net) = sim.tcp(0);
+        let hops = net.hop_limit;
+        t.set_no_delay(sv, true, hops, net.sockets).unwrap();
+        t.start_send(sv).unwrap();
+        let data: Vec<u8> = (0..LEN).map(|n| (n % 251) as u8).collect();
+        let head = LEN - 4 * CHUNK;
+        write(&mut sim, 0, sv, &data[..head], false);
+        for (i, chunk) in data[head..].chunks(CHUNK).enumerate() {
+            let at = (30 + i as u64) * MS;
+            sim.run(at);
+            sim.now = at;
+            write(&mut sim, 0, sv, chunk, i == 3);
+        }
+        let (got, end) = read_stream(&mut sim, cl, 10_000 * MS);
+        if end != Some(Ok(())) || got != data {
+            short.push((c, got.len(), end));
+        }
+        // The FIN did go past the window once: a fast retransmission of the 4 chunks.
+        let segs = sim.tcp_segs();
+        assert!(
+            segs.iter()
+                .any(|s| s.from == 0 && s.flags & FIN != 0 && s.len as usize == 4 * CHUNK),
+            "{c}: no FIN past the window"
+        );
+    }
+    assert!(
+        short.is_empty(),
+        "(controller, bytes read, end) of the streams that ended short of {LEN} bytes: {short:?}"
+    );
+}
+
+#[test]
+fn reno_loses_no_byte_to_a_loss_while_the_reader_has_stopped() {
+    // The receive buffer holds the whole stream but its scaled window counts in steps of 4
+    // bytes, so with the app not reading the window's right edge moves back and forth by a few
+    // bytes as data arrives. A segment sent against an older, larger window is then cut at the
+    // edge; when it carries the FIN, the FIN must be dropped with the cut bytes. Every loss
+    // position, each run read only from 10 s on. (Without congestion control one position
+    // hangs instead, with only the FIN unacknowledged: smoltcp issue #34 in
+    // `docs/upstream/smoltcp.md`, not fixed; so this covers Reno.)
+    let mut short = Vec::new();
+    for n in 1..=142 {
+        let t = transfer(&[], BULK, lose_data_segment(n), 10_000 * MS);
+        if t.end != Some(Ok(())) || t.got != t.data {
+            short.push((n, t.got.len(), t.end));
+        }
+    }
+    assert!(
+        short.is_empty(),
+        "(lost segment, bytes read, end) of the transfers that ended short of {BULK} bytes: \
+         {short:?}"
+    );
 }

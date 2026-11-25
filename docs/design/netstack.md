@@ -178,14 +178,16 @@ with one-shot mDNS queries, DNS servers or not. The keys are in
 
 ## smoltcp, patched
 
-smoltcp is vendored in [third_party/smoltcp](../../third_party/smoltcp) with three patches,
+smoltcp is vendored in [third_party/smoltcp](../../third_party/smoltcp) with four patches,
 kept as files in [docs/upstream](../upstream): neighbor discovery rate-limited per address
 instead of per interface (`smoltcp-0001-neighbor-rate-limit-per-address.patch`), so a host
 resolves several neighbors within a second; a `snapshot` feature that reads and restores
 interface state (`smoltcp-0002-snapshot-state.patch`), which `wasmnet:netstack/state` uses;
-and NewReno's partial-ACK retransmission in TCP fast recovery
+NewReno's partial-ACK retransmission in TCP fast recovery
 (`smoltcp-0003-newreno-partial-acks.patch`), so several losses in one window are repaired
-without a retransmission timeout.
+without a retransmission timeout; and a FIN on a segment cut at the receive window's right edge
+ignored with the cut bytes (`smoltcp-0004-fin-past-the-receive-window.patch`), so a stream no longer
+ends with bytes missing.
 [docs/upstream/smoltcp.md](../upstream/smoltcp.md) lists every smoltcp issue found and the
 workaround in use.
 
