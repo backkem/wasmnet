@@ -433,7 +433,7 @@ impl<H: JsHost + Clone + Unpin + 'static> Runtime for JsRuntime<H> {
     }
 
     /// Supplied bytes, as the core judged them on every backend: a component
-    /// ([`wasmnet_core::component_imports`]) that imports only what the page serves ([`served`]),
+    /// ([`wasmnet_core::component_imports`]) that imports only what the page serves (`served`),
     /// which JavaScript then turns into something it instantiates ([`JsHost::compile`]: an
     /// embedder's hook, or a pre-transpiled component with that digest). Its key is the digest.
     fn compile_supplied(&self, digest: &str, bytes: &[u8]) -> Result<String, String> {
