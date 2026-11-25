@@ -1,7 +1,7 @@
 [package]
 name = "xtask"
 version = "0.0.0"
-description = "Build orchestration for this workspace: build (components, composed nodes, validation)."
+description = "Build orchestration for this workspace: build (components, composed nodes, validation), artifacts, tools, check-tree, web."
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -9,3 +9,11 @@ publish.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+# The artifact manifest's format (`artifacts`), shared with embedders that read it.
+wasmnet-artifacts = { path = "../crates/wasmnet-artifacts" }
+# `cargo metadata`'s output: the source directories behind the components (remap.rs).
+serde_json = "1"
+# The interfaces a component imports and exports, for the artifact manifest.
+wasmparser = { version = "0.261", default-features = false, features = ["std", "component-model"] }

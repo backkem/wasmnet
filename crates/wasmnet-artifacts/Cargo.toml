@@ -1,0 +1,16 @@
+[package]
+name = "wasmnet-artifacts"
+version = "0.0.0"
+description = "The component artifacts of one revision: their manifest, and fetching a pinned set from a directory or an OCI registry with every hash checked."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+# The files are named by their SHA-256 (pure Rust, no C).
+sha2.workspace = true
+
+[lints]
+workspace = true

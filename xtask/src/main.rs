@@ -15,6 +15,18 @@
 //!                          the pinned command-line tools (tools.toml), one <package>@<version>
 //!                          per line, as `cargo install --locked` takes them; --check compares
 //!                          them, and the Rust toolchain, with what is on PATH
+//! cargo xtask artifacts [--out DIR] [--rebuild MANIFEST]
+//!                          the published components, apps and nodes (not the test fixtures)
+//!                          in DIR (default target/artifacts), with manifest.toml (revision,
+//!                          toolchain, tools, and each file's SHA-256, size and interfaces)
+//!                          and SHA256SUMS; --rebuild then compares with a manifest built
+//!                          elsewhere from the same revision
+//! cargo xtask artifacts --verify DIR | --compare A B
+//!                          check a set against its manifest; compare two manifests' hashes
+//! cargo xtask check-tree [--commits BASE..HEAD]
+//!                          no local path, AI coding tool session link or merge conflict
+//!                          marker in the tree, nor in the messages and added lines of the
+//!                          commits in the range
 //! cargo xtask web [--no-build] [--test]
 //!                          the browser example in web/dist: `build`, the simulator for
 //!                          wasm32-unknown-unknown, then `npm ci` and `npm run build` in web/;
@@ -23,9 +35,15 @@
 //! ```
 //!
 //! Build outputs land in `target/wasm32-wasip2/release/` (or under `$CARGO_TARGET_DIR`).
+//! `build` maps every source path out of the components' bytes (`remap.rs`), so the same
+//! source, toolchain and tools give the same bytes in any checkout on the same platform.
 //! `build` needs `wac` and `wasm-tools` on `PATH`, `test-guest` needs `wasmtime`, `web` needs
 //! Node 24 and npm, and a Chromium for `--test`. The tools' versions are in `tools.toml`; the
 //! components and nodes are listed in `components/README.md`.
+
+mod artifacts;
+mod leaks;
+mod remap;
 
 use std::collections::BTreeSet;
 use std::error::Error;
@@ -33,17 +51,17 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
-type Result<T> = std::result::Result<T, Box<dyn Error>>;
+pub(crate) type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
-const TARGET: &str = "wasm32-wasip2";
+pub(crate) const TARGET: &str = "wasm32-wasip2";
 
 /// The workspace root.
-fn root() -> PathBuf {
+pub(crate) fn root() -> PathBuf {
     let xtask = Path::new(env!("CARGO_MANIFEST_DIR"));
     xtask.parent().unwrap_or(xtask).to_path_buf()
 }
 
-fn target_dir(root: &Path) -> PathBuf {
+pub(crate) fn target_dir(root: &Path) -> PathBuf {
     std::env::var_os("CARGO_TARGET_DIR").map_or_else(|| root.join("target"), PathBuf::from)
 }
 
@@ -51,7 +69,7 @@ fn target_dir(root: &Path) -> PathBuf {
 /// composition carry), its package (`wasmnet-<name>`), whether it is an app
 /// (`components/apps/<name>`), and whether it has a library target (`src/lib.rs`, where a
 /// component keeps its tested logic).
-struct Crate {
+pub(crate) struct Crate {
     name: String,
     package: String,
     app: bool,
@@ -71,7 +89,7 @@ impl Crate {
 }
 
 /// A composed node: `compositions/<stem>.wac`, built into `node-<stem>.wasm`.
-struct Node {
+pub(crate) struct Node {
     /// `node-<stem>`.
     name: String,
     wac: PathBuf,
@@ -136,7 +154,7 @@ fn output(dir: &Path, name: &str) -> Option<PathBuf> {
 }
 
 /// Every component crate: `components/<name>`, then `components/apps/<name>`.
-fn components(root: &Path) -> Result<Vec<Crate>> {
+pub(crate) fn components(root: &Path) -> Result<Vec<Crate>> {
     let mut crates = crates_in(&root.join("components"), false)?;
     crates.extend(crates_in(&root.join("components").join("apps"), true)?);
     Ok(crates)
@@ -163,7 +181,7 @@ fn wac_parts(text: &str) -> Vec<String> {
 }
 
 /// Every composed node: `compositions/<stem>.wac`, sorted.
-fn nodes(root: &Path) -> Result<Vec<Node>> {
+pub(crate) fn nodes(root: &Path) -> Result<Vec<Node>> {
     let mut wacs: Vec<PathBuf> = fs::read_dir(root.join("compositions"))?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().is_some_and(|x| x == "wac"))
@@ -202,7 +220,7 @@ fn test_guest() -> Result<()> {
 
 /// What `build` was asked for.
 #[derive(Debug, Default, PartialEq)]
-struct BuildArgs {
+pub(crate) struct BuildArgs {
     /// `--only`: the components and nodes to build, by name; empty for all of them.
     only: Vec<String>,
     /// `--out-dir`: where to copy what was asked for.
@@ -299,19 +317,36 @@ fn list(crates: &[Crate], nodes: &[Node]) {
     }
 }
 
-fn build(args: &BuildArgs) -> Result<()> {
+/// What one build made: each file, and the name `--out-dir` gives it (none for a part nobody
+/// named).
+type Built = Vec<(PathBuf, Option<String>)>;
+
+fn build(args: &BuildArgs) -> Result<Built> {
     let root = root();
     let crates = components(&root)?;
     let nodes = nodes(&root)?;
     if args.list {
         list(&crates, &nodes);
-        return Ok(());
+        return Ok(Vec::new());
     }
     let selected = select(&crates, &nodes, &args.only)?;
 
+    // No build path in the bytes (remap.rs): the same source gives the same components in any
+    // checkout. The flags are the components' alone, so RUSTFLAGS from the environment would
+    // not reach them anyway; say so rather than drop them silently. The mappings cover every
+    // component, whatever was selected: one set of flags, so that a partial build and a full one
+    // share what cargo built.
+    let packages: Vec<&str> = crates.iter().map(|c| c.package.as_str()).collect();
+    let argfile = remap::argfile(&root, &target_dir(&root), &packages)?;
+    for var in ["RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS"] {
+        if std::env::var_os(var).is_some_and(|v| !v.is_empty()) {
+            println!("xtask build: {var} is not used for the components");
+        }
+    }
     let mut cmd = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
     cmd.current_dir(&root)
-        .args(["build", "--release", "--target", TARGET]);
+        .args(["build", "--release", "--target", TARGET])
+        .env("CARGO_ENCODED_RUSTFLAGS", format!("@{}", argfile.display()));
     for c in &selected.crates {
         cmd.args(["-p", &c.package]);
     }
@@ -323,8 +358,7 @@ fn build(args: &BuildArgs) -> Result<()> {
     if args.only.is_empty() && deps.exists() {
         fs::remove_dir_all(&deps)?;
     }
-    // What was built, and the name `--out-dir` gets it under (none for a part nobody named).
-    let mut built: Vec<(PathBuf, Option<String>)> = Vec::new();
+    let mut built: Built = Vec::new();
     for c in &selected.crates {
         let path = output(&out, &c.name)
             .ok_or_else(|| format!("{}: no .wasm in {}", c.name, out.display()))?;
@@ -388,12 +422,12 @@ fn build(args: &BuildArgs) -> Result<()> {
         }
         println!("xtask build: {copied} file(s) copied to {}", dir.display());
     }
-    Ok(())
+    Ok(built)
 }
 
 /// The pinned versions in `tools.toml`: the Rust toolchain, and the command-line tools by
 /// their crates.io package.
-struct Tools {
+pub(crate) struct Tools {
     rust: String,
     cargo_install: Vec<(String, String)>,
 }
@@ -408,7 +442,7 @@ impl Tools {
 
 /// Reads `tools.toml`: `rust = "<version>"` first, then `<package> = "<version>"` lines under
 /// `[cargo-install]`.
-fn tools(text: &str) -> Result<Tools> {
+pub(crate) fn tools(text: &str) -> Result<Tools> {
     let mut section = "";
     let mut rust = None;
     let mut cargo_install = Vec::new();
@@ -481,24 +515,31 @@ fn tools_command(args: &[String]) -> Result<()> {
     // The program a package installs: `wasmtime-cli` gives `wasmtime`, `wac-cli` gives `wac`.
     let mut programs = vec![("rustc", pins.rust.as_str())];
     programs.extend(selected.map(|(p, v)| (p.trim_end_matches("-cli"), v.as_str())));
-    let mut wrong = 0;
-    for (program, version) in programs {
-        match reported_version(program, &root) {
-            Some(found) if found == version => println!("  ok       {program} {version}"),
-            Some(found) => {
-                println!("  WRONG    {program} {found}: tools.toml pins {version}");
-                wrong += 1;
-            }
-            None => {
-                println!("  MISSING  {program}: tools.toml pins {version}");
-                wrong += 1;
-            }
+    let wrong = tool_problems(&root, &programs);
+    for (program, version) in &programs {
+        if !wrong.iter().any(|w| w.starts_with(&format!("{program} "))) {
+            println!("  ok       {program} {version}");
         }
     }
-    if wrong > 0 {
-        return Err(format!("{wrong} tool(s) not at the pinned version").into());
+    for w in &wrong {
+        println!("  {w}");
+    }
+    if !wrong.is_empty() {
+        return Err(format!("{} tool(s) not at the pinned version", wrong.len()).into());
     }
     Ok(())
+}
+
+/// The programs (name, pinned version) that are missing or at another version, one line each.
+fn tool_problems(root: &Path, programs: &[(&str, &str)]) -> Vec<String> {
+    programs
+        .iter()
+        .filter_map(|(program, version)| match reported_version(program, root) {
+            Some(found) if found == *version => None,
+            Some(found) => Some(format!("{program} {found}: tools.toml pins {version}")),
+            None => Some(format!("{program} missing: tools.toml pins {version}")),
+        })
+        .collect()
 }
 
 /// `npm` (`npm.cmd` on Windows, where Command does not search for `.cmd` files).
@@ -560,12 +601,16 @@ fn web(args: &[String]) -> Result<()> {
 
 const USAGE: &str = "usage: cargo xtask build [--only NAME[,NAME...]] [--out-dir DIR] | \
 cargo xtask build --list | cargo xtask test-guest | cargo xtask tools [--check] [PACKAGE...] | \
+cargo xtask artifacts [--out DIR] [--rebuild MANIFEST] | cargo xtask artifacts --verify DIR | \
+cargo xtask artifacts --compare A B | cargo xtask check-tree [--commits BASE..HEAD] | \
 cargo xtask web [--no-build] [--test]";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
-        Some("build") => build_args(&args[1..]).and_then(|args| build(&args)),
+        Some("build") => build_args(&args[1..]).and_then(|args| build(&args).map(drop)),
+        Some("artifacts") => artifacts::command(&args[1..]),
+        Some("check-tree") => leaks::command(&args[1..]),
         Some("test-guest") if args.len() == 1 => test_guest(),
         Some("tools") => tools_command(&args[1..]),
         Some("web") => web(&args[1..]),
