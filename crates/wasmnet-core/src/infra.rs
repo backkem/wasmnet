@@ -84,6 +84,42 @@ pub struct Change {
     pub device: DeviceView,
 }
 
+/// The answer to a command a controller sent with a request id (`devices.control-answer`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommandAnswer {
+    /// The device it went to, and the command.
+    pub name: String,
+    pub command: String,
+    /// When the answer came: the instant the command ran in the device (or was refused).
+    pub at: Nanos,
+    /// The device's `ok` text, or its refusal (or why the command never reached it); at most
+    /// [`MAX_ANSWER`] bytes.
+    pub answer: Result<String, String>,
+}
+
+/// The longest command answer kept (longer ones are cut at a character boundary).
+pub const MAX_ANSWER: usize = 64 << 10;
+
+/// A command sent with a request id, and its answer once it came.
+#[derive(Clone, Debug)]
+struct Sent {
+    id: String,
+    name: String,
+    command: String,
+    answer: Option<(Nanos, Result<String, String>)>,
+}
+
+fn cut(mut text: String) -> String {
+    if text.len() > MAX_ANSWER {
+        let mut end = MAX_ANSWER;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+    }
+    text
+}
+
 /// One journalled output line.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LogLine {
@@ -236,6 +272,11 @@ struct State {
     views: BTreeMap<String, Vec<usize>>,
     /// The tasks waiting for a change in a controller's view ([`ChangeWait`]), by controller.
     waiters: BTreeMap<String, Vec<Waker>>,
+    /// The request ids of commands queued with one, by request index.
+    command_ids: BTreeMap<usize, String>,
+    /// The last [`ANSWERS_KEPT`] commands each controller sent with a request id, oldest
+    /// first, with their answers once they came.
+    sent: BTreeMap<String, VecDeque<Sent>>,
     /// The components controllers may create ([`crate::Network::set_infra_catalog`]); `None`: any.
     catalog: Option<std::collections::BTreeSet<String>>,
 }
@@ -277,6 +318,8 @@ impl Infra {
             scopes: Vec::new(),
             views: BTreeMap::new(),
             waiters: BTreeMap::new(),
+            command_ids: BTreeMap::new(),
+            sent: BTreeMap::new(),
             catalog: None,
         }));
         // App exits are folded in as they are journalled, in the exiting device's own
@@ -550,22 +593,47 @@ impl Infra {
     }
 
     /// The device answered the command of derived request `index` (a `control`), at the
-    /// current instant and in the device's own processing context. A refusal is the device's
-    /// `message` and an `infra-failed` on the caller, like a request the network refused.
+    /// current instant and in the device's own processing context. The answer is kept for the
+    /// caller's `control-answer` (if it gave a request id) and is a `modified` change of the
+    /// device; a refusal is also the device's `message` and an `infra-failed` on the caller,
+    /// like a request the network refused.
     pub(crate) fn command_answered(&self, index: usize, answer: &Result<String, String>) {
-        let Err(message) = answer else {
-            return;
-        };
         let at = self.clock.now();
-        let Some(req) = self.state().requests.get(index).cloned() else {
+        let mut s = self.state();
+        let Some(req) = s.requests.get(index).cloned() else {
             return;
         };
-        if let Some(item) = self.state().items.get_mut(&req.name)
+        Self::answer(&mut s, index, &req, answer.clone(), at);
+        drop(s);
+        if let Err(message) = answer {
+            self.journal_failed(&req, message.clone(), at);
+        }
+    }
+
+    /// Keeps the answer to command request `index` and records it as a change of the device
+    /// (its `message` the refusal, if any), which wakes the caller's `changes.wait`.
+    fn answer(
+        s: &mut State,
+        index: usize,
+        req: &Request,
+        answer: Result<String, String>,
+        at: Nanos,
+    ) {
+        let answer = answer.map(cut).map_err(cut);
+        if let Some(id) = s.command_ids.remove(&index)
+            && let Some(sent) = s
+                .sent
+                .get_mut(&req.caller)
+                .and_then(|q| q.iter_mut().rev().find(|x| x.id == id))
+        {
+            sent.answer = Some((at, answer.clone()));
+        }
+        if let Some(item) = s.items.get_mut(&req.name)
             && item.uid == req.uid
         {
-            item.message = Some(message.clone());
+            item.message = answer.err();
+            Self::change(s, ChangeKind::Modified, &req.name);
         }
-        self.journal_failed(&req, message.clone(), at);
     }
 
     fn journal_failed(&self, req: &Request, message: String, at: Nanos) {
@@ -613,6 +681,10 @@ impl Infra {
         }
         if failed_create {
             Self::change(&mut s, ChangeKind::Modified, &req.name);
+        }
+        // A command that never reached its device: that is its answer.
+        if let (Verb::Control(_), Some(m)) = (&req.verb, &error) {
+            Self::answer(&mut s, index, &req, Err(m.clone()), at);
         }
         drop(s);
         if let Some(message) = error {
@@ -1196,6 +1268,24 @@ impl InfraEnd {
         }
         let answer = self.control_now(name, command, argument);
         self.record(&request_id, args, Answer::Device(answer.clone()));
+        if answer.is_ok()
+            && let Some(id) = &request_id
+        {
+            // Its answer is kept under the request id, for `control-answer`.
+            let mut s = self.infra.state();
+            let index = s.requests.len() - 1;
+            s.command_ids.insert(index, id.clone());
+            let q = s.sent.entry(self.device.clone()).or_default();
+            if q.len() == ANSWERS_KEPT {
+                q.pop_front();
+            }
+            q.push_back(Sent {
+                id: id.clone(),
+                name: name.to_owned(),
+                command: command.to_owned(),
+                answer: None,
+            });
+        }
         if answer.is_ok() {
             let mut f = vec![("name", name.to_owned()), ("command", command.to_owned())];
             if let Some(id) = request_id {
@@ -1243,6 +1333,28 @@ impl InfraEnd {
         };
         self.queue(&mut s, req, now, Phase::Running);
         Ok(self.view(&s, name))
+    }
+
+    /// `devices.control-answer`: the answer to the command this controller sent with
+    /// `request_id` (`None` while the command has not run yet). `not-found` for an id it never
+    /// sent a command with, or one more than [`ANSWERS_KEPT`] commands ago.
+    pub fn control_answer(&self, request_id: &str) -> Result<Option<CommandAnswer>, InfraError> {
+        let s = self.infra.state();
+        let sent = s
+            .sent
+            .get(&self.device)
+            .and_then(|q| q.iter().rev().find(|x| x.id == request_id))
+            .ok_or_else(|| {
+                InfraError::NotFound(format!(
+                    "no command was sent with request id `{request_id}`"
+                ))
+            })?;
+        Ok(sent.answer.as_ref().map(|(at, answer)| CommandAnswer {
+            name: sent.name.clone(),
+            command: sent.command.clone(),
+            at: *at,
+            answer: answer.clone(),
+        }))
     }
 
     /// `devices.get`: a device this controller sees (the network's own, or one it created).
@@ -2007,6 +2119,56 @@ mod tests {
             .filter(|e| matches!(&e.record, Record::Event { kind, .. } if kind == "infra-control"))
             .count();
         assert_eq!(controls, 2, "the retry was not journalled again");
+    }
+
+    /// A command sent with a request id has its answer kept for its caller: `None` until the
+    /// device answers, then the text (cut at `MAX_ANSWER`), as a `modified` change of the
+    /// device; a command that never reaches its device is answered with why.
+    #[test]
+    fn a_controller_reads_its_commands_answers() {
+        let clock = VirtualClock::new(std::time::Duration::ZERO);
+        let infra = Infra::new(clock.clone(), Journal::new(clock.clone()));
+        let ctl = infra.end("ctl", None);
+        infra.added(
+            "ctl",
+            spec_value("ctl", &DeviceConfig::new(), DeviceOptions::default(), None),
+            0,
+            None,
+        );
+        ctl.apply(None, "r1", vec![], &spec("router")).unwrap();
+        ctl.control(Some("q".into()), "r1", "routes", "").unwrap();
+        ctl.control(Some("bad".into()), "r1", "route-add", "x")
+            .unwrap();
+        ctl.control(None, "r1", "routes", "").unwrap();
+        assert_eq!(ctl.control_answer("q"), Ok(None), "not answered yet");
+        assert!(matches!(
+            ctl.control_answer("nope"),
+            Err(InfraError::NotFound(_))
+        ));
+        assert!(matches!(
+            infra.end("other", None).control_answer("q"),
+            Err(InfraError::NotFound(_))
+        ));
+        infra.added("r1", vec![], 0, Some(0));
+        infra.applied(0, None, 0);
+        let rv = ctl.list(&[]).0;
+        infra.applied(1, None, 0);
+        let long = "x".repeat(MAX_ANSWER + 10);
+        infra.command_answered(1, &Ok(long));
+        let a = ctl.control_answer("q").unwrap().expect("answered");
+        assert_eq!((a.name.as_str(), a.command.as_str()), ("r1", "routes"));
+        assert_eq!(a.answer.map(|t| t.len()), Ok(MAX_ANSWER));
+        let (_, changes) = ctl.watch(&[], rv, 10);
+        assert_eq!(changes.len(), 1, "the answer is a change of the device");
+        assert_eq!(changes[0].kind, ChangeKind::Modified);
+        // The device stopped before the second one reached it: that is its answer.
+        infra.applied(2, Some("`r1` is not running".into()), 0);
+        let b = ctl.control_answer("bad").unwrap().expect("answered");
+        assert_eq!(b.answer, Err("`r1` is not running".into()));
+        assert_eq!(
+            ctl.get("r1").unwrap().message.as_deref(),
+            Some("`r1` is not running")
+        );
     }
 
     /// Each controller sees the network's own devices and the ones it created, with resource
