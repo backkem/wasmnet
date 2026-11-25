@@ -72,6 +72,7 @@ impl<'h> Sim<'h> {
             self.config.seed,
             name,
             args,
+            &[],
             stdout.clone(),
             stderr.clone(),
         );

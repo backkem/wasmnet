@@ -130,13 +130,15 @@ impl WasiView for HostState {
 }
 
 impl HostState {
-    /// A store's state. The guest's stdout and stderr go to the given captures (which may
+    /// A store's state: `argv[0]` is `component`, then `args`; `env` is its environment, in
+    /// order (`wasi:cli/environment`, p2 and p3). The guest's stdout and stderr go to the given captures (which may
     /// journal their lines, [`wasmnet_core::Record::Output`]).
     pub(crate) fn new(
         clock: &VirtualClock,
         sim_seed: u64,
         component: &str,
         args: &[&str],
+        env: &[(String, String)],
         stdout: OutputCapture,
         stderr: OutputCapture,
     ) -> Self {
@@ -151,6 +153,7 @@ impl HostState {
         let mut b = WasiCtxBuilder::new();
         b.arg(component)
             .args(args)
+            .envs(env)
             .stdin(InputPipe(stdin.clone()))
             .stdout(OutputPipe(stdout))
             .stderr(OutputPipe(stderr))

@@ -29,7 +29,8 @@ impl Runtime for Host {
             &ctx.clock,
             ctx.seed,
             name,
-            &[],
+            &ctx.args.iter().map(String::as_str).collect::<Vec<_>>(),
+            &ctx.env,
             ctx.stdout.clone(),
             ctx.stderr.clone(),
         );
