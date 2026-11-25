@@ -1011,12 +1011,11 @@ impl Infra {
 
     /// The extensions' parsers as they are now.
     fn parsers(&self) -> crate::ext::Parsers {
-        let p = self.state().parsers.clone();
-        let p = p
+        let shared = self.state().parsers.clone();
+        shared
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        p
+            .clone()
     }
 
     /// Whether a recreate of `name` is in progress.
@@ -2959,6 +2958,27 @@ fn spec_value_ext(
     Value::Map(m).encode()
 }
 
+/// A spec's CBOR value as the generic value an extension's parser reads: maps with text keys
+/// are records, arrays lists, unsigned integers `U64` (or `U32` when they fit), `null` none.
+fn cbor_value(v: &Value) -> crate::value::Value {
+    use crate::value::Value as V;
+    match v {
+        Value::Uint(n) => u32::try_from(*n).map_or(V::U64(*n), V::U32),
+        Value::Nint(n) => V::Str(format!("-{}", n.saturating_add(1))),
+        Value::Bytes(b) => V::Bytes(b.clone()),
+        Value::Text(s) => V::Str(s.clone()),
+        Value::Array(items) => V::List(items.iter().map(cbor_value).collect()),
+        Value::Map(entries) => V::Record(
+            entries
+                .iter()
+                .map(|(k, v)| (k.as_text().unwrap_or_default().to_owned(), cbor_value(v)))
+                .collect(),
+        ),
+        Value::Bool(b) => V::Bool(*b),
+        Value::Null => V::None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3883,26 +3903,5 @@ mod tests {
             panic!("ready")
         };
         assert_eq!(r.devices, ["r1"]);
-    }
-}
-
-/// A spec's CBOR value as the generic value an extension's parser reads: maps with text keys
-/// are records, arrays lists, unsigned integers `U64` (or `U32` when they fit), `null` none.
-fn cbor_value(v: &Value) -> crate::value::Value {
-    use crate::value::Value as V;
-    match v {
-        Value::Uint(n) => u32::try_from(*n).map_or(V::U64(*n), V::U32),
-        Value::Nint(n) => V::Str(format!("-{}", n.saturating_add(1))),
-        Value::Bytes(b) => V::Bytes(b.clone()),
-        Value::Text(s) => V::Str(s.clone()),
-        Value::Array(items) => V::List(items.iter().map(cbor_value).collect()),
-        Value::Map(entries) => V::Record(
-            entries
-                .iter()
-                .map(|(k, v)| (k.as_text().unwrap_or_default().to_owned(), cbor_value(v)))
-                .collect(),
-        ),
-        Value::Bool(b) => V::Bool(*b),
-        Value::Null => V::None,
     }
 }

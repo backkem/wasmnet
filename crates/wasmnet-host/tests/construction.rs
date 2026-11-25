@@ -163,3 +163,20 @@ fn portable_extensions() {
     }
     assert_eq!(Value::option(None).into_option(), None);
 }
+
+/// Extension options and op parsers.
+#[test]
+fn extension_parsers() {
+    use wasmnet_host::sim::ext::{ExtOpParser, ExtOption, ExtensionOp};
+    use wasmnet_host::sim::value::Value;
+    let option = ExtOption::new("example.level", |v| match v {
+        Value::U32(n) => Ok(*n),
+        other => Err(format!("{other:?}")),
+    });
+    assert_eq!(option.key(), "example.level");
+    assert!(option.parse(&Value::U32(3)).is_ok());
+    let op = ExtOpParser::new("example.reset", |_| Err("no".to_owned()));
+    assert_eq!(op.kind(), "example.reset");
+    assert!(op.parse(&Value::None).is_err());
+    let _: fn(ExtensionOp) = |_| {};
+}
