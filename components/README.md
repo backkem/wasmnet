@@ -54,6 +54,7 @@ An app never runs alone: a composition plugs it into a netstack
 |---|---|---|---|
 | `blaster` | `wasmnet-blaster` | `blaster.wasm` | Emits a train of raw Ethernet probe frames. |
 | `clock-probe` | `wasmnet-clock-probe` | `clock-probe.wasm` | A command that samples every source of time and entropy it can reach. |
+| `infra-script` | `wasmnet-infra-script` | `infra-script.wasm` | A device with no ports that makes scripted `wasmnet:infra` calls at set times. |
 | `reflector` | `wasmnet-reflector` | `reflector.wasm` | Echoes frames back out of the port they came in on. |
 
 ## Nodes
