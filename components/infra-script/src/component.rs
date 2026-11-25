@@ -1,6 +1,6 @@
 //! wit-bindgen glue: a stepped device with no ports that exports `wasmnet:link/device` and
-//! `wasmnet:control/commands` (`set`, `variables`) and makes the script's calls through
-//! `wasmnet:infra/devices`.
+//! `wasmnet:control/commands` (`set`, `variables`, `args`, `env`) and makes the script's calls
+//! through `wasmnet:infra/devices`.
 
 // Generated bindings and `export!` need unsafe (raw ABI glue); our own code here does not.
 #![allow(unsafe_code)]
@@ -173,7 +173,17 @@ impl commands::Guest for Component {
                 Ok(done.to_owned())
             }
             "variables" if argument.trim().is_empty() => Ok(with(|s| s.variables())),
-            other => Err(format!("unknown command `{other}` (set, variables)")),
+            // What `wasi:cli/environment` gives this device, one entry per line.
+            "args" if argument.trim().is_empty() => {
+                Ok(std::env::args().collect::<Vec<_>>().join("\n"))
+            }
+            "env" if argument.trim().is_empty() => Ok(std::env::vars()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join("\n")),
+            other => Err(format!(
+                "unknown command `{other}` (set, variables, args, env)"
+            )),
         }
     }
 }

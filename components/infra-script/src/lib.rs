@@ -34,7 +34,9 @@
 //! what it learnt elsewhere (from another controller, for instance): `set <variable> <value>`
 //! (a name of `a-z`, `0-9` and `-`; a value without spaces) answers `set` or `unchanged` and
 //! journals `infra-script-set {variable, value}`; `variables` lists them, `<variable> <value>`
-//! per line.
+//! per line. `args` and `env` answer what `wasi:cli/environment` gives the fixture: its
+//! arguments (its name first) one per line, and its environment as `<name>=<value>` lines, in
+//! order.
 //!
 //! Every step's result is journalled as `infra-script {step, verb, name, result}`: `result` is
 //! `ok`, `unchanged` (an `apply` that changed nothing, a `remove` of nothing) or the error. A
