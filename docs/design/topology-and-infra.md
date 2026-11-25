@@ -10,8 +10,9 @@ A third changes a device in place: commands into its `wasmnet:control/commands` 
 
 `wasmnet_core::Op` has topology variants: `AddDevice`, `StopDevice`, `StartDevice`,
 `RemoveDevice`, `Wire`, `Unwire`, `SetLink` and `ImpairNamed` (a link's impairments,
-[links.md](links.md)), plus name-resolved writes (`StdinNamed`, `ControlNamed`) and extension
-ops. They name devices and links by name and are resolved when they apply, so an op can refer
+[links.md](links.md)), plus name-resolved writes (`StdinNamed`, `ControlNamed`), extension
+ops, and faults (`PauseDevice`, `ResumeDevice`, `CrashDevice`) and embedder actions (`Action`)
+([below](#faults-pause-crash-and-embedder-actions)). They name devices and links by name and are resolved when they apply, so an op can refer
 to a device an earlier op creates. They are queued like every
 operator event (see [event-order.md](event-order.md)), but the network applies them, not the
 executor: the executor returns from its run at such an event, the network applies it, and the
@@ -47,8 +48,95 @@ A refused change (a name taken, a port in use, an unknown component) becomes the
   `-2`, `-3`, ... suffix, so link names and pcap files stay unique.
 
 Every change is journalled under the device it concerns (`device-added`, `device-stopped`,
-`device-started`, `device-removed`, `device-crashed`, `link-added`, `link-removed`,
-`link-changed`).
+`device-started`, `device-removed`, `device-crashed`, `device-paused`, `device-resumed`,
+`action`, `link-added`, `link-removed`, `link-changed`).
+
+## Faults: pause, crash and embedder actions
+
+Embedder surface, unstable. Tested end to end in
+[crates/wasmnet-host/tests/faults.rs](../../crates/wasmnet-host/tests/faults.rs).
+
+### Pause and resume
+
+`Op::PauseDevice { device, link_down }` puts a running device to sleep, as a laptop's lid
+closing does: it keeps its store (memory, sockets, connections, timers) but does not run, and
+misses the time it sleeps. `Op::ResumeDevice` wakes it. Precisely:
+
+- **Its store** is kept and never polled while paused. Its phase is `DevicePhase::Paused`.
+- **Frames** that reach its ports are dropped there, as a powered-down NIC drops them. They
+  crossed the link, so the link's capture has them; `device-resumed` counts them (`dropped`).
+- **The carrier.** With `link_down: false` its links stay up: the far ends learn of the sleep
+  only from its silence (a frozen machine). With `link_down: true` its links go down at the
+  pause (the far ends see the carrier drop; frames in flight are lost) and come up at the
+  resume, as a sleeping NIC's do. A link wired to it while it sleeps follows the same choice.
+- **Its timers and poll deadline** are held as they come due (the guest's `wasi:clocks` waits,
+  p2 and p3, a stepped device's `poll` deadline, a controller's `changes.wait` deadline).
+  **Link changes, stdin and wakes** wait in its inbox. **Control calls** are refused: between
+  runs `Network::counters`, `Network::control` and `Network::command` answer
+  `Error::Refused` (the network goes on), an `Op::Control` or `Op::ControlNamed` fails (`is
+  paused`), a controller's `devices.control` is `infra-failed`.
+- **At the resume** its clocks read the network's time, so monotonic and wall clock alike jump
+  by the length of the sleep. The resume's rounds come first: the device is polled with what
+  waited in its inbox (the link changes, in order: a `link_down` pause shows the device its
+  link going down and then up, as a waking NIC reports). Then its held timers and poll
+  deadline fire, at the resume's instant, one event each, in the order they came due, before
+  any other event still queued ([event-order.md](event-order.md)). The guest catches up from
+  there as it would after any late wake (a TCP stack's overdue retransmission goes out at the
+  resume instant). Everything it does at that instant is paid from one instant's fuel.
+- **Records.** `device-paused {carrier: up|down}` and `device-resumed {overdue, dropped}`
+  (held events, frames dropped at its ports). The device table that `wasmnet:infra` serves does
+  not show a pause: a paused device is `running` there, as a frozen machine looks to its
+  orchestrator until it stops answering, and no change is recorded.
+- **Other ops.** A paused device can be stopped, removed or crashed (its held events go with its
+  store); a controller's `stop`, `remove` and new spec apply to it as to a running one (a new
+  config is a recreation, since it cannot answer in place). `PauseDevice` needs a running
+  device and `ResumeDevice` a paused one (`OpState::Failed` otherwise). A network that goes
+  quiet with a device still paused reports it neither parked nor deadlocked.
+- **Split networks** refuse pauses, like every op that is not a timed write at a device
+  ([sites.md](sites.md)).
+
+### One rule for crashes
+
+A device faults when its own code traps, when it runs out of fuel or memory, when a host
+extension's import returns an error (a trap raised by the host), or when an operator event
+says so: `Op::CrashDevice { device, message }` faults a running or paused device at the op's
+position, as if its guest had trapped there. Whatever raised it, one rule decides what follows:
+
+- a device that **crashes alone** stops as crashed: its store is dropped, its links go down
+  (the far ends see it), `device-crashed {message}` is journalled (the trap's last cause, one
+  line; the op's message for `CrashDevice`), its phase in the device table is `crashed` with the
+  message, and the network runs on. `StartDevice` (or a controller's `start`) runs it again.
+- any other device's fault **fails the network** with `Error::Trap`, at the same instant on
+  every rerun.
+
+A device crashes alone when an in-world controller created it, or when its options say so:
+`DeviceOptions::crash_alone` (a device an embedder builds or adds with an op). An operator's
+crash of a device that does not crash alone fails the network, as its guest's trap would. An
+extension makes a device crash at a chosen import call by returning an error from that call
+(`wasmtime::Error`); `tests/faults.rs` traps the n-th write of a disk. Failures before the device
+runs (instantiation, `ports()`) are not crashes: they fail the creation (`OpState::Failed`,
+`failed` in the table) or the builder call. A device the network was built with keeps failing
+the network by default, as before.
+
+`stopped` and `crashed` stay apart: an operator's or a controller's stop is `stopped` with no
+message, an operator's crash is `crashed` with its message, the same as a trap.
+
+### Embedder actions
+
+`Network::register_action(name, closure)` registers a closure; `Op::Action { name, device,
+argument }` calls it when the op applies, at its placement among the instant's operator events,
+journalled first as `action {name, argument}` on `device` (which must exist). The closure gets
+an `OpContext` (the op's instant, device phases, journal events, control calls, the network's
+extensions through `extension_mut`, and `add_op` for further operator events) and an
+`ActionCall` (name, device, argument); its `Err` is the op's refusal. It cannot run guest code,
+change the topology directly (it places an op for that) or move time. `add_op` refuses an
+action whose name is not registered.
+
+Replay: a rerun calls the closure again at the same position. The network stays a function of
+its inputs only as long as the closure's effects depend only on what it is given (the instant,
+the argument, the state it changes); a closure that reads anything else makes the network a
+function of that too. `tests/faults.rs` wipes a device's disk (an extension's state) between a
+stop and a start at one instant.
 
 ## `wasmnet:infra`: the operational API for in-world controllers
 
@@ -110,8 +198,8 @@ share the history up to that event ([event-order.md](event-order.md)), agree on 
 
 **A controller's device crashes alone.** A trap in a device that a controller created stops
 only that device (its links go down), journals `device-crashed` with a one-line message, and
-shows it as `crashed`; `start` runs it again. A trap anywhere else still fails the whole
-network.
+shows it as `crashed`; `start` runs it again. Elsewhere a trap fails the whole network unless
+the device has `DeviceOptions::crash_alone` ([the one rule](#one-rule-for-crashes)).
 
 **Arguments and environment.** A device's `wasi:cli/environment` serves `argv[0]` (its name),
 then `DeviceOptions::args`, and `DeviceOptions::env` in the order given; a controller sets
@@ -165,8 +253,8 @@ a device's linear memory, all its instances together (in a composed node the net
 app): the wasmtime backend counts each growth, and the growth that would pass the limit traps
 at the growing instruction, at the same instant in every run (`memory limit: ...`). It fails
 like a device out of fuel: a device a controller created crashes alone (`device-crashed`,
-`crashed`), any other fails the network; a limit too small for the device to start fails its
-creation (`failed`). The browser backend neither enforces nor measures it. Every device's
+`crashed`), and so does one with `crash_alone`; any other fails the network; a limit too small
+for the device to start fails its creation (`failed`). The browser backend neither enforces nor measures it. Every device's
 memory is measured either way: `DeviceCost::memory` (now, 0 once stopped) and `peak_memory`,
 deterministic, read with `Network::costs` or `cost_of` during and after a run.
 

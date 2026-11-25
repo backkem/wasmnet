@@ -60,6 +60,16 @@ A **control call** (`Network::counters`, `Network::control`) is queued into a li
 inbox between runs. The executor then settles the current instant (rounds only, no event is
 popped), so virtual time does not move.
 
+A **paused** actor (`Op::PauseDevice`, [topology-and-infra.md](topology-and-infra.md#pause-and-resume))
+keeps its store and is skipped by the rounds, its wake kept for later. When one of its timers
+or its poll deadline is popped, the executor holds the event, under the key it was popped with,
+instead of waking the actor (a timer's key names the device whose poll set it); a frame for it
+is dropped at its port. At the resume the held events are queued again under those keys: being
+earlier than the current instant, they pop next, one at a time and in their order, before
+anything else still queued, while `now` stays where it is. So a guest's overdue timers come due
+at the resume instant, each processed to quiescence. A paused device is never a deadlock: its
+outstanding calls wait for its resume.
+
 ## Push in, push out
 
 - `wire.transmit(port, frame)` is a **sync import that only enqueues**. The peer gets the frame

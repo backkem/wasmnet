@@ -39,7 +39,10 @@ versions without notice. Rustdoc and the design notes mark it **embedder surface
 
 - operator events (`Op`, `Network::add_op`, `run_stoppable`, frame rules, the transmit hook,
   the component resolver for dynamic topology), including `Op::Impair` and `Op::ImpairNamed`,
-  which change a link's impairments while the network runs;
+  which change a link's impairments while the network runs, and the faults: `Op::PauseDevice`,
+  `Op::ResumeDevice`, `Op::CrashDevice`, `DeviceOptions::crash_alone`, `Op::Action` with
+  `Network::register_action`, and `NetworkExtension::device_life`
+  (`crates/wasmnet-host/tests/faults.rs`);
 - multi-site runs (`wasmnet_core::sites` and the `Network` methods for them) and the
   `wasmnet:wan` carrier contract (the site-sync wire format is at version 3 since the records
   carry frame lengths and capture options; version 2 added impairments

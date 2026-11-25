@@ -34,8 +34,17 @@ here so that nobody has to find these the hard way. Each entry names where the c
   decoder has tests of its own, and operator events and control calls only as far as device
   commands use them (`crates/wasmnet-host/tests/routes.rs`) and a device removed and added
   again (`measure.rs`), and the merging of two sites' recordings in `impairments.rs`,
-  `infra_sites.rs` (in-world controllers) and `measure.rs` (capture options). Treat that
+  `infra_sites.rs` (in-world controllers) and `measure.rs` (capture options), and pauses,
+  crashes, embedder actions and a network extension's life hooks in `faults.rs`. Treat that
   surface as unstable ([stability.md](stability.md)).
+- **`wasmnet:infra` neither pauses nor shows a pause.** A controller cannot pause or resume
+  the devices it created, and a paused device is `running` in the device table: a `paused`
+  phase and the verbs need a new package version. A controller cannot crash a device either
+  (an operator event can).
+- **A paused device holds only what its own polls set.** Its timers are recognised by the
+  device that set them; a timer it set while being instantiated by an operator event is not
+  held, and completes at the resume's rounds instead of in its order. Its overdue work all runs
+  at the resume instant, under one instant's fuel.
 - **Device commands are native only.** The browser backend (`wasmnet-web`) reports no
   optional exports, so it does not serve `wasmnet:control/commands`: an `Op::Control` with a
   `DeviceCommand` is refused when added, and a controller's `devices.control` is refused when it

@@ -289,9 +289,9 @@ pub struct DeviceOptions {
     pub infra_max_devices: Option<u32>,
     /// The most linear memory the device may use, in bytes, all its instances together. A
     /// device that grows past it traps, deterministically, at the growing instruction: a
-    /// device a controller created crashes alone (`crashed`), any other fails the network,
-    /// as when it runs out of fuel. `None`: no limit (the backend's own). Backends that cannot
-    /// enforce it (the browser) ignore it.
+    /// device that crashes alone (a controller's, or one with [`crash_alone`](Self::crash_alone))
+    /// stops as `crashed`, any other fails the network, as when it runs out of fuel. `None`: no
+    /// limit (the backend's own). Backends that cannot enforce it (the browser) ignore it.
     pub memory: Option<u64>,
     /// A fault of this device is a crash of the device alone, not the network's failure: when
     /// it traps (its own code, its fuel, its memory, a host extension's import, or

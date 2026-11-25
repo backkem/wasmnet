@@ -37,7 +37,10 @@ extensions made for it. `instantiate` must:
    replace the deadline with `VirtualClock::set_poll`;
 5. serve the device's time from `clock`, its entropy from seeds derived with
    `derive_seed(seed, name, stream)`, and refuse every infra call when `infra` is `None`;
-6. end the actor with a `Fault` on a trap (it never ends otherwise).
+6. end the actor with a `Fault` on a trap (it never ends otherwise), whatever raised it: the
+   guest, its fuel or memory, or a host import that returned an error. The network then applies
+   one rule: a device that crashes alone stops as crashed, any other fails the network
+   ([topology-and-infra.md](topology-and-infra.md#one-rule-for-crashes)).
 
 Two backends are in this repository: `wasmnet-host` on wasmtime, and `wasmnet-web`, where the
 core itself is built for `wasm32-unknown-unknown` and a browser's engine runs the devices
@@ -115,10 +118,11 @@ shows up as a deterministic failure, never as a slow run.
 
 | point | registered with | called |
 |---|---|---|
-| `NetworkExtension` | `Network::add_extension`, or a runtime's `install` | `device_setup` first when a device's context is built: for a created device right after it entered its setup slot, for an added or restarted one in the op's own processing context |
+| `NetworkExtension` | `Network::add_extension`, or a runtime's `install` | `device_setup` first when a device's context is built: for a created device right after it entered its setup slot, for an added or restarted one in the op's own processing context; `device_life` right after the network journalled a pause, resume, stop, start, crash or removal |
 | `CableModel` | `Network::register_cable(CableKind, model)` | on every message sent on a link of that kind (`LinkMut::kind(LinkKind::Cable(kind))`) |
 | `ControlCall` | `Network::control`, `Op::Control`, `Op::ControlNamed`, `OpContext::control` | inside the device's event loop, at the current instant |
 | `ExtOp` | `Op::Extension(ExtensionOp::new(op))` | when the operator event applies, in its own processing context |
+| `Action` | `Network::register_action(name, closure)`, called by `Op::Action` | when the operator event applies, in its own processing context, after its `action` record |
 | `HostExtension` | `Host::with_extension`, `Host::with_extensions` | at engine build, linking, store creation and device instantiation |
 
 All of them are in [crates/wasmnet-core/src/ext.rs](../../crates/wasmnet-core/src/ext.rs), except
@@ -131,6 +135,39 @@ of the same type replaces the first in its place. `device_setup` gets the device
 into `DeviceExt`, keyed by type; the backend reads them from `DeviceContext::ext`. Per-device
 options of an extension travel in `DeviceOptions::ext` (`ExtOptions`, one value per type).
 `Network::extension` reaches the network-wide state.
+
+`device_life` tells an extension what happens to a device, one call per journal record the
+network makes about it: `LifeEvent::Paused` (`device-paused`), `Resumed` (`device-resumed`),
+`Stopped` (`device-stopped`, by an operator, a controller or a cascade), `Started`
+(`device-started`), `Crashed { message }` (`device-crashed`, whatever raised it) and
+`Removed` (`device-removed`). The order is fixed: the network makes the change, journals its
+record, then calls every extension's `device_life` in registration order, in the same
+processing context and before anything else (a controller's cascade then stops or removes its
+devices, each with its own record and call, in creation order; the event's rounds follow). So a
+record an extension journals in the hook comes right after the network's. For `Stopped`,
+`Crashed` and `Removed` the device's store is already gone, and with it every host extension's
+per-store state; for `Started` the new store exists and has not run. **Removed is the end**:
+the name is free, and a later device of that name (or a controller's recreation of it with a
+new spec) is a new device, set up through `device_setup` again. A stop and a crash are not: the
+device may start again with the same name. Creation has no life event; `device_setup` is it.
+
+`HostExtension` has no hook of its own for these: its per-store state lives and dies with the
+store. Whatever must outlive a store (a disk, a counter across restarts) belongs to a network
+extension, which hears the life events and hands each new store a handle through `DeviceExt`.
+
+**An example: a disk per device.** [crates/wasmnet-host/tests/faults.rs](../../crates/wasmnet-host/tests/faults.rs)
+has a small, complete one. `DiskHost` (a `HostExtension`) serves a test-only import,
+`wasmnet-test:disk/disk` (`read` and `write` of blocks), and registers the network extension
+`Disks` from `install`. `Disks` keeps one disk per device name: `device_setup` puts the disk of
+the device's name (a new one the first time) into `DeviceExt`, `DiskHost::init_device` copies
+that handle into the store's state, and the import's host functions read and write through it.
+The disk therefore survives a stop, a crash and a pause, and `device_life` drops it on
+`Removed`. A failing disk is one line: the host function returns an error on the n-th write,
+and the device crashes inside that call, alone or failing the network by the rule above. An
+embedder action (`Op::Action` with a closure that calls `ctx.extension_mut::<Disks>()`) wipes a
+disk at an exact place among an instant's events. The device that uses it is
+[components/clock-probe/examples/disk_device.rs](../../components/clock-probe/examples/disk_device.rs):
+it counts its boots in block 0, so the tests read the disk's life from its journal.
 
 **Cables** carry something other than Ethernet frames. A cable kind has a code from 1 to 255 (0
 is Ethernet). A cable has no pcap and no frame log and is counted in its link's `LinkStats`.
@@ -157,8 +194,14 @@ as it grows (`DeviceCost::memory` and `peak_memory`, deterministic), and bounds 
 device has `DeviceOptions::memory`: a growth past it traps at the growing instruction.
 
 **Extension ops** apply like topology changes. `ExtOp::apply` gets an `OpContext`: the op's
-instant, `running(name)`, `require_export`, `journal_event`, `control` (answered in the op's
-rounds) and `extension_mut`. An `Err` is the op's refusal (`OpState::Failed`).
+instant, `running(name)`, `phase(name)`, `require_export`, `journal_event`, `control`
+(answered in the op's rounds), `extension_mut` and `add_op` (a further operator event, with
+`Network::add_op`'s refusals). An `Err` is the op's refusal (`OpState::Failed`).
+
+**Embedder actions** are the same without a type: `Network::register_action(name, closure)`,
+called by `Op::Action { name, device, argument }` with the same `OpContext` and an
+`ActionCall`, after an `action {name, argument}` record on `device`. What they may do, and what
+replay means for them, is in [topology-and-infra.md](topology-and-infra.md#embedder-actions).
 
 **Host extensions** link extra imports into every store. Hooks, each in the order the
 extensions were added: `configure_engine` and `engine_built` (only for extensions given to
@@ -175,11 +218,15 @@ first value instead of merging with it; an extension that wants state of its own
 type private.
 
 **What is implemented here.** `Runtime` has two implementations, `Host` (wasmtime) and
-`wasmnet-web`'s `JsRuntime` (a browser). `HostExtension` has one,
-a test (`Probe` in [crates/wasmnet-host/tests/extension.rs](../../crates/wasmnet-host/tests/extension.rs))
-that implements `name`, `add_to_linker` and `init_store`. `ControlCall`, `ControlRequest`,
-`ControlAnswer` and `ControlHandler` have one each, device commands (`CommandCall`,
-`DeviceCommand`, `CommandAnswer`, and the host's handler in
-[crates/wasmnet-host/src/control.rs](../../crates/wasmnet-host/src/control.rs)).
-`NetworkExtension`, `CableModel` and `ExtOp` have no implementation in this repository. An embedder grants a capability its extension serves
-through `DeviceOptions::ext` (a typed value its extension reads in `device_setup`).
+`wasmnet-web`'s `JsRuntime` (a browser). `HostExtension` has two, both tests: `Probe` in
+[crates/wasmnet-host/tests/extension.rs](../../crates/wasmnet-host/tests/extension.rs)
+(`name`, `add_to_linker` and `init_store`) and `DiskHost` in
+[crates/wasmnet-host/tests/faults.rs](../../crates/wasmnet-host/tests/faults.rs) (also
+`init_device` and `install`), whose `Disks` is the one `NetworkExtension` (`device_setup` and
+`device_life`); a fake runtime's `Recorder` in the core's unit tests is another.
+`ControlCall`, `ControlRequest`, `ControlAnswer` and `ControlHandler` have one each, device
+commands (`CommandCall`, `DeviceCommand`, `CommandAnswer`, and the host's handler in
+[crates/wasmnet-host/src/control.rs](../../crates/wasmnet-host/src/control.rs)). `CableModel`
+and `ExtOp` have no implementation in this repository. An embedder grants a capability its
+extension serves through `DeviceOptions::ext` (a typed value its extension reads in
+`device_setup`); `Disks` gives every device a disk instead, to stay short.

@@ -69,7 +69,8 @@ What does not cross sites:
   ports and perhaps shrink the lookahead.
 - **Most operator events.** `Network::add_op` takes only timed operator events at a device
   (`StartOf` or `EndOf`: `Op::Stdin`, `Op::Control`, `Op::Inject`) once the network has a
-  remote device, and refuses the rest (`Error::Refused`): topology ops, link changes, and
+  remote device, and refuses the rest (`Error::Refused`): topology ops (pauses, resumes,
+  operator crashes and embedder actions among them), link changes, and
   events anchored before another event, whose pre number is not on the wire
   ([event-order.md](event-order.md)). Every site must add the same operator events in the same
   order; an op at another site's device takes its index and key but is not queued, and stays

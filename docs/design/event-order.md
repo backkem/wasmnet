@@ -95,6 +95,18 @@ consequences. Existing keys keep their order (their pre number is 0), so placing
 changes nothing. `Network::op_states` reports each operator event as `Pending`, `Applied`,
 `Unreached` or `Failed` (the device or the topology refused it).
 
+Three kinds of operator event act on a device's life rather than the topology, and one on the
+embedder's own state ([topology-and-infra.md](topology-and-infra.md#faults-pause-crash-and-embedder-actions)):
+`Op::PauseDevice` and `Op::ResumeDevice`, `Op::CrashDevice`, and `Op::Action`, which calls a
+closure registered with `Network::register_action`. They apply in their own processing context
+like topology changes. A resume is the one place where keys before the current instant are
+queued: the events a paused device's timers and poll deadline came due with are queued again
+under their own keys, so they pop right after the resume's rounds, in the order they came due,
+at the resume's instant (time never moves back). Their consequences carry those keys as their
+cause, so a resumed run is as deterministic as any other. An action may place further operator
+events (`OpContext::add_op`); one placed for the current instant whose key sorts before the
+next queued event applies next.
+
 **Frame rules** (`Network::set_frame_rule`: drop, replace or delay one transmission,
 `FrameAction`) are not queued at all: they are keyed by the transmission's causal digest and
 applied at `wire.transmit` whenever that transmission happens. A rule therefore carries over to
