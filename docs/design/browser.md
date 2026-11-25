@@ -211,16 +211,59 @@ keep in step, which is what this avoids; a thin typed wrapper over `Network.op` 
 where an embedder wants one. Embedder actions and extensions' ops carry Rust closures and values
 and stay Rust-only (`wasmnet_web::Network::sim_mut`).
 
+## Portable imports
+
+An interface an extension serves ([runtime-and-extensions.md](runtime-and-extensions.md#portable-extensions))
+needs nothing written for the page. When a network is created the binding reads the
+interfaces its extensions serve (`wn_interfaces`: name, functions, resources) and builds every
+device's imports from those names:
+
+- a function per function, which sends `interface#function` and the arguments as jco handed
+  them over to `wn_import`, and returns the answer (a `result`'s error is thrown, a fault traps
+  the device with the server's message);
+- a class per resource and device, extending `codec.ResourceHandle`, whose instances carry the
+  server's handle: jco calls `new Note(name)` for the WIT constructor (the server makes the
+  note), the class's methods and static functions call their functions, a handle the server
+  answers (at the top of an answer or inside an option) comes back as an instance, and
+  disposing of one tells the server (`wn_import_drop`).
+
+A device-side export like `wn_infra`: `wn_import` runs inside a step, never borrows the
+network, and answers at once. Large byte strings cross with one copy each way in JavaScript:
+the writer keeps them by reference and writes the call straight into the simulator's memory,
+and a reply's bytes are a view of the copy the binding takes of the result; the Rust half
+decodes them into the `Vec<u8>` the server receives. What one 4 MiB append costs through all
+of it in Chromium is measured by the page test's step "a portable call carries 4 MiB through
+the page".
+
+## An embedder's own page module
+
+The page loads the simulator as `wasmnet_web.wasm`, this repository's build of
+`crates/wasmnet-web`. An embedder whose devices need extensions of its own builds that module
+itself: a crate with `crate-type = ["cdylib"]` that depends on `wasmnet-web` and on its
+extensions, and names an installer:
+
+```rust
+fn install(network: &mut wasmnet_web::install::PageNetwork) {
+    network.add_extension(wasmnet_pad::Pad::default());
+}
+wasmnet_web::install!(install);
+```
+
+`cargo build --release --target wasm32-unknown-unknown -p <that crate>` makes a module with every
+export of `wasmnet-web` (they carry over from the dependency) plus `wn_install`. The page loads it
+in place of `wasmnet_web.wasm`; the binding calls `wn_install` before it creates a network, and
+the installer then runs on every network the module creates, before any device: it may add
+extensions, register cable kinds, set a component resolver or a catalog, like a wasmtime
+backend's `Runtime::install`. The test fixture's module is
+[crates/wasmnet-pad/examples/pad_page.rs](../../crates/wasmnet-pad/examples/pad_page.rs), which
+`cargo xtask web` builds and the page test loads for its portable-extension steps.
+
 ## Sites and host extensions
 
-Not served in a page, and not planned here. What an embedder would need:
-
-- **Host extensions** (`HostExtension`, wasmtime only) link imports of their own. In a page the
-  equivalent is the import object: the embedder adds its interface's functions next to the ones
-  `network.ts` serves, and serves them from its own state or, to keep them deterministic, from
-  a `NetworkExtension` in the simulator through new device-side exports of its own build of
-  `wasmnet-web`. The core's extension points (`NetworkExtension`, cable kinds, extension ops) are
-  backend-independent already.
+- **Host extensions** (`HostExtension`, wasmtime only) are not served in a page. A capability
+  meant for both backends is a portable extension (above); an import only page code can serve
+  (a blob fetched on demand, an HTTP client over `fetch`) is still the embedder's own import
+  object, beside the ones `network.ts` serves.
 - **Sites** (a network split over processes, `docs/design/sites.md`): each site is a network of
   its own driven in lockstep with the others; a page could run one site per Worker and pass the
   site-sync messages between them, but the stepping protocol and the WAN carriers (real
@@ -244,6 +287,7 @@ call to the core. What the core decides for both:
 | a device's memory: what is counted, the limit and its error text (`MemoryBudget`: `growing` before a growth, `observe` after one) | the host's limiter; the browser's actor |
 | a device's stdin queue (`InputQueue`) | the host's stdio streams; the browser's registry |
 | which supplied bytes are admitted (`ImportPolicy`, `component_imports`) and how a refusal is worded (`supply::not_compiled`, `not_linked`) | the host's `compile_supplied`; the browser's `compile_supplied` |
+| portable imports: which device has which server, what a call answers, a fault's crash text (`DeviceExt::serve`, `ImportServer`, `Status::set_fault`) | the host's generated adapters (`portable`); the browser's `wn_import` |
 | validation, ordering, operator events, the device table, limits, digests, admission, the journal, captures | the network itself |
 
 What each backend still does itself, module by module:

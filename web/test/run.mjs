@@ -237,7 +237,7 @@ await step('a portable extension in the page: an embedder-built simulator serves
   const r = await page.evaluate(() => window.wasmnetScenario('portable', '42'));
   const got = r.notes.lines;
   for (const want of ['p pad-big size=1048576 tail=85868788898a8b8c8d8e8f9091929394 state=State::Written', 'q device-crashed message=pad: append 3 failed', 'r pad-boot boots=1', 'r pad-dropped notes=2', 'p pad-cleared notes=3']) {
-    if (!got.includes(want)) throw new Error(`no "${want}" in:\n${got}`);
+    if (!got.includes(want)) throw new Error(`no "${want}" in:\n${got}\noutcome: ${JSON.stringify(r.outcome)}\npage errors: ${errors.join(' | ')}`);
   }
   // NATIVE_PAD: the same network natively (`page_scenario_native`): the same lines.
   if (process.env.NATIVE_PAD) {

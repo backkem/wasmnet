@@ -137,3 +137,29 @@ fn every_listed_type_has_a_constructor_outside_its_crate() {
     assert_eq!(LinkStats::default().frames, [0, 0]);
     assert_eq!(DeviceCost::default().fuel, 0);
 }
+
+/// Portable extensions: what an extension builds to declare and answer an interface.
+#[test]
+fn portable_extensions() {
+    use wasmnet_host::sim::value::Value;
+    use wasmnet_host::sim::{Interface, Served};
+    let i = Interface::new("example:pad/notes@0.1.0")
+        .function("[constructor]note")
+        .function("names")
+        .resource("note");
+    assert_eq!(i.name, "example:pad/notes@0.1.0");
+    assert_eq!(i.functions, ["[constructor]note", "names"]);
+    assert_eq!(i.resources, ["note"]);
+    let answers = [
+        Served::Ok(Value::resource("note", 3)),
+        Served::Err(Value::case("full", Value::U64(1))),
+        Served::Fault("pad: append 3 failed".to_owned()),
+    ];
+    // Closed on purpose: a backend handles every case.
+    for a in answers {
+        match a {
+            Served::Ok(_) | Served::Err(_) | Served::Fault(_) => {}
+        }
+    }
+    assert_eq!(Value::option(None).into_option(), None);
+}

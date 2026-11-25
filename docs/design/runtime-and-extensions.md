@@ -155,6 +155,7 @@ these figures say nothing about how fast a native build is.
 | `ExtOp` | `Op::Extension(ExtensionOp::new(op))` | when the operator event applies, in its own processing context |
 | `Action` | `Network::register_action(name, closure)`, called by `Op::Action` | when the operator event applies, in its own processing context, after its `action` record |
 | `HostExtension` | `Host::with_extension`, `Host::with_extensions` | at engine build, linking, store creation and device instantiation |
+| Portable imports: `NetworkExtension::interfaces`, `DeviceExt::serve`, `ImportServer` | the extension, with the network; its wasmtime adapter (`portable_adapter!`) with the host; nothing in a page | the server is called inside the device's own call, at the current instant ([below](#portable-extensions)) |
 
 All of them are in [crates/wasmnet-core/src/ext.rs](../../crates/wasmnet-core/src/ext.rs), except
 `HostExtension` and its `ControlHandler`
@@ -261,4 +262,94 @@ commands (`CommandCall`, `DeviceCommand`, `CommandAnswer`, and the host's handle
 [crates/wasmnet-host/src/control.rs](../../crates/wasmnet-host/src/control.rs)). `CableModel`
 and `ExtOp` have no implementation in this repository. An embedder grants a capability its
 extension serves through `DeviceOptions::ext` (a typed value its extension reads in
-`device_setup`); `Disks` gives every device a disk instead, to stay short.
+`device_setup`); `Disks` gives every device a disk instead, to stay short. The portable
+extension points have one user here, the test fixture `wasmnet-pad` (below).
+
+## Portable extensions
+
+A capability a device imports (a disk, a screen, a clock of its own kind) is served once, in
+Rust, against the core's public API, and every backend links it: an extension does not write
+wasmtime bindings for one backend and a page's imports for the other. It is a
+`NetworkExtension` like any other, plus three things:
+
+- **What it serves.** `NetworkExtension::interfaces` lists each interface (`Interface`: its
+  full name with its version, its functions by their component-model names such as `open`,
+  `[constructor]note`, `[method]note.append` and `[static]note.find`, and its resources).
+- **Who serves it, per device.** In `device_setup` the extension hands the device a server of
+  each interface it is given: `ext.serve(name, Arc<dyn ImportServer>)`. A device given none
+  that imports the interface anyway faults at its first call, with `<interface> is not served
+  to this device`, on both backends.
+- **How a call is served.** `ImportServer::call(interface, function, args) -> Served`, inside
+  the device's own call: synchronous, at the current virtual instant, in the device's
+  processing context, so whatever the server does is ordered with the device's other effects.
+  Arguments and answers are the core's `Value`s (`wasmnet_core::value`), close to jco's own
+  shapes; a resource is `Value::Resource(name, handle)` with a handle the server chose
+  (`drop_resource` says when the device lets go of one). `Served::Ok` and `Served::Err` are a
+  value and a `result`'s error; `Served::Fault(message)` faults the device inside the call,
+  and its crash is journalled with that message on every backend (the backend leaves it with
+  `Status::set_fault`).
+
+The rest is the existing points: options from `DeviceOptions::ext`, operator events as
+`ExtOp`s, the device's life from `device_life` (`DeviceLife::replaced` tells a controller's
+recreation of a device, which keeps its name, from a removal), and the network's seed in
+`DeviceSetup::seed` for anything the extension draws.
+
+**On wasmtime** a typed adapter is generated from the interfaces' WIT:
+
+```rust
+wasmnet_host::portable_adapter!({
+    name: PadAdapter,
+    path: "wit/test-pad",
+    world: "wasmnet-test:pad/user",
+});
+let host = Host::builder().extension(PadAdapter).build()?;
+```
+
+It runs wasmtime's `bindgen!` on the world and implements the generated host traits: each
+call's typed arguments become `Value`s for the device's server, its answer becomes the typed
+result, and a resource is a host resource whose representation is the server's handle (a
+marker type of its own per resource, so two extensions' resources never mix). Bytes move as
+they would through hand-written bindings: `crates/wasmnet-host/tests/portable_cost.rs`
+measured, optimised, a 4 MiB append at 2.22 ms through the adapter against 2.17 ms written by
+hand, and a 16 MiB one at 9.04 ms against 9.07 ms. `PadAdapter::interfaces()` is what its WIT
+declares; a test compares it with the extension's own list. Linking an interface from its
+names alone through wasmtime's dynamic `Val`s was measured too and is not offered: a `Val`
+per list element made a 16 MiB value a hundred times slower and passed wasmtime's 128 MiB of
+hostcall fuel at about 4 MiB.
+
+**In a page** nothing is generated: the binding reads the network's interfaces when it is
+created (`wn_interfaces`) and builds each device's imports from the names, a function per
+function (calling `wn_import`) and a class per resource. The extension is compiled into the
+page's simulator module by the embedder's own build ([browser.md](browser.md#an-embedders-own-page-module)).
+
+**What the WIT may use.** `bool`, unsigned integers, `string`, records, variants, enums,
+options, results, tuples, lists (`list<u8>` as bytes) and resources with constructors,
+methods and static functions. Signed integers, floats, `char`, flags, streams, futures and
+async functions are refused at compile time by the adapter: the page's boundary does not
+carry them yet ([known-issues.md](../known-issues.md#the-embedder-surface)).
+
+**Rules a server follows.** It is called with no lock of the network held and may journal
+through the `JournalEnd` its `device_setup` was given, at the instant its clock reads. It
+never waits: an answer that depends on later events (a wait) is not expressible yet. On
+wasmtime a server may block the calling thread (a debugger holding a device until a person
+answers), which stops that device's whole run; in a page it must not, since the page has one
+thread. The order of extensions is the order they were added: `device_setup`, `device_life`
+and the servers' records follow it on both backends.
+
+**A worked example: the test fixture `wasmnet-pad`** ([crates/wasmnet-pad](../../crates/wasmnet-pad),
+`wit/test-pad/pad.wit`). Each device keeps named notes:
+
+- `Pad` (a `NetworkExtension`) hands every device a server in `device_setup`, clears a device's
+  notes when it crashes (`pad-cleared`), drops them when it is removed (`pad-dropped`) and
+  keeps them through a stop, a start and a controller's recreation.
+- Its server answers `note`'s constructor, `append`, `read`, `info` (a record with an enum),
+  `find` (an `option<note>`), `names` (a list) and `totals` (a tuple), and faults the device at
+  the append its options (`PadOptions::fault_at`) or a name rule (`Pad::fault_at`) arm.
+- Its probe device ([components/clock-probe/examples/pad_probe.rs](../../components/clock-probe/examples/pad_probe.rs))
+  counts its boots in a note and moves a large value through `append` and `read`.
+
+It runs at two seeds with byte-identical reruns on wasmtime
+([crates/wasmnet-host/tests/portable.rs](../../crates/wasmnet-host/tests/portable.rs)), alike
+on both backends ([crates/wasmnet-web/tests/parity.rs](../../crates/wasmnet-web/tests/parity.rs),
+`a_portable_extension_is_served_alike`), and in a real page (`web/test`), whose lines must
+equal the native run's.
