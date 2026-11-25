@@ -294,6 +294,28 @@ The rest is the existing points: options from `DeviceOptions::ext`, operator eve
 recreation of a device, which keeps its name, from a removal), and the network's seed in
 `DeviceSetup::seed` for anything the extension draws.
 
+**Options and operator events from outside Rust.** An extension's options and ops reach it from
+three places that are not Rust: a controller's spec, the page's plain objects and an
+embedder's own formats. Each goes through the extension's own parser, once per option or op:
+
+- `NetworkExtension::options` declares each option: `ExtOption::new(key, parse)`, a key of the
+  extension's own (`pad.fault-at`) and a parser from a `Value` to the option's type.
+  `Network::parse_option(key, value)` and `Network::set_option(&mut options, key, value)` use
+  it from Rust; a controller's spec takes the key beside the core's (its CBOR read as a
+  `Value`: maps are records, arrays lists, numbers `U32` or `U64`), and keeps it as given in the
+  canonical spec the device table shows; the page's device options take it as a field.
+- `NetworkExtension::check_options(name, &options)` checks a device's options before it is
+  created, by the embedder (`Error::Refused`), an operator event (the op fails) or a controller
+  (the device is `failed` with the reason). A restart is not checked again.
+- `NetworkExtension::ops` declares each operator event the page may build: `ExtOpParser::new(kind,
+  parse)`, from a `Value` to an `ExtensionOp` (`Network::parse_op`).
+- `Op::ExtensionAt { device, op }` is an extension's op timed at a device: it applies at its
+  instant like `Op::Extension`, `OpContext::device` names the device, and a split network
+  accepts it (only the device's own site applies it), where it refuses `Op::Extension`.
+
+A key or kind two extensions declare goes to the first one added. `Network::register_cable`
+refuses a cable kind that already has a model, so two extensions cannot share a code.
+
 **On wasmtime** a typed adapter is generated from the interfaces' WIT:
 
 ```rust

@@ -68,7 +68,12 @@ versions without notice. Rustdoc and the design notes mark it **embedder surface
   `Status::set_fault`, `DeviceLife::replaced`, `DeviceSetup::seed`, `Network::add_boxed_extension`,
   the value model `wasmnet_core::value`, `wasmnet_host::portable` with `portable_adapter!`, and in
   a page `wn_import`, `wn_import_drop`, `wn_interfaces` and an embedder's own page module
-  (`wasmnet_web::install`, `install!`); the test fixture `wasmnet-pad` is their worked example.
+  (`wasmnet_web::install`, `install!`, `export!`, `install::with_network`, and in the binding
+  `NetworkOptions.imports` and `Network.callExport`); extension options and operator events from
+  generic values (`ExtOption`, `ExtOpParser`, `NetworkExtension::{options, check_options, ops}`,
+  `Network::{parse_option, set_option, option_keys, parse_op}`, `ExtOptions::set_value`,
+  `Op::ExtensionAt`, `OpContext::device`, a spec's extension keys, the page's `extension` ops),
+  and `Network::register_cable` refusing a kind twice; the test fixture `wasmnet-pad` is their worked example.
 - the netstack's snapshot interface (`wasmnet:netstack/state`, `snapshot.paused`);
 - the HTTP apps' event-stream routes and `POST /echo` (`http-server`) and forward proxy
   (`http-get`).
@@ -105,6 +110,7 @@ from outside the core, so a lost constructor fails the tests.
     `SimConfig::seeded(seed).wall_epoch(epoch)`, `Fault::new(message)`,
     `DeviceInstance::new(ports, actor).apps(apps)`, `JournalEntry::new(at, device, record)`,
     `DeviceCommand::new(command, argument)`, `Interface::new(name).function(f).resource(r)`,
+    `ExtOption::new(key, parse)`, `ExtOpParser::new(kind, parse)`,
     `infra::Follow::new(name, kinds, since)`,
     `infra::TableSince::new(selector, since)` and, in `wasmnet-app-kit`,
     `mdns::Resolved::new(name, instance, host, port)`.

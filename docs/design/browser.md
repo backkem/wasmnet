@@ -258,6 +258,24 @@ backend's `Runtime::install`. The test fixture's module is
 [crates/wasmnet-pad/examples/pad_page.rs](../../crates/wasmnet-pad/examples/pad_page.rs), which
 `cargo xtask web` builds and the page test loads for its portable-extension steps.
 
+**Its own exports and imports.** The module may carry exports of the embedder's and import
+what its extensions need from the page:
+
+- `wasmnet_web::export!(name, |input: &[u8]| -> Result<Vec<u8>, String> { ... })` defines an
+  export the page calls with `Network.callExport(name, bytes)`: bytes in, bytes out, an error
+  thrown. Between steps it may reach the network with `wasmnet_web::install::with_network`
+  (`None` while a network export runs; inside a step an extension reaches its state through the
+  servers it handed devices, never through the network).
+- `NetworkOptions.imports` adds import modules beside `wasmnet_js`. A function that must wait for
+  the page is passed wrapped in `WebAssembly.Suspending`, and the export that reaches it is
+  called with `callExport(name, bytes, { promising: true })`, which answers a promise.
+
+**Options and ops from plain objects.** A device's options take the keys of the network's
+extensions as fields (`{ crashAlone: true, 'pad.fault-at': 3 }`), and an operator event of an
+extension's is `{ kind: 'extension', device, op, value, at }`, timed at `device`; the
+simulator hands each to the extension's parser (`NetworkExtension::options`, `ops`), and
+refuses a field or an `op` no extension declares.
+
 ## Sites and host extensions
 
 - **Host extensions** (`HostExtension`, wasmtime only) are not served in a page. A capability

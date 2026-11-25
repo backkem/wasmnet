@@ -101,10 +101,12 @@ here so that nobody has to find these the hard way. Each entry names where the c
   page code) is not expressible, so an async import is still an embedder's own glue. Only
   imports are portable: a device's optional exports (commands, reconfiguration, an inspection
   export) are called through each backend's own control calls. A page reads the interfaces when
-  a network is created, so an extension added later serves only on wasmtime. A page cannot set
-  an extension's device options or build an extension's operator events from its plain objects;
-  an extension op still counts as a topology op in a split network (refused). A resource handle
-  a device drops in a page reaches the server only when jco disposes of the object.
+  a network is created, so an extension added later serves only on wasmtime. `Op::Extension`
+  still counts as a topology op in a split network (refused); `Op::ExtensionAt`, timed at a
+  device, is accepted. A resource handle a device drops in a page reaches the server only when
+  jco disposes of the object. An embedder that drives a page's run from its own export (instead
+  of the binding's `run`) has `wasmnet_web::Network::step`, `take_dirty` and `next_event_time`,
+  but no test or example of that yet.
 - **The browser binding reports errors as strings** (`wasmnet_web::Network::link`, the
   `JsHost` methods), where the native API has one typed error. Its TypeScript `Network` reaches
   operator events, device options and link options as plain objects that the simulator reads
