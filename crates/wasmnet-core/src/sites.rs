@@ -128,10 +128,19 @@ pub enum SyncError {
 pub enum MergeError {
     #[error("a site's records are out of processing order")]
     OutOfOrder,
-    #[error("the sites saw {0} and {1} links")]
+    /// The sites disagree on how many links the network was built with.
+    #[error("the sites saw {0} and {1} setup links")]
     LinkCount(usize, usize),
-    #[error("link end on unknown device {0}")]
+    /// The sites disagree on how many devices the network was built with.
+    #[error("the sites saw {0} and {1} setup devices")]
+    SetupDevices(usize, usize),
+    /// The sites disagree on a setup link.
+    #[error("the sites' setup links differ: `{0}` and `{1}`")]
+    SetupLink(String, String),
+    #[error("unknown device {0}")]
     UnknownDevice(usize),
+    #[error("unknown link {0}")]
+    UnknownLink(usize),
     #[error("link {0} has an end on no site")]
     NoSite(String),
     #[error("a tap on link end {0}")]
@@ -381,6 +390,18 @@ impl Writer {
         for &d in &r.devices {
             self.uv(d as u64);
         }
+        self.uv(r.setup_devices as u64);
+        self.uv(r.created_devices.len() as u64);
+        for (d, name, t) in &r.created_devices {
+            self.uv(*d as u64);
+            self.string(name);
+            self.tag(t);
+        }
+        self.uv(r.created_links.len() as u64);
+        for (l, t) in &r.created_links {
+            self.uv(*l as u64);
+            self.tag(t);
+        }
         self.uv(r.journal.len() as u64);
         for (t, e) in &r.journal {
             self.tag(t);
@@ -561,6 +582,17 @@ impl Reader<'_> {
         let now = self.uv()?;
         let n = self.usize()?;
         let devices = (0..n).map(|_| self.usize()).collect::<Result<_, _>>()?;
+        let setup_devices = self.usize()?;
+        let n = self.usize()?;
+        let mut created_devices = Vec::new();
+        for _ in 0..n {
+            created_devices.push((self.usize()?, self.string()?, self.tag()?));
+        }
+        let n = self.usize()?;
+        let mut created_links = Vec::new();
+        for _ in 0..n {
+            created_links.push((self.usize()?, self.tag()?));
+        }
         let n = self.usize()?;
         let mut journal = Vec::new();
         for _ in 0..n {
@@ -707,6 +739,9 @@ impl Reader<'_> {
             outcome,
             now,
             devices,
+            setup_devices,
+            created_devices,
+            created_links,
             journal,
             journal_dropped,
             frames,
@@ -1100,8 +1135,18 @@ pub struct SiteRecords {
     pub outcome: std::result::Result<Outcome, (Nanos, String)>,
     /// Its virtual time at the end.
     pub now: Nanos,
-    /// Global indices of its devices.
+    /// Indices of its devices.
     pub devices: Vec<usize>,
+    /// How many devices the network was built with (the same on every site). Indices below
+    /// it are the same everywhere; the devices created while the network ran have indices
+    /// local to their site.
+    pub setup_devices: usize,
+    /// The devices this site created while the network ran: index, name, and the tag of the
+    /// processing context that created it.
+    pub created_devices: Vec<(usize, String, Tag)>,
+    /// The links this site created while the network ran: index and creation tag. The links
+    /// it did not create are the network's setup links, the same on every site.
+    pub created_links: Vec<(usize, Tag)>,
     pub journal: Vec<(Tag, JournalEntry)>,
     pub journal_dropped: u64,
     pub frames: Vec<(Tag, FrameRecord)>,
@@ -1119,6 +1164,11 @@ impl SiteRecords {
         outcome: std::result::Result<Outcome, (Nanos, String)>,
     ) -> Self {
         let zip = |tags: Vec<Tag>, items| tags.into_iter().zip(items).collect();
+        let created_devices: Vec<(usize, String, Tag)> = network
+            .created_devices()
+            .into_iter()
+            .map(|(d, t)| (d.index(), network.device_name(d).to_owned(), t))
+            .collect();
         Self {
             outcome,
             now: network.now(),
@@ -1127,6 +1177,13 @@ impl SiteRecords {
                 .into_iter()
                 .filter(|&d| !network.is_remote(d))
                 .map(DeviceId::index)
+                .collect(),
+            setup_devices: network.devices().len() - created_devices.len(),
+            created_devices,
+            created_links: network
+                .created_links()
+                .into_iter()
+                .map(|(l, t)| (l.index(), t))
                 .collect(),
             journal: zip(network.journal_tags(), network.journal()),
             journal_dropped: network.journal_dropped(),
@@ -1156,22 +1213,128 @@ impl SiteRecords {
 pub struct Merged {
     pub outcome: std::result::Result<Outcome, (Nanos, String)>,
     pub end: Nanos,
+    /// Every device's name, by index: the setup devices, then the devices created while the
+    /// network ran, in the order the unsplit network created them.
+    pub devices: Vec<String>,
     pub journal: Vec<JournalEntry>,
     pub journal_dropped: u64,
     pub frames: Vec<FrameRecord>,
     pub transitions: Vec<LinkTransition>,
     /// Per link: counters and capture.
     pub links: Vec<(LinkStats, Vec<u8>)>,
+    /// Per link: its properties at the end, from the site that ran it (a WAN link's from
+    /// site 0).
+    pub link_infos: Vec<LinkInfo>,
 }
 
-/// Merges two sites' records (see `docs/design/sites.md`). `device_names` are the network's device names
-/// in order (outcome lists are merged in device order), `deadline` the run's deadline if any.
+/// Where each site's site-local indices go in the merged records: the setup indices stay,
+/// the indices of what a site created while the network ran follow in the unsplit creation
+/// order (the order of the creations' tags).
+struct Renumber {
+    setup_devices: usize,
+    setup_links: usize,
+    devices: [BTreeMap<usize, usize>; 2],
+    links: [BTreeMap<usize, usize>; 2],
+}
+
+impl Renumber {
+    fn new(sites: [&SiteRecords; 2]) -> std::result::Result<Self, MergeError> {
+        let setup_devices = sites[0].setup_devices;
+        if sites[1].setup_devices != setup_devices {
+            return Err(MergeError::SetupDevices(
+                setup_devices,
+                sites[1].setup_devices,
+            ));
+        }
+        let setup = |s: &SiteRecords| s.links.len().checked_sub(s.created_links.len());
+        let (Some(a), Some(b)) = (setup(sites[0]), setup(sites[1])) else {
+            return Err(MergeError::LinkCount(
+                sites[0].links.len(),
+                sites[1].links.len(),
+            ));
+        };
+        if a != b {
+            return Err(MergeError::LinkCount(a, b));
+        }
+        let setup_links = a;
+        let mut devices: Vec<(&Tag, usize, usize)> = Vec::new();
+        let mut links: Vec<(&Tag, usize, usize)> = Vec::new();
+        for (k, s) in sites.iter().enumerate() {
+            for (d, _, t) in &s.created_devices {
+                if *d < setup_devices {
+                    return Err(MergeError::UnknownDevice(*d));
+                }
+                devices.push((t, k, *d));
+            }
+            for (l, t) in &s.created_links {
+                if !(setup_links..s.links.len()).contains(l) {
+                    return Err(MergeError::UnknownLink(*l));
+                }
+                links.push((t, k, *l));
+            }
+        }
+        // Everything one processing context creates is on one site, in its local order.
+        devices.sort();
+        links.sort();
+        let mut out = Self {
+            setup_devices,
+            setup_links,
+            devices: Default::default(),
+            links: Default::default(),
+        };
+        for (n, (_, k, d)) in devices.into_iter().enumerate() {
+            if out.devices[k].insert(d, setup_devices + n).is_some() {
+                return Err(MergeError::UnknownDevice(d));
+            }
+        }
+        for (n, (_, k, l)) in links.into_iter().enumerate() {
+            if out.links[k].insert(l, setup_links + n).is_some() {
+                return Err(MergeError::UnknownLink(l));
+            }
+        }
+        Ok(out)
+    }
+
+    fn device(&self, site: usize, d: DeviceId) -> std::result::Result<DeviceId, MergeError> {
+        let i = d.index();
+        if i < self.setup_devices {
+            return Ok(d);
+        }
+        self.devices[site]
+            .get(&i)
+            .map(|&m| DeviceId::from_index(m))
+            .ok_or(MergeError::UnknownDevice(i))
+    }
+
+    fn port(&self, site: usize, p: PortRef) -> std::result::Result<PortRef, MergeError> {
+        Ok(PortRef {
+            device: self.device(site, p.device)?,
+            port: p.port,
+        })
+    }
+
+    fn link(&self, site: usize, l: LinkId) -> std::result::Result<LinkId, MergeError> {
+        let j = l.index();
+        if j < self.setup_links {
+            return Ok(l);
+        }
+        self.links[site]
+            .get(&j)
+            .map(|&m| LinkId::from_index(m))
+            .ok_or(MergeError::UnknownLink(j))
+    }
+}
+
+/// Merges two sites' records (see `docs/design/sites.md`). `device_names` are the names of
+/// the devices the network was built with, in order (the names of devices created while it
+/// ran come with the records; names past the setup devices are ignored), `deadline` the run's
+/// deadline if any. The devices and links a site created while the network ran are
+/// renumbered into the unsplit network's order.
 pub fn merge(
     sites: [&SiteRecords; 2],
     device_names: &[String],
     deadline: Option<Nanos>,
 ) -> std::result::Result<Merged, MergeError> {
-    let site_of = |device: usize| sites.iter().position(|s| s.devices.contains(&device));
     for s in sites {
         let ordered = |tags: Vec<&Tag>| tags.windows(2).all(|w| w[0] < w[1]);
         if !ordered(s.journal.iter().map(|(t, _)| t).collect())
@@ -1183,28 +1346,52 @@ pub fn merge(
     }
 
     // Records can come from a peer: what they name must exist (an error, never a panic).
-    if sites[0].links.len() != sites[1].links.len() {
-        return Err(MergeError::LinkCount(
-            sites[0].links.len(),
-            sites[1].links.len(),
-        ));
+    let renumber = Renumber::new(sites)?;
+    let setup = renumber.setup_devices;
+    if device_names.len() < setup {
+        return Err(MergeError::UnknownDevice(device_names.len()));
     }
+    let mut names: Vec<String> = device_names[..setup].to_vec();
+    names.resize(
+        setup + renumber.devices.iter().map(BTreeMap::len).sum::<usize>(),
+        String::new(),
+    );
+    for (k, s) in sites.iter().enumerate() {
+        for (d, name, _) in &s.created_devices {
+            let m = renumber.device(k, DeviceId::from_index(*d))?.index();
+            names[m] = name.clone();
+        }
+    }
+    let site_of = |device: usize| {
+        (device < setup)
+            .then(|| sites.iter().position(|s| s.devices.contains(&device)))
+            .flatten()
+    };
     let device_name = |e: crate::PortRef| {
-        device_names
+        names
             .get(e.device.index())
             .map(|n| format!("{n}:{}", e.port))
             .ok_or(MergeError::UnknownDevice(e.device.index()))
     };
 
-    // Links: a site-local link from its site; a WAN link from both halves.
+    // The setup links: a site-local link from its site; a WAN link from both halves.
     let mut links = Vec::new();
-    for (j, (info, _, _)) in sites[0].links.iter().enumerate() {
+    let mut link_infos = Vec::new();
+    for j in 0..renumber.setup_links {
+        let info = &sites[0].links[j].0;
+        if sites[1].links[j].0.name != info.name {
+            return Err(MergeError::SetupLink(
+                info.name.clone(),
+                sites[1].links[j].0.name.clone(),
+            ));
+        }
         let [ea, eb] = info.ends;
         let (sa, sb) = (site_of(ea.device.index()), site_of(eb.device.index()));
         match (sa, sb) {
             (Some(a), Some(b)) if a == b => {
-                let (_, stats, pcap) = &sites[a].links[j];
+                let (info, stats, pcap) = &sites[a].links[j];
                 links.push((*stats, pcap.clone()));
+                link_infos.push(info.clone());
             }
             (Some(_), Some(_)) => {
                 let mut stats = LinkStats::default();
@@ -1241,12 +1428,31 @@ pub fn merge(
                     pcap.write_packet_directed(iface, t.at, &t.bytes, dir)?;
                 }
                 links.push((stats, pcap.bytes().to_vec()));
+                link_infos.push(info.clone());
             }
             _ => return Err(MergeError::NoSite(info.name.clone())),
         }
     }
+    // The links created while the network ran: each from the site that created it (both its
+    // ends are there), in the unsplit creation order.
+    let mut created: Vec<(usize, usize, usize)> = Vec::new();
+    for (k, s) in sites.iter().enumerate() {
+        for (l, _) in &s.created_links {
+            created.push((renumber.link(k, LinkId::from_index(*l))?.index(), k, *l));
+        }
+    }
+    created.sort();
+    for (_, k, l) in created {
+        let (info, stats, pcap) = &sites[k].links[l];
+        let mut info = info.clone();
+        for e in &mut info.ends {
+            *e = renumber.port(k, *e)?;
+        }
+        links.push((*stats, pcap.clone()));
+        link_infos.push(info);
+    }
 
-    // Frames: each site's log with the fates the other site saw, merged by tag.
+    // Frames: each site's log with the fates the other site saw, renumbered, merged by tag.
     let mut frames: Vec<(Tag, FrameRecord)> = Vec::new();
     for (k, s) in sites.iter().enumerate() {
         let mut log = s.frames.clone();
@@ -1259,6 +1465,11 @@ pub fn merge(
             }
             f.fate = a.fate;
         }
+        for (_, f) in &mut log {
+            f.link = renumber.link(k, f.link)?;
+            f.from = renumber.port(k, f.from)?;
+            f.to = renumber.port(k, f.to)?;
+        }
         frames.extend(log);
     }
     frames.sort_by(|x, y| x.0.cmp(&y.0));
@@ -1268,14 +1479,17 @@ pub fn merge(
     journal.sort_by(|x, y| x.0.cmp(&y.0));
     // A scripted change of a WAN link happens on both sites, under the same tag: keep one.
     let mut transitions: BTreeMap<Tag, LinkTransition> = BTreeMap::new();
-    for s in sites {
+    for (k, s) in sites.iter().enumerate() {
         for (t, tr) in &s.transitions {
-            transitions.insert(t.clone(), *tr);
+            let mut tr = *tr;
+            tr.link = renumber.link(k, tr.link)?;
+            transitions.insert(t.clone(), tr);
         }
     }
 
     let end = sites.iter().map(|s| s.now).max().unwrap_or(0);
-    let index_of = |name: &str| device_names.iter().position(|d| d == name);
+    // The live device of a name is its latest one.
+    let index_of = |name: &str| names.iter().rposition(|d| d == name);
     let outcome = match (&sites[0].outcome, &sites[1].outcome) {
         (Err(e), _) | (_, Err(e)) => Err(e.clone()),
         (Ok(a), Ok(b)) => {
@@ -1315,11 +1529,13 @@ pub fn merge(
     Ok(Merged {
         outcome,
         end,
+        devices: names,
         journal: journal.into_iter().map(|(_, e)| e).collect(),
         journal_dropped: sites.iter().map(|s| s.journal_dropped).sum(),
         frames: frames.into_iter().map(|(_, f)| f).collect(),
         transitions: transitions.into_values().collect(),
         links,
+        link_infos,
     })
 }
 
@@ -1376,14 +1592,17 @@ mod tests {
             device: "alice".to_owned(),
             record,
         };
-        SiteRecords {
+        let mut r = SiteRecords {
             outcome: Ok(Outcome::Quiescent {
                 at: 9_000,
                 parked: vec!["alice".to_owned()],
                 daemons: vec!["web: app-http-server.run".to_owned()],
             }),
             now: 9_000,
-            devices: vec![0, 3],
+            devices: vec![0, 3, 4],
+            setup_devices: 4,
+            created_devices: vec![(4, "web-1".to_owned(), tag(30))],
+            created_links: vec![(1, tag(31))],
             journal: vec![
                 (
                     tag(0),
@@ -1421,7 +1640,7 @@ mod tests {
                 (
                     tag(10 + i as u64),
                     FrameRecord {
-                        link: LinkId::from_index(1),
+                        link: LinkId::from_index(0),
                         from: port(0, 0),
                         to: port(3, 1),
                         sent_at: 1_000,
@@ -1437,7 +1656,7 @@ mod tests {
             }],
             taps: vec![Tap {
                 tag: tag(20),
-                link: LinkId::from_index(1),
+                link: LinkId::from_index(0),
                 end: 1,
                 at: 1_100,
                 inbound: true,
@@ -1447,7 +1666,7 @@ mod tests {
                 setup,
                 LinkTransition {
                     at: 5_000,
-                    link: LinkId::from_index(1),
+                    link: LinkId::from_index(0),
                     up: false,
                 },
             )],
@@ -1480,6 +1699,140 @@ mod tests {
                 },
                 vec![0x0a, 0x0d, 0x0d, 0x0a],
             )],
+        };
+        // A link `web-1` was created with, to `sw`.
+        let mut created = r.links[0].clone();
+        created.0.name = "web-1.0-sw.2".to_owned();
+        created.0.ends = [port(4, 0), port(3, 2)];
+        r.links.push(created);
+        r
+    }
+
+    /// Two sites' records whose sites each created devices and links while the network ran:
+    /// site 0 `ctl-a`'s `a-1` (at tag 1) and `a-2` (tag 3), site 1 `ctl-b`'s `b-1` (tag 2).
+    /// Both were built with devices 0 (`sw-a`, site 0) and 1 (`sw-b`, site 1) and one WAN link.
+    fn created_on_both() -> [SiteRecords; 2] {
+        let tag = |n: u64| Tag {
+            ctx: Ctx {
+                origin: Origin::Popped,
+                cause: Some(key(n * 1_000)),
+                slot: 0,
+                round: 0,
+                device: crate::clock::HOST_DEVICE,
+            },
+            n: 0,
+        };
+        let port = |d, port| PortRef {
+            device: DeviceId::from_index(d),
+            port,
+        };
+        let link = |name: &str, a, b| {
+            (
+                LinkInfo {
+                    name: name.to_owned(),
+                    ends: [a, b],
+                    latency: 1_000,
+                    mtu: 1500,
+                    up: true,
+                    removed: false,
+                    kind: LinkKind::Ethernet,
+                    impairments: [Impairments::default(); 2],
+                },
+                LinkStats::default(),
+                Vec::new(),
+            )
+        };
+        let frame = |link, from, to| FrameRecord {
+            link: LinkId::from_index(link),
+            from,
+            to,
+            sent_at: 0,
+            fate: FrameFate::Delivered { at: 1 },
+            bytes: vec![1],
+        };
+        let wan = link("sw-a.0-sw-b.0", port(0, 0), port(1, 0));
+        let empty = |devices| SiteRecords {
+            outcome: Ok(Outcome::Deadline {
+                at: 9_000,
+                pending_events: 0,
+            }),
+            now: 9_000,
+            devices,
+            setup_devices: 2,
+            created_devices: Vec::new(),
+            created_links: Vec::new(),
+            journal: Vec::new(),
+            journal_dropped: 0,
+            frames: Vec::new(),
+            arrivals: Vec::new(),
+            taps: Vec::new(),
+            transitions: Vec::new(),
+            links: vec![wan.clone()],
+        };
+        let mut a = empty(vec![0, 2, 3]);
+        a.created_devices = vec![(2, "a-1".to_owned(), tag(1)), (3, "a-2".to_owned(), tag(3))];
+        a.created_links = vec![(1, tag(1)), (2, tag(3))];
+        a.links.push(link("a-1.0-sw-a.1", port(2, 0), port(0, 1)));
+        a.links.push(link("a-2.0-sw-a.2", port(3, 0), port(0, 2)));
+        a.frames = vec![
+            (tag(1), frame(1, port(2, 0), port(0, 1))),
+            (tag(3), frame(2, port(3, 0), port(0, 2))),
+        ];
+        let mut b = empty(vec![1, 2]);
+        b.created_devices = vec![(2, "b-1".to_owned(), tag(2))];
+        b.created_links = vec![(1, tag(2))];
+        b.links.push(link("b-1.0-sw-b.1", port(2, 0), port(1, 1)));
+        b.frames = vec![(tag(2), frame(1, port(2, 0), port(1, 1)))];
+        [a, b]
+    }
+
+    #[test]
+    fn devices_and_links_created_on_both_sites_merge_in_creation_order() {
+        let [a, b] = created_on_both();
+        let names: Vec<String> = ["sw-a", "sw-b"].map(String::from).to_vec();
+        let m = merge([&a, &b], &names, None).expect("merges");
+        assert_eq!(m.devices, ["sw-a", "sw-b", "a-1", "b-1", "a-2"]);
+        let link_names: Vec<&str> = m.link_infos.iter().map(|l| l.name.as_str()).collect();
+        assert_eq!(
+            link_names,
+            [
+                "sw-a.0-sw-b.0",
+                "a-1.0-sw-a.1",
+                "b-1.0-sw-b.1",
+                "a-2.0-sw-a.2"
+            ]
+        );
+        // `b-1` is device 3 and its link is link 2 in the merged records; `a-2` device 4 on
+        // link 3.
+        assert_eq!(m.link_infos[2].ends[0].device.index(), 3);
+        let renumbered: Vec<(usize, usize)> = m
+            .frames
+            .iter()
+            .map(|f| (f.link.index(), f.from.device.index()))
+            .collect();
+        assert_eq!(renumbered, [(1, 2), (2, 3), (3, 4)]);
+        // The names past the setup devices are the records' own.
+        let more: Vec<String> = ["sw-a", "sw-b", "x"].map(String::from).to_vec();
+        assert_eq!(merge([&a, &b], &more, None).unwrap().devices, m.devices);
+        // Sites that disagree on the setup, or name what they did not create, are errors.
+        let mut bad = b.clone();
+        bad.setup_devices = 3;
+        assert!(merge([&a, &bad], &names, None).is_err());
+        let mut bad = b.clone();
+        bad.created_links.clear();
+        assert!(merge([&a, &bad], &names, None).is_err());
+        let mut bad = b.clone();
+        bad.frames[0].1.from = port_of(7);
+        assert!(merge([&a, &bad], &names, None).is_err());
+        let mut bad = b.clone();
+        bad.links[0].0.name = "other".to_owned();
+        assert!(merge([&a, &bad], &names, None).is_err());
+    }
+
+    fn port_of(device: usize) -> PortRef {
+        PortRef {
+            device: DeviceId::from_index(device),
+            port: 0,
         }
     }
 
@@ -1548,6 +1901,9 @@ mod tests {
         a.taps[0].link = LinkId::from_index(0);
         let mut b = records();
         b.devices = vec![3];
+        b.created_devices.clear();
+        b.created_links.clear();
+        b.links.truncate(1);
         b.arrivals.clear();
         b.journal.clear();
         b.frames.clear();
