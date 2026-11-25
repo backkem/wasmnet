@@ -40,5 +40,12 @@ name = "disk-device"
 path = "examples/disk_device.rs"
 crate-type = ["cdylib"]
 
+# `examples/pad_probe.rs`: a stepped device (no ports) that keeps notes through a portable
+# extension (`crates/wasmnet-pad`), for the tests of portable extensions on both backends.
+[[example]]
+name = "pad-probe"
+path = "examples/pad_probe.rs"
+crate-type = ["cdylib"]
+
 [lints]
 workspace = true

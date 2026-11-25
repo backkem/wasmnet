@@ -115,6 +115,7 @@ mod control;
 mod extension;
 mod glue;
 mod infra;
+pub mod portable;
 mod reconfigure;
 mod runtime;
 mod stdio;
@@ -186,6 +187,9 @@ pub use wasmnet_core::{
     Nanos, Outcome, PortInfo, PortRef, Record, Result, SimConfig, SimRng, Sleep, Stats, Stream,
     VirtualClock, derive_seed,
 };
+/// Generates the wasmtime half of a portable extension from the WIT of its interfaces: a
+/// [`HostExtension`] that links them, typed ([`portable`]).
+pub use wasmnet_host_macros::portable_adapter;
 /// The wasmtime this host is built on, at the exact version and with the features it pins: an
 /// embedder names `wasmtime::component::Component` (what [`Host::load`] returns),
 /// `wasmtime::component::Linker` (a [`HostExtension`]'s) and `wasmtime::Error` through this

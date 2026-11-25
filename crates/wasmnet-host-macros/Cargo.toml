@@ -1,0 +1,22 @@
+[package]
+name = "wasmnet-host-macros"
+version = "0.0.0"
+description = "The wasmtime half of portable extensions: typed adapters generated from an interface's WIT (`wasmnet_host::portable_adapter!`)."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full"] }
+# The same WIT parser wasmtime's `bindgen!` uses, so both read an interface alike.
+wit-parser = "=0.261.0"
+heck = "0.5"
+
+[lints]
+workspace = true

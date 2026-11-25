@@ -1718,9 +1718,22 @@ dependencies = [
  "tokio",
  "wasmnet-core",
  "wasmnet-det-cbor",
+ "wasmnet-host-macros",
+ "wasmnet-pad",
  "wasmnet-wire",
  "wasmtime",
  "wasmtime-wasi",
+]
+
+[[package]]
+name = "wasmnet-host-macros"
+version = "0.0.0"
+dependencies = [
+ "heck",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+ "wit-parser 0.261.0",
 ]
 
 [[package]]
@@ -1788,6 +1801,13 @@ dependencies = [
  "wasip3",
  "wasmnet-wire",
  "wit-bindgen 0.61.1",
+]
+
+[[package]]
+name = "wasmnet-pad"
+version = "0.0.0"
+dependencies = [
+ "wasmnet-core",
 ]
 
 [[package]]

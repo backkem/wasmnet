@@ -14,6 +14,8 @@ thiserror.workspace = true
 wasmnet-wire = { path = "../wasmnet-wire" }
 # The runtime-agnostic sim core: this crate is its wasmtime backend.
 wasmnet-core = { path = "../wasmnet-core" }
+# The typed adapters of portable extensions (`portable_adapter!`).
+wasmnet-host-macros = { path = "../wasmnet-host-macros" }
 # Content keys of the precompiled-component cache.
 sha2.workspace = true
 # wasmtime-wasi's p2 `Pollable` trait is declared with `#[async_trait]`.
@@ -24,6 +26,8 @@ bytes = "1"
 tokio = { version = "1", default-features = false, features = ["rt"] }
 
 [dev-dependencies]
+# The tests of portable extensions: their fixture.
+wasmnet-pad = { path = "../wasmnet-pad" }
 # The end-to-end tests read TCP segments off the frame log.
 etherparse.workspace = true
 # The route-change test builds a controller's device spec (CBOR).

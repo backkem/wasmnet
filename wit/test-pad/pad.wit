@@ -1,0 +1,51 @@
+package wasmnet-test:pad@0.1.0;
+
+/// A test fixture's portable interface (`crates/wasmnet-pad`): notes a device keeps, served by
+/// a network extension on every backend. Every function is synchronous, never yields and takes
+/// no virtual time; it is served from the calling device's own notes. The caller owns every
+/// list it gets back.
+interface notes {
+    /// Why an append did not happen.
+    variant error {
+        /// The device's notes would pass their bound: the bytes they hold now.
+        full(u64),
+        /// The note was discarded (its device's notes were cleared since it was opened).
+        gone,
+    }
+
+    /// A note's state.
+    enum state { empty, written }
+
+    /// What a note holds.
+    record info {
+        name: string,
+        size: u64,
+        appends: u32,
+        state: state,
+    }
+
+    /// One named note of the device: created empty, or found again with `find`.
+    resource note {
+        /// The note `name`, created empty if the device has none of that name.
+        constructor(name: string);
+        /// Appends `bytes`; answers the note's new size. The extension may fault the device
+        /// here instead (a fault its options arm).
+        append: func(bytes: list<u8>) -> result<u64, error>;
+        /// Up to `len` bytes from `offset` (fewer at the end, none past it).
+        read: func(offset: u64, len: u32) -> list<u8>;
+        info: func() -> info;
+        /// The note `name`, if the device has one.
+        find: static func(name: string) -> option<note>;
+    }
+
+    /// The device's notes, by name, ascending.
+    names: func() -> list<string>;
+
+    /// How many notes the device has, and the bytes they hold.
+    totals: func() -> tuple<u32, u64>;
+}
+
+/// What a device that keeps notes imports.
+world user {
+    import notes;
+}

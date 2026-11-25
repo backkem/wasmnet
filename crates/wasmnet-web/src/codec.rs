@@ -607,56 +607,10 @@ pub fn decode_reconfigured(bytes: &[u8]) -> Result<Result<(), Refusal>, DecodeEr
 
 // ---- values: wasmnet:infra calls -------------------------------------------------------------
 
-/// A WIT value as `wasmnet:infra` calls carry it across the boundary, close to jco's own
-/// shapes, so the JavaScript side converts generically and knows nothing of the interface:
-/// JavaScript sends a call's arguments the way jco handed them to the import, and gets the
-/// answer in the shape jco expects back.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Value {
-    /// `option::none` (JavaScript: `undefined`).
-    None,
-    /// `option::some` (JavaScript: the value itself). JavaScript sends a present option as
-    /// the bare value.
-    Some(Box<Value>),
-    Bool(bool),
-    /// Integers up to 32 bits (JavaScript: a number).
-    U32(u32),
-    /// 64-bit integers (JavaScript: a bigint).
-    U64(u64),
-    Str(String),
-    /// `list<u8>` (JavaScript: a `Uint8Array`).
-    Bytes(Vec<u8>),
-    List(Vec<Value>),
-    /// JavaScript: an array, like a list.
-    Tuple(Vec<Value>),
-    /// Fields by their WIT (kebab-case) names; JavaScript camel-cases them.
-    Record(Vec<(String, Value)>),
-    /// A variant case or a `result` (`ok`/`err`); JavaScript: `{ tag, val }`.
-    Variant(String, Option<Box<Value>>),
-    /// JavaScript: the case's name.
-    Enum(String),
-}
-
-impl Value {
-    pub fn str(s: impl Into<String>) -> Self {
-        Value::Str(s.into())
-    }
-
-    /// `option<T>`.
-    pub fn option(v: Option<Value>) -> Self {
-        v.map_or(Value::None, |v| Value::Some(Box::new(v)))
-    }
-
-    /// A variant case with a payload.
-    pub fn case(tag: &str, payload: Value) -> Self {
-        Value::Variant(tag.to_owned(), Some(Box::new(payload)))
-    }
-
-    /// A record from `(field, value)` pairs.
-    pub fn record(fields: Vec<(&str, Value)>) -> Self {
-        Value::Record(fields.into_iter().map(|(k, v)| (k.to_owned(), v)).collect())
-    }
-}
+/// A WIT value as calls carry it across the boundary (`wasmnet:infra`, the interfaces extensions
+/// serve): the core's [`wasmnet_core::value::Value`], close to jco's own shapes, so the
+/// JavaScript side converts generically and knows nothing of an interface.
+pub use wasmnet_core::value::Value;
 
 /// How deep values nest at most (the interface's deepest is 5); deeper input is malformed.
 const MAX_DEPTH: usize = 32;
@@ -695,6 +649,7 @@ impl Writer {
                 }
             }
             Value::Enum(name) => self.u8(11).str(name),
+            Value::Resource(name, handle) => self.u8(12).str(name).u32(*handle),
         }
     }
 }
@@ -766,6 +721,7 @@ impl Reader<'_> {
                 Value::Variant(tag, payload)
             }
             11 => Value::Enum(self.str()?),
+            12 => Value::Resource(self.str()?, self.u32()?),
             _ => {
                 return Err(DecodeError {
                     at,

@@ -200,6 +200,8 @@ struct StatusState {
     /// In-flight calls: name and whether it is a daemon call.
     outstanding: BTreeMap<u64, (String, bool)>,
     guest_tasks_alive: bool,
+    /// The message of a fault a host import raised, for the crash record ([`Status::set_fault`]).
+    fault: Option<String>,
 }
 
 /// What a device is still busy with when the network looks at it.
@@ -226,6 +228,18 @@ impl Status {
 
     pub fn end(&self, id: u64) {
         lock(&self.inner).outstanding.remove(&id);
+    }
+
+    /// A host import is faulting the device with `message` (it returns a trap right after). The
+    /// crash is then journalled with this message rather than the runtime's own trap text, so
+    /// it reads the same on every backend. A later fault replaces an earlier one.
+    pub fn set_fault(&self, message: impl Into<String>) {
+        lock(&self.inner).fault = Some(message.into());
+    }
+
+    /// The message [`set_fault`](Self::set_fault) left, taken.
+    pub(crate) fn take_fault(&self) -> Option<String> {
+        lock(&self.inner).fault.take()
     }
 
     pub fn set_guest_tasks_alive(&self, alive: bool) {

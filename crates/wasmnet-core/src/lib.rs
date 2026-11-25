@@ -95,6 +95,7 @@ pub mod reconfigure;
 mod rng;
 pub mod sites;
 pub mod supply;
+pub mod value;
 
 use std::any::Any;
 use std::fmt;
@@ -109,7 +110,10 @@ pub use config::{DeviceConfig, argv};
 pub use device::{Command, CostMeter, CountersReply, DeviceCost, Inbox, Snapshot, Status};
 pub use digest::Digest;
 pub use exec::{ActorFuture, Boundary, OpState, Stalled, Stats, Step, block_on};
-pub use ext::{CableKind, Control, DeviceExt, ExtOptions, ExtValue, ExtensionOp, NetworkExtension};
+pub use ext::{
+    CableKind, Control, DeviceExt, ExtOptions, ExtValue, ExtensionOp, ImportServer, Interface,
+    NetworkExtension, Served,
+};
 pub use infra::{Infra, InfraEnd};
 pub use input::InputQueue;
 pub use journal::{JournalEnd, JournalEntry, Level, Record, Stream};

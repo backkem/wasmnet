@@ -735,11 +735,15 @@ impl Executor {
             _ => 0,
         };
         slot.inbox.cost().add_poll(wall_ns, idle);
-        let error = match polled {
+        let mut error = match polled {
             Poll::Pending => return Ok(()),
             Poll::Ready(Ok(())) => Fault::new("device actor exited"),
             Poll::Ready(Err(e)) => e,
         };
+        // A host import that faulted the device said why, in words every backend shares.
+        if let Some(message) = self.actors[i].status.take_fault() {
+            error.message = message;
+        }
         let message = error.message.clone();
         if self.fault(i, error)? {
             // The network is told: it stops the device as crashed.

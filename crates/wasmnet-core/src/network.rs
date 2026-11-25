@@ -664,6 +664,29 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
         }
     }
 
+    /// [`add_extension`](Self::add_extension) for an extension whose type the caller does not
+    /// name (an installer that returns boxed extensions): one per type, the same rules.
+    pub fn add_boxed_extension(&mut self, extension: Box<dyn NetworkExtension>) {
+        let id = (&*extension as &dyn Any).type_id();
+        match self
+            .extensions
+            .iter_mut()
+            .find(|e| (&***e as &dyn Any).type_id() == id)
+        {
+            Some(slot) => *slot = extension,
+            None => self.extensions.push(extension),
+        }
+    }
+
+    /// The portable interfaces the network's extensions serve, in registration order
+    /// ([`NetworkExtension::interfaces`]). A backend links these for its devices.
+    pub fn interfaces(&self) -> Vec<crate::ext::Interface> {
+        self.extensions
+            .iter()
+            .flat_map(|e| e.interfaces())
+            .collect()
+    }
+
     /// The network's extension of type `T`, if registered.
     pub fn extension<T: NetworkExtension>(&self) -> Option<&T> {
         self.extensions
@@ -1044,6 +1067,7 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
             options: &options,
             clock: &self.clock,
             journal: &journal,
+            seed: self.config.seed,
         };
         for e in &mut self.extensions {
             e.device_setup(&setup, &mut ext);
@@ -1404,6 +1428,7 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
             at,
             event,
             journal: &journal,
+            replaced: self.infra.is_recreating(&name),
         };
         for e in &mut self.extensions {
             e.device_life(&life);

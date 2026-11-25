@@ -34,6 +34,7 @@ use std::sync::Arc;
 use crate::clock::{Nanos, VirtualClock};
 use crate::journal::{JournalEnd, Record};
 use crate::network::{DeviceId, DeviceOptions};
+use crate::value::Value;
 
 // ---- typed values --------------------------------------------------------------------------
 
@@ -150,30 +151,63 @@ pub struct DeviceSetup<'a> {
     pub clock: &'a VirtualClock,
     /// Its journal (records under its name).
     pub journal: &'a JournalEnd,
+    /// The network's root seed: an extension derives its own streams from it
+    /// ([`crate::derive_seed`] with the device's name and a stream name of its own).
+    pub seed: u64,
 }
 
 /// Per-device handles of the network's extensions, one value per type: what a backend serves
-/// the device's extension imports from ([`crate::DeviceContext::ext`]).
+/// the device's extension imports from ([`crate::DeviceContext::ext`]); and the servers of the
+/// portable interfaces the device is given ([`DeviceExt::serve`]).
 #[derive(Default)]
-pub struct DeviceExt(Vec<(TypeId, Box<dyn Any + Send + Sync>)>);
+pub struct DeviceExt {
+    handles: Vec<(TypeId, Box<dyn Any + Send + Sync>)>,
+    servers: Vec<(String, Arc<dyn ImportServer>)>,
+}
 
 impl DeviceExt {
     /// Sets the handle of `value`'s type, replacing an earlier one.
     pub fn insert<T: Any + Send + Sync>(&mut self, value: T) {
         let id = TypeId::of::<T>();
-        match self.0.iter_mut().find(|(t, _)| *t == id) {
+        match self.handles.iter_mut().find(|(t, _)| *t == id) {
             Some(slot) => slot.1 = Box::new(value),
-            None => self.0.push((id, Box::new(value))),
+            None => self.handles.push((id, Box::new(value))),
         }
     }
 
     /// The handle of type `T`, if an extension set one.
     pub fn get<T: Any>(&self) -> Option<&T> {
         let id = TypeId::of::<T>();
-        self.0
+        self.handles
             .iter()
             .find(|(t, _)| *t == id)
             .and_then(|(_, v)| v.downcast_ref())
+    }
+
+    /// Serves the portable `interface` (its full name with its version, as the device imports
+    /// it: `example:pad/notes@0.1.0`) to this device through `server`, replacing an earlier
+    /// server of it. Every backend links the interface and hands each of the device's calls to
+    /// the server ([`ImportServer`]); a device given no server of an interface it imports
+    /// faults at its first call.
+    pub fn serve(&mut self, interface: impl Into<String>, server: Arc<dyn ImportServer>) {
+        let interface = interface.into();
+        match self.servers.iter_mut().find(|(i, _)| *i == interface) {
+            Some(slot) => slot.1 = server,
+            None => self.servers.push((interface, server)),
+        }
+    }
+
+    /// The server of `interface` for this device, if an extension set one.
+    pub fn server(&self, interface: &str) -> Option<&Arc<dyn ImportServer>> {
+        self.servers
+            .iter()
+            .find(|(i, _)| i == interface)
+            .map(|(_, s)| s)
+    }
+
+    /// Every interface served to this device, with its server, in the order they were set.
+    pub fn servers(&self) -> impl Iterator<Item = (&str, &Arc<dyn ImportServer>)> {
+        self.servers.iter().map(|(i, s)| (i.as_str(), s))
     }
 }
 
@@ -216,6 +250,11 @@ pub struct DeviceLife<'a> {
     pub event: LifeEvent<'a>,
     /// Its journal (records under its name), after the network's own record.
     pub journal: &'a JournalEnd,
+    /// The device is being replaced: this removal, and the stop before it, are part of a
+    /// recreation of the device under the same name (an in-world controller applied a new
+    /// spec), and the new device is set up right after (`device_setup`, origin
+    /// [`SetupOrigin::Added`]). State an extension keeps for the name (a disk) may stay.
+    pub replaced: bool,
 }
 
 /// A network extension: network-wide state plus hooks the network calls at fixed points, in
@@ -237,6 +276,13 @@ pub trait NetworkExtension: Any + Send {
     /// exists and has not run yet.
     fn device_life(&mut self, life: &DeviceLife<'_>) {
         let _ = life;
+    }
+
+    /// The portable interfaces this extension serves to devices, on every backend. A backend
+    /// links them for every device; `device_setup` hands each device the servers of those it
+    /// is given ([`DeviceExt::serve`]). The default serves none.
+    fn interfaces(&self) -> Vec<Interface> {
+        Vec::new()
     }
 }
 
@@ -568,5 +614,78 @@ impl OpContext<'_> {
         self.network
             .extension_any(TypeId::of::<T>())
             .and_then(|e| e.downcast_mut())
+    }
+}
+
+// ---- portable imports ----------------------------------------------------------------------
+
+/// An interface an extension serves to devices on every backend
+/// ([`NetworkExtension::interfaces`]): its full name with its version, as devices import it
+/// (`example:pad/notes@0.1.0`), its functions by their component-model names (`open`,
+/// `[constructor]note`, `[method]note.write`, `[static]note.count`), and its resources.
+///
+/// The wasmtime backend links it through an adapter generated from the interface's WIT
+/// (`wasmnet_host::portable_adapter!`), the browser backend from these names alone.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Interface {
+    pub name: String,
+    pub functions: Vec<String>,
+    pub resources: Vec<String>,
+}
+
+impl Interface {
+    /// An interface called `name` (with its version), with no functions yet.
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            functions: Vec::new(),
+            resources: Vec::new(),
+        }
+    }
+
+    /// Adds a function, by its component-model name.
+    pub fn function(mut self, name: impl Into<String>) -> Self {
+        self.functions.push(name.into());
+        self
+    }
+
+    /// Adds a resource, by its WIT name.
+    pub fn resource(mut self, name: impl Into<String>) -> Self {
+        self.resources.push(name.into());
+        self
+    }
+}
+
+/// How a served call ends.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Served {
+    /// The function's value: for a `result`, its `ok` value; for a function without a result,
+    /// anything (it is dropped).
+    Ok(Value),
+    /// A `result`'s `err` value.
+    Err(Value),
+    /// The device faults inside the call: its crash is journalled with this message on every
+    /// backend (`device-crashed`), and the one rule for crashes applies.
+    Fault(String),
+}
+
+/// One device's server of a portable interface ([`DeviceExt::serve`]).
+///
+/// Called by the device's backend while the device runs, synchronously, at the current virtual
+/// instant and in the device's own processing context: a call never yields, so whatever the
+/// server does is ordered with the device's other effects. Arguments arrive in the shapes of
+/// [`Value`]; a resource argument (`borrow` or `own`) arrives as [`Value::Resource`] with the
+/// handle the server gave out, and a resource the server answers is a handle it chose. The
+/// server owns what it keeps; the backend owns nothing of the call once it returned.
+pub trait ImportServer: Send + Sync {
+    /// Serves `function` (its component-model name) of `interface` with `args`.
+    fn call(&self, interface: &str, function: &str, args: Vec<Value>) -> Served;
+
+    /// The device dropped its handle `handle` to `resource` of `interface` (or its store went
+    /// away with the handle still held: then this is not called; the device's life events say
+    /// so). The default does nothing.
+    fn drop_resource(&self, interface: &str, resource: &str, handle: u32) {
+        let _ = (interface, resource, handle);
     }
 }

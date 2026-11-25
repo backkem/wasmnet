@@ -1001,6 +1001,11 @@ impl Infra {
         self.state().requests.get(index).cloned()
     }
 
+    /// Whether a recreate of `name` is in progress.
+    pub(crate) fn is_recreating(&self, name: &str) -> bool {
+        self.state().items.get(name).is_some_and(|i| i.recreating)
+    }
+
     /// Marks a recreate in progress (its removal keeps the device in the table).
     pub(crate) fn set_recreating(&self, name: &str, on: bool) {
         if let Some(item) = self.state().items.get_mut(name) {
