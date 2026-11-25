@@ -22,6 +22,7 @@
 //! | `max` | the most `replicas` may become (stdin included) | `16` |
 //! | `prefix` | instance names `<prefix>-<n>` and their label `replicas=<prefix>` | `web` |
 //! | `period` | virtual time between two reconciles | `500ms` |
+//! | `wake` | `true`: also reconcile as soon as a device it sees changes (`wasmnet:infra/changes.wait`: a crash or an exit is handled at once, not at the next `period`) | `false` |
 //! | `start` | virtual time before the first reconcile | `0` |
 //! | `grace` | a removed instance keeps running this long first (`stop` with grace) | `0` |
 //! | `template.component` | the instances' catalog name (`node:http-server`) | required |
@@ -110,6 +111,9 @@ pub struct Config {
     pub max: u32,
     pub prefix: String,
     pub period_ns: u64,
+    /// `wake`: between two reconciles, wait for a change in its view (`changes.wait`) as well
+    /// as for `period`, so a crash or an exit is seen at once.
+    pub wake: bool,
     pub start_ns: u64,
     pub grace_ns: u64,
     pub component: String,
@@ -151,6 +155,7 @@ impl Config {
             max: 16,
             prefix: "web".to_owned(),
             period_ns: 500_000_000,
+            wake: false,
             start_ns: 0,
             grace_ns: 0,
             component: String::new(),
@@ -211,6 +216,13 @@ impl Config {
                     c.prefix = v;
                 }
                 "period" => c.period_ns = dur(&k, &v)?.max(1),
+                "wake" => {
+                    c.wake = match v.trim() {
+                        "true" => true,
+                        "false" => false,
+                        _ => return Err(invalid(&k, &v, "true or false")),
+                    }
+                }
                 "start" => c.start_ns = dur(&k, &v)?,
                 "grace" => c.grace_ns = dur(&k, &v)?,
                 "template.component" => c.component = v.trim().to_owned(),
@@ -583,6 +595,13 @@ mod tests {
         .expect("valid");
         assert!(early.lb.expect("lb").half_close);
         assert!(Config::from_pairs(pairs(&[("half-close", "yes")])).is_err());
+        assert!(!c.wake);
+        assert!(
+            Config::from_pairs(pairs(&[("wake", "true")]))
+                .expect("valid")
+                .wake
+        );
+        assert!(Config::from_pairs(pairs(&[("wake", "soon")])).is_err());
         assert!(Config::from_pairs(pairs(&[("backend", "x")])).is_err());
         assert!(Config::from_pairs(pairs(&[("bogus", "1")])).is_err());
         assert!(Config::from_pairs(vec![]).is_err());

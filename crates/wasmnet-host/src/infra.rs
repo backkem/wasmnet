@@ -6,7 +6,7 @@
 //! `docs/design/topology-and-infra.md`.
 
 use wasmnet_core::infra::{ChangeKind, DeviceView, InfraError, Phase};
-use wasmtime::component::{Component, HasData, Linker};
+use wasmtime::component::{Accessor, Component, HasData, Linker};
 
 use crate::wasi::HostState;
 
@@ -17,7 +17,7 @@ mod bindings {
     });
 }
 
-use bindings::wasmnet::infra::{devices, types};
+use bindings::wasmnet::infra::{changes, devices, types};
 
 /// [`HasData`] marker: the state is the store's [`HostState`].
 struct Infra;
@@ -189,8 +189,26 @@ impl devices::Host for HostState {
     }
 }
 
+impl changes::Host for HostState {}
+
+impl<U> changes::HostWithStore<U> for Infra {
+    /// Waits on virtual time for a change in the caller's view ([`wasmnet_core::InfraEnd::wait`]).
+    async fn wait(
+        store: &Accessor<U, Self>,
+        selector: Vec<(String, String)>,
+        since: u64,
+        deadline: Option<u64>,
+    ) -> Result<u64, types::Error> {
+        let end = store
+            .with(|mut view| view.get().infra.clone())
+            .ok_or_else(ungranted)?;
+        Ok(end.wait(selector, since, deadline).await)
+    }
+}
+
 pub(crate) fn add_to_linker(l: &mut Linker<HostState>) -> wasmtime::Result<()> {
-    devices::add_to_linker::<_, Infra>(l, |s| s)
+    devices::add_to_linker::<_, Infra>(l, |s| s)?;
+    changes::add_to_linker::<_, Infra>(l, |s| s)
 }
 
 /// Whether `component` imports `wasmnet:infra` (any interface, any version).

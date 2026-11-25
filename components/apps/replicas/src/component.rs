@@ -21,7 +21,8 @@ wit_bindgen::generate!({
         package app:replicas;
         world replicas {
             include wasmnet:app/app@0.1.0;
-            import wasmnet:infra/devices@0.1.1;
+            import wasmnet:infra/devices@0.1.2;
+            import wasmnet:infra/changes@0.1.2;
         }
     ",
     path: [
@@ -46,8 +47,8 @@ wit_bindgen::generate!({
 });
 
 use wasi::config::store;
-use wasmnet::infra::devices;
 use wasmnet::infra::types::{ChangeKind, Phase};
+use wasmnet::infra::{changes, devices};
 use wasmnet::link::log::{self, Level};
 
 fn event(kind: &str, fields: &[(&str, String)]) {
@@ -281,7 +282,16 @@ async fn controller() -> Result<(), String> {
             );
         }
         step(&c, desired.get(), &mut registered).await;
-        monotonic_clock::wait_for(c.period_ns).await;
+        if c.wake {
+            // Until a device it sees changes (its own requests applying included), or `period`.
+            let deadline = monotonic_clock::now().saturating_add(c.period_ns);
+            if let Err(e) = changes::wait(labels.clone(), rv, Some(deadline)).await {
+                error("wait", e);
+                monotonic_clock::wait_for(c.period_ns).await;
+            }
+        } else {
+            monotonic_clock::wait_for(c.period_ns).await;
+        }
     }
 }
 

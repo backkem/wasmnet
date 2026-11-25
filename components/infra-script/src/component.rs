@@ -13,7 +13,7 @@ wit_bindgen::generate!({
         package wasmnet:infra-script;
         world infra-script {
             include wasmnet:link/stepped-device@0.1.0;
-            import wasmnet:infra/devices@0.1.1;
+            import wasmnet:infra/devices@0.1.2;
         }
     ",
     path: ["../../wit/deps/config", "../../wit/link", "../../wit/infra"],
@@ -49,8 +49,8 @@ fn with<R>(f: impl FnOnce(&mut Script) -> R) -> R {
     STATE.with(|s| f(s.borrow_mut().get_or_insert_with(create)))
 }
 
-/// Makes one step's call; its result for the journal.
-fn run(step: &Step) -> String {
+/// Makes one step's call; its result for the journal, and any fields it adds.
+fn run(step: &Step) -> (String, Vec<(String, String)>) {
     let id = Some(step.request_id.as_str());
     let name = step.name.as_str();
     let answer = match &step.verb {
@@ -63,10 +63,23 @@ fn run(step: &Step) -> String {
         Verb::Start => devices::start(id, name).map(|_| "ok"),
         Verb::Stop => devices::stop(id, name, 0).map(|_| "ok"),
         Verb::Remove => devices::remove(id, name).map(|r| if r { "ok" } else { "unchanged" }),
+        Verb::Logs { stream, tail } => {
+            return match devices::logs(name, stream, 0, *tail) {
+                Ok(lines) => {
+                    let text: Vec<&str> = lines.iter().map(|l| l.line.as_str()).collect();
+                    let fields = vec![
+                        ("lines".to_owned(), lines.len().to_string()),
+                        ("text".to_owned(), text.join(" | ")),
+                    ];
+                    ("ok".to_owned(), fields)
+                }
+                Err(e) => (format!("{e:?}"), Vec::new()),
+            };
+        }
     };
     match answer {
-        Ok(r) => r.to_owned(),
-        Err(e) => format!("{e:?}"),
+        Ok(r) => (r.to_owned(), Vec::new()),
+        Err(e) => (format!("{e:?}"), Vec::new()),
     }
 }
 
@@ -84,16 +97,15 @@ impl device::Guest for Component {
         // them out of it costs nothing.
         let due = with(|s| s.due(now));
         for step in &due {
-            let result = run(step);
-            log::event(
-                "infra-script",
-                &[
-                    ("step".to_owned(), step.n.to_string()),
-                    ("verb".to_owned(), step.verb.name().to_owned()),
-                    ("name".to_owned(), step.name.clone()),
-                    ("result".to_owned(), result),
-                ],
-            );
+            let (result, extra) = run(step);
+            let mut fields = vec![
+                ("step".to_owned(), step.n.to_string()),
+                ("verb".to_owned(), step.verb.name().to_owned()),
+                ("name".to_owned(), step.name.clone()),
+                ("result".to_owned(), result),
+            ];
+            fields.extend(extra);
+            log::event("infra-script", &fields);
         }
         with(|s| s.next_deadline())
     }

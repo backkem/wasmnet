@@ -11,7 +11,8 @@
 /// world reaches that event, before anything it causes, so it is deterministic, recomputed on
 /// replay (never recorded as an operator input), and a debugger can stop the world between the
 /// request and its effect. Reads (`get`, `list`, `watch`, `logs`) are answered from the
-/// world as it is at the call.
+/// world as it is at the call. `changes.wait` is the one function that does not return at
+/// once: it waits, on virtual time, for a change in the caller's view.
 ///
 /// **No new authority.** The host serves this interface only to devices whose
 /// `DeviceOptions::infra` is set, and refuses to instantiate any other component that imports
@@ -27,6 +28,11 @@
 ///   "config":    { "mac": "02:..", "app.http-server.listen": "0.0.0.0:80", ... },
 ///                                               ; text values; nested maps flatten with "."
 ///   ? "stdio":   "journal",                     ; stdout/stderr lines into the journal
+///                                               ; (what `logs` reads)
+///   ? "args":    [ text ],                      ; arguments after argv[0] (the name), <= 256
+///   ? "env":     { "NAME": "value", ... },      ; environment variables, <= 256, sorted
+///                                               ; by name; both served by wasi:cli/environment;
+///                                               ; each text <= 4 KiB, no NUL, no `=` in a name
 ///   ? "fuel_per_instant": uint,
 ///   ? "wire":    [ { "port": uint, "to": "sw:3" / "sw", ? "latency": uint (ns), ? "mtu": uint } ] }
 ///                                               ; "to" without a port: the first free port
@@ -36,9 +42,10 @@
 /// No other system's types cross this interface: a controller translates whatever it speaks
 /// into these specs.
 ///
-/// Versions: 0.1.1 added `devices.control`. A component built against 0.1.0 still links, since
-/// an addition keeps the `0.1` line compatible.
-package wasmnet:infra@0.1.1;
+/// Versions: 0.1.1 added `devices.control`; 0.1.2 added `changes.wait` and the spec keys `args`
+/// and `env`. A component built against 0.1.0 or 0.1.1 still links, since an addition keeps
+/// the `0.1` line compatible.
+package wasmnet:infra@0.1.2;
 
 interface types {
     /// Virtual time in nanoseconds since the simulation started.
@@ -214,12 +221,36 @@ interface devices {
 
     /// The last `tail` lines (0: all) the device wrote to `stream` (`stdout` or `stderr`) at or
     /// after `since`, oldest first, of a device the caller created (`denied` for the network's own
-    /// devices). Needs the device's `DeviceOptions::journal_stdio` (otherwise none).
+    /// devices). Needs the device's `DeviceOptions::journal_stdio`, which a spec asks for with
+    /// `"stdio": "journal"` (otherwise none).
     logs: func(name: string, %stream: string, since: instant, tail: u32) -> result<list<log-line>, error>;
+}
+
+/// A change feed that wakes its caller (0.1.2), for a controller that should react to a crash
+/// or an exit at once instead of polling `watch` on a timer. A controller without async tasks
+/// (a stepped device) keeps polling `watch` from its `poll`.
+interface changes {
+    use types.{instant, rv, labels, error};
+
+    /// Waits until the caller's view of the device table (see `devices`) has a change after
+    /// `since` to a device whose labels include all of `selector`'s pairs, or until virtual
+    /// time reaches `deadline` (`none`: no deadline), and returns the latest `rv` of the view;
+    /// read the changes with `devices.watch(selector, since, ...)`.
+    ///
+    /// - Returns at once if such a change exists already (`since` older than the latest `rv`),
+    ///   or if `deadline` is not after now.
+    /// - Otherwise the caller's task waits; nothing else of the caller is blocked. A change
+    ///   wakes it in the processing context the change is made in (a request of the caller
+    ///   applying, a device's app exit, a crash), so the caller runs in that event's next round:
+    ///   at the same position on every replay, and the same in a world split over sites.
+    /// - Cancelling the call (dropping it) stops waiting and cancels its deadline.
+    /// - Fails with `denied` from a device that was not granted this interface.
+    wait: async func(selector: labels, since: rv, deadline: option<instant>) -> result<rv, error>;
 }
 
 /// An in-world controller's capability: what the embedder grants a device it marks as a
 /// controller.
 world controller {
     import devices;
+    import changes;
 }

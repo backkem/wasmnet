@@ -14,10 +14,13 @@
 //!   and arguments exercise a retry.
 //! * `<verb> <name> [<rest>]`: `apply <name> <spec>` (the CBOR spec as hex, no labels),
 //!   `control <name> <command> [<argument>]` (the argument is the rest of the line, trimmed),
-//!   `start <name>`, `stop <name>` (no grace period) or `remove <name>`.
+//!   `start <name>`, `stop <name>` (no grace period), `remove <name>`, or
+//!   `logs <name> [stdout|stderr] [<tail>]` (the device's journalled output lines, default
+//!   `stderr` and every line).
 //!
 //! Every step's result is journalled as `infra-script {step, verb, name, result}`: `result` is
-//! `ok`, `unchanged` (an `apply` that changed nothing, a `remove` of nothing) or the error.
+//! `ok`, `unchanged` (an `apply` that changed nothing, a `remove` of nothing) or the error. A
+//! `logs` step adds `lines` (how many) and `text` (the lines, joined with ` | `).
 //! Unknown keys and malformed steps are configuration errors (the glue logs and traps).
 //!
 //! This file is pure logic with no bindings, unit-tested inside wasmtime. The wit-bindgen glue
@@ -33,11 +36,21 @@ use wasmnet_wire::parse_duration;
 /// What a step asks of the infra API.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Verb {
-    Apply { spec: Vec<u8> },
-    Control { command: String, argument: String },
+    Apply {
+        spec: Vec<u8>,
+    },
+    Control {
+        command: String,
+        argument: String,
+    },
     Start,
     Stop,
     Remove,
+    /// `devices.logs` on `stream` (`stdout` or `stderr`), the last `tail` lines (0: all).
+    Logs {
+        stream: String,
+        tail: u32,
+    },
 }
 
 impl Verb {
@@ -48,6 +61,7 @@ impl Verb {
             Verb::Start => "start",
             Verb::Stop => "stop",
             Verb::Remove => "remove",
+            Verb::Logs { .. } => "logs",
         }
     }
 }
@@ -88,7 +102,7 @@ fn hex(text: &str) -> Option<Vec<u8>> {
 
 /// Parses one step's value.
 pub fn parse_step(n: u32, text: &str) -> Result<Step, String> {
-    let syntax = "`<at> [id=<id>] apply|control|start|stop|remove <name> [<rest>]`";
+    let syntax = "`<at> [id=<id>] apply|control|start|stop|remove|logs <name> [<rest>]`";
     let text = text.trim();
     let (at, rest) = text.split_once(char::is_whitespace).ok_or(syntax)?;
     let at = parse_duration(at).ok_or_else(|| format!("`{at}` is not a duration"))?;
@@ -126,6 +140,27 @@ pub fn parse_step(n: u32, text: &str) -> Result<Step, String> {
         "start" => Verb::Start,
         "stop" => Verb::Stop,
         "remove" => Verb::Remove,
+        "logs" => {
+            let mut words = rest.split_whitespace();
+            let stream = match words.next() {
+                None => "stderr",
+                Some(s @ ("stdout" | "stderr")) => s,
+                Some(s) => return Err(format!("logs: `{s}` is not stdout or stderr")),
+            };
+            let tail = match words.next() {
+                None => 0,
+                Some(t) => t
+                    .parse()
+                    .map_err(|_| format!("logs: `{t}` is not a line count"))?,
+            };
+            if words.next().is_some() {
+                return Err("logs: `logs <name> [stdout|stderr] [<tail>]`".to_owned());
+            }
+            Verb::Logs {
+                stream: stream.to_owned(),
+                tail,
+            }
+        }
         _ => return Err(syntax.to_owned()),
     };
     Ok(Step {
@@ -256,6 +291,32 @@ mod tests {
             }
         );
         assert_eq!(again.next_deadline(), None);
+    }
+
+    #[test]
+    fn logs_steps_name_a_stream_and_a_tail() {
+        let logs = |text| parse_step(0, text).map(|s| s.verb);
+        assert_eq!(
+            logs("1ms logs r1"),
+            Ok(Verb::Logs {
+                stream: "stderr".into(),
+                tail: 0
+            })
+        );
+        assert_eq!(
+            logs("1ms logs r1 stdout 3"),
+            Ok(Verb::Logs {
+                stream: "stdout".into(),
+                tail: 3
+            })
+        );
+        for bad in [
+            "1ms logs r1 stdin",
+            "1ms logs r1 stderr x",
+            "1ms logs r1 stderr 1 2",
+        ] {
+            assert!(parse_step(0, bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]
