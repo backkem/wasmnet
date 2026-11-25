@@ -2,7 +2,7 @@
 //! generates.
 //!
 //! A portable extension serves an interface to devices through the core's
-//! [`ImportServer`](wasmnet_core::ImportServer) (`DeviceExt::serve`), the same on every backend.
+//! [`ImportServer`] (`DeviceExt::serve`), the same on every backend.
 //! On wasmtime an adapter generated from the interface's WIT links it (typed, so bytes move
 //! once) and hands each call here: [`attach`] puts the device's servers into its store,
 //! [`call`] finds the interface's server and calls it, a [`Served::Fault`] faults the device
