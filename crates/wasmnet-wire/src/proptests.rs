@@ -24,15 +24,42 @@ fn config(cases: u32, seed: u64) -> proptest::test_runner::Config {
 
 // ---- DNS -------------------------------------------------------------------------------------
 
-/// A name of 1 to 4 labels (mixed case: compression must keep it), or `local` names (mDNS).
+/// A name of 1 to 4 labels (mixed case: compression must keep it), or `local` names (mDNS),
+/// sometimes behind a DNS-SD instance label of any bytes (spaces, dots, backslashes, UTF-8 or
+/// not), escaped as the parser writes it.
 fn name() -> impl Strategy<Value = String> {
-    (vec("[a-zA-Z0-9][a-zA-Z0-9-]{0,11}", 1..4), any::<bool>()).prop_map(|(labels, local)| {
-        let mut n = labels.join(".");
-        if local {
-            n.push_str(".local");
-        }
-        n
-    })
+    (
+        vec("[a-zA-Z0-9][a-zA-Z0-9-]{0,11}", 1..4),
+        any::<bool>(),
+        prop::option::weighted(0.3, instance_label()),
+    )
+        .prop_map(|(labels, local, instance)| {
+            let mut n = labels.join(".");
+            if local {
+                n.push_str(".local");
+            }
+            match instance {
+                Some(i) => alloc::format!("{i}.{n}"),
+                None => n,
+            }
+        })
+}
+
+/// One label of 1 to 63 arbitrary bytes, or of readable text, in presentation form.
+fn instance_label() -> impl Strategy<Value = String> {
+    prop_oneof![
+        vec(any::<u8>(), 1..64).prop_map(|b| dns::escape_label_bytes(&b)),
+        "[ -~é中]{1,20}".prop_map(|s| dns::escape_label(&s)),
+    ]
+}
+
+/// TXT strings of up to 255 bytes each, or none at all.
+fn txt() -> impl Strategy<Value = Vec<Vec<u8>>> {
+    prop_oneof![
+        vec(vec(any::<u8>(), 0..256), 0..4),
+        vec("[a-z]{1,9}(=[ -~]{0,12})?", 0..4)
+            .prop_map(|v| v.into_iter().map(String::into_bytes).collect()),
+    ]
 }
 
 fn rdata() -> impl Strategy<Value = (u16, RData)> {
@@ -53,7 +80,25 @@ fn rdata() -> impl Strategy<Value = (u16, RData)> {
                 minimum: v[4],
             }
         )),
-        vec(any::<u8>(), 0..40).prop_map(|b| (rtype::TXT, RData::Other(b))),
+        (any::<[u16; 3]>(), name()).prop_map(|(v, target)| (
+            rtype::SRV,
+            RData::Srv {
+                priority: v[0],
+                weight: v[1],
+                port: v[2],
+                target,
+            }
+        )),
+        txt().prop_map(|t| (rtype::TXT, RData::Txt(t))),
+        (name(), proptest::collection::btree_set(any::<u16>(), 0..8)).prop_map(|(next, set)| (
+            rtype::NSEC,
+            RData::Nsec {
+                next,
+                types: set.into_iter().collect(),
+            }
+        )),
+        // A type with no typed data (SPF, 99) stays raw bytes.
+        vec(any::<u8>(), 0..40).prop_map(|b| (99, RData::Other(b))),
     ]
 }
 
@@ -128,8 +173,52 @@ proptest! {
     #[test]
     fn dns_decode_of_arbitrary_bytes_never_panics_and_reencodes(bytes in vec(any::<u8>(), 0..300)) {
         if let Ok(m) = Message::parse(&bytes) {
-            prop_assert_eq!(Message::parse(&m.encode()), Ok(m));
+            let again = m.encode();
+            prop_assert_eq!(Message::parse(&again), Ok(m));
+            // Encoding what was parsed is a fixed point: the same bytes every time.
+            prop_assert_eq!(Message::parse(&again).unwrap().encode(), again);
         }
+    }
+
+    #[test]
+    fn dns_decode_of_a_damaged_message_never_panics_and_reencodes(
+        m in message(),
+        hits in vec((any::<prop::sample::Index>(), any::<u8>()), 1..4),
+        cut in any::<prop::sample::Index>(),
+    ) {
+        // A real message (SRV, TXT and NSEC data included) with a few bytes changed, then cut.
+        let mut bytes = m.encode();
+        for (at, v) in hits {
+            let i = at.index(bytes.len());
+            bytes[i] = v;
+        }
+        bytes.truncate(12 + cut.index(bytes.len() - 11));
+        if let Ok(m) = Message::parse(&bytes) {
+            let again = m.encode();
+            prop_assert_eq!(Message::parse(&again), Ok(m));
+            prop_assert_eq!(Message::parse(&again).unwrap().encode(), again);
+        }
+    }
+
+    #[test]
+    fn txt_attributes_round_trip(
+        pairs in proptest::collection::btree_map("[a-z][a-z0-9-]{0,8}", prop::option::of(vec(any::<u8>(), 0..40)), 0..6),
+    ) {
+        let pairs: Vec<dns::TxtPair> = pairs.into_iter().collect();
+        let strings = dns::txt_strings(&pairs);
+        let m = Message {
+            answers: alloc::vec![Record {
+                name: dns::instance_name("Web (2)", "_http._tcp", "local"),
+                rtype: rtype::TXT,
+                class: dns::CLASS_IN,
+                ttl: 4500,
+                data: RData::Txt(strings),
+            }],
+            ..Message::default()
+        };
+        let back = Message::parse(&m.encode()).unwrap();
+        let RData::Txt(strings) = &back.answers[0].data else { panic!("not TXT") };
+        prop_assert_eq!(dns::txt_pairs(strings), pairs);
     }
 
     #[test]

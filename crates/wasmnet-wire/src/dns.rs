@@ -1,10 +1,22 @@
-//! DNS messages (RFC 1035, RFC 3596 for AAAA): parse and encode.
+//! DNS messages (RFC 1035, RFC 3596 for AAAA, RFC 2782 for SRV, RFC 4034 for NSEC): parse and
+//! encode, plus the DNS-SD helpers of RFC 6763 (service instance names, TXT key/value pairs).
 //!
-//! Shared by the netstack's stub resolver (`wasi:sockets/ip-name-lookup`), the `dns-server` app
-//! and packet decoders. Parsing follows compression pointers (bounded, so a pointer loop is
-//! an error, never a hang); encoding compresses names against earlier names in the message, as
-//! servers do. Only the record types wasmnet uses have typed data ([`RData`]); every other type
-//! round-trips as raw bytes.
+//! Shared by the netstack's stub resolver (`wasi:sockets/ip-name-lookup`), the `dns-server` and
+//! `mdns-responder` apps, the app kit's service browser and packet decoders. Parsing follows
+//! compression pointers (bounded, so a pointer loop is an error, never a hang); encoding
+//! compresses names against earlier names in the message, as servers do (in SRV and NSEC data
+//! too, which RFC 6762 §18.14 allows for Multicast DNS). Only the record types wasmnet uses have
+//! typed data ([`RData`]); every other type round-trips as raw bytes.
+//!
+//! # Names
+//!
+//! A name is held in presentation form: labels joined by dots, without the trailing dot, case
+//! preserved. A label is any 1 to 63 bytes on the wire (a DNS-SD instance name such as
+//! `My Printer (2)` holds spaces, and may hold a dot), so the text escapes as RFC 1035 §5.1
+//! does: `\.` is a dot inside a label, `\\` a backslash, and `\DDD` (three decimal digits) a
+//! control character, or any byte of a label that is not UTF-8. A label that is valid UTF-8
+//! keeps its other characters as they are. Parsing a name and encoding it again gives back the
+//! same bytes. [`escape_label`] and [`unescape_label`] convert one label.
 
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
@@ -39,6 +51,7 @@ pub mod rtype {
     pub const AAAA: u16 = 28;
     pub const SRV: u16 = 33;
     pub const OPT: u16 = 41;
+    pub const NSEC: u16 = 47;
     pub const ANY: u16 = 255;
 }
 
@@ -65,6 +78,7 @@ pub fn type_name(t: u16) -> String {
         rtype::AAAA => "AAAA".into(),
         rtype::SRV => "SRV".into(),
         rtype::OPT => "OPT".into(),
+        rtype::NSEC => "NSEC".into(),
         rtype::ANY => "ANY".into(),
         n => format!("TYPE{n}"),
     }
@@ -87,6 +101,7 @@ pub fn type_from_name(name: &str) -> Option<u16> {
         rtype::AAAA,
         rtype::SRV,
         rtype::OPT,
+        rtype::NSEC,
         rtype::ANY,
     ]
     .into_iter()
@@ -188,6 +203,24 @@ pub enum RData {
         expire: u32,
         minimum: u32,
     },
+    /// Where a service is (RFC 2782): its host and port.
+    Srv {
+        priority: u16,
+        weight: u16,
+        port: u16,
+        target: String,
+    },
+    /// Character strings (RFC 1035 §3.3.14), each at most 255 bytes. DNS-SD puts one key or
+    /// `key=value` pair in each string ([`txt_pairs`], [`txt_strings`]). No strings at all is
+    /// empty record data; RFC 6763 §6.1 writes an empty TXT record as one empty string instead.
+    Txt(Vec<Vec<u8>>),
+    /// The owner has records of these types and no others (RFC 4034 §4). Multicast DNS uses it
+    /// for negative answers with `next` set to the owner itself (RFC 6762 §6.1). `types` is
+    /// ascending and without repeats when parsed, and must be so to encode identically.
+    Nsec {
+        next: String,
+        types: Vec<u16>,
+    },
     /// Any other type, as raw bytes.
     Other(Vec<u8>),
 }
@@ -208,9 +241,54 @@ impl RData {
                 expire,
                 minimum,
             } => format!("{mname} {rname} {serial} {refresh} {retry} {expire} {minimum}"),
+            RData::Srv {
+                priority,
+                weight,
+                port,
+                target,
+            } => format!("{priority} {weight} {port} {target}"),
+            RData::Txt(strings) => strings
+                .iter()
+                .map(|s| quoted(s))
+                .collect::<Vec<_>>()
+                .join(" "),
+            RData::Nsec { next, types } => {
+                let mut t = next.clone();
+                for ty in types {
+                    t.push(' ');
+                    t.push_str(&type_name(*ty));
+                }
+                t
+            }
             RData::Other(b) => format!("\\# {}", b.len()),
         }
     }
+
+    /// The record data as on the wire with every name written out in full (no compression
+    /// pointers): what RFC 6762 §8.2 compares in a probe tiebreak, and a key for a cache.
+    pub fn wire_bytes(&self) -> Vec<u8> {
+        let mut b = Vec::new();
+        write_rdata(&mut b, self, None);
+        b
+    }
+}
+
+/// A character string in presentation form: in double quotes, `"` and `\` escaped, bytes
+/// outside printable ASCII as `\DDD`.
+fn quoted(s: &[u8]) -> String {
+    let mut t = String::from("\"");
+    for &c in s {
+        match c {
+            b'"' | b'\\' => {
+                t.push('\\');
+                t.push(char::from(c));
+            }
+            0x20..=0x7e => t.push(char::from(c)),
+            _ => t.push_str(&format!("\\{c:03}")),
+        }
+    }
+    t.push('"');
+    t
 }
 
 /// One resource record.
@@ -248,7 +326,7 @@ impl Message {
             id,
             flags: RD,
             questions: vec![Question {
-                name: name.strip_suffix('.').unwrap_or(name).into(),
+                name: strip_root(name).into(),
                 qtype,
                 qclass: CLASS_IN,
             }],
@@ -378,27 +456,7 @@ impl Message {
             b.extend_from_slice(&r.ttl.to_be_bytes());
             let len_at = b.len();
             b.extend_from_slice(&[0, 0]);
-            match &r.data {
-                RData::A(a) => b.extend_from_slice(&a.octets()),
-                RData::Aaaa(a) => b.extend_from_slice(&a.octets()),
-                RData::Cname(n) | RData::Ns(n) | RData::Ptr(n) => write_name(&mut b, n, &mut seen),
-                RData::Soa {
-                    mname,
-                    rname,
-                    serial,
-                    refresh,
-                    retry,
-                    expire,
-                    minimum,
-                } => {
-                    write_name(&mut b, mname, &mut seen);
-                    write_name(&mut b, rname, &mut seen);
-                    for v in [serial, refresh, retry, expire, minimum] {
-                        b.extend_from_slice(&v.to_be_bytes());
-                    }
-                }
-                RData::Other(raw) => b.extend_from_slice(raw),
-            }
+            write_rdata(&mut b, &r.data, Some(&mut seen));
             let len = b.len() - len_at - 2;
             debug_assert!(len <= usize::from(u16::MAX), "{len} bytes of record data");
             b[len_at..len_at + 2].copy_from_slice(&(len as u16).to_be_bytes());
@@ -412,6 +470,8 @@ fn read_name(b: &[u8], at: &mut usize) -> Result<String, DnsError> {
     let mut name = String::new();
     let mut pos = *at;
     let mut jumped = false;
+    // On the wire: every label with its length byte, plus the root's zero (at most 255).
+    let mut wire_len = 1;
     // Every pointer must go strictly backwards, which stops a pointer to itself, but not labels
     // that run into the same pointer again: that loops, and only the jump cap ends it.
     let mut jumps = 0;
@@ -428,16 +488,14 @@ fn read_name(b: &[u8], at: &mut usize) -> Result<String, DnsError> {
                 let label = b
                     .get(pos + 1..pos + 1 + usize::from(len))
                     .ok_or(DnsError::Truncated)?;
+                wire_len += 1 + label.len();
+                if wire_len > 255 {
+                    return Err(DnsError::BadName);
+                }
                 if !name.is_empty() {
                     name.push('.');
                 }
-                if label.iter().any(|&c| c == b'.' || !c.is_ascii_graphic()) {
-                    return Err(DnsError::BadName);
-                }
-                name.extend(label.iter().map(|&c| char::from(c)));
-                if name.len() > 253 {
-                    return Err(DnsError::BadName);
-                }
+                name.push_str(&escape_label_bytes(label));
                 pos += 1 + usize::from(len);
             }
             0xc0 => {
@@ -467,10 +525,11 @@ fn read_record(b: &[u8], at: &mut usize) -> Result<Record, DnsError> {
     let ttl = u32::from_be_bytes([head[4], head[5], head[6], head[7]]);
     let len = usize::from(u16::from_be_bytes([head[8], head[9]]));
     let start = *at + 10;
+    let end = start + len;
     let raw = field(start, len)?;
     let name_in = |mut p: usize| -> Result<String, DnsError> {
         let n = read_name(b, &mut p)?;
-        (p <= start + len).then_some(n).ok_or(DnsError::BadRecord)
+        (p <= end).then_some(n).ok_or(DnsError::BadRecord)
     };
     let data = match rtype {
         rtype::A => RData::A(Ipv4Addr::from(
@@ -488,7 +547,7 @@ fn read_record(b: &[u8], at: &mut usize) -> Result<Record, DnsError> {
             let rname = read_name(b, &mut p)?;
             let nums = b
                 .get(p..p + 20)
-                .filter(|_| p + 20 == start + len)
+                .filter(|_| p + 20 == end)
                 .ok_or(DnsError::BadRecord)?;
             let n = |i: usize| u32::from_be_bytes([nums[i], nums[i + 1], nums[i + 2], nums[i + 3]]);
             RData::Soa {
@@ -501,9 +560,44 @@ fn read_record(b: &[u8], at: &mut usize) -> Result<Record, DnsError> {
                 minimum: n(16),
             }
         }
+        rtype::SRV => {
+            let w = |i: usize| -> Result<u16, DnsError> {
+                Ok(u16::from_be_bytes([
+                    *raw.get(i).ok_or(DnsError::BadRecord)?,
+                    *raw.get(i + 1).ok_or(DnsError::BadRecord)?,
+                ]))
+            };
+            RData::Srv {
+                priority: w(0)?,
+                weight: w(2)?,
+                port: w(4)?,
+                target: name_in(start + 6).map_err(|_| DnsError::BadRecord)?,
+            }
+        }
+        rtype::TXT => {
+            let mut strings = Vec::new();
+            let mut rest = raw;
+            while let Some((&n, tail)) = rest.split_first() {
+                let s = tail.get(..usize::from(n)).ok_or(DnsError::BadRecord)?;
+                strings.push(s.to_vec());
+                rest = &tail[usize::from(n)..];
+            }
+            RData::Txt(strings)
+        }
+        rtype::NSEC => {
+            let mut p = start;
+            let next = read_name(b, &mut p)?;
+            if p > end {
+                return Err(DnsError::BadRecord);
+            }
+            RData::Nsec {
+                next,
+                types: read_type_bitmap(&b[p..end])?,
+            }
+        }
         _ => RData::Other(raw.to_vec()),
     };
-    *at = start + len;
+    *at = end;
     Ok(Record {
         name,
         rtype,
@@ -513,9 +607,113 @@ fn read_record(b: &[u8], at: &mut usize) -> Result<Record, DnsError> {
     })
 }
 
+/// RFC 4034 §4.1.2's type bit maps, in their one canonical form: windows ascending, each of 1
+/// to 32 bytes whose last byte is not zero. Anything else is malformed, so that what parses
+/// encodes back to the same bytes.
+fn read_type_bitmap(mut b: &[u8]) -> Result<Vec<u16>, DnsError> {
+    let mut types = Vec::new();
+    let mut last_window: Option<u8> = None;
+    while !b.is_empty() {
+        let [window, len, ..] = *b else {
+            return Err(DnsError::BadRecord);
+        };
+        let bits = b
+            .get(2..2 + usize::from(len))
+            .filter(|bits| (1..=32).contains(&bits.len()) && bits.last() != Some(&0))
+            .ok_or(DnsError::BadRecord)?;
+        if last_window.is_some_and(|w| w >= window) {
+            return Err(DnsError::BadRecord);
+        }
+        last_window = Some(window);
+        for (i, byte) in bits.iter().enumerate() {
+            for bit in 0..8u16 {
+                if byte & (0x80u8 >> bit) != 0 {
+                    types.push(u16::from(window) << 8 | (i as u16) << 3 | bit);
+                }
+            }
+        }
+        b = &b[2 + bits.len()..];
+    }
+    Ok(types)
+}
+
+fn write_type_bitmap(b: &mut Vec<u8>, types: &[u16]) {
+    let mut set: Vec<u16> = types.to_vec();
+    set.sort_unstable();
+    set.dedup();
+    let mut i = 0;
+    while i < set.len() {
+        let window = (set[i] >> 8) as u8;
+        let mut bits = [0u8; 32];
+        let mut used = 0;
+        while i < set.len() && (set[i] >> 8) as u8 == window {
+            let low = usize::from(set[i] as u8);
+            bits[low / 8] |= 0x80 >> (low % 8);
+            used = low / 8 + 1;
+            i += 1;
+        }
+        b.push(window);
+        b.push(used as u8);
+        b.extend_from_slice(&bits[..used]);
+    }
+}
+
+/// Writes record data; names are compressed against `seen` when it is given, written out in
+/// full otherwise.
+fn write_rdata(b: &mut Vec<u8>, data: &RData, mut seen: Option<&mut BTreeMap<String, u16>>) {
+    let mut name = |b: &mut Vec<u8>, n: &str| match seen.as_deref_mut() {
+        Some(seen) => write_name(b, n, seen),
+        None => write_name(b, n, &mut BTreeMap::new()),
+    };
+    match data {
+        RData::A(a) => b.extend_from_slice(&a.octets()),
+        RData::Aaaa(a) => b.extend_from_slice(&a.octets()),
+        RData::Cname(n) | RData::Ns(n) | RData::Ptr(n) => name(b, n),
+        RData::Soa {
+            mname,
+            rname,
+            serial,
+            refresh,
+            retry,
+            expire,
+            minimum,
+        } => {
+            name(b, mname);
+            name(b, rname);
+            for v in [serial, refresh, retry, expire, minimum] {
+                b.extend_from_slice(&v.to_be_bytes());
+            }
+        }
+        RData::Srv {
+            priority,
+            weight,
+            port,
+            target,
+        } => {
+            for v in [priority, weight, port] {
+                b.extend_from_slice(&v.to_be_bytes());
+            }
+            name(b, target);
+        }
+        RData::Txt(strings) => {
+            for s in strings {
+                debug_assert!(s.len() <= 255, "a TXT string of {} bytes", s.len());
+                let s = &s[..s.len().min(255)];
+                b.push(s.len() as u8);
+                b.extend_from_slice(s);
+            }
+        }
+        RData::Nsec { next, types } => {
+            name(b, next);
+            write_type_bitmap(b, types);
+        }
+        RData::Other(raw) => b.extend_from_slice(raw),
+    }
+}
+
 /// Writes `name`, ending in a pointer to the longest suffix already written (offsets < 0x4000).
 fn write_name(b: &mut Vec<u8>, name: &str, seen: &mut BTreeMap<String, u16>) {
-    let name = name.strip_suffix('.').unwrap_or(name);
+    let name = strip_root(name);
     let mut rest = name;
     while !rest.is_empty() {
         // Case-sensitive: a pointer must reproduce the name exactly (servers may match
@@ -528,14 +726,15 @@ fn write_name(b: &mut Vec<u8>, name: &str, seen: &mut BTreeMap<String, u16>) {
         if b.len() < 0x4000 {
             seen.insert(key, b.len() as u16);
         }
-        let (label, tail) = rest.split_once('.').unwrap_or((rest, ""));
+        let (label, tail) = split_label(rest);
+        let label = unescape_label(label);
         // An empty label would end the name early; one over 63 bytes cannot be written.
         debug_assert!(
             (1..=63).contains(&label.len()),
             "a DNS label of {} bytes in {name:?}",
             label.len()
         );
-        let label = &label.as_bytes()[..label.len().min(63)];
+        let label = &label[..label.len().min(63)];
         b.push(label.len() as u8);
         b.extend_from_slice(label);
         rest = tail;
@@ -543,11 +742,203 @@ fn write_name(b: &mut Vec<u8>, name: &str, seen: &mut BTreeMap<String, u16>) {
     b.push(0);
 }
 
+/// The name without its trailing dot (the root), if it has one that is not escaped.
+fn strip_root(name: &str) -> &str {
+    match name.strip_suffix('.') {
+        Some(rest) if rest.bytes().rev().take_while(|&c| c == b'\\').count() % 2 == 0 => rest,
+        _ => name,
+    }
+}
+
+/// Splits a name in presentation form at its first unescaped dot: the first label (still
+/// escaped) and the rest.
+pub fn split_label(name: &str) -> (&str, &str) {
+    let bytes = name.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2,
+            b'.' => return (&name[..i], &name[i + 1..]),
+            _ => i += 1,
+        }
+    }
+    (name, "")
+}
+
+/// One label of a name in presentation form, as text: a dot becomes `\.`, a backslash `\\`, and
+/// a control character `\DDD`. `escape_label("Web (2)")` is `Web (2)`;
+/// `escape_label("v1.2")` is `v1\.2`.
+pub fn escape_label(label: &str) -> String {
+    escape_label_bytes(label.as_bytes())
+}
+
+/// [`escape_label`] for a label's raw bytes, as [`Message::parse`] does it: UTF-8 stays as it
+/// is (but for dots, backslashes and control characters); in a label that is not UTF-8 every
+/// byte outside printable ASCII is `\DDD`.
+pub fn escape_label_bytes(label: &[u8]) -> String {
+    let mut t = String::with_capacity(label.len());
+    let escape = |t: &mut String, c: u32| match c {
+        0x2e => t.push_str("\\."),
+        0x5c => t.push_str("\\\\"),
+        0..=0x1f | 0x7f => t.push_str(&format!("\\{c:03}")),
+        _ => {}
+    };
+    match core::str::from_utf8(label) {
+        Ok(s) => {
+            for ch in s.chars() {
+                match u32::from(ch) {
+                    c @ (0x2e | 0x5c | 0..=0x1f | 0x7f) => escape(&mut t, c),
+                    _ => t.push(ch),
+                }
+            }
+        }
+        Err(_) => {
+            for &c in label {
+                match c {
+                    b'.' | b'\\' | 0..=0x1f | 0x7f => escape(&mut t, u32::from(c)),
+                    0x20..=0x7e => t.push(char::from(c)),
+                    _ => t.push_str(&format!("\\{c:03}")),
+                }
+            }
+        }
+    }
+    t
+}
+
+/// The bytes of one label in presentation form: the inverse of [`escape_label_bytes`]. A
+/// backslash that starts no valid escape is kept as it is.
+pub fn unescape_label(label: &str) -> Vec<u8> {
+    let b = label.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\\' {
+            let digits = b
+                .get(i + 1..i + 4)
+                .filter(|d| d.iter().all(u8::is_ascii_digit));
+            if let Some(d) = digits {
+                let v = d.iter().fold(0u32, |v, c| v * 10 + u32::from(c - b'0'));
+                if let Ok(byte) = u8::try_from(v) {
+                    out.push(byte);
+                    i += 4;
+                    continue;
+                }
+            }
+            if let Some(&c) = b.get(i + 1)
+                && !c.is_ascii_digit()
+            {
+                out.push(c);
+                i += 2;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    out
+}
+
 /// Case-insensitive name equality, ignoring one trailing dot.
 pub fn same_name(a: &str, b: &str) -> bool {
-    a.strip_suffix('.')
-        .unwrap_or(a)
-        .eq_ignore_ascii_case(b.strip_suffix('.').unwrap_or(b))
+    strip_root(a).eq_ignore_ascii_case(strip_root(b))
+}
+
+// ---- DNS-SD (RFC 6763) ------------------------------------------------------------------------
+
+/// The name a DNS-SD browser asks for the service types on a link (RFC 6763 §9).
+pub const DNS_SD_SERVICES: &str = "_services._dns-sd._udp.local";
+
+/// Whether `t` is a service type as RFC 6763 §7 writes it: `_<name>._tcp` or `_<name>._udp`,
+/// where the name has 1 to 15 letters, digits and hyphens, at least one letter, and no hyphen
+/// at either end or next to another (RFC 6335 §5.1).
+pub fn valid_service_type(t: &str) -> bool {
+    let Some((name, proto)) = t.split_once('.') else {
+        return false;
+    };
+    let Some(name) = name.strip_prefix('_') else {
+        return false;
+    };
+    (proto == "_tcp" || proto == "_udp")
+        && (1..=15).contains(&name.len())
+        && name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-')
+        && name.bytes().any(|c| c.is_ascii_alphabetic())
+        && !name.starts_with('-')
+        && !name.ends_with('-')
+        && !name.contains("--")
+}
+
+/// Whether `instance` can be a service instance name (RFC 6763 §4.1.1): 1 to 63 bytes of UTF-8,
+/// no control characters. Dots, spaces and any other characters are allowed.
+pub fn valid_instance(instance: &str) -> bool {
+    (1..=63).contains(&instance.len()) && !instance.chars().any(char::is_control)
+}
+
+/// The full name of a service instance: `instance_name("Web (2)", "_http._tcp", "local")` is
+/// `Web (2)._http._tcp.local`, the instance label escaped ([`escape_label`]).
+pub fn instance_name(instance: &str, service_type: &str, domain: &str) -> String {
+    format!("{}.{service_type}.{domain}", escape_label(instance))
+}
+
+/// Splits a service instance's full name into its instance (unescaped; bytes that are not
+/// UTF-8 replaced) and the rest, the service type and domain:
+/// `Web (2)._http._tcp.local` is `("Web (2)", "_http._tcp.local")`.
+pub fn split_instance(name: &str) -> (String, &str) {
+    let (label, rest) = split_label(strip_root(name));
+    let bytes = unescape_label(label);
+    (String::from_utf8_lossy(&bytes).into_owned(), rest)
+}
+
+/// One TXT attribute (RFC 6763 §6.4, §6.5): a key with no value (`key`, a boolean that is
+/// present), or with a value that may be empty (`key=`) and may hold any bytes.
+pub type TxtPair = (String, Option<Vec<u8>>);
+
+/// The strings of a TXT record for these attributes, in order: `key` or `key=value`. With no
+/// attributes, one empty string (RFC 6763 §6.1). Keys are not checked here
+/// ([`valid_txt_key`]); a string longer than 255 bytes is the caller's to avoid.
+pub fn txt_strings(pairs: &[TxtPair]) -> Vec<Vec<u8>> {
+    if pairs.is_empty() {
+        return vec![Vec::new()];
+    }
+    pairs
+        .iter()
+        .map(|(key, value)| {
+            let mut s = key.as_bytes().to_vec();
+            if let Some(v) = value {
+                s.push(b'=');
+                s.extend_from_slice(v);
+            }
+            s
+        })
+        .collect()
+}
+
+/// Whether `key` can be a TXT attribute's key (RFC 6763 §6.4): 1 to 9 characters are
+/// recommended, at most 255 bytes are allowed, of printable ASCII (space included) except `=`.
+pub fn valid_txt_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= 255
+        && key.bytes().all(|c| (0x20..=0x7e).contains(&c) && c != b'=')
+}
+
+/// The attributes in a TXT record's strings, as RFC 6763 §6.4 reads them: an empty string, one
+/// that starts with `=` or whose key is not printable ASCII is skipped, and of a key that
+/// appears twice (compared without case) only the first counts.
+pub fn txt_pairs(strings: &[Vec<u8>]) -> Vec<TxtPair> {
+    let mut out: Vec<TxtPair> = Vec::new();
+    for s in strings {
+        let (key, value) = match s.iter().position(|&c| c == b'=') {
+            Some(i) => (&s[..i], Some(s[i + 1..].to_vec())),
+            None => (&s[..], None),
+        };
+        let Ok(key) = core::str::from_utf8(key) else {
+            continue;
+        };
+        if !valid_txt_key(key) || out.iter().any(|(k, _)| k.eq_ignore_ascii_case(key)) {
+            continue;
+        }
+        out.push((key.to_string(), value));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -659,5 +1050,190 @@ mod tests {
         r[7] = 1;
         r.extend_from_slice(&[0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 3, 1, 2, 3]);
         assert_eq!(Message::parse(&r), Err(DnsError::BadRecord));
+    }
+
+    fn record(name: &str, rtype: u16, data: RData) -> Record {
+        Record {
+            name: name.into(),
+            rtype,
+            class: CLASS_IN | MDNS_CLASS_BIT,
+            ttl: 120,
+            data,
+        }
+    }
+
+    #[test]
+    fn service_records_round_trip_with_compression() {
+        let instance = instance_name("Alpha Web (2)", "_http._tcp", "local");
+        assert_eq!(instance, "Alpha Web (2)._http._tcp.local");
+        let mut m = Message {
+            flags: 0x8400,
+            ..Message::default()
+        };
+        m.answers.push(record(
+            "_http._tcp.local",
+            rtype::PTR,
+            RData::Ptr(instance.clone()),
+        ));
+        m.answers.push(record(
+            &instance,
+            rtype::SRV,
+            RData::Srv {
+                priority: 0,
+                weight: 0,
+                port: 80,
+                target: "alpha.local".into(),
+            },
+        ));
+        m.answers.push(record(
+            &instance,
+            rtype::TXT,
+            RData::Txt(vec![b"path=/".to_vec(), b"secure".to_vec()]),
+        ));
+        m.additionals.push(record(
+            "alpha.local",
+            rtype::NSEC,
+            RData::Nsec {
+                next: "alpha.local".into(),
+                types: vec![rtype::A],
+            },
+        ));
+        let bytes = m.encode();
+        assert_eq!(Message::parse(&bytes).unwrap(), m);
+        // The SRV target and the NSEC's next name point at earlier copies.
+        // Six bytes, then `alpha` and a pointer to `local` (from `_http._tcp.local`).
+        let srv_at = bytes
+            .windows(6)
+            .position(|w| w == [0, 0, 0, 0, 0, 80])
+            .unwrap();
+        assert_eq!(bytes[srv_at - 2..srv_at], [0, 14], "6 + 5alpha + pointer");
+        let nsec_name = bytes.len() - 3 - 2;
+        assert_eq!(
+            bytes[nsec_name] & 0xc0,
+            0xc0,
+            "the NSEC next name is a pointer"
+        );
+        assert_eq!(m.answers[1].data.text(), "0 0 80 alpha.local");
+        assert_eq!(m.answers[2].data.text(), "\"path=/\" \"secure\"");
+        assert_eq!(m.additionals[0].data.text(), "alpha.local A");
+        // RFC 4034 §4.1.2: window 0, one byte, bit 1 (A).
+        assert_eq!(
+            m.additionals[0].data.wire_bytes(),
+            [
+                5, b'a', b'l', b'p', b'h', b'a', 5, b'l', b'o', b'c', b'a', b'l', 0, 0, 1, 0x40
+            ]
+        );
+        assert_eq!(type_name(rtype::NSEC), "NSEC");
+        assert_eq!(type_from_name("nsec"), Some(rtype::NSEC));
+    }
+
+    #[test]
+    fn instance_labels_escape_dots_and_backslashes() {
+        assert_eq!(escape_label("v1.2 \\ x"), "v1\\.2 \\\\ x");
+        assert_eq!(unescape_label("v1\\.2 \\\\ x"), b"v1.2 \\ x");
+        assert_eq!(escape_label_bytes(&[0xff, b'a', 7]), "\\255a\\007");
+        assert_eq!(unescape_label("\\255a\\007"), [0xff, b'a', 7]);
+        assert_eq!(escape_label("Café"), "Café");
+        let name = instance_name("v1.2", "_ipp._tcp", "local");
+        assert_eq!(name, "v1\\.2._ipp._tcp.local");
+        assert_eq!(
+            split_instance(&name),
+            (String::from("v1.2"), "_ipp._tcp.local")
+        );
+        let m = Message::query(0, &name, rtype::SRV);
+        let bytes = m.encode();
+        // One label of four bytes, `v1.2`, then `_ipp`.
+        assert_eq!(&bytes[12..18], &[4, b'v', b'1', b'.', b'2', 4]);
+        assert_eq!(Message::parse(&bytes).unwrap(), m);
+        // A name ending in an escaped dot keeps it.
+        assert_eq!(strip_root("a\\."), "a\\.");
+        assert_eq!(strip_root("a\\\\."), "a\\\\");
+        assert!(same_name("A\\.b.local.", "a\\.B.local"));
+    }
+
+    #[test]
+    fn service_types_and_instances_are_validated() {
+        assert!(valid_service_type("_http._tcp") && valid_service_type("_x-y2._udp"));
+        for bad in [
+            "http._tcp",
+            "_http._sctp",
+            "_._tcp",
+            "_-a._tcp",
+            "_a--b._tcp",
+            "_12._tcp",
+        ] {
+            assert!(!valid_service_type(bad), "{bad}");
+        }
+        assert!(
+            !valid_service_type("_abcdefghijklmnop._tcp"),
+            "16 characters"
+        );
+        assert!(valid_instance("My Printer (2)") && valid_instance("a.b"));
+        assert!(!valid_instance("") && !valid_instance("a\nb") && !valid_instance(&"x".repeat(64)));
+    }
+
+    #[test]
+    fn txt_attributes_follow_rfc_6763() {
+        let pairs = vec![
+            (String::from("path"), Some(b"/".to_vec())),
+            (String::from("secure"), None),
+            (String::from("empty"), Some(Vec::new())),
+        ];
+        let strings = txt_strings(&pairs);
+        assert_eq!(
+            strings,
+            [b"path=/".to_vec(), b"secure".to_vec(), b"empty=".to_vec()]
+        );
+        assert_eq!(txt_pairs(&strings), pairs);
+        assert_eq!(txt_strings(&[]), [Vec::<u8>::new()], "one empty string");
+        // Skipped: empty, no key, a repeated key (any case); the first value wins.
+        let read = txt_pairs(&[
+            Vec::new(),
+            b"=x".to_vec(),
+            b"a=1".to_vec(),
+            b"A=2".to_vec(),
+            b"b=x=y".to_vec(),
+        ]);
+        assert_eq!(
+            read,
+            [
+                (String::from("a"), Some(b"1".to_vec())),
+                (String::from("b"), Some(b"x=y".to_vec()))
+            ]
+        );
+    }
+
+    #[test]
+    fn malformed_service_records_are_errors() {
+        let answer = |rtype: u16, data: &[u8]| {
+            let mut r = Message::response_to(&Message::query(1, "a", rtype::A), 0).encode();
+            r[7] = 1;
+            r.extend_from_slice(&[0xc0, 12]);
+            r.extend_from_slice(&rtype.to_be_bytes());
+            r.extend_from_slice(&[0, 1, 0, 0, 0, 60]);
+            r.extend_from_slice(&(data.len() as u16).to_be_bytes());
+            r.extend_from_slice(data);
+            Message::parse(&r)
+        };
+        // A TXT string that runs past the record.
+        assert_eq!(answer(rtype::TXT, &[3, b'a']), Err(DnsError::BadRecord));
+        assert!(answer(rtype::TXT, &[]).is_ok(), "empty TXT data");
+        // An SRV shorter than its fixed part, or whose target runs past the record.
+        assert_eq!(answer(rtype::SRV, &[0, 0, 0]), Err(DnsError::BadRecord));
+        assert_eq!(
+            answer(rtype::SRV, &[0, 0, 0, 0, 0, 80, 1, b'a']),
+            Err(DnsError::BadRecord)
+        );
+        // NSEC bitmaps: a trailing zero byte, an empty window, windows out of order.
+        let nsec = |bitmap: &[u8]| {
+            let mut d = vec![0];
+            d.extend_from_slice(bitmap);
+            answer(rtype::NSEC, &d)
+        };
+        assert!(nsec(&[0, 1, 0x40]).is_ok());
+        assert_eq!(nsec(&[0, 2, 0x40, 0]), Err(DnsError::BadRecord));
+        assert_eq!(nsec(&[0, 0]), Err(DnsError::BadRecord));
+        assert_eq!(nsec(&[1, 1, 0x40, 0, 1, 0x40]), Err(DnsError::BadRecord));
+        assert_eq!(nsec(&[0, 1]), Err(DnsError::BadRecord));
     }
 }

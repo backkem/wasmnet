@@ -204,6 +204,9 @@ fn rtype_of(d: &RData) -> u16 {
         RData::Ns(_) => rtype::NS,
         RData::Ptr(_) => rtype::PTR,
         RData::Soa { .. } => rtype::SOA,
+        RData::Srv { .. } => rtype::SRV,
+        RData::Txt(_) => rtype::TXT,
+        RData::Nsec { .. } => rtype::NSEC,
         RData::Other(_) => 0,
     }
 }
