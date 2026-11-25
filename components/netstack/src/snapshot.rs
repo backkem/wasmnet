@@ -29,14 +29,18 @@ use wasmnet_wire::MacAddr;
 
 use crate::device::FrameCounters;
 use crate::resolver::ResolverCounters;
-use crate::stack::{Stack, StackCounters};
+use crate::sockets::Handle;
+use crate::stack::{PortCounters, Stack, StackCounters};
 use crate::tcp::TcpCounters;
 use crate::udp::UdpCounters;
 
 const MAGIC: &[u8; 7] = b"NSSTATE";
 /// 2: version 1 had a reserved `u32` after the ICMP sockets, always 0.
 /// 3: the TCP counters gained `path_mtu_lowered`.
-const VERSION: u8 = 3;
+/// 4: several ports: a port count, then each port's interface state, tables and counters;
+///    every socket slot names its port; a UDP membership names its interface; a listener lists
+///    its ports.
+const VERSION: u8 = 4;
 
 /// A snapshot writer: little-endian scalars, length-prefixed collections.
 #[derive(Default)]
@@ -100,6 +104,14 @@ impl W {
     }
     pub fn mac(&mut self, m: MacAddr) {
         self.0.extend_from_slice(&m.octets());
+    }
+    /// Socket slots: a count, then each one's port and slot index.
+    pub fn handles(&mut self, hs: &[Handle]) {
+        self.count(hs.len());
+        for h in hs {
+            self.u32(h.port as u32);
+            self.u64(h.slot.index() as u64);
+        }
     }
 }
 
@@ -189,6 +201,15 @@ impl<'a> R<'a> {
     pub fn mac(&mut self) -> Res<MacAddr> {
         Ok(MacAddr(self.arr::<6>()?))
     }
+    /// [`W::handles`]: `(port, slot)` pairs.
+    pub fn handles(&mut self) -> Res<Vec<(usize, usize)>> {
+        let mut all = Vec::new();
+        for _ in 0..self.count()? {
+            let port = self.u32()? as usize;
+            all.push((port, self.u64()? as usize));
+        }
+        Ok(all)
+    }
     pub fn end(&self) -> Res<()> {
         if self.at == self.b.len() {
             Ok(())
@@ -232,6 +253,12 @@ counters!(StackCounters {
     icmp_errors_received,
     multicast_joins,
     multicast_leaves,
+});
+counters!(PortCounters {
+    arp_resolved,
+    ndp_resolved,
+    multicast_queries,
+    icmp_errors_received,
 });
 counters!(FrameCounters {
     rx_frames,
@@ -446,36 +473,35 @@ impl Stack {
         let mut w = W::default();
         w.0.extend_from_slice(MAGIC);
         w.u8(VERSION);
-        // What the restoring stack must have been built from (the same config).
-        w.mac(self.mac);
-        let addrs: Vec<String> = self
-            .iface
-            .ip_addrs()
-            .iter()
-            .map(|c| c.to_string())
-            .collect();
-        w.bytes(addrs.join(",").as_bytes());
-        put_iface(&mut w, &self.iface.snapshot_state())?;
-        put_times(&mut w, &self.arp_pending, IpAddr::V4);
-        put_times(&mut w, &self.nd_pending, IpAddr::V6);
-        let (due, window) = self.mcast.parts();
-        w.opt_u64(due);
-        w.opt_u64(window.map(|w| w.0));
-        w.opt_u64(window.map(|w| w.1));
-        w.bool(self.carrier);
-        w.count(self.joined.len());
-        for a in &self.joined {
-            w.ip(*a);
-        }
-        w.count(self.neighbors.len());
-        for (a, (m, t)) in &self.neighbors {
-            w.ip(*a);
-            w.mac(*m);
-            w.u64(*t);
+        w.count(self.ports.len());
+        for p in &self.ports {
+            // What the restoring stack must have been built from (the same config).
+            w.mac(p.mac);
+            let addrs: Vec<String> = p.iface.ip_addrs().iter().map(|c| c.to_string()).collect();
+            w.bytes(addrs.join(",").as_bytes());
+            put_iface(&mut w, &p.iface.snapshot_state())?;
+            put_times(&mut w, &p.arp_pending, IpAddr::V4);
+            put_times(&mut w, &p.nd_pending, IpAddr::V6);
+            let (due, window) = p.mcast.parts();
+            w.opt_u64(due);
+            w.opt_u64(window.map(|w| w.0));
+            w.opt_u64(window.map(|w| w.1));
+            w.bool(p.carrier);
+            w.count(p.joined.len());
+            for a in &p.joined {
+                w.ip(*a);
+            }
+            w.count(p.neighbors.len());
+            for (a, (m, t)) in &p.neighbors {
+                w.ip(*a);
+                w.mac(*m);
+                w.u64(*t);
+            }
+            p.counters.put(&mut w);
+            p.dev.counters.put(&mut w);
         }
         self.icmp.snapshot_save(&mut w)?;
         self.counters.put(&mut w);
-        self.dev.counters.put(&mut w);
         self.resolver.snapshot_save(&mut w);
         self.udp.snapshot_save(&mut w, &self.sockets)?;
         self.tcp.snapshot_save(&mut w, &self.sockets)?;
@@ -483,7 +509,8 @@ impl Stack {
     }
 
     /// Puts a saved state onto this stack, which must be fresh and built from the same config
-    /// (the same MAC and addresses): no app socket yet. On an error the stack must be dropped.
+    /// (the same ports, MACs and addresses): no app socket yet. On an error the stack must be
+    /// dropped.
     pub fn restore(&mut self, bytes: &[u8]) -> Res<()> {
         let mut r = R::new(bytes);
         if r.take(MAGIC.len())? != MAGIC {
@@ -495,64 +522,66 @@ impl Stack {
                 "netstack state version {version}, expected {VERSION}"
             ));
         }
-        let mac = r.mac()?;
-        if mac != self.mac {
+        let count = r.count()?;
+        if count != self.ports.len() {
             return Err(format!(
-                "the state is of MAC {mac}, this node is {}",
-                self.mac
+                "the state is of {count} ports, this node has {}",
+                self.ports.len()
             ));
         }
-        let addrs = String::from_utf8(r.bytes()?).map_err(|e| e.to_string())?;
-        let ours: Vec<String> = self
-            .iface
-            .ip_addrs()
-            .iter()
-            .map(|c| c.to_string())
-            .collect();
-        if addrs != ours.join(",") {
-            return Err(format!(
-                "the state is of addresses {addrs}, this node has {}",
-                ours.join(",")
-            ));
-        }
-        if self.sockets.iter().next().is_some()
+        if !self.sockets.is_empty()
             || !self.udp.is_empty()
             || !self.tcp.is_empty()
             || !self.icmp.is_empty()
         {
             return Err("a netstack state restores onto a fresh stack only".into());
         }
-        let iface = get_iface(&mut r)?;
-        self.iface.restore_state(&iface)?;
-        let mut arp = BTreeMap::new();
-        for _ in 0..r.count()? {
-            arp.insert(v4(r.ip()?)?, r.u64()?);
+        for p in &mut self.ports {
+            let mac = r.mac()?;
+            if mac != p.mac {
+                return Err(format!("the state is of MAC {mac}, this node is {}", p.mac));
+            }
+            let addrs = String::from_utf8(r.bytes()?).map_err(|e| e.to_string())?;
+            let ours: Vec<String> = p.iface.ip_addrs().iter().map(|c| c.to_string()).collect();
+            if addrs != ours.join(",") {
+                return Err(format!(
+                    "the state is of addresses {addrs}, this node has {}",
+                    ours.join(",")
+                ));
+            }
+            let iface = get_iface(&mut r)?;
+            p.iface.restore_state(&iface)?;
+            let mut arp = BTreeMap::new();
+            for _ in 0..r.count()? {
+                arp.insert(v4(r.ip()?)?, r.u64()?);
+            }
+            let mut nd = BTreeMap::new();
+            for _ in 0..r.count()? {
+                nd.insert(v6(r.ip()?)?, r.u64()?);
+            }
+            p.arp_pending = arp;
+            p.nd_pending = nd;
+            let due = r.opt_u64()?;
+            let from = r.opt_u64()?;
+            let end = r.opt_u64()?;
+            p.mcast = crate::mcast::MulticastDeadline::from_parts(due, from.zip(end));
+            p.carrier = r.bool()?;
+            let mut joined = BTreeSet::new();
+            for _ in 0..r.count()? {
+                joined.insert(r.ip()?);
+            }
+            p.joined = joined;
+            let mut neighbors = BTreeMap::new();
+            for _ in 0..r.count()? {
+                let a = r.ip()?;
+                neighbors.insert(a, (r.mac()?, r.u64()?));
+            }
+            p.neighbors = neighbors;
+            p.counters = PortCounters::get(&mut r)?;
+            p.dev.counters = FrameCounters::get(&mut r)?;
         }
-        let mut nd = BTreeMap::new();
-        for _ in 0..r.count()? {
-            nd.insert(v6(r.ip()?)?, r.u64()?);
-        }
-        self.arp_pending = arp;
-        self.nd_pending = nd;
-        let due = r.opt_u64()?;
-        let from = r.opt_u64()?;
-        let end = r.opt_u64()?;
-        self.mcast = crate::mcast::MulticastDeadline::from_parts(due, from.zip(end));
-        self.carrier = r.bool()?;
-        let mut joined = BTreeSet::new();
-        for _ in 0..r.count()? {
-            joined.insert(r.ip()?);
-        }
-        self.joined = joined;
-        let mut neighbors = BTreeMap::new();
-        for _ in 0..r.count()? {
-            let a = r.ip()?;
-            neighbors.insert(a, (r.mac()?, r.u64()?));
-        }
-        self.neighbors = neighbors;
         self.icmp.snapshot_restore(&mut r)?;
         self.counters = StackCounters::get(&mut r)?;
-        self.dev.counters = FrameCounters::get(&mut r)?;
         self.resolver.snapshot_restore(&mut r)?;
         let hops = self.hop_limit;
         self.udp.snapshot_restore(&mut r, &mut self.sockets, hops)?;
@@ -562,11 +591,15 @@ impl Stack {
 
     /// `Ok` when the stack is at a quiescent point; otherwise the first reason it is not.
     fn quiescent(&self) -> Res<()> {
-        if !self.rx_seen.is_empty() || !self.dev.rx.is_empty() || !self.dev.tx.is_empty() {
-            return Err("frames are queued".into());
-        }
-        if self.dhcp.is_some() {
-            return Err("a DHCP client runs (quiescent snapshots need static addresses)".into());
+        for p in &self.ports {
+            if !p.rx_seen.is_empty() || !p.dev.rx.is_empty() || !p.dev.tx.is_empty() {
+                return Err("frames are queued".into());
+            }
+            if p.dhcp.is_some() {
+                return Err(
+                    "a DHCP client runs (quiescent snapshots need static addresses)".into(),
+                );
+            }
         }
         if self.resolver.in_flight() > 0 {
             return Err("a name lookup is in flight".into());

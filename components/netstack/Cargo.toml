@@ -43,6 +43,9 @@ wasip3 = { workspace = true, features = ["std"] }
 # `iface-max-addr-count-4`: IPv4 + IPv6 link-local + IPv6 global (+1 spare); smoltcp's default is 2.
 # `socket-dhcpv4`: the DHCP client behind `ipv4 = "dhcp"`; a stack without a DHCP socket
 # behaves exactly as if the feature were off.
+# `iface-max-route-count-64`: each port's smoltcp interface holds that port's static routes (at
+# most 32 from `routes`, plus the gateway keys' and a DHCP lease's defaults); smoltcp's default
+# is 2.
 # `iface-max-multicast-group-count-16`: smoltcp's default of 4 groups is used up by the
 # solicited-node groups and two mDNS groups; apps may join more.
 # `socket-tcp-reno`: TCP congestion control. Every socket gets the controller the
@@ -63,6 +66,7 @@ smoltcp = { version = "=0.14.0", default-features = false, features = [
     "auto-icmp-echo-reply",
     "iface-max-addr-count-4",
     "iface-max-multicast-group-count-16",
+    "iface-max-route-count-64",
     # Our vendored patch (`docs/upstream/smoltcp-0002-snapshot-state.patch`): read and restore
     # the interface state and socket slots for quiescent snapshots (`src/snapshot.rs`).
     "snapshot",

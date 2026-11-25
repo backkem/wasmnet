@@ -578,10 +578,13 @@ impl Resolver {
             bound = udp.bind(sock, SocketAddr::new(family.unspecified(), 0), net);
         }
         // mDNS packets carry hop limit 255 (RFC 6762 §11), so a receiver can tell they are on-link.
+        // A one-shot query asks on every port with an address of its family.
         let set = bound
             .and_then(|_| udp.set_recv_errors(sock, true))
             .and_then(|_| match l.mdns {
-                true => udp.set_multicast_hop_limit(sock, 255),
+                true => udp
+                    .set_multicast_hop_limit(sock, 255)
+                    .and_then(|_| udp.set_every_port(sock)),
                 false => Ok(()),
             });
         if let Err(e) = set {

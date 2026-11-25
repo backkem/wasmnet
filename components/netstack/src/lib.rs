@@ -120,7 +120,9 @@ pub mod mcast;
 pub mod names;
 pub mod observe;
 pub mod resolver;
+pub mod route;
 pub mod snapshot;
+pub mod sockets;
 pub mod stack;
 pub mod tcp;
 pub mod time;
@@ -181,7 +183,8 @@ pub enum Note {
 /// notes, after it released the stack.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Output {
-    pub frames: Vec<Vec<u8>>,
+    /// Frames to transmit, each with the port it leaves by (0 is `eth0`), in order.
+    pub frames: Vec<(u32, Vec<u8>)>,
     pub notes: Vec<Note>,
     /// Anything happened: frames in or out, a socket changed state, the TCP table moved. The
     /// driver then polls its TCP pumps again.

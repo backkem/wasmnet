@@ -41,15 +41,30 @@
 //!   are still queued, because smoltcp applies one per-socket hop limit at dispatch (#9).
 //! * Dropping a socket with datagrams still queued keeps the smoltcp socket for up to
 //!   [`LINGER_NS`] (about as long as an ARP resolution may fail), then discards what is left.
+//!
+//! Several ports ([`crate::sockets`]):
+//! * A socket bound to one of the node's addresses has one smoltcp socket, in that address's
+//!   port: it receives what arrives there, and sends only by that port's routes (the strong host
+//!   model; a destination no route of that port covers is `remote-unreachable`). A socket bound
+//!   to the unspecified address has one smoltcp socket per port, so it receives on every port.
+//! * A datagram leaves by the port the route table picks for its destination
+//!   ([`crate::stack::Routing::route`]); a multicast or limited broadcast one by the socket's
+//!   `multicast-interface`, else the family's default port. smoltcp then picks the source
+//!   address among that port's addresses (RFC 6724's rules for IPv6).
+//! * `receive` takes the datagrams set aside by the family demultiplexer first, then each
+//!   port's smoltcp socket in port order. On a node with several ports, an IPv6 link-local
+//!   source comes with its port's interface index as the scope id, so a reply to it leaves by
+//!   the same port.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 
-use smoltcp::iface::{Interface, SocketHandle, SocketSet};
 use smoltcp::socket::udp;
 use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint};
 
 use crate::observe::IcmpError;
+use crate::sockets::{Handle, Sockets};
+use crate::stack::Routing;
 
 /// The netstack's name for one `udp-socket` resource.
 pub type SocketId = u32;
@@ -65,7 +80,8 @@ const SLOTS: usize = 64;
 pub const LINGER_NS: u64 = 3_000_000_000;
 /// ICMP errors queued per socket (`wasmnet:sockets-ext/udp`).
 pub const ERROR_QUEUE: usize = 16;
-/// The node's interfaces: one, `eth0`, index 1 (0 means "the default" wherever an index is taken).
+/// The interface index of `eth0`, port 0 (port N is index N + 1; 0 means "the default"
+/// wherever an index is taken).
 pub const INTERFACES: u32 = 1;
 
 /// An address family.
@@ -135,51 +151,52 @@ pub enum Send {
     WouldBlock,
 }
 
-/// What the UDP logic needs from the stack for one call.
+/// What the UDP (and ICMP) logic needs from the stack for one call.
 pub struct Net<'a> {
-    pub iface: &'a Interface,
-    pub sockets: &'a mut SocketSet<'static>,
-    /// IP MTU.
-    pub mtu: u16,
+    /// The ports and the routes: which port a datagram leaves by.
+    pub routing: Routing<'a>,
+    pub sockets: &'a mut Sockets,
     /// The node's unicast hop limit (the default for new sockets).
     pub hop_limit: u8,
     /// The node's multicast hop limit (the default for new sockets).
     pub multicast_hop_limit: u8,
-    /// A default route exists for IPv4 / IPv6.
-    pub gateway_v4: bool,
-    pub gateway_v6: bool,
 }
 
 impl Net<'_> {
     fn is_ours(&self, ip: IpAddr) -> bool {
-        self.iface.has_ip_addr(IpAddress::from(ip))
+        self.routing.is_ours(ip)
     }
 
-    /// On-link (inside one of our prefixes), multicast/broadcast, or covered by a gateway.
-    fn routable(&self, ip: IpAddr) -> bool {
-        routable(self.iface, ip, self.gateway_v4, self.gateway_v6)
+    /// The largest payload that fits one frame of this family on port `port` (no
+    /// fragmentation).
+    pub fn max_payload_on(&self, family: Family, port: usize) -> usize {
+        usize::from(self.routing.mtu(port)).saturating_sub(family.overhead())
     }
 
-    /// The largest payload that fits one frame of this family (no fragmentation).
+    /// The largest payload that fits one frame of this family on the port with the largest MTU.
     pub fn max_payload(&self, family: Family) -> usize {
-        usize::from(self.mtu).saturating_sub(family.overhead())
+        usize::from(self.routing.max_mtu()).saturating_sub(family.overhead())
     }
 }
 
-/// Whether `ip` can be reached from `iface`: on-link (inside one of its prefixes),
-/// multicast/broadcast, or covered by a default gateway of its family. Shared by UDP and TCP.
-pub fn routable(iface: &Interface, ip: IpAddr, gateway_v4: bool, gateway_v6: bool) -> bool {
-    let smol = IpAddress::from(ip);
-    let on_link = iface.ip_addrs().iter().any(|c| c.contains_addr(&smol));
-    let group = match ip {
-        IpAddr::V4(a) => a.is_multicast() || a.is_broadcast(),
-        IpAddr::V6(a) => a.is_multicast(),
-    };
-    let gateway = match ip {
-        IpAddr::V4(_) => gateway_v4,
-        IpAddr::V6(_) => gateway_v6,
-    };
-    on_link || group || gateway
+/// The scope id of `addr`: an IPv6 address's, else 0.
+pub(crate) fn scope_of(addr: SocketAddr) -> u32 {
+    match addr {
+        SocketAddr::V6(a) => a.scope_id(),
+        SocketAddr::V4(_) => 0,
+    }
+}
+
+/// `from` as an app sees it: on a node with several ports an IPv6 link-local source carries
+/// the index of the port it arrived on as its scope id.
+pub(crate) fn scoped(from: SocketAddr, port: usize, ports: usize) -> SocketAddr {
+    match from {
+        SocketAddr::V6(mut a) if ports > 1 && a.ip().segments()[0] & 0xffc0 == 0xfe80 => {
+            a.set_scope_id(port as u32 + 1);
+            SocketAddr::V6(a)
+        }
+        other => other,
+    }
 }
 
 /// A multicast destination: sent with the multicast hop limit. An IPv4 broadcast is not:
@@ -224,12 +241,15 @@ struct Entry {
     family: Family,
     local: Option<SocketAddr>,
     remote: Option<SocketAddr>,
-    handle: Option<SocketHandle>,
+    /// The smoltcp sockets, from `bind` on: one in the bound address's port, or one per port
+    /// (in port order) for the unspecified address.
+    handles: Vec<Handle>,
     /// Set by `set-unicast-hop-limit`; `None` is the node's default.
     hop_limit: Option<u8>,
-    /// `wasmnet:sockets-ext/multicast`: groups joined, the multicast hop limit (`None`:
-    /// the node's), loopback, the outgoing interface (0: default).
-    groups: Vec<IpAddr>,
+    /// `wasmnet:sockets-ext/multicast`: groups joined with the interface index each was joined
+    /// on (0: the default), the multicast hop limit (`None`: the node's), loopback, the outgoing
+    /// interface (0: default).
+    groups: Vec<(IpAddr, u32)>,
     multicast_hop_limit: Option<u8>,
     multicast_loopback: bool,
     multicast_interface: u32,
@@ -242,6 +262,27 @@ struct Entry {
     /// both families), in arrival order, with their total payload bytes.
     pending: VecDeque<(Vec<u8>, SocketAddr)>,
     pending_bytes: u64,
+    /// The stack's own: a multicast datagram leaves by every port with an address of the
+    /// family (the resolver's one-shot mDNS queries), not by one.
+    every_port: bool,
+}
+
+impl Entry {
+    /// The smoltcp socket on `port`, if the socket has one there.
+    fn on(&self, port: usize) -> Option<Handle> {
+        self.handles.iter().copied().find(|h| h.port == port)
+    }
+}
+
+/// A smoltcp UDP socket with buffers of these sizes.
+fn new_socket(rx_bytes: u64, tx_bytes: u64) -> udp::Socket<'static> {
+    let buffer = |bytes: u64| {
+        udp::PacketBuffer::new(
+            vec![udp::PacketMetadata::EMPTY; SLOTS],
+            vec![0u8; bytes as usize],
+        )
+    };
+    udp::Socket::new(buffer(rx_bytes), buffer(tx_bytes))
 }
 
 /// Every app UDP socket of the node.
@@ -251,17 +292,27 @@ pub struct UdpSockets {
     next_id: SocketId,
     next_port: u16,
     /// Dropped sockets still sending: `(handle, port, give-up deadline)`.
-    closing: Vec<(SocketHandle, u16, u64)>,
+    closing: Vec<(Handle, u16, u64)>,
+    /// The node's ports.
+    ports: usize,
     pub counters: UdpCounters,
 }
 
 impl Default for UdpSockets {
     fn default() -> Self {
+        Self::new(1)
+    }
+}
+
+impl UdpSockets {
+    /// An empty table for a node with `ports` ports.
+    pub fn new(ports: usize) -> Self {
         Self {
             entries: BTreeMap::new(),
             next_id: 1,
             next_port: FIRST_EPHEMERAL,
             closing: Vec::new(),
+            ports: ports.max(1),
             counters: UdpCounters::default(),
         }
     }
@@ -283,7 +334,7 @@ impl UdpSockets {
     pub fn snapshot_save(
         &self,
         w: &mut crate::snapshot::W,
-        sockets: &SocketSet<'static>,
+        sockets: &Sockets,
     ) -> crate::snapshot::Res<()> {
         use crate::snapshot::Counters;
         if !self.closing.is_empty() {
@@ -297,7 +348,7 @@ impl UdpSockets {
             if !e.errors.is_empty() || !e.pending.is_empty() {
                 return Err(format!("UDP socket {id} has data waiting"));
             }
-            if let Some(h) = e.handle {
+            for &h in &e.handles {
                 let s = sockets.get::<udp::Socket>(h);
                 if s.can_recv() || s.send_queue() > 0 {
                     return Err(format!("UDP socket {id} has data waiting"));
@@ -307,11 +358,12 @@ impl UdpSockets {
             w.bool(e.family == Family::Ipv6);
             w.sock(e.local);
             w.sock(e.remote);
-            w.opt_u64(e.handle.map(|h| h.index() as u64));
+            w.handles(&e.handles);
             w.opt_u8(e.hop_limit);
             w.count(e.groups.len());
-            for g in &e.groups {
-                w.ip(*g);
+            for &(g, interface) in &e.groups {
+                w.ip(g);
+                w.u32(interface);
             }
             w.opt_u8(e.multicast_hop_limit);
             w.bool(e.multicast_loopback);
@@ -328,7 +380,7 @@ impl UdpSockets {
     pub fn snapshot_restore(
         &mut self,
         r: &mut crate::snapshot::R<'_>,
-        sockets: &mut SocketSet<'static>,
+        sockets: &mut Sockets,
         node_hops: u8,
     ) -> crate::snapshot::Res<()> {
         use crate::snapshot::Counters;
@@ -344,17 +396,17 @@ impl UdpSockets {
             };
             let local = r.sock()?;
             let remote = r.sock()?;
-            let slot = r.opt_u64()?;
+            let slots = r.handles()?;
             let hop_limit = r.opt_u8()?;
             let mut groups = Vec::new();
             for _ in 0..r.count()? {
-                groups.push(r.ip()?);
+                groups.push((r.ip()?, r.u32()?));
             }
             let mut e = Entry {
                 family,
                 local,
                 remote,
-                handle: None,
+                handles: Vec::new(),
                 hop_limit,
                 groups,
                 multicast_hop_limit: r.opt_u8()?,
@@ -366,16 +418,11 @@ impl UdpSockets {
                 errors: VecDeque::new(),
                 pending: VecDeque::new(),
                 pending_bytes: 0,
+                every_port: false,
             };
-            if let Some(slot) = slot {
+            for (port, slot) in slots {
                 let bound = local.ok_or("snapshot: a UDP socket in a slot is not bound")?;
-                let buffer = |bytes: u64| {
-                    udp::PacketBuffer::new(
-                        vec![udp::PacketMetadata::EMPTY; SLOTS],
-                        vec![0u8; bytes as usize],
-                    )
-                };
-                let mut socket = udp::Socket::new(buffer(e.rx_buffer), buffer(e.tx_buffer));
+                let mut socket = new_socket(e.rx_buffer, e.tx_buffer);
                 let ip = bound.ip();
                 socket
                     .bind(IpListenEndpoint {
@@ -384,10 +431,10 @@ impl UdpSockets {
                     })
                     .map_err(|e| format!("snapshot: rebinding UDP {bound}: {e}"))?;
                 socket.set_hop_limit(Some(e.hop_limit.unwrap_or(node_hops)));
-                e.handle = Some(
+                e.handles.push(
                     sockets
-                        .add_at(slot as usize, socket)
-                        .ok_or("snapshot: two sockets in one slot")?,
+                        .add_at(port, slot, socket)
+                        .ok_or("snapshot: two sockets in one slot, or no such port")?,
                 );
             }
             self.entries.insert(id, e);
@@ -397,13 +444,13 @@ impl UdpSockets {
 
     /// Every socket, for inspection. Read only. Queues are bytes: smoltcp's
     /// buffers plus the datagrams demultiplexed for this socket.
-    pub fn inspect(&self, sockets: &SocketSet<'static>) -> Vec<crate::debug::SockInfo> {
+    pub fn inspect(&self, sockets: &Sockets) -> Vec<crate::debug::SockInfo> {
         self.entries
             .iter()
             .map(|(&id, e)| {
-                let (rx, tx) = e.handle.map_or((0, 0), |h| {
+                let (rx, tx) = e.handles.iter().fold((0, 0), |(rx, tx), &h| {
                     let s = sockets.get::<udp::Socket>(h);
-                    (s.recv_queue() as u64, s.send_queue() as u64)
+                    (rx + s.recv_queue() as u64, tx + s.send_queue() as u64)
                 });
                 let state = if e.remote.is_some() {
                     "connected"
@@ -426,6 +473,12 @@ impl UdpSockets {
     }
 }
 
+/// Two interface indexes name the same interface: equal, or on a node with one port, 0 (the
+/// default) and 1 (`eth0`).
+fn same_interface(a: u32, b: u32, ports: usize) -> bool {
+    a == b || (ports == 1 && a.max(b) <= 1)
+}
+
 /// `true` when two bindings on the same port would compete for the same datagrams: same
 /// family, and one is unspecified or both are equal. Families never compete (V6ONLY).
 pub(crate) fn overlaps(a: IpAddr, b: IpAddr) -> bool {
@@ -438,6 +491,13 @@ fn endpoint(addr: SocketAddr) -> IpEndpoint {
 
 fn socket_addr(ep: IpEndpoint) -> SocketAddr {
     SocketAddr::new(IpAddr::from(ep.addr), ep.port)
+}
+
+/// The connected peer `r` sent `from`: the same address and port, and the same scope unless
+/// one of them names none.
+fn same_peer(r: SocketAddr, from: SocketAddr) -> bool {
+    let (a, b) = (scope_of(r), scope_of(from));
+    r.ip() == from.ip() && r.port() == from.port() && (a == b || a == 0 || b == 0)
 }
 
 impl UdpSockets {
@@ -460,7 +520,7 @@ impl UdpSockets {
                 family,
                 local: None,
                 remote: None,
-                handle: None,
+                handles: Vec::new(),
                 hop_limit: None,
                 groups: Vec::new(),
                 multicast_hop_limit: None,
@@ -472,9 +532,17 @@ impl UdpSockets {
                 pending_bytes: 0,
                 rx_buffer: DEFAULT_BUFFER,
                 tx_buffer: DEFAULT_BUFFER,
+                every_port: false,
             },
         );
         id
+    }
+
+    /// The stack's own sockets: a multicast datagram from `id` leaves by every port with an
+    /// address of its family, one copy per port (the resolver's one-shot mDNS queries).
+    pub(crate) fn set_every_port(&mut self, id: SocketId) -> Result<(), SockError> {
+        self.entry_mut(id)?.every_port = true;
+        Ok(())
     }
 
     pub fn family(&self, id: SocketId) -> Result<Family, SockError> {
@@ -539,22 +607,23 @@ impl UdpSockets {
         };
         let entry = self.entry_mut(id)?;
         let bound = SocketAddr::new(ip, port);
-        let buffer = |bytes: u64| {
-            udp::PacketBuffer::new(
-                vec![udp::PacketMetadata::EMPTY; SLOTS],
-                vec![0u8; bytes as usize],
-            )
-        };
-        let mut socket = udp::Socket::new(buffer(entry.rx_buffer), buffer(entry.tx_buffer));
         let listen = IpListenEndpoint {
             addr: (!ip.is_unspecified()).then(|| IpAddress::from(ip)),
             port,
         };
-        socket
-            .bind(listen)
-            .map_err(|_| SockError::AddressNotBindable)?;
-        socket.set_hop_limit(Some(entry.hop_limit.unwrap_or(net.hop_limit)));
-        entry.handle = Some(net.sockets.add(socket));
+        // The bound address's port, or every port for the unspecified address.
+        let ports: Vec<usize> = match net.routing.port_of(ip) {
+            Some(p) => vec![p],
+            None => (0..net.routing.count()).collect(),
+        };
+        for p in ports {
+            let mut socket = new_socket(entry.rx_buffer, entry.tx_buffer);
+            socket
+                .bind(listen)
+                .map_err(|_| SockError::AddressNotBindable)?;
+            socket.set_hop_limit(Some(entry.hop_limit.unwrap_or(net.hop_limit)));
+            entry.handles.push(net.sockets.add(p, socket));
+        }
         entry.local = Some(bound);
         self.counters.binds += 1;
         Ok(bound)
@@ -627,12 +696,17 @@ impl UdpSockets {
         if data.len() > net.max_payload(family) {
             return Err(SockError::DatagramTooLarge);
         }
-        if !net.routable(dst.ip()) {
-            return Err(SockError::RemoteUnreachable);
+        // Bound already? Then a socket bound to an address sends by its port only.
+        let tied = entry.local.and_then(|l| net.routing.port_of(l.ip()));
+        let ports = self.ports_for(id, dst, tied, net)?;
+        if ports
+            .iter()
+            .any(|&p| data.len() > net.max_payload_on(family, p))
+        {
+            return Err(SockError::DatagramTooLarge);
         }
         self.ensure_bound(id, net)?;
         let entry = self.entry(id)?;
-        let handle = entry.handle.ok_or(SockError::InvalidState)?;
         // Per-datagram hop limits (smoltcp #9 keeps one hop limit per socket and applies it
         // when a datagram leaves): stamp the socket with this datagram's hop limit, and if
         // datagrams with another one are still queued, wait until they left.
@@ -641,26 +715,80 @@ impl UdpSockets {
         } else {
             entry.hop_limit.unwrap_or(net.hop_limit)
         };
-        let socket = net.sockets.get_mut::<udp::Socket>(handle);
-        if socket.hop_limit() != Some(hops) {
-            if socket.send_queue() > 0 {
+        let handles = ports
+            .iter()
+            .map(|&p| entry.on(p))
+            .collect::<Option<Vec<Handle>>>()
+            .ok_or(SockError::InvalidState)?;
+        for &handle in &handles {
+            let socket = net.sockets.get_mut::<udp::Socket>(handle);
+            if socket.hop_limit() != Some(hops) && socket.send_queue() > 0 {
                 self.counters.hop_limit_waits += 1;
                 return Ok(Send::WouldBlock);
             }
-            socket.set_hop_limit(Some(hops));
-        }
-        match socket.send_slice(data, endpoint(dst)) {
-            Ok(()) => {
-                self.counters.tx_datagrams += 1;
-                self.counters.tx_bytes += data.len() as u64;
-                Ok(Send::Queued)
-            }
-            Err(udp::SendError::BufferFull) => {
+            // Several copies (one per port): every one must fit before any is queued.
+            let room = socket.payload_send_capacity() - socket.send_queue();
+            if handles.len() > 1 && (!socket.can_send() || room < data.len()) {
                 self.counters.would_block += 1;
-                Ok(Send::WouldBlock)
+                return Ok(Send::WouldBlock);
             }
-            Err(udp::SendError::Unaddressable) => Err(SockError::InvalidArgument),
         }
+        for &handle in &handles {
+            let socket = net.sockets.get_mut::<udp::Socket>(handle);
+            if socket.hop_limit() != Some(hops) {
+                socket.set_hop_limit(Some(hops));
+            }
+            match socket.send_slice(data, endpoint(dst)) {
+                Ok(()) => {
+                    self.counters.tx_datagrams += 1;
+                    self.counters.tx_bytes += data.len() as u64;
+                }
+                Err(udp::SendError::BufferFull) => {
+                    self.counters.would_block += 1;
+                    return Ok(Send::WouldBlock);
+                }
+                Err(udp::SendError::Unaddressable) => return Err(SockError::InvalidArgument),
+            }
+        }
+        Ok(Send::Queued)
+    }
+
+    /// The ports a datagram from `id` to `dst` leaves by: the route's (only the bound port's
+    /// routes when `tied`), a group destination's interface, or every port with an address of
+    /// the family for the stack's own every-port sockets. `remote-unreachable` when no route
+    /// covers it.
+    fn ports_for(
+        &self,
+        id: SocketId,
+        dst: SocketAddr,
+        tied: Option<usize>,
+        net: &Net<'_>,
+    ) -> Result<Vec<usize>, SockError> {
+        let entry = self.entry(id)?;
+        let ip = dst.ip();
+        if crate::stack::is_group(ip) && tied.is_none() {
+            if entry.every_port && is_multicast(ip) {
+                let all: Vec<usize> = (0..net.routing.count())
+                    .filter(|&p| {
+                        net.routing.ports[p]
+                            .iface
+                            .ip_addrs()
+                            .iter()
+                            .any(|c| IpAddr::from(c.address()).is_ipv4() == ip.is_ipv4())
+                    })
+                    .collect();
+                if !all.is_empty() {
+                    return Ok(all);
+                }
+            }
+            if entry.multicast_interface != 0 {
+                return Ok(vec![entry.multicast_interface as usize - 1]);
+            }
+        }
+        net.routing
+            .route(ip, scope_of(dst), tied)
+            .map(|p| vec![p])
+            .ok_or(SockError::RemoteUnreachable)
     }
 
     /// `udp-socket.receive`: the next datagram for this socket, or `None` if there is none yet.
@@ -669,15 +797,16 @@ impl UdpSockets {
         id: SocketId,
         net: &mut Net<'_>,
     ) -> Result<Option<(Vec<u8>, SocketAddr)>, SockError> {
+        let ports = self.ports;
         let entry = self.entries.get_mut(&id).ok_or(SockError::InvalidState)?;
-        let (Some(handle), Some(_)) = (entry.handle, entry.local) else {
+        if entry.handles.is_empty() || entry.local.is_none() {
             return Err(SockError::InvalidState);
-        };
+        }
         let (family, remote) = (entry.family, entry.remote);
         // Datagrams the family demultiplexer already set aside for this socket come first.
         while let Some((payload, from)) = entry.pending.pop_front() {
             entry.pending_bytes -= payload.len() as u64;
-            if remote.is_some_and(|r| r != from) {
+            if remote.is_some_and(|r| !same_peer(r, from)) {
                 self.counters.rx_filtered += 1;
                 continue;
             }
@@ -685,16 +814,18 @@ impl UdpSockets {
             self.counters.rx_bytes += payload.len() as u64;
             return Ok(Some((payload, from)));
         }
-        let socket = net.sockets.get_mut::<udp::Socket>(handle);
-        while let Ok((payload, meta)) = socket.recv() {
-            let from = socket_addr(meta.endpoint);
-            if Family::of(from.ip()) != family || remote.is_some_and(|r| r != from) {
-                self.counters.rx_filtered += 1;
-                continue;
+        for &handle in &entry.handles {
+            let socket = net.sockets.get_mut::<udp::Socket>(handle);
+            while let Ok((payload, meta)) = socket.recv() {
+                let from = scoped(socket_addr(meta.endpoint), handle.port, ports);
+                if Family::of(from.ip()) != family || remote.is_some_and(|r| !same_peer(r, from)) {
+                    self.counters.rx_filtered += 1;
+                    continue;
+                }
+                self.counters.rx_datagrams += 1;
+                self.counters.rx_bytes += payload.len() as u64;
+                return Ok(Some((payload.to_vec(), from)));
             }
-            self.counters.rx_datagrams += 1;
-            self.counters.rx_bytes += payload.len() as u64;
-            return Ok(Some((payload.to_vec(), from)));
         }
         Ok(None)
     }
@@ -737,7 +868,7 @@ impl UdpSockets {
             return Err(SockError::InvalidArgument);
         }
         let entry = self.entry_mut(id)?;
-        if entry.handle.is_some() {
+        if !entry.handles.is_empty() {
             return Ok(());
         }
         let min = net.max_payload(entry.family) as u64;
@@ -803,18 +934,20 @@ impl UdpSockets {
     }
 
     /// The resource was dropped at `now`. A socket with datagrams still queued lingers.
-    pub fn close(&mut self, id: SocketId, now: u64, sockets: &mut SocketSet<'static>) {
+    pub fn close(&mut self, id: SocketId, now: u64, sockets: &mut Sockets) {
         let Some(entry) = self.entries.remove(&id) else {
             return;
         };
-        let (Some(handle), Some(local)) = (entry.handle, entry.local) else {
+        let Some(local) = entry.local else {
             return;
         };
-        if sockets.get::<udp::Socket>(handle).send_queue() > 0 {
-            self.closing
-                .push((handle, local.port(), now.saturating_add(LINGER_NS)));
-        } else {
-            sockets.remove(handle);
+        for handle in entry.handles {
+            if sockets.get::<udp::Socket>(handle).send_queue() > 0 {
+                self.closing
+                    .push((handle, local.port(), now.saturating_add(LINGER_NS)));
+            } else {
+                sockets.remove(handle);
+            }
         }
     }
 
@@ -822,55 +955,66 @@ impl UdpSockets {
     /// each received datagram out of whichever smoltcp socket caught it and queues it for the
     /// socket that owns it (`Self::owner`), or drops it (`udp-rx-filtered`) if none does.
     /// Call after every `Interface::poll`. Returns whether it moved anything.
-    pub fn demux(&mut self, sockets: &mut SocketSet<'static>) -> bool {
-        let bound = |family| {
-            self.entries
-                .values()
-                .filter(move |e| e.family == family && e.handle.is_some())
-                .filter_map(|e| e.local.map(|l| l.port()))
-                .collect::<std::collections::BTreeSet<u16>>()
-        };
-        let (v4, v6) = (bound(Family::Ipv4), bound(Family::Ipv6));
+    pub fn demux(&mut self, sockets: &mut Sockets) -> bool {
         let mut moved = false;
-        for port in v4.intersection(&v6).copied() {
-            let handles: Vec<SocketHandle> = self
-                .entries
-                .values()
-                .filter(|e| e.local.is_some_and(|l| l.port() == port))
-                .filter_map(|e| e.handle)
-                .collect();
-            for handle in handles {
-                let socket = sockets.get_mut::<udp::Socket>(handle);
-                while let Ok((payload, meta)) = socket.recv() {
-                    moved = true;
-                    let from = socket_addr(meta.endpoint);
-                    let to = meta.local_address.map(IpAddr::from);
-                    let owner = self.owner(port, Family::of(from.ip()), to);
-                    let Some(entry) = owner.and_then(|id| self.entries.get_mut(&id)) else {
-                        self.counters.rx_filtered += 1;
-                        continue;
-                    };
-                    // Bounded like the smoltcp buffer it stands in for.
-                    let len = payload.len() as u64;
-                    if entry.pending.len() >= SLOTS || entry.pending_bytes + len > entry.rx_buffer {
-                        self.counters.rx_filtered += 1;
-                        continue;
+        for iface in 0..self.ports {
+            let bound = |family| {
+                self.entries
+                    .values()
+                    .filter(move |e| e.family == family && e.on(iface).is_some())
+                    .filter_map(|e| e.local.map(|l| l.port()))
+                    .collect::<BTreeSet<u16>>()
+            };
+            let (v4, v6) = (bound(Family::Ipv4), bound(Family::Ipv6));
+            for port in v4.intersection(&v6).copied() {
+                let handles: Vec<Handle> = self
+                    .entries
+                    .values()
+                    .filter(|e| e.local.is_some_and(|l| l.port() == port))
+                    .filter_map(|e| e.on(iface))
+                    .collect();
+                for handle in handles {
+                    let socket = sockets.get_mut::<udp::Socket>(handle);
+                    while let Ok((payload, meta)) = socket.recv() {
+                        moved = true;
+                        let from = scoped(socket_addr(meta.endpoint), iface, self.ports);
+                        let to = meta.local_address.map(IpAddr::from);
+                        let owner = self.owner(port, Family::of(from.ip()), to, iface);
+                        let Some(entry) = owner.and_then(|id| self.entries.get_mut(&id)) else {
+                            self.counters.rx_filtered += 1;
+                            continue;
+                        };
+                        // Bounded like the smoltcp buffer it stands in for.
+                        let len = payload.len() as u64;
+                        if entry.pending.len() >= SLOTS
+                            || entry.pending_bytes + len > entry.rx_buffer
+                        {
+                            self.counters.rx_filtered += 1;
+                            continue;
+                        }
+                        entry.pending_bytes += len;
+                        entry.pending.push_back((payload.to_vec(), from));
                     }
-                    entry.pending_bytes += len;
-                    entry.pending.push_back((payload.to_vec(), from));
                 }
             }
         }
         moved
     }
 
-    /// The socket on `port` that owns a datagram of `family` sent to `to`: a socket bound to
-    /// exactly `to` first, else the family's unspecified-address socket.
-    fn owner(&self, port: u16, family: Family, to: Option<IpAddr>) -> Option<SocketId> {
+    /// The socket on `port` with a smoltcp socket on interface `iface` that owns a datagram of
+    /// `family` sent to `to`: a socket bound to exactly `to` first, else the family's
+    /// unspecified-address socket.
+    fn owner(
+        &self,
+        port: u16,
+        family: Family,
+        to: Option<IpAddr>,
+        iface: usize,
+    ) -> Option<SocketId> {
         let on_port = || {
             self.entries.iter().filter(move |(_, e)| {
                 e.family == family
-                    && e.handle.is_some()
+                    && e.on(iface).is_some()
                     && e.local.is_some_and(|l| l.port() == port)
             })
         };
@@ -880,7 +1024,7 @@ impl UdpSockets {
     }
 
     /// Removes lingering sockets that drained or gave up. Call after every `Interface::poll`.
-    pub fn reap(&mut self, now: u64, sockets: &mut SocketSet<'static>) {
+    pub fn reap(&mut self, now: u64, sockets: &mut Sockets) {
         let counters = &mut self.counters;
         self.closing.retain(|&(handle, _, deadline)| {
             let drained = sockets.get::<udp::Socket>(handle).send_queue() == 0;
@@ -904,37 +1048,54 @@ impl UdpSockets {
     // -----------------------------------------------------------------------------------------
     // multicast (`wasmnet:sockets-ext/multicast`)
 
-    /// `join-multicast-group`. The interface joins at the stack's next pass ([`Self::groups`]).
+    /// `join-multicast-group` on interface index `interface` (0: the default, which
+    /// [`Self::groups`] resolves to the family's default port). The interface joins at the
+    /// stack's next pass.
     pub fn join(&mut self, id: SocketId, group: IpAddr, interface: u32) -> Result<(), SockError> {
+        let ports = self.ports;
         let entry = self.entry_mut(id)?;
-        if Family::of(group) != entry.family || !is_multicast(group) || interface > INTERFACES {
+        if Family::of(group) != entry.family || !is_multicast(group) || interface as usize > ports {
             return Err(SockError::InvalidArgument);
         }
-        if entry.groups.contains(&group) {
+        if entry
+            .groups
+            .iter()
+            .any(|&(g, i)| g == group && same_interface(i, interface, ports))
+        {
             return Err(SockError::AddressInUse);
         }
-        entry.groups.push(group);
+        entry.groups.push((group, interface));
         Ok(())
     }
 
-    /// `leave-multicast-group`.
+    /// `leave-multicast-group`: the membership joined on `interface`, or with 0 the first
+    /// membership of the group.
     pub fn leave(&mut self, id: SocketId, group: IpAddr, interface: u32) -> Result<(), SockError> {
+        let ports = self.ports;
         let entry = self.entry_mut(id)?;
-        let at = entry
+        let exact = entry
             .groups
             .iter()
-            .position(|g| *g == group)
-            .filter(|_| interface <= INTERFACES)
+            .position(|&(g, i)| g == group && same_interface(i, interface, ports));
+        let any = entry.groups.iter().position(|(g, _)| *g == group);
+        let at = exact
+            .or(any.filter(|_| interface == 0))
+            .filter(|_| interface as usize <= ports)
             .ok_or(SockError::InvalidArgument)?;
         entry.groups.remove(at);
         Ok(())
     }
 
-    /// Every group some open socket is a member of (the interface's memberships).
-    pub fn groups(&self) -> std::collections::BTreeSet<IpAddr> {
+    /// Every membership some open socket holds, as `(port, group)`: what each port's interface
+    /// joins. A membership on interface 0 is on `default_port(group)`.
+    pub fn groups(&self, default_port: impl Fn(IpAddr) -> usize) -> BTreeSet<(usize, IpAddr)> {
         self.entries
             .values()
             .flat_map(|e| e.groups.iter().copied())
+            .map(|(g, interface)| match interface {
+                0 => (default_port(g), g),
+                i => (i as usize - 1, g),
+            })
             .collect()
     }
 
@@ -965,7 +1126,7 @@ impl UdpSockets {
     }
 
     pub fn set_multicast_interface(&mut self, id: SocketId, value: u32) -> Result<(), SockError> {
-        if value > INTERFACES {
+        if value as usize > self.ports {
             return Err(SockError::InvalidArgument);
         }
         self.entry_mut(id)?.multicast_interface = value;

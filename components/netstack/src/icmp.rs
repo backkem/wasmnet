@@ -25,7 +25,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::net::IpAddr;
 
-use smoltcp::iface::{SocketHandle, SocketSet};
+use crate::sockets::{Handle, Sockets};
 use smoltcp::socket::icmp;
 use smoltcp::wire::{Icmpv4Packet, Icmpv6Packet, IpAddress};
 
@@ -63,7 +63,9 @@ struct Entry {
     /// The bound address and identifier.
     local: Option<(IpAddr, u16)>,
     remote: Option<IpAddr>,
-    handle: Option<SocketHandle>,
+    /// The smoltcp sockets, from `bind` on: one in the bound address's port, or one per port
+    /// for the unspecified address (an identifier socket takes replies on any port it is on).
+    handles: Vec<Handle>,
     /// Set by `set-unicast-hop-limit`; `None` is the node's default.
     hop_limit: Option<u8>,
     recv_errors: bool,
@@ -182,7 +184,7 @@ impl IcmpSockets {
                 family,
                 local: None,
                 remote: None,
-                handle: None,
+                handles: Vec::new(),
                 hop_limit: None,
                 recv_errors: false,
                 errors: VecDeque::new(),
@@ -212,7 +214,7 @@ impl IcmpSockets {
         if Family::of(local) != family || is_mapped(local) {
             return Err(SockError::InvalidArgument);
         }
-        if !local.is_unspecified() && !net.iface.has_ip_addr(IpAddress::from(local)) {
+        if !local.is_unspecified() && !net.routing.is_ours(local) {
             return Err(SockError::AddressNotBindable);
         }
         let ident = match ident {
@@ -220,16 +222,27 @@ impl IcmpSockets {
             i if self.in_use(i, Some(family)) => return Err(SockError::AddressInUse),
             i => i,
         };
-        let payload = SLOTS * (usize::from(net.mtu) + 8);
-        let buffer = || {
-            icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY; SLOTS], vec![0u8; payload])
+        let ports: Vec<usize> = match net.routing.port_of(local) {
+            Some(p) => vec![p],
+            None => (0..net.routing.count()).collect(),
         };
-        let mut socket = icmp::Socket::new(buffer(), buffer());
-        socket
-            .bind(icmp::Endpoint::Ident(ident))
-            .map_err(|_| SockError::AddressNotBindable)?;
+        let mut handles = Vec::new();
+        for p in ports {
+            let payload = SLOTS * (usize::from(net.routing.mtu(p)) + 8);
+            let buffer = || {
+                icmp::PacketBuffer::new(
+                    vec![icmp::PacketMetadata::EMPTY; SLOTS],
+                    vec![0u8; payload],
+                )
+            };
+            let mut socket = icmp::Socket::new(buffer(), buffer());
+            socket
+                .bind(icmp::Endpoint::Ident(ident))
+                .map_err(|_| SockError::AddressNotBindable)?;
+            handles.push(net.sockets.add(p, socket));
+        }
         let entry = self.entry_mut(id)?;
-        entry.handle = Some(net.sockets.add(socket));
+        entry.handles = handles;
         entry.local = Some((local, ident));
         self.counters.binds += 1;
         Ok(ident)
@@ -319,15 +332,21 @@ impl IcmpSockets {
             Family::Ipv4 => 20,
             Family::Ipv6 => 40,
         };
-        if data.len() + ip_header > usize::from(net.mtu) {
+        if data.len() + ip_header > usize::from(net.routing.max_mtu()) {
             return Err(SockError::DatagramTooLarge);
         }
-        if !crate::udp::routable(net.iface, dst, net.gateway_v4, net.gateway_v6) {
+        // The route's port; a socket bound to an address only by that address's port.
+        let tied = entry.local.and_then(|(a, _)| net.routing.port_of(a));
+        let Some(port) = net.routing.route(dst, 0, tied) else {
             return Err(SockError::RemoteUnreachable);
+        };
+        if data.len() + ip_header > usize::from(net.routing.mtu(port)) {
+            return Err(SockError::DatagramTooLarge);
         }
         self.ensure_bound(id, net)?;
         let entry = self.entry(id)?;
-        let (Some(handle), Some((local, ident))) = (entry.handle, entry.local) else {
+        let handle = entry.handles.iter().copied().find(|h| h.port == port);
+        let (Some(handle), Some((local, ident))) = (handle, entry.local) else {
             return Err(SockError::InvalidState);
         };
         let hops = if is_multicast(dst) {
@@ -338,7 +357,7 @@ impl IcmpSockets {
         // The ICMPv6 checksum covers the source address smoltcp will choose.
         let src6 = match dst {
             IpAddr::V6(d) => {
-                let src = net.iface.get_source_address_ipv6(&d);
+                let src = net.routing.ports[port].iface.get_source_address_ipv6(&d);
                 if !local.is_unspecified() && IpAddr::V6(src) != local {
                     return Err(SockError::InvalidArgument);
                 }
@@ -374,27 +393,30 @@ impl IcmpSockets {
         net: &mut Net<'_>,
     ) -> Result<Option<(Vec<u8>, IpAddr)>, SockError> {
         let entry = self.entry(id)?;
-        let (Some(handle), Some(_)) = (entry.handle, entry.local) else {
+        if entry.handles.is_empty() || entry.local.is_none() {
             return Err(SockError::InvalidState);
-        };
+        }
         let (family, remote) = (entry.family, entry.remote);
+        let handles = entry.handles.clone();
         let reply = match family {
             Family::Ipv4 => 0,
             Family::Ipv6 => 129,
         };
-        let socket = net.sockets.get_mut::<icmp::Socket>(handle);
-        while let Ok((payload, from)) = socket.recv() {
-            let from = IpAddr::from(from);
-            if Family::of(from) != family
-                || payload.first() != Some(&reply)
-                || payload.len() < 8
-                || remote.is_some_and(|r| r != from)
-            {
-                self.counters.rx_filtered += 1;
-                continue;
+        for handle in handles {
+            let socket = net.sockets.get_mut::<icmp::Socket>(handle);
+            while let Ok((payload, from)) = socket.recv() {
+                let from = IpAddr::from(from);
+                if Family::of(from) != family
+                    || payload.first() != Some(&reply)
+                    || payload.len() < 8
+                    || remote.is_some_and(|r| r != from)
+                {
+                    self.counters.rx_filtered += 1;
+                    continue;
+                }
+                self.counters.replies += 1;
+                return Ok(Some((payload.to_vec(), from)));
             }
-            self.counters.replies += 1;
-            return Ok(Some((payload.to_vec(), from)));
         }
         Ok(None)
     }
@@ -493,11 +515,11 @@ impl IcmpSockets {
     }
 
     /// The resource was dropped: requests still queued are discarded, the identifier is free.
-    pub fn close(&mut self, id: SocketId, sockets: &mut SocketSet<'static>) {
+    pub fn close(&mut self, id: SocketId, sockets: &mut Sockets) {
         let Some(entry) = self.entries.remove(&id) else {
             return;
         };
-        if let Some(handle) = entry.handle {
+        for handle in entry.handles {
             sockets.remove(handle);
         }
         if let Some((_, ident)) = entry.local
@@ -508,13 +530,13 @@ impl IcmpSockets {
     }
 
     /// Every socket, for inspection. Queues are bytes in smoltcp's buffers.
-    pub fn inspect(&self, sockets: &SocketSet<'static>) -> Vec<crate::debug::SockInfo> {
+    pub fn inspect(&self, sockets: &Sockets) -> Vec<crate::debug::SockInfo> {
         self.entries
             .iter()
             .map(|(&id, e)| {
-                let (rx, tx) = e.handle.map_or((0, 0), |h| {
+                let (rx, tx) = e.handles.iter().fold((0, 0), |(rx, tx), &h| {
                     let s = sockets.get::<icmp::Socket>(h);
-                    (s.recv_queue() as u64, s.send_queue() as u64)
+                    (rx + s.recv_queue() as u64, tx + s.send_queue() as u64)
                 });
                 let state = if e.remote.is_some() {
                     "connected"

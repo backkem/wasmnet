@@ -51,13 +51,15 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 
-use smoltcp::iface::{Interface, SocketHandle, SocketSet};
+use crate::sockets::{Handle, Sockets};
+use crate::stack::{Port, Routing};
 use smoltcp::socket::tcp::{self, State};
 use smoltcp::time::Duration;
 use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint};
 
 use crate::observe::IcmpError;
-use crate::udp::{Family, SockError, is_mapped, routable};
+use crate::route::StaticRoute;
+use crate::udp::{Family, SockError, is_mapped, scope_of, scoped};
 
 /// The netstack's name for one `tcp-socket` resource (its own id space, apart from UDP's).
 pub type SocketId = u32;
@@ -221,13 +223,22 @@ impl Options {
 
 /// What the TCP logic needs from the stack for one call.
 pub struct TcpNet<'a> {
-    pub iface: &'a mut Interface,
-    pub sockets: &'a mut SocketSet<'static>,
+    /// The ports (a connect needs the chosen port's interface) and the routes.
+    pub ports: &'a mut [Port],
+    pub routes: &'a [StaticRoute],
+    pub sockets: &'a mut Sockets,
     /// The node's unicast hop limit (the default for new sockets).
     pub hop_limit: u8,
-    /// A default route exists for IPv4 / IPv6.
-    pub gateway_v4: bool,
-    pub gateway_v6: bool,
+}
+
+impl TcpNet<'_> {
+    /// The ports and routes, for choosing a port.
+    pub fn routing(&self) -> Routing<'_> {
+        Routing {
+            ports: self.ports,
+            routes: self.routes,
+        }
+    }
 }
 
 /// TCP counters (part of the netstack's `counters`).
@@ -286,7 +297,7 @@ pub enum Accept {
 
 #[derive(Debug)]
 struct Conn {
-    handle: SocketHandle,
+    handle: Handle,
     /// The peer's FIN was seen, so a later CLOSED is an orderly end.
     fin_seen: bool,
     /// `abort` was called.
@@ -306,7 +317,7 @@ struct Conn {
 }
 
 impl Conn {
-    fn new(handle: SocketHandle) -> Self {
+    fn new(handle: Handle) -> Self {
         Self {
             handle,
             fin_seen: false,
@@ -330,18 +341,32 @@ impl Conn {
 #[derive(Debug)]
 struct Listener {
     /// Sockets in LISTEN, each waiting for one SYN.
-    listening: Vec<SocketHandle>,
+    listening: Vec<Handle>,
     /// Sockets mid-handshake (SYN-RECEIVED).
-    embryonic: Vec<SocketHandle>,
+    embryonic: Vec<Handle>,
     /// Established connections the app has not taken yet, in completion order.
-    ready: VecDeque<SocketHandle>,
+    ready: VecDeque<Handle>,
     /// Taken from `ready` and on their way through the accept stream.
     handoff: u64,
     /// The app stopped accepting (resource or accept stream dropped).
     closed: bool,
+    /// The ports it listens on: its bound address's, or every port for the unspecified
+    /// address.
+    ports: Vec<usize>,
 }
 
 impl Listener {
+    fn new(ports: Vec<usize>) -> Self {
+        Self {
+            listening: Vec::new(),
+            embryonic: Vec::new(),
+            ready: VecDeque::new(),
+            handoff: 0,
+            closed: false,
+            ports,
+        }
+    }
+
     fn queued(&self) -> u64 {
         (self.embryonic.len() + self.ready.len()) as u64 + self.handoff
     }
@@ -353,7 +378,7 @@ enum Phase {
     Bound,
     Listening(Listener),
     Connecting {
-        handle: SocketHandle,
+        handle: Handle,
         since: u64,
         /// An ICMP error said the peer cannot be reached: the connect fails at its next poll.
         failed: Option<SockError>,
@@ -379,7 +404,7 @@ struct Entry {
 /// A connection whose resource is gone, kept until smoltcp is done with it.
 #[derive(Debug)]
 struct Orphan {
-    handle: SocketHandle,
+    handle: Handle,
     since: u64,
 }
 
@@ -467,7 +492,7 @@ impl TcpSockets {
     pub fn snapshot_save(
         &self,
         w: &mut crate::snapshot::W,
-        sockets: &SocketSet<'static>,
+        sockets: &Sockets,
     ) -> crate::snapshot::Res<()> {
         use crate::snapshot::Counters;
         if !self.orphans.is_empty() {
@@ -509,10 +534,11 @@ impl TcpSockets {
                         return Err(format!("TCP listener {id} is mid-handshake"));
                     }
                     w.u8(2);
-                    w.count(l.listening.len());
-                    for h in &l.listening {
-                        w.u64(h.index() as u64);
+                    w.count(l.ports.len());
+                    for &p in &l.ports {
+                        w.u32(p as u32);
                     }
+                    w.handles(&l.listening);
                 }
                 _ => return Err(format!("TCP socket {id} is connecting or connected")),
             }
@@ -526,7 +552,7 @@ impl TcpSockets {
     pub fn snapshot_restore(
         &mut self,
         r: &mut crate::snapshot::R<'_>,
-        sockets: &mut SocketSet<'static>,
+        sockets: &mut Sockets,
         node_hops: u8,
     ) -> crate::snapshot::Res<()> {
         use crate::snapshot::Counters;
@@ -559,21 +585,18 @@ impl TcpSockets {
                 1 => Phase::Bound,
                 2 => {
                     let bound = local.ok_or("snapshot: a TCP listener is not bound")?;
-                    let mut l = Listener {
-                        listening: Vec::new(),
-                        embryonic: Vec::new(),
-                        ready: VecDeque::new(),
-                        handoff: 0,
-                        closed: false,
-                    };
+                    let mut ports = Vec::new();
                     for _ in 0..r.count()? {
-                        let slot = r.u64()? as usize;
+                        ports.push(r.u32()? as usize);
+                    }
+                    let mut l = Listener::new(ports);
+                    for (port, slot) in r.handles()? {
                         let sock = listen_socket(bound, &opts, node_hops)
                             .ok_or_else(|| format!("snapshot: listening on {bound}"))?;
                         l.listening.push(
                             sockets
-                                .add_at(slot, sock)
-                                .ok_or("snapshot: two sockets in one slot")?,
+                                .add_at(port, slot, sock)
+                                .ok_or("snapshot: two sockets in one slot, or no such port")?,
                         );
                     }
                     Phase::Listening(l)
@@ -598,7 +621,7 @@ impl TcpSockets {
 
     /// Every socket, for inspection. Read only. A listener's queues are its
     /// backlog (connections not yet accepted); a connection's are smoltcp's buffers, in bytes.
-    pub fn inspect(&self, sockets: &SocketSet<'static>) -> Vec<crate::debug::SockInfo> {
+    pub fn inspect(&self, sockets: &Sockets) -> Vec<crate::debug::SockInfo> {
         self.entries
             .iter()
             .map(|(&id, e)| {
@@ -722,7 +745,7 @@ impl TcpSockets {
 
     /// The resource was dropped at `now`. A live connection is closed (FIN) and lingers as an
     /// orphan; a listener stops listening. The entry itself goes once no job uses it.
-    pub fn close(&mut self, id: SocketId, now: u64, sockets: &mut SocketSet<'static>) {
+    pub fn close(&mut self, id: SocketId, now: u64, sockets: &mut Sockets) {
         let Some(entry) = self.entries.get_mut(&id) else {
             return;
         };
@@ -760,11 +783,7 @@ impl TcpSockets {
 
     /// After the FIN: `Ok` once every byte the app sent was acknowledged, an error if the
     /// connection was reset first, `None` while data is still in flight.
-    pub fn send_flushed(
-        &self,
-        id: SocketId,
-        sockets: &SocketSet<'static>,
-    ) -> Option<Result<(), SockError>> {
+    pub fn send_flushed(&self, id: SocketId, sockets: &Sockets) -> Option<Result<(), SockError>> {
         let conn = match self.conn(id) {
             Ok(c) => c,
             Err(e) => return Some(Err(e)),
@@ -780,7 +799,7 @@ impl TcpSockets {
     }
 
     /// A driver job that used `id` is done.
-    pub fn job_done(&mut self, id: SocketId, now: u64, sockets: &mut SocketSet<'static>) {
+    pub fn job_done(&mut self, id: SocketId, now: u64, sockets: &mut Sockets) {
         if let Some(e) = self.entries.get_mut(&id) {
             e.jobs = e.jobs.saturating_sub(1);
         }
@@ -795,7 +814,7 @@ impl TcpSockets {
     }
 
     /// Removes a dropped entry no job uses any more, handing its connection to the orphans.
-    fn reap_entry(&mut self, id: SocketId, now: u64, sockets: &mut SocketSet<'static>) {
+    fn reap_entry(&mut self, id: SocketId, now: u64, sockets: &mut Sockets) {
         let removable = self
             .entries
             .get(&id)
@@ -827,7 +846,7 @@ impl TcpSockets {
         }
     }
 
-    fn orphan(&mut self, handle: SocketHandle, now: u64, sockets: &mut SocketSet<'static>) {
+    fn orphan(&mut self, handle: Handle, now: u64, sockets: &mut Sockets) {
         if finished(sockets.get::<tcp::Socket>(handle)) {
             sockets.remove(handle);
         } else {
@@ -836,7 +855,7 @@ impl TcpSockets {
     }
 
     /// Stops a listener: queued connections are reset, the LISTEN sockets removed.
-    fn shut_listener(&mut self, l: Listener, now: u64, sockets: &mut SocketSet<'static>) {
+    fn shut_listener(&mut self, l: Listener, now: u64, sockets: &mut Sockets) {
         for h in l.listening {
             sockets.remove(h);
         }
@@ -881,8 +900,8 @@ impl TcpSockets {
 
     /// Whether any live smoltcp TCP socket uses local `port` (an ephemeral port must be fresh,
     /// so a new connection never meets an old one in TIME-WAIT).
-    fn port_busy(&self, port: u16, sockets: &SocketSet<'static>) -> bool {
-        let used = |h: SocketHandle| {
+    fn port_busy(&self, port: u16, sockets: &Sockets) -> bool {
+        let used = |h: Handle| {
             let s = sockets.get::<tcp::Socket>(h);
             s.local_endpoint().is_some_and(|ep| ep.port == port) || s.listen_endpoint().port == port
         };
@@ -899,7 +918,7 @@ impl TcpSockets {
             })
     }
 
-    fn ephemeral(&mut self, sockets: &SocketSet<'static>) -> Result<u16, SockError> {
+    fn ephemeral(&mut self, sockets: &Sockets) -> Result<u16, SockError> {
         for _ in 0..=(u16::MAX - FIRST_EPHEMERAL) {
             let port = self.next_port;
             self.next_port = if port == u16::MAX {
@@ -929,7 +948,7 @@ impl TcpSockets {
         if Family::of(ip) != entry.family || is_mapped(ip) || ip.is_multicast() {
             return Err(SockError::InvalidArgument);
         }
-        if !ip.is_unspecified() && !net.iface.has_ip_addr(IpAddress::from(ip)) {
+        if !ip.is_unspecified() && !net.routing().is_ours(ip) {
             return Err(SockError::AddressNotBindable);
         }
         let port = match local.port() {
@@ -972,9 +991,11 @@ impl TcpSockets {
             Phase::Bound => entry.local,
             _ => return Err(SockError::InvalidState),
         };
-        if !routable(net.iface, ip, net.gateway_v4, net.gateway_v6) {
+        // The route's port; a socket bound to an address only by that address's port.
+        let tied = local.and_then(|l| net.routing().port_of(l.ip()));
+        let Some(via) = net.routing().route(ip, scope_of(remote), tied) else {
             return Err(SockError::RemoteUnreachable);
-        }
+        };
         let port = match local {
             Some(l) => l.port(),
             None => self.ephemeral(net.sockets)?,
@@ -989,10 +1010,11 @@ impl TcpSockets {
                 .map(IpAddress::from),
             port,
         };
-        sock.connect(net.iface.context(), endpoint(remote), listen)
+        // smoltcp picks the source address among the port's own (RFC 6724 for IPv6).
+        sock.connect(net.ports[via].iface.context(), endpoint(remote), listen)
             .map_err(|_| SockError::InvalidArgument)?;
         let local_ep = sock.local_endpoint().map(socket_addr);
-        let handle = net.sockets.add(sock);
+        let handle = net.sockets.add(via, sock);
         self.counters.connects += 1;
         let entry = self.entry_mut(id)?;
         entry.local = local_ep.or(local);
@@ -1010,7 +1032,7 @@ impl TcpSockets {
         &mut self,
         id: SocketId,
         now: u64,
-        sockets: &mut SocketSet<'static>,
+        sockets: &mut Sockets,
     ) -> Option<Result<(), SockError>> {
         let entry = self.entries.get_mut(&id)?;
         let Phase::Connecting {
@@ -1068,7 +1090,7 @@ impl TcpSockets {
     /// (`tcp_v4_err`): `connection-refused` for a port unreachable, `remote-unreachable` for
     /// everything else that [`IcmpError::is_hard`] accepts. An established connection is not
     /// affected (Linux only records a soft error). Returns whether a connect was failed.
-    pub fn icmp_error(&mut self, e: &IcmpError, sockets: &SocketSet<'static>) -> bool {
+    pub fn icmp_error(&mut self, e: &IcmpError, sockets: &Sockets) -> bool {
         if e.proto != 6 || !e.is_hard() {
             return false;
         }
@@ -1109,7 +1131,7 @@ impl TcpSockets {
         &mut self,
         e: &IcmpError,
         own_mtu: u16,
-        sockets: &mut SocketSet<'static>,
+        sockets: &mut Sockets,
     ) -> Option<PathMtu> {
         let too_big = matches!((e.v6, e.icmp_type, e.code), (false, 3, 4) | (true, 2, _));
         if e.proto != 6 || !too_big || e.mtu == 0 {
@@ -1161,14 +1183,12 @@ impl TcpSockets {
             }
             _ => return Err(SockError::InvalidState),
         };
-        let entry = self.entry_mut(id)?;
-        let mut l = Listener {
-            listening: Vec::new(),
-            embryonic: Vec::new(),
-            ready: VecDeque::new(),
-            handoff: 0,
-            closed: false,
+        let ports: Vec<usize> = match net.routing().port_of(local.ip()) {
+            Some(p) => vec![p],
+            None => (0..net.ports.len()).collect(),
         };
+        let entry = self.entry_mut(id)?;
+        let mut l = Listener::new(ports);
         let (opts, hops) = (entry.opts, net.hop_limit);
         arm(&mut l, local, &opts, hops, net.sockets);
         entry.phase = Phase::Listening(l);
@@ -1177,7 +1197,7 @@ impl TcpSockets {
     }
 
     /// The accept loop's next connection: `None` while there is none yet.
-    pub fn accept(&mut self, listener: SocketId, sockets: &SocketSet<'static>) -> Option<Accept> {
+    pub fn accept(&mut self, listener: SocketId, sockets: &Sockets) -> Option<Accept> {
         let entry = self.entries.get_mut(&listener)?;
         let (family, opts) = (entry.family, entry.opts);
         let Phase::Listening(l) = &mut entry.phase else {
@@ -1191,10 +1211,13 @@ impl TcpSockets {
         let sock = sockets.get::<tcp::Socket>(handle);
         let mut conn = Conn::new(handle);
         conn.fin_seen = fin_state(sock.state());
+        let ports = sockets.ports();
         let id = self.insert(Entry {
             family,
             local: sock.local_endpoint().map(socket_addr),
-            remote: sock.remote_endpoint().map(socket_addr),
+            remote: sock
+                .remote_endpoint()
+                .map(|ep| scoped(socket_addr(ep), handle.port, ports)),
             opts: Options {
                 backlog: DEFAULT_BACKLOG,
                 ..opts
@@ -1257,7 +1280,7 @@ impl TcpSockets {
     pub fn send_room(
         &mut self,
         id: SocketId,
-        sockets: &SocketSet<'static>,
+        sockets: &Sockets,
     ) -> Option<Result<usize, SockError>> {
         let conn = match self.conn_mut(id) {
             Ok(c) => c,
@@ -1283,7 +1306,7 @@ impl TcpSockets {
     }
 
     /// While the send pump waits for the app: has the connection failed meanwhile?
-    pub fn send_check(&self, id: SocketId, sockets: &SocketSet<'static>) -> Option<SockError> {
+    pub fn send_check(&self, id: SocketId, sockets: &Sockets) -> Option<SockError> {
         let conn = match self.conn(id) {
             Ok(c) => c,
             Err(e) => return Some(e),
@@ -1303,7 +1326,7 @@ impl TcpSockets {
         &mut self,
         id: SocketId,
         data: &[u8],
-        sockets: &mut SocketSet<'static>,
+        sockets: &mut Sockets,
     ) -> Result<(), SockError> {
         let handle = self.conn(id)?.handle;
         match sockets.get_mut::<tcp::Socket>(handle).send_slice(data) {
@@ -1316,7 +1339,7 @@ impl TcpSockets {
     }
 
     /// The app dropped its send stream: FIN after the queued data.
-    pub fn finish_send(&mut self, id: SocketId, sockets: &mut SocketSet<'static>) {
+    pub fn finish_send(&mut self, id: SocketId, sockets: &mut Sockets) {
         if let Ok(conn) = self.conn_mut(id)
             && !conn.wr_shut
         {
@@ -1328,11 +1351,7 @@ impl TcpSockets {
 
     /// The receive pump's next step: data to offer, the end of the peer's direction, or `None`
     /// to wait.
-    pub fn recv_step(
-        &mut self,
-        id: SocketId,
-        sockets: &mut SocketSet<'static>,
-    ) -> Option<RecvStep> {
+    pub fn recv_step(&mut self, id: SocketId, sockets: &mut Sockets) -> Option<RecvStep> {
         let conn = match self.conn_mut(id) {
             Ok(c) => c,
             Err(e) => return Some(RecvStep::End(Err(e))),
@@ -1354,7 +1373,7 @@ impl TcpSockets {
     }
 
     /// While the receive pump waits for the app: has the connection been reset meanwhile?
-    pub fn recv_check(&self, id: SocketId, sockets: &SocketSet<'static>) -> Option<SockError> {
+    pub fn recv_check(&self, id: SocketId, sockets: &Sockets) -> Option<SockError> {
         let conn = match self.conn(id) {
             Ok(c) => c,
             Err(e) => return Some(e),
@@ -1364,7 +1383,7 @@ impl TcpSockets {
     }
 
     /// The app took `n` bytes: they leave smoltcp, which reopens the window.
-    pub fn consume(&mut self, id: SocketId, n: usize, sockets: &mut SocketSet<'static>) {
+    pub fn consume(&mut self, id: SocketId, n: usize, sockets: &mut Sockets) {
         let Ok(conn) = self.conn(id) else { return };
         let sock = sockets.get_mut::<tcp::Socket>(conn.handle);
         let mut left = n;
@@ -1382,7 +1401,7 @@ impl TcpSockets {
 
     /// The app dropped its receive stream: `SHUT_RD`. Data still queued, and data that arrives
     /// from now on, is discarded.
-    pub fn shutdown_read(&mut self, id: SocketId, sockets: &mut SocketSet<'static>) {
+    pub fn shutdown_read(&mut self, id: SocketId, sockets: &mut Sockets) {
         let Ok(conn) = self.conn_mut(id) else { return };
         conn.rd_shut = true;
         let n = discard(sockets.get_mut::<tcp::Socket>(conn.handle));
@@ -1390,11 +1409,7 @@ impl TcpSockets {
     }
 
     /// After `SHUT_RD`: how the peer's direction ended, or `None` while it is still open.
-    pub fn recv_end(
-        &self,
-        id: SocketId,
-        sockets: &SocketSet<'static>,
-    ) -> Option<Result<(), SockError>> {
+    pub fn recv_end(&self, id: SocketId, sockets: &Sockets) -> Option<Result<(), SockError>> {
         let conn = match self.conn(id) {
             Ok(c) => c,
             Err(e) => return Some(Err(e)),
@@ -1424,7 +1439,7 @@ impl TcpSockets {
     }
 
     /// `wasmnet:sockets-ext/tcp.abort`: RST now. Does nothing on an unconnected socket.
-    pub fn abort(&mut self, id: SocketId, sockets: &mut SocketSet<'static>) {
+    pub fn abort(&mut self, id: SocketId, sockets: &mut Sockets) {
         let Ok(conn) = self.conn_mut(id) else { return };
         if conn.aborted {
             return;
@@ -1450,7 +1465,7 @@ impl TcpSockets {
     }
 
     /// Re-applies the changeable options to a connected socket.
-    fn reapply(&mut self, id: SocketId, net_hops: u8, sockets: &mut SocketSet<'static>) {
+    fn reapply(&mut self, id: SocketId, net_hops: u8, sockets: &mut Sockets) {
         let Ok(entry) = self.entry(id) else { return };
         let opts = entry.opts;
         let handle = match &entry.phase {
@@ -1486,7 +1501,7 @@ impl TcpSockets {
         id: SocketId,
         change: KeepAlive,
         net_hops: u8,
-        sockets: &mut SocketSet<'static>,
+        sockets: &mut Sockets,
     ) -> Result<(), SockError> {
         let opts = self.opts_mut(id)?;
         match change {
@@ -1509,7 +1524,7 @@ impl TcpSockets {
         id: SocketId,
         value: u8,
         net_hops: u8,
-        sockets: &mut SocketSet<'static>,
+        sockets: &mut Sockets,
     ) -> Result<(), SockError> {
         if value == 0 {
             return Err(SockError::InvalidArgument);
@@ -1525,7 +1540,7 @@ impl TcpSockets {
         id: SocketId,
         value: bool,
         net_hops: u8,
-        sockets: &mut SocketSet<'static>,
+        sockets: &mut Sockets,
     ) -> Result<(), SockError> {
         if matches!(self.entry(id)?.phase, Phase::Closed) {
             return Err(SockError::InvalidState);
@@ -1537,12 +1552,7 @@ impl TcpSockets {
 
     /// `get-receive-buffer-size` (`rx`) or `get-send-buffer-size`: a connected socket reports
     /// its actual buffer.
-    pub fn buffer_size(
-        &self,
-        id: SocketId,
-        rx: bool,
-        sockets: &SocketSet<'static>,
-    ) -> Result<u64, SockError> {
+    pub fn buffer_size(&self, id: SocketId, rx: bool, sockets: &Sockets) -> Result<u64, SockError> {
         let e = self.entry(id)?;
         if let Phase::Connected(c) = &e.phase {
             let s = sockets.get::<tcp::Socket>(c.handle);
@@ -1581,11 +1591,11 @@ impl TcpSockets {
     /// Brings the table up to date with smoltcp: FINs seen, `SHUT_RD` discards, zero windows,
     /// listener queues (re-arming LISTEN sockets), finished orphans. Returns whether it changed
     /// anything smoltcp should act on (another poll is due).
-    pub fn after_poll(&mut self, now: u64, hops: u8, sockets: &mut SocketSet<'static>) -> bool {
+    pub fn after_poll(&mut self, now: u64, hops: u8, sockets: &mut Sockets) -> bool {
         let mut progress = false;
         let counters = &mut self.counters;
         // Connections that reached a listener of the other family: `(from listener, port, socket)`.
-        let mut strays: Vec<(SocketId, u16, SocketHandle)> = Vec::new();
+        let mut strays: Vec<(SocketId, u16, Handle)> = Vec::new();
         for (&id, entry) in self.entries.iter_mut() {
             let local = entry.local;
             let (family, opts) = (entry.family, entry.opts);
@@ -1674,6 +1684,7 @@ impl TcpSockets {
                     ready: std::mem::take(&mut l.ready),
                     handoff: 0,
                     closed: true,
+                    ports: Vec::new(),
                 };
                 for h in shut.listening {
                     sockets.remove(h);
@@ -1754,14 +1765,10 @@ pub enum KeepAlive {
 /// (smoltcp lets a wildcard LISTEN socket take a SYN of either family) is taken out and
 /// returned, for [`TcpSockets::after_poll`] to hand to its own listener. Returns whether
 /// anything moved, and those strays.
-fn sort(
-    l: &mut Listener,
-    family: Family,
-    sockets: &mut SocketSet<'static>,
-) -> (bool, Vec<SocketHandle>) {
+fn sort(l: &mut Listener, family: Family, sockets: &mut Sockets) -> (bool, Vec<Handle>) {
     let mut moved = false;
     let mut strays = Vec::new();
-    let all: Vec<SocketHandle> = l.listening.drain(..).chain(l.embryonic.drain(..)).collect();
+    let all: Vec<Handle> = l.listening.drain(..).chain(l.embryonic.drain(..)).collect();
     for h in all {
         let sock = sockets.get_mut::<tcp::Socket>(h);
         let wrong = sock
@@ -1788,26 +1795,24 @@ fn sort(
     (moved, strays)
 }
 
-/// Arms LISTEN sockets until listening + queued connections fill the backlog.
-fn arm(
-    l: &mut Listener,
-    local: SocketAddr,
-    opts: &Options,
-    hops: u8,
-    sockets: &mut SocketSet<'static>,
-) {
+/// Arms LISTEN sockets on each of the listener's ports until that port's LISTEN sockets plus
+/// the queued connections fill the backlog (so the backlog applies per port).
+fn arm(l: &mut Listener, local: SocketAddr, opts: &Options, hops: u8, sockets: &mut Sockets) {
     let listen = IpListenEndpoint {
         addr: (!local.ip().is_unspecified()).then(|| IpAddress::from(local.ip())),
         port: local.port(),
     };
-    while (l.listening.len() as u64) + l.queued() < opts.backlog {
-        let mut sock = opts.socket(hops);
-        // A half-open connection gives up like a connect does.
-        sock.set_timeout(Some(smol_duration(CONNECT_TIMEOUT_NS)));
-        if sock.listen(listen).is_err() {
-            break;
+    for p in l.ports.clone() {
+        let on = |l: &Listener| l.listening.iter().filter(|h| h.port == p).count() as u64;
+        while on(l) + l.queued() < opts.backlog {
+            let mut sock = opts.socket(hops);
+            // A half-open connection gives up like a connect does.
+            sock.set_timeout(Some(smol_duration(CONNECT_TIMEOUT_NS)));
+            if sock.listen(listen).is_err() {
+                break;
+            }
+            l.listening.push(sockets.add(p, sock));
         }
-        l.listening.push(sockets.add(sock));
     }
 }
 

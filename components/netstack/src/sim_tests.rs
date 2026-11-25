@@ -11,6 +11,8 @@ use crate::{Config, Event, Note, Stack};
 const US: u64 = 1_000;
 const MS: u64 = 1_000_000;
 
+mod multi;
+
 enum Ev {
     Deliver { to: usize, frame: Vec<u8> },
     Wake(usize),
@@ -82,7 +84,7 @@ impl Sim {
         let now = self.now;
         self.active = now;
         let out = self.nodes[i].poll(now);
-        for frame in out.frames {
+        for (_port, frame) in out.frames {
             let bounced = self.bounce.as_mut().and_then(|bounce| bounce(i, &frame));
             let lost = bounced.is_some() || self.lose.as_mut().is_some_and(|lose| lose(i, &frame));
             if let Some(reply) = bounced {

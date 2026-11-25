@@ -81,13 +81,14 @@ use wasmnet::link::log;
 use wasmnet::link::types::PortInfo;
 use wasmnet::link::wire;
 
-/// The only port, `eth0`.
-const PORT: u32 = 0;
-
 /// The node's state. Created on first use (normally `ports()`), from `wasi:config`.
 struct Node {
     config: Config,
+    /// Port 0's MAC (`macs[0]`), for the log lines.
     mac: MacAddr,
+    /// Every port's MAC, port 0 first: configured, or drawn from the seeded `wasi:random` in
+    /// port order (a node with one port draws exactly what it always did).
+    macs: Vec<MacAddr>,
     /// Built by `start()`, or by `state.restore` on a paused node.
     stack: Option<Stack>,
     /// The seeds `start()` drew (a paused node draws them too, so its `wasi:random` stream
@@ -97,7 +98,7 @@ struct Node {
     /// paused, until its restore. They are handed to the stack when it exists. At most
     /// [`EARLY_FRAMES`] are kept; a paused node on a busy link drops the rest, like a NIC whose
     /// receive ring is full.
-    early: Vec<Vec<u8>>,
+    early: Vec<(u32, Vec<u8>)>,
     /// Frames dropped because `early` was full.
     early_dropped: u64,
 }
@@ -274,12 +275,19 @@ fn create() -> Node {
         log::log(log::Level::Error, &e.to_string());
         panic!("netstack: {e}")
     });
-    let mac = config
-        .mac
-        .unwrap_or_else(|| MacAddr::local_from_seed(wasip3::random::random::get_random_u64()));
+    let macs: Vec<MacAddr> = config
+        .ports()
+        .iter()
+        .map(|p| {
+            p.mac.unwrap_or_else(|| {
+                MacAddr::local_from_seed(wasip3::random::random::get_random_u64())
+            })
+        })
+        .collect();
     Node {
         config,
-        mac,
+        mac: macs[0],
+        macs,
         stack: None,
         seeds: (0, 0),
         early: Vec::new(),
@@ -337,8 +345,8 @@ pub(crate) fn wake_driver() {
 
 /// Hands one poll's output to the host: frames, then logs and events, in order.
 fn emit(out: Output) {
-    for frame in &out.frames {
-        wire::transmit(PORT, frame);
+    for (port, frame) in &out.frames {
+        wire::transmit(*port, frame);
     }
     emit_notes(out.notes);
 }
@@ -513,24 +521,30 @@ pub struct Component;
 impl device::Guest for Component {
     fn ports() -> Vec<PortInfo> {
         with_node(|n| {
-            vec![PortInfo {
-                id: PORT,
-                name: "eth0".to_owned(),
-                mac: Some(n.mac.octets().to_vec()),
-                mtu: u32::from(n.config.mtu),
-            }]
+            n.config
+                .ports()
+                .iter()
+                .zip(&n.macs)
+                .enumerate()
+                .map(|(i, (p, mac))| PortInfo {
+                    id: i as u32,
+                    name: crate::stack::port_name(i),
+                    mac: Some(mac.octets().to_vec()),
+                    mtu: u32::from(p.mtu),
+                })
+                .collect()
         })
     }
 
     /// Push in: enqueue and wake, nothing else. Never spawns.
     fn receive(_now: u64, port: u32, frame: Vec<u8>) {
         note_entry();
-        if port != PORT {
+        if port as usize >= with_node(|n| n.macs.len()) {
             return;
         }
         with_node(|n| match n.stack.as_mut() {
-            Some(stack) => stack.receive(frame),
-            None if n.early.len() < EARLY_FRAMES => n.early.push(frame),
+            Some(stack) => stack.receive_on(port as usize, frame),
+            None if n.early.len() < EARLY_FRAMES => n.early.push((port, frame)),
             None => n.early_dropped += 1,
         });
         wake_driver();
@@ -543,17 +557,21 @@ impl device::Guest for Component {
 
     fn link_state(_now: u64, port: u32, up: bool) {
         note_entry();
-        if port != PORT {
+        if port as usize >= with_node(|n| n.macs.len()) {
             return;
         }
         with_node(|n| {
             if let Some(stack) = n.stack.as_mut() {
-                stack.link_state(up);
+                stack.link_state_on(port as usize, up);
             }
         });
         log::log(
             log::Level::Debug,
-            &format!("eth0 carrier {}", if up { "up" } else { "down" }),
+            &format!(
+                "{} carrier {}",
+                crate::stack::port_name(port as usize),
+                if up { "up" } else { "down" }
+            ),
         );
     }
 }
@@ -570,9 +588,9 @@ impl lifecycle::Guest for Component {
                 // Built by `state.restore`; until then silent.
                 return format!("netstack eth0: mac {}: paused until a restore", n.mac);
             }
-            let mut stack = Stack::new(&n.config, n.mac, random_seed, ident_seed, now);
-            for frame in n.early.drain(..) {
-                stack.receive(frame);
+            let mut stack = Stack::with_macs(&n.config, &n.macs, random_seed, ident_seed, now);
+            for (port, frame) in n.early.drain(..) {
+                stack.receive_on(port as usize, frame);
             }
             let line = stack.describe();
             n.stack = Some(stack);
@@ -590,7 +608,7 @@ impl counters::Guest for Component {
 }
 
 /// The `counters` export's answer (also `crate::debug::counters`): the stack's, then the
-/// driver's.
+/// driver's, then each port's (`eth<N>.<name>`, only on a node with several ports).
 pub(crate) fn all_counters() -> Vec<(String, u64)> {
     let mut out = with_node(|n| n.stack.as_ref().map(Stack::counters).unwrap_or_default());
     DRIVER.with(|d| {
@@ -619,6 +637,13 @@ pub(crate) fn all_counters() -> Vec<(String, u64)> {
             out.push((name.to_owned(), cell.get()));
         }
     });
+    // Each port's own counters last, on a node with several ports only.
+    out.extend(with_node(|n| {
+        n.stack
+            .as_ref()
+            .map(Stack::port_counters)
+            .unwrap_or_default()
+    }));
     out
 }
 
@@ -1380,26 +1405,26 @@ impl sockets_ext_mc::Guest for Component {
 impl sockets_ext_if::Guest for Component {
     fn list_interfaces() -> Vec<sockets_ext_if::NetworkInterface> {
         note_entry();
-        with_stack(|s| s.interface())
-            .map(|i| {
-                vec![sockets_ext_if::NetworkInterface {
-                    index: i.index,
-                    name: i.name,
-                    hardware_address: Some(i.mac.octets().to_vec()),
-                    addresses: i
-                        .addresses
-                        .into_iter()
-                        .map(|(a, p)| sockets_ext_if::InterfaceAddress {
-                            address: wit_ip(a),
-                            prefix_length: p,
-                        })
-                        .collect(),
-                    mtu: u32::from(i.mtu),
-                    up: i.up,
-                    multicast: true,
-                }]
-            })
+        with_stack(|s| s.interfaces())
             .unwrap_or_default()
+            .into_iter()
+            .map(|i| sockets_ext_if::NetworkInterface {
+                index: i.index,
+                name: i.name,
+                hardware_address: Some(i.mac.octets().to_vec()),
+                addresses: i
+                    .addresses
+                    .into_iter()
+                    .map(|(a, p)| sockets_ext_if::InterfaceAddress {
+                        address: wit_ip(a),
+                        prefix_length: p,
+                    })
+                    .collect(),
+                mtu: u32::from(i.mtu),
+                up: i.up,
+                multicast: true,
+            })
+            .collect()
     }
 }
 
@@ -1713,10 +1738,10 @@ fn restore_node(bytes: &[u8]) -> Result<(), String> {
             );
         }
         let (seed, ident) = n.seeds;
-        let mut stack = Stack::new(&n.config, n.mac, seed, ident, saved_at);
+        let mut stack = Stack::with_macs(&n.config, &n.macs, seed, ident, saved_at);
         stack.restore(&stack_bytes)?;
-        for frame in n.early.drain(..) {
-            stack.receive(frame);
+        for (port, frame) in n.early.drain(..) {
+            stack.receive_on(port as usize, frame);
         }
         let dropped = match std::mem::take(&mut n.early_dropped) {
             0 => String::new(),
