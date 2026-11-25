@@ -56,26 +56,18 @@ here so that nobody has to find these the hard way. Each entry names where the c
   device that set them; a timer it set while being instantiated by an operator event is not
   held, and completes at the resume's rounds instead of in its order. Its overdue work all runs
   at the resume instant, under one instant's fuel.
-- **A browser page cannot create a device while the network runs.** jco instantiates a
-  component asynchronously, so the page instantiates a device before it adds it
-  (`Network.device()` in `web/src/network.ts`) and has nothing to hand over when the simulator
-  asks for a device in the middle of a step. An `Op::AddDevice`, a controller's `apply` that
-  creates or recreates a device, an `Op::StartDevice` and a controller's `start` (a fresh
-  instance) therefore fail there (`failed`, or the op's refusal). The browser backend's Rust half
-  handles them (`crates/wasmnet-web/tests/parity.rs` creates devices through a controller); the
-  page's JavaScript does not yet. So in a page a switch's `wasmnet:reconfigure` is reachable only
-  through `Network::control` from Rust, since a controller may change only devices it created.
-- **What else the browser backend does not do yet** ([design/browser.md](design/browser.md#what-each-backend-does-itself)):
+- **What the browser backend does not do yet** ([design/browser.md](design/browser.md#what-each-backend-does-itself)):
   stdin (`Op::Stdin` is dropped), fuel metering (`fuel_per_instant` is ignored; the guard is
-  `Guard::max_polls_per_instant`), memory, the refusal of a component that imports
-  `wasmnet:infra` without the grant at instantiation (it instantiates and every call is
-  `denied`), host extensions' imports, sites, and `wasmnet:infra/changes.wait-any` (the page links only
-  `changes.wait`, whose answer it passes as a number; a component that imports `wait-any` does
-  not instantiate there). Its `wasmnet:infra/changes.wait`, `events.read` and `events.arm` and
-  a controller that is an async app (the `replicas` node) are untested in a real browser.
-- **Supplied components are native only, and kept in memory.** The browser backend compiles
-  nothing while a network runs (`Runtime::compile_supplied` keeps its default refusal), so a
-  creation from a digest fails there (`failed`). On wasmtime a controller's store and the
+  `Guard::max_polls_per_instant`), memory (neither measured nor bounded), host extensions'
+  imports, and sites. A page creates a device while the network runs with JSPI (Chromium's
+  `WebAssembly.Suspending`), and checks a component's imports against the `wasmnet:infra` grant
+  only when it knows them (`ComponentSource.imports`; without them, every infra call of an
+  ungranted device is `denied` instead).
+- **Supplied components are kept in memory, and a page cannot transpile them.** A browser page
+  runs a supplied component only from a transpile it already has: a `ComponentSource` with that
+  digest, or the embedder's `NetworkOptions.supply` hook. The kit's transpiler (`codelib-web/transpile`)
+  is a Node tool that writes files, so the page cannot transpile supplied bytes itself
+  ([design/browser.md](design/browser.md#components-a-controller-supplies)). On wasmtime a controller's store and the
   compiled components live in memory for the run, bounded per controller by its
   `SupplyLimits`, not across controllers. A component compiled in another process is shared
   only through a compile cache directory, which must be trusted as before.

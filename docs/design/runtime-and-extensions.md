@@ -20,7 +20,8 @@ has one associated type and four methods (three with defaults; `summarize` is th
 - `compile_supplied(digest, bytes)`: turns a component a controller supplied as bytes into a
   component, once per digest (`docs/design/topology-and-infra.md`); its refusal fails the
   creation, never the network. The default refuses (a backend that compiles nothing at run
-  time, as the browser's).
+  time). The browser backend checks the bytes with the core and asks its page for a transpile
+  of them ([browser.md](browser.md#components-a-controller-supplies)).
 
 `DeviceContext` carries everything one device needs: its index and unique name, the network
 seed, the shared `VirtualClock`, its `Wire` (`wire.transmit`), its `JournalEnd` (`log`), its
@@ -86,7 +87,7 @@ core itself is built for `wasm32-unknown-unknown` and a browser's engine runs th
   `wasmnet/compile-cache`); the embedder may pass any other.
   Components controllers supply go through it with `CompileCache::load_bytes`, named by their
   full SHA-256 ([topology-and-infra.md](topology-and-infra.md#components-a-controller-supplies)).
-- **`ImportPolicy`** ([src/admit.rs](../../crates/wasmnet-host/src/admit.rs)): a ready-made
+- **`ImportPolicy`** (the sim core's [admit.rs](../../crates/wasmnet-core/src/admit.rs), re-exported here): a ready-made
   admission for supplied components, an allow list of import patterns checked by parsing the
   component (`component_imports`), before anything is compiled.
 - **`Sim`**: runs one `wasi:cli/run` command under its own virtual clock, outside any network.

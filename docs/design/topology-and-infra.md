@@ -300,8 +300,9 @@ stores nothing. Supplying bytes the store already keeps costs nothing and is not
 network calls the embedder's admission callback (`Network::set_supply_admission`) with the
 bytes, their digest and the calling controller. Its `Err(reason)` is the controller's
 `denied(reason)`, and nothing is stored. Without a callback every supply is refused: a grant
-alone runs nothing. This is where an embedder applies its import policy. The wasmtime host
-offers one ready-made: `wasmnet_host::ImportPolicy` lists a component's imports by parsing it
+alone runs nothing. This is where an embedder applies its import policy. The sim core offers one
+ready-made, for every backend: `ImportPolicy` (`wasmnet_core::ImportPolicy`, re-exported as
+`wasmnet_host::ImportPolicy`; a page sets one with `setSupplyAdmission`) lists a component's imports by parsing it
 (nothing is compiled) and refuses any import its patterns do not allow, and a component that is
 not a well-formed component. The host links the same imports for every device whatever the
 policy says, so a policy only narrows them: a supplied component that imports something the
@@ -312,8 +313,9 @@ component that imports `wasmnet:infra` is refused at instantiation like every co
 spec, which can grant nothing.
 
 **Compiled once per digest.** When a creation from a digest applies, the network asks the
-runtime to compile the controller's bytes (`Runtime::compile_supplied`; the default refuses,
-which is what the browser backend does) and keeps the result by digest for as long as any
+runtime to compile the controller's bytes (`Runtime::compile_supplied`; the default refuses;
+the browser backend checks them with the core and asks its page for a transpile, see
+[browser.md](browser.md#components-a-controller-supplies)) and keeps the result by digest for as long as any
 controller's store keeps those bytes, so a second device, a recreation and a start of a stopped
 one compile nothing (`Network::supplied_compiles` counts the compilations). On wasmtime, with a
 compile cache directory ([runtime-and-extensions.md](runtime-and-extensions.md)), the

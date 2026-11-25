@@ -65,9 +65,50 @@ failed add leaves the index to the next device. The device's options (`DeviceOpt
 arguments and environment, a `wasmnet:infra` grant, journalled stdio) cross as one `options`
 message; the simulator applies them as the native host does.
 
-The same order is why a page cannot yet add a device while the network runs: when an operator
-event or a controller asks for one in the middle of a step, there is no instance waiting
-([known-issues.md](../known-issues.md)).
+The same import adds a device while the network runs: when an operator event or a controller
+(`apply`, `start`) asks for one in the middle of a step, there is no instance waiting, so the
+page instantiates the component the simulator names (a key of `NetworkOptions.components`, the
+same name the core's catalog uses) for the index it gives. `js_instantiate` is a JSPI
+`Suspending` import, and the exports that may reach it (`wn_add_device`, `wn_step`, `wn_finish`,
+`wn_command`, `wn_counters`) are `promising`: the step waits while the page loads the
+component, and JavaScript's event loop runs meanwhile, so guests' async work may run inside
+such a step (at the same virtual instant). V8 suspends at every `Suspending` call, even one that
+answers at once, which is why `wn_add_device` is `promising` too. A browser without JSPI gets
+the page's existing message: jco's runtime needs JSPI anyway. When a device stops, crashes or
+is removed its actor is dropped: the registry forgets that instance (what its guest still
+calls is an orphan) and the page lets go of it (`js_release`); a start makes a fresh one.
+
+Before it instantiates anything the simulator asks the page for the component's import names
+(`js_imports`: `ComponentSource.imports`, which the page build records with
+`wasm-tools component wit`) and refuses a component that imports `wasmnet:infra` for a device
+without the grant, by the core's rule (`infra::require_grant`), with the native error. A page
+that does not know a component's imports skips that check, and every infra call of such a
+device is `denied` instead.
+
+## Components a controller supplies
+
+A controller granted `infra_supply` supplies a component's bytes (`wasmnet:infra/components`)
+and creates devices from its digest. Store, digest, limits and admission are the core's, as
+natively; a page sets the admission with the core's `ImportPolicy` (`setSupplyAdmission`). When
+a creation from a digest applies, the browser backend's `compile_supplied` checks the bytes with
+the core (`component_imports`: a well-formed component; every import one the page serves) and
+asks the page for something to instantiate (`js_compile`, `Suspending`):
+
+- **a pre-transpiled component** (built): a `ComponentSource` whose `digest` is the bytes'
+  digest reference. The page build records each component's (`sha256:` of the `.wasm` it
+  transpiled), so a controller that supplies the bytes of a component the page ships runs that
+  transpile. This is what the page test does.
+- **the embedder's hook** (built): `NetworkOptions.supply(digest, bytes)` returns a
+  `ComponentSource`, from wherever the embedder transpiles components (a build step, a service
+  of its own).
+- **transpiling in the tab** (not built): the kit's transpiler (`codelib-web/transpile`, jco's
+  code generator plus the kit's patches) is a Node tool that writes files; running it in a page
+  needs a browser build of it and a place to put the modules it writes. An embedder that wants
+  it can do it inside its `supply` hook.
+
+Refusals use the core's words on both backends (`supply::not_compiled`, `supply::not_linked`):
+"`sha256:...` does not link on this host: ...", followed by the backend's own reason.
+
 
 ## The stepping protocol
 
@@ -133,6 +174,7 @@ call to the core. What the core decides for both:
 | `wasmnet:infra`: every call, the answers to a device without the grant, the stream names of `logs`, the refusal of an ungranted importer (`infra::Calls`, `infra::require_grant`); the events kept of the devices controllers created, and the wake of an armed wait (`events.arm`: one more `poll` of the controller, queued by the core) | the host's bindings; the browser's `wn_infra` |
 | commands and their answers, a controller's `control-answer` (`commands`, `CommandCall::finish`) | both actors |
 | reconfiguration, and which config `wasi:config/store` serves after it (`ReconfigureCall::finish_serving`) | both actors |
+| which supplied bytes are admitted (`ImportPolicy`, `component_imports`) and how a refusal is worded (`supply::not_compiled`, `not_linked`) | the host's `compile_supplied`; the browser's `compile_supplied` |
 | validation, ordering, operator events, the device table, limits, digests, admission, the journal, captures | the network itself |
 
 What each backend still does itself, module by module:
@@ -146,7 +188,6 @@ What each backend still does itself, module by module:
 | `glue` (`wasmnet:link` and `wasi:config/store` to the core's wire, journal and config) | wasmtime-specific glue |
 | `stdio` (wasmtime-wasi streams over the core's captures and stdin queue) | wasmtime-specific glue |
 | `wasi` (the deterministic WASI linker; its memory limiter decides the limit and its error) | wasmtime-specific, but the limit's decision would move to the core with a browser memory limit |
-| `admit` (`ImportPolicy`: a supplied component's imports, parsed from its bytes) | not wasmtime-specific: it moves to the core when the browser runs supplied components |
 | `cache`, `extension`, `command` (`Sim`), `lib` (engines, fuel) | wasmtime-specific |
 
 | `wasmnet-web` module | Kind |
@@ -156,21 +197,21 @@ What each backend still does itself, module by module:
 | `codec`, `ffi` (the boundary) | browser-specific |
 | `web/src/network.ts` (instantiate with the kit, call exports, forward imports) | browser-specific glue; it decides nothing |
 
-What the browser backend does not do yet: create a device while the network runs (the page
-instantiates asynchronously, see above), stdin, fuel, memory (measured or bounded), supplied
-components, the refusal of an ungranted `wasmnet:infra` importer at instantiation (the page does
-not see a component's imports; every call is `denied` instead), `changes.wait-any` (the page
-links only `changes.wait`, whose answer is a number: a component that imports `wait-any` does
-not instantiate there; `events.read` and `events.arm` are served), host extensions and sites
-([known-issues.md](../known-issues.md)).
+What the browser backend does not do yet: stdin, fuel, memory (measured or bounded), host
+extensions and sites ([known-issues.md](../known-issues.md)).
 
 **One set of scenarios for both.** `crates/wasmnet-web/tests/parity.rs` runs the same
 scenarios on the wasmtime backend and on the browser backend's Rust half, and requires the
 same answers and the same journalled events: device commands between runs and as operator
-events, a controller that creates devices, commands them, reads the answers and reconfigures a
-switch in place, a controller that follows the events of a router it created (`events.read`,
-`events.arm`), and a device's arguments and environment. On the browser side wasmtime stands
+events, a controller that creates devices, commands them, reads the answers, reconfigures a
+switch in place and restarts a router, a controller that follows the events of a router it
+created (`events.read`, `events.arm`), a controller that supplies components (one runs, one is
+no component, one does not link), and a device's arguments and environment. On the browser side wasmtime stands
 in for the page: it runs the components and serves their imports through the registry and the
 boundary's encoding, as `network.ts` does, so every line of Rust a browser runs is exercised.
-The page's own test (`web/test`) then has to prove only the TypeScript: it runs a command, an
-operator event, and a server that reads its arguments and environment in headless Chromium.
+The page's own test (`web/test`) then has to prove only the TypeScript, in headless Chromium:
+a command, an operator event, a server that reads its arguments and environment, and devices
+created while the network runs (an `infra-script` controller creating, commanding and
+restarting a router; a `replicas` controller woken by `changes.wait`; a second one that fetches
+a component's bytes, supplies them and runs two instances from the page's own transpile; an
+ungranted importer refused).
