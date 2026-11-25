@@ -112,6 +112,7 @@ mod actor;
 mod cache;
 mod command;
 mod control;
+mod exports;
 mod extension;
 mod glue;
 mod infra;

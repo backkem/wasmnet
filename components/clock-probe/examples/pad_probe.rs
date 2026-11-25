@@ -5,10 +5,12 @@
 //! On its first poll it counts its boots in the note `boot` (found with `note.find`, one byte
 //! appended per boot), journals `pad-boot {boots, notes, bytes}`, and with `big` in its config
 //! (bytes) appends that many bytes (`reps` times, default once) to the note `big` and reads the
-//! last 16 back
-//! (`pad-big {size, tail, state}`), then journals the device's note names (`pad-names`). Then
-//! every `period` (default 10ms) it appends 64 bytes to the note `log`: `pad-append {size}`, or
-//! `pad-error {error}`.
+//! last 16 back (`pad-big {size, tail, state}`), then journals the device's note names
+//! (`pad-names`). Then every `period` (default 10ms) it appends 64 bytes to the note `log`:
+//! `pad-append {size}`, or `pad-error {error}`.
+//!
+//! It exports `wasmnet-test:pad/inspect`, which no host calls by itself: the tests of portable
+//! exports call it by name (`write` journals `pad-written {name, size}`).
 
 // Native builds (a `cargo test --workspace`) compile it without the export, so nothing is used.
 #![cfg_attr(not(target_family = "wasm"), allow(dead_code))]
@@ -23,7 +25,7 @@ wit_bindgen::generate!({
 
         world pad-probe {
             include wasmnet:link/stepped-device@0.1.0;
-            include wasmnet-test:pad/user@0.1.0;
+            include wasmnet-test:pad/keeper@0.1.0;
         }
     "#,
     path: ["../../wit/deps/config", "../../wit/link", "../../wit/test-pad"],
@@ -32,6 +34,7 @@ wit_bindgen::generate!({
 });
 
 use exports::wasmnet::link::device::Guest;
+use exports::wasmnet_test::pad::inspect;
 use wasi::config::store;
 use wasmnet::link::log;
 use wasmnet::link::types::PortInfo;
@@ -145,6 +148,24 @@ impl Guest for Component {
     }
 
     fn link_state(_now: u64, _port: u32, _up: bool) {}
+}
+
+impl inspect::Guest for Component {
+    fn write(name: String, bytes: Vec<u8>) -> Result<u64, String> {
+        let size = Note::new(&name)
+            .append(&bytes)
+            .map_err(|e| format!("{e:?}"))?;
+        event("pad-written", &[("name", name), ("size", size.to_string())]);
+        Ok(size)
+    }
+
+    fn read(name: String, offset: u64, len: u32) -> Vec<u8> {
+        Note::find(&name).map_or_else(Vec::new, |n| n.read(offset, len))
+    }
+
+    fn size(name: String) -> Option<u64> {
+        Note::find(&name).map(|n| n.info().size)
+    }
 }
 
 #[cfg(target_family = "wasm")]

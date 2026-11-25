@@ -107,6 +107,11 @@ impl Runtime for Host {
                 controls.push(handler);
             }
         }
+        // Last: any export function by name (portable exports), for the calls no typed handler
+        // took.
+        controls.push(Box::new(crate::exports::Exports::find(
+            component, &mut store, &instance,
+        )));
         let apps = load_apps(component, &mut store, &instance).map_err(runtime_error)?;
         let app_names = apps
             .iter()
@@ -146,7 +151,7 @@ impl Runtime for Host {
         };
         Ok(DeviceInstance::new(ports, actor.into_future())
             .has_counters(has_counters)
-            .exports(exports)
+            .exports(interface_exports(component, exports))
             .apps(app_names))
     }
 
@@ -212,6 +217,23 @@ fn load_apps(
             Ok(App { export, run })
         })
         .collect()
+}
+
+/// Every interface `component` exports, by name without a version, with `served` (the exports
+/// the host's and the extensions' handlers found), sorted and once each: what the network
+/// reports as the device's exports (the page reports the same list).
+fn interface_exports(component: &Component, served: Vec<String>) -> Vec<String> {
+    let mut names: Vec<String> = component
+        .component_type()
+        .exports(component.engine())
+        .map(|(name, _)| name)
+        .filter(|name| name.contains(':'))
+        .map(|name| wasmnet_core::export::unversioned(name).to_owned())
+        .chain(served)
+        .collect();
+    names.sort();
+    names.dedup();
+    names
 }
 
 #[cfg(test)]

@@ -138,6 +138,8 @@ struct Gen<'a> {
     resolve: &'a Resolve,
     /// Resource definitions to their marker types.
     markers: BTreeMap<TypeId, Ident>,
+    /// The world's exported interfaces (their bindings live under `exports::`).
+    exported: Vec<InterfaceId>,
 }
 
 fn expand(input: &Input) -> R<TokenStream> {
@@ -170,15 +172,31 @@ fn expand(input: &Input) -> R<TokenStream> {
                     .any(|t| matches!(resolve.types[*t].kind, TypeDefKind::Resource))
         })
         .collect();
-    if interfaces.is_empty() {
+    let exported: Vec<InterfaceId> = resolve.worlds[world]
+        .exports
+        .values()
+        .filter_map(|item| match item {
+            WorldItem::Interface { id, .. } => Some(*id),
+            _ => None,
+        })
+        .filter(|id| !resolve.interfaces[*id].functions.is_empty())
+        .collect();
+    if interfaces.is_empty() && exported.is_empty() {
         return Err(format!(
-            "world `{}` imports no interface with functions or resources",
+            "world `{}` imports no interface with functions or resources and exports none with functions",
             input.world.value()
+        ));
+    }
+    if let Some(both) = exported.iter().find(|e| interfaces.contains(e)) {
+        return Err(format!(
+            "`{}` is both imported and exported",
+            resolve.id_of(*both).unwrap_or_default()
         ));
     }
     let mut g = Gen {
         resolve: &resolve,
         markers: BTreeMap::new(),
+        exported: exported.clone(),
     };
     let mut marker_items = Vec::new();
     let mut with = Vec::new();
@@ -208,6 +226,7 @@ fn expand(input: &Input) -> R<TokenStream> {
         links.push(link);
         decls.push(decl);
     }
+    let (export_fields, export_finds, export_arms, export_names) = g.exports()?;
     let name = &input.name;
     let module = format_ident!("__{}", name.to_string().to_snake_case());
     let paths: Vec<String> = input.paths.iter().map(LitStr::value).collect();
@@ -229,6 +248,7 @@ fn expand(input: &Input) -> R<TokenStream> {
                     path: [#(#paths),*],
                     world: #world_name,
                     imports: { default: trappable },
+                    exports: { default: async | store },
                     with: { #(#with),* },
                     wasmtime_crate: ::wasmnet_host::wasmtime,
                 });
@@ -253,6 +273,43 @@ fn expand(input: &Input) -> R<TokenStream> {
 
             pub fn interfaces() -> ::std::vec::Vec<::wasmnet_host::sim::Interface> {
                 ::std::vec![#(#decls),*]
+            }
+
+            /// The world's exported interfaces a device has: calls of them by name.
+            pub struct Exports {
+                #(#export_fields,)*
+            }
+
+            impl Exports {
+                pub fn find(
+                    pre: &::wasmnet_host::wasmtime::component::InstancePre<::wasmnet_host::HostState>,
+                    store: &mut ::wasmnet_host::wasmtime::Store<::wasmnet_host::HostState>,
+                    instance: &::wasmnet_host::wasmtime::component::Instance,
+                ) -> Trap<::std::option::Option<(::std::string::String, ::std::boxed::Box<dyn ::wasmnet_host::ControlHandler>)>> {
+                    let found = Exports { #(#export_finds,)* };
+                    let names: &[(&str, bool)] = &[#(#export_names),*];
+                    let _ = (&pre, &store, &instance);
+                    Ok(names.iter().find(|(_, has)| *has).map(|(n, _)| {
+                        ((*n).to_owned(), ::std::boxed::Box::new(found) as ::std::boxed::Box<dyn ::wasmnet_host::ControlHandler>)
+                    }))
+                }
+            }
+
+            impl ::wasmnet_host::ControlHandler for Exports {
+                fn serve<'a>(
+                    &'a self,
+                    acc: &'a ::wasmnet_host::wasmtime::component::Accessor<::wasmnet_host::HostState>,
+                    call: ::std::boxed::Box<dyn ::wasmnet_host::sim::ext::ControlCall>,
+                ) -> ::std::result::Result<::wasmnet_host::ControlFuture<'a>, ::std::boxed::Box<dyn ::wasmnet_host::sim::ext::ControlCall>> {
+                    let ::std::option::Option::Some(inv) = call.invocation(::wasmnet_host::portable::now(acc)) else {
+                        return Err(call);
+                    };
+                    let mut args = inv.args.into_iter();
+                    match (inv.interface.as_str(), inv.function.as_str()) {
+                        #(#export_arms)*
+                        _ => Err(call),
+                    }
+                }
             }
         }
 
@@ -282,6 +339,14 @@ fn expand(input: &Input) -> R<TokenStream> {
                 ::wasmnet_host::portable::attach(state, device);
                 Ok(())
             }
+            fn instance_ready(
+                &self,
+                pre: &::wasmnet_host::wasmtime::component::InstancePre<::wasmnet_host::HostState>,
+                store: &mut ::wasmnet_host::wasmtime::Store<::wasmnet_host::HostState>,
+                instance: &::wasmnet_host::wasmtime::component::Instance,
+            ) -> ::wasmnet_host::wasmtime::Result<::std::option::Option<(::std::string::String, ::std::boxed::Box<dyn ::wasmnet_host::ControlHandler>)>> {
+                #module::Exports::find(pre, store, instance)
+            }
         }
     })
 }
@@ -298,6 +363,9 @@ impl Gen<'_> {
                 i.name.as_deref().ok_or("an unnamed interface")?,
             )),
         );
+        if self.exported.contains(&iid) {
+            return Ok(quote!(bindings::exports::#ns::#p::#n));
+        }
         Ok(quote!(bindings::#ns::#p::#n))
     }
 
@@ -656,6 +724,113 @@ impl Gen<'_> {
         })
     }
 
+    /// The exported interfaces' handler parts: its fields, how each is found in an instance,
+    /// the match arms that call each function, and the interfaces' names (without a version)
+    /// with whether the instance has them.
+    #[allow(clippy::type_complexity)]
+    fn exports(
+        &self,
+    ) -> R<(
+        Vec<TokenStream>,
+        Vec<TokenStream>,
+        Vec<TokenStream>,
+        Vec<TokenStream>,
+    )> {
+        let (mut fields, mut finds, mut arms, mut names) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for &iid in &self.exported {
+            let i = &self.resolve.interfaces[iid];
+            let full = self.resolve.id_of(iid).ok_or("an unnamed interface")?;
+            let iname = full
+                .split_once('@')
+                .map_or(full.as_str(), |(n, _)| n)
+                .to_owned();
+            let m = self.module(iid)?;
+            let f = format_ident!("e_{}", rust_ident(i.name.as_deref().unwrap_or_default()));
+            fields.push(quote!(#f: ::std::option::Option<#m::Guest>));
+            finds.push(quote! {
+                #f: match #m::GuestIndices::new(pre) {
+                    Ok(ix) => Some(ix.load(&mut *store, instance)?),
+                    Err(_) => None,
+                }
+            });
+            names.push(quote!((#iname, found.#f.is_some())));
+            for func in i.functions.values() {
+                if !matches!(func.kind, FunctionKind::Freestanding) {
+                    return Err(format!(
+                        "`{}` in exported `{iname}`: only freestanding functions of an exported interface are portable yet",
+                        func.name
+                    ));
+                }
+                let wit = &func.name;
+                let call = format_ident!("call_{}", rust_ident(&func.name));
+                let mut convs = Vec::new();
+                let mut checks = Vec::new();
+                let mut names_a = Vec::new();
+                for (n, p) in func.params.iter().enumerate() {
+                    let a = format_ident!("a{}", n);
+                    let conv = self.value_to(quote!(v), &p.ty)?;
+                    convs.push(quote! {
+                        let #a = match args.next() {
+                            Some(v) => #conv,
+                            None => Err(::std::string::String::from("a missing argument")),
+                        };
+                    });
+                    checks.push(quote! {
+                        let #a = #a.map_err(|e| ::wasmnet_host::wasmtime::format_err!("{}#{}: {}", #iname, #wit, e))?;
+                    });
+                    names_a.push(a);
+                }
+                let decode = match &func.result {
+                    None => quote!({
+                        let () = r;
+                        Ok(Value::None)
+                    }),
+                    Some(Type::Id(id))
+                        if matches!(
+                            self.resolve.types[self.def(*id)].kind,
+                            TypeDefKind::Result(_)
+                        ) =>
+                    {
+                        let TypeDefKind::Result(res) = &self.resolve.types[self.def(*id)].kind
+                        else {
+                            unreachable!()
+                        };
+                        let side = |t: Option<&Type>| -> R<TokenStream> {
+                            Ok(match t {
+                                Some(t) => self.to_value(quote!(x), t)?,
+                                None => quote!({
+                                    let _ = x;
+                                    Value::None
+                                }),
+                            })
+                        };
+                        let ok = side(res.ok.as_ref())?;
+                        let err = side(res.err.as_ref())?;
+                        quote!(match r { Ok(x) => Ok(#ok), Err(x) => Err(#err) })
+                    }
+                    Some(t) => {
+                        let v = self.to_value(quote!(r), t)?;
+                        quote!(Ok(#v))
+                    }
+                };
+                arms.push(quote! {
+                    (#iname, #wit) if self.#f.is_some() => {
+                        let g = self.#f.as_ref().expect("checked above");
+                        #(#convs)*
+                        Ok(::std::boxed::Box::pin(async move {
+                            #(#checks)*
+                            let r = g.#call(acc, #(#names_a),*).await?;
+                            let answer: ::std::result::Result<Value, Value> = #decode;
+                            ::wasmnet_host::portable::invoked(acc, call, answer);
+                            Ok(())
+                        }))
+                    }
+                });
+            }
+        }
+        Ok((fields, finds, arms, names))
+    }
     /// One function's trait method.
     fn method(&self, iface: &str, f: &Function) -> R<TokenStream> {
         let name = match f.kind {

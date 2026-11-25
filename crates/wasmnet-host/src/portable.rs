@@ -90,3 +90,20 @@ pub fn bad_answer(interface: &str, function: &str, why: &str) -> wasmtime::Error
         "{interface}#{function}: the extension answered a value of the wrong shape: {why}"
     )
 }
+
+/// The device's virtual instant inside a control call (an export adapter's
+/// [`ControlCall::invocation`](wasmnet_core::ext::ControlCall::invocation)).
+pub fn now(acc: &wasmtime::component::Accessor<HostState>) -> wasmnet_core::Nanos {
+    acc.with(|mut s| s.get().clock().now())
+}
+
+/// Hands a device's answer to an export call to `call`
+/// ([`ControlCall::invoked`](wasmnet_core::ext::ControlCall::invoked)), with the configuration
+/// the device's `wasi:config/store` serves, which the call may replace.
+pub fn invoked(
+    acc: &wasmtime::component::Accessor<HostState>,
+    call: Box<dyn wasmnet_core::ext::ControlCall>,
+    answer: Result<Value, Value>,
+) {
+    acc.with(|mut s| call.invoked(answer, &mut s.get().config));
+}
