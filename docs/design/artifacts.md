@@ -94,12 +94,12 @@ with the pinned toolchain and tools:
 
 - **Two builds in one checkout** give the same 36 files (components and nodes, fixtures
   included).
-- **Before this change, a build embedded its paths.** rustc writes the source path of every
+- **Without the mapping, a build embeds its paths.** rustc writes the source path of every
   place that can panic into the binary. Cargo passes a workspace crate's files relative to the
   workspace root with the platform's separator (`components\router\src\nat.rs`), and a
   crates.io crate's files as absolute paths into the cargo home, which name the user. The
-  netstack carried 16 such strings.
-- **`build` now maps them out** (`xtask/src/remap.rs`): one `--remap-path-prefix` per source
+  netstack would carry 16 such strings.
+- **`build` maps them out** (`xtask/src/remap.rs`): one `--remap-path-prefix` per source
   directory of every crate the components are built from, a workspace directory to its
   relative path with `/` separators, any other crate's to `/deps/<name>-<version>/...`. Per
   directory, not per crate, because rustc keeps the rest of a path as it found it, separators
@@ -116,7 +116,10 @@ with the pinned toolchain and tools:
 
 What is guaranteed: the same revision, built with `cargo xtask artifacts` with the pinned
 toolchain and tools, gives the same bytes in any checkout directory, for any user and cargo
-home, **on the same operating system**. `--rebuild` checks it.
+home, **on the same operating system**. `--rebuild` checks it. This was observed on Windows
+(two checkouts at different paths, each with a cargo home of its own); on Linux it follows from
+the same mechanism and has not been observed yet: the proposed publishing workflow builds a set
+on two runners and compares them before it publishes.
 
 What is not guaranteed: **the same bytes on Linux and on Windows.** Nobody has compared yet.
 The paths are no longer a reason for them to differ, but one more is likely: cargo derives
