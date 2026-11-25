@@ -22,6 +22,8 @@ and [the main README](../README.md) shows a network in ten lines.
 
 For embedders:
 
+- [../components/README.md](../components/README.md): every component and node by name, its
+  package and artifact, and how to build a few of them into a directory.
 - [design/runtime-and-extensions.md](design/runtime-and-extensions.md): the `Runtime` backend
   contract, what `wasmnet-host` adds, and the extension points.
 - [design/links.md](design/links.md): the link model: latency, MTU, carrier, and per-direction

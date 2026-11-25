@@ -1,9 +1,14 @@
 //! `cargo xtask` for this workspace (run from its root).
 //!
 //! ```text
-//! cargo xtask build        build every component under components/ (and components/apps/)
+//! cargo xtask build [--only NAME[,NAME...]] [--out-dir DIR]
+//!                          build every component under components/ (and components/apps/)
 //!                          for wasm32-wasip2 (release), compose every compositions/<node>.wac
-//!                          into node-<node>.wasm with wac, and `wasm-tools validate` all of them
+//!                          into node-<node>.wasm with wac, and `wasm-tools validate` all of
+//!                          them. --only builds the named components and nodes (a node's
+//!                          parts with it); --out-dir also copies what was asked for into DIR,
+//!                          as <name>.wasm
+//! cargo xtask build --list every component and node by name, without building
 //! cargo xtask test-guest   run every component's own tests (and wasmnet-wire's) as
 //!                          wasm32-wasip2 binaries inside wasmtime
 //! cargo xtask web [--no-build] [--test]
@@ -15,8 +20,10 @@
 //!
 //! Build outputs land in `target/wasm32-wasip2/release/` (or under `$CARGO_TARGET_DIR`).
 //! `build` needs `wac` and `wasm-tools` on `PATH`, `test-guest` needs `wasmtime`, `web` needs
-//! Node 24 and npm, and a Chromium for `--test` (the versions are in the workspace README).
+//! Node 24 and npm, and a Chromium for `--test` (the versions are in the workspace README). The
+//! components and nodes are listed in `components/README.md`.
 
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -45,6 +52,27 @@ struct Crate {
     package: String,
     app: bool,
     lib: bool,
+}
+
+impl Crate {
+    /// Its namespace in a composition and in wac's `--deps-dir` layout: `app` or `wasmnet`.
+    fn namespace(&self) -> &'static str {
+        if self.app { "app" } else { "wasmnet" }
+    }
+
+    /// How a composition names it: `wasmnet:<component>` or `app:<app>`.
+    fn reference(&self) -> String {
+        format!("{}:{}", self.namespace(), self.name)
+    }
+}
+
+/// A composed node: `compositions/<stem>.wac`, built into `node-<stem>.wasm`.
+struct Node {
+    /// `node-<stem>`.
+    name: String,
+    wac: PathBuf,
+    /// The components it instantiates, as the composition names them ([`Crate::reference`]).
+    parts: Vec<String>,
 }
 
 /// The package name in a `Cargo.toml` (`name = "..."` under `[package]`).
@@ -110,6 +138,45 @@ fn components(root: &Path) -> Result<Vec<Crate>> {
     Ok(crates)
 }
 
+/// The components a composition instantiates: every `new wasmnet:<name>` and `new app:<name>`
+/// outside its `//` comments, in order, each once.
+fn wac_parts(text: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    for line in text.lines() {
+        let mut rest = line.split("//").next().unwrap_or_default();
+        while let Some(at) = rest.find("new ") {
+            rest = rest[at + 4..].trim_start();
+            let reference: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | ':'))
+                .collect();
+            if reference.contains(':') && !parts.contains(&reference) {
+                parts.push(reference);
+            }
+        }
+    }
+    parts
+}
+
+/// Every composed node: `compositions/<stem>.wac`, sorted.
+fn nodes(root: &Path) -> Result<Vec<Node>> {
+    let mut wacs: Vec<PathBuf> = fs::read_dir(root.join("compositions"))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "wac"))
+        .collect();
+    wacs.sort();
+    wacs.into_iter()
+        .map(|wac| {
+            let stem = wac.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
+            Ok(Node {
+                name: format!("node-{stem}"),
+                parts: wac_parts(&fs::read_to_string(&wac)?),
+                wac,
+            })
+        })
+        .collect()
+}
+
 /// Tests run as wasm inside wasmtime: the `wasm32-wasip2` runner in `.cargo/config.toml`.
 fn test_guest() -> Result<()> {
     let root = root();
@@ -122,56 +189,160 @@ fn test_guest() -> Result<()> {
     run(&mut cmd)
 }
 
-fn build() -> Result<()> {
+/// What `build` was asked for.
+#[derive(Debug, Default, PartialEq)]
+struct BuildArgs {
+    /// `--only`: the components and nodes to build, by name; empty for all of them.
+    only: Vec<String>,
+    /// `--out-dir`: where to copy what was asked for.
+    out_dir: Option<PathBuf>,
+    /// `--list`: print the names instead of building.
+    list: bool,
+}
+
+fn build_args(args: &[String]) -> Result<BuildArgs> {
+    let mut parsed = BuildArgs::default();
+    let mut args = args.iter();
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--only" => {
+                let names = args.next().ok_or("build: --only needs names")?;
+                let names = names.split(',').filter(|n| !n.is_empty());
+                parsed.only.extend(names.map(str::to_owned));
+            }
+            "--out-dir" => {
+                let dir = args.next().ok_or("build: --out-dir needs a directory")?;
+                parsed.out_dir = Some(PathBuf::from(dir));
+            }
+            "--list" => parsed.list = true,
+            other => return Err(format!("build: unknown option {other}").into()),
+        }
+    }
+    Ok(parsed)
+}
+
+/// What one build covers.
+struct Selection<'a> {
+    /// The crates to build: the named ones and the parts of the named nodes.
+    crates: Vec<&'a Crate>,
+    /// The nodes to compose.
+    nodes: Vec<&'a Node>,
+    /// The crates that were asked for by name (all of them without `--only`): what
+    /// `--out-dir` gets, with the nodes.
+    named: BTreeSet<&'a str>,
+}
+
+/// The components and nodes `only` names (everything when it is empty), and the parts those
+/// nodes are composed from.
+fn select<'a>(crates: &'a [Crate], nodes: &'a [Node], only: &[String]) -> Result<Selection<'a>> {
+    if only.is_empty() {
+        return Ok(Selection {
+            crates: crates.iter().collect(),
+            nodes: nodes.iter().collect(),
+            named: crates.iter().map(|c| c.name.as_str()).collect(),
+        });
+    }
+    let mut named = BTreeSet::new();
+    let mut parts = BTreeSet::new();
+    let mut composed = BTreeSet::new();
+    for name in only {
+        if let Some(c) = crates.iter().find(|c| &c.name == name) {
+            named.insert(c.name.as_str());
+        } else if let Some(n) = nodes.iter().find(|n| &n.name == name) {
+            composed.insert(n.name.as_str());
+            for part in &n.parts {
+                let c = crates
+                    .iter()
+                    .find(|c| &c.reference() == part)
+                    .ok_or_else(|| format!("{}: no component `{part}`", n.wac.display()))?;
+                parts.insert(c.name.as_str());
+            }
+        } else {
+            return Err(format!(
+                "build: no component or node `{name}` (`cargo xtask build --list` names them)"
+            )
+            .into());
+        }
+    }
+    Ok(Selection {
+        crates: crates
+            .iter()
+            .filter(|c| named.contains(c.name.as_str()) || parts.contains(c.name.as_str()))
+            .collect(),
+        nodes: nodes
+            .iter()
+            .filter(|n| composed.contains(n.name.as_str()))
+            .collect(),
+        named,
+    })
+}
+
+/// `build --list`: every component and node by name, with the package or the parts behind it.
+fn list(crates: &[Crate], nodes: &[Node]) {
+    for c in crates {
+        let kind = if c.app { "app" } else { "component" };
+        println!("{:<22} {kind:<10} {}", c.name, c.package);
+    }
+    for n in nodes {
+        println!("{:<22} {:<10} {}", n.name, "node", n.parts.join(" + "));
+    }
+}
+
+fn build(args: &BuildArgs) -> Result<()> {
     let root = root();
     let crates = components(&root)?;
+    let nodes = nodes(&root)?;
+    if args.list {
+        list(&crates, &nodes);
+        return Ok(());
+    }
+    let selected = select(&crates, &nodes, &args.only)?;
 
     let mut cmd = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
     cmd.current_dir(&root)
         .args(["build", "--release", "--target", TARGET]);
-    for c in &crates {
+    for c in &selected.crates {
         cmd.args(["-p", &c.package]);
     }
     run(&mut cmd)?;
 
     let out = target_dir(&root).join(TARGET).join("release");
     let deps = target_dir(&root).join("wac-deps");
-    if deps.exists() {
+    // A full build starts from an empty directory; a partial one replaces only its own parts.
+    if args.only.is_empty() && deps.exists() {
         fs::remove_dir_all(&deps)?;
     }
-    let mut built = Vec::new();
-    for c in &crates {
+    // What was built, and the name `--out-dir` gets it under (none for a part nobody named).
+    let mut built: Vec<(PathBuf, Option<String>)> = Vec::new();
+    for c in &selected.crates {
         let path = output(&out, &c.name)
             .ok_or_else(|| format!("{}: no .wasm in {}", c.name, out.display()))?;
         // wac's `--deps-dir` layout: `wasmnet:<component>` and `app:<app>`.
-        let namespace = if c.app { "app" } else { "wasmnet" };
-        fs::create_dir_all(deps.join(namespace))?;
-        fs::copy(&path, deps.join(namespace).join(format!("{}.wasm", c.name)))?;
+        fs::create_dir_all(deps.join(c.namespace()))?;
+        fs::copy(
+            &path,
+            deps.join(c.namespace()).join(format!("{}.wasm", c.name)),
+        )?;
         println!("  {:<20} {}", c.name, path.display());
-        built.push(path);
+        let named = selected.named.contains(c.name.as_str());
+        built.push((path, named.then(|| format!("{}.wasm", c.name))));
     }
 
-    let mut wacs: Vec<PathBuf> = fs::read_dir(root.join("compositions"))?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "wac"))
-        .collect();
-    wacs.sort();
-    for wac in &wacs {
-        let stem = wac.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
-        let node = out.join(format!("node-{stem}.wasm"));
+    for n in &selected.nodes {
+        let node = out.join(format!("{}.wasm", n.name));
         run(Command::new("wac")
             .arg("compose")
-            .arg(wac)
+            .arg(&n.wac)
             .arg("--deps-dir")
             .arg(&deps)
             .arg("-o")
             .arg(&node))?;
-        println!("  {:<20} {}", format!("node-{stem}"), node.display());
-        built.push(node);
+        println!("  {:<20} {}", n.name, node.display());
+        built.push((node, Some(format!("{}.wasm", n.name))));
     }
 
     let mut invalid = 0;
-    for path in &built {
+    for (path, _) in &built {
         let out = Command::new("wasm-tools")
             .arg("validate")
             .arg(path)
@@ -190,10 +361,22 @@ fn build() -> Result<()> {
     }
     println!(
         "xtask build: {} component(s) and {} node(s), all {} valid",
-        crates.len(),
-        wacs.len(),
+        selected.crates.len(),
+        selected.nodes.len(),
         built.len()
     );
+
+    if let Some(dir) = &args.out_dir {
+        fs::create_dir_all(dir)?;
+        let mut copied = 0;
+        for (path, name) in &built {
+            if let Some(name) = name {
+                fs::copy(path, dir.join(name))?;
+                copied += 1;
+            }
+        }
+        println!("xtask build: {copied} file(s) copied to {}", dir.display());
+    }
     Ok(())
 }
 
@@ -219,7 +402,7 @@ fn web(args: &[String]) -> Result<()> {
         return Err("web: needs Node 24 and npm on PATH".into());
     }
     if !no_build {
-        build()?;
+        build(&BuildArgs::default())?;
         run(
             Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
                 .current_dir(&root)
@@ -254,16 +437,16 @@ fn web(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+const USAGE: &str = "usage: cargo xtask build [--only NAME[,NAME...]] [--out-dir DIR] | \
+cargo xtask build --list | cargo xtask test-guest | cargo xtask web [--no-build] [--test]";
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
-        Some("build") if args.len() == 1 => build(),
+        Some("build") => build_args(&args[1..]).and_then(|args| build(&args)),
         Some("test-guest") if args.len() == 1 => test_guest(),
         Some("web") => web(&args[1..]),
-        _ => Err(
-            "usage: cargo xtask build | cargo xtask test-guest | cargo xtask web [--no-build] [--test]"
-                .into(),
-        ),
+        _ => Err(USAGE.into()),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -271,5 +454,127 @@ fn main() -> ExitCode {
             eprintln!("xtask: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn strings(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| (*n).to_owned()).collect()
+    }
+
+    #[test]
+    fn a_composition_names_its_parts() {
+        let wac = "// node = new app:commented { ... }\n\
+                   package wasmnet:node-x;\n\
+                   let net = new wasmnet:netstack { ... };\n\
+                   let a = new app:http-server { ... }; let b = new app:dns-server {\n\
+                   };\n\
+                   let again = new app:http-server { ... }; // new app:late\n";
+        assert_eq!(
+            wac_parts(wac),
+            ["wasmnet:netstack", "app:http-server", "app:dns-server"]
+        );
+    }
+
+    #[test]
+    fn build_options() {
+        let args = build_args(&strings(&[
+            "--only",
+            "netstack,switch",
+            "--out-dir",
+            "out",
+            "--only",
+            "node-ping",
+        ]))
+        .unwrap();
+        assert_eq!(args.only, ["netstack", "switch", "node-ping"]);
+        assert_eq!(args.out_dir.as_deref(), Some(Path::new("out")));
+        assert!(!args.list);
+        assert_eq!(build_args(&[]).unwrap(), BuildArgs::default());
+        assert!(build_args(&strings(&["--only"])).is_err());
+        assert!(build_args(&strings(&["--release"])).is_err());
+    }
+
+    /// The names in a selection: the crates built, the nodes composed, the crates named.
+    fn names(s: &Selection) -> (Vec<String>, Vec<String>, Vec<String>) {
+        (
+            s.crates.iter().map(|c| c.name.clone()).collect(),
+            s.nodes.iter().map(|n| n.name.clone()).collect(),
+            s.named.iter().map(|n| (*n).to_owned()).collect(),
+        )
+    }
+
+    #[test]
+    fn a_named_node_brings_its_parts_and_nothing_else() {
+        let root = root();
+        let (crates, nodes) = (components(&root).unwrap(), nodes(&root).unwrap());
+
+        let all = select(&crates, &nodes, &[]).unwrap();
+        assert_eq!(all.crates.len(), crates.len());
+        assert_eq!(all.nodes.len(), nodes.len());
+        assert_eq!(all.named.len(), crates.len());
+
+        let some = select(&crates, &nodes, &strings(&["node-http-server", "switch"])).unwrap();
+        let (built, composed, named) = names(&some);
+        assert_eq!(built, ["netstack", "switch", "http-server"]);
+        assert_eq!(composed, ["node-http-server"]);
+        assert_eq!(named, ["switch"], "the node's parts were not asked for");
+
+        let unknown = select(&crates, &nodes, &strings(&["node-nowhere"]));
+        assert!(unknown.is_err_and(|e| e.to_string().contains("node-nowhere")));
+    }
+
+    /// The cells of the Markdown table rows in `text` whose first cell is a name in backticks.
+    fn table_rows(text: &str) -> Vec<Vec<String>> {
+        text.lines()
+            .filter(|l| l.starts_with("| `"))
+            .map(|l| {
+                l.trim_matches('|')
+                    .split('|')
+                    .map(|cell| cell.trim().replace('`', ""))
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// `components/README.md` lists exactly the components and nodes there are, with their
+    /// packages and parts.
+    #[test]
+    fn the_component_list_is_current() {
+        let root = root();
+        let (crates, nodes) = (components(&root).unwrap(), nodes(&root).unwrap());
+        let readme = fs::read_to_string(root.join("components/README.md")).unwrap();
+        let rows = table_rows(&readme);
+        let row = |name: &str| {
+            rows.iter()
+                .find(|r| r[0] == name)
+                .unwrap_or_else(|| panic!("components/README.md has no row for `{name}`"))
+        };
+        for c in &crates {
+            let r = row(&c.name);
+            assert_eq!(r[1], c.package, "the package of `{}`", c.name);
+            assert_eq!(r[2], format!("{}.wasm", c.name));
+        }
+        for n in &nodes {
+            let parts: Vec<&str> = n
+                .parts
+                .iter()
+                .map(|p| p.split_once(':').unwrap().1)
+                .collect();
+            assert_eq!(
+                row(&n.name)[1],
+                parts.join(", "),
+                "the parts of `{}`",
+                n.name
+            );
+        }
+        assert_eq!(
+            rows.len(),
+            crates.len() + nodes.len(),
+            "components/README.md lists something that is not there"
+        );
     }
 }

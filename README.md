@@ -64,7 +64,7 @@ The full version is [`crates/wasmnet-host/examples/http.rs`](crates/wasmnet-host
 | [`crates/wasmnet-host`](crates/wasmnet-host) | Runs a network on wasmtime: one store per device, deterministic WASI. Start here. |
 | [`crates/wasmnet-core`](crates/wasmnet-core) | The simulator itself: virtual clock, event queue, patch panel, link model, pcap taps. No wasmtime. |
 | [`crates/wasmnet-web`](crates/wasmnet-web) | The simulator for a browser, with [`web/`](web): a TypeScript binding and the page behind the link above. |
-| [`components/`](components) | `netstack` (smoltcp behind `wasi:sockets@0.3`), `switch`, `router`, `wan-port`. |
+| [`components/`](components) | `netstack` (smoltcp behind `wasi:sockets@0.3`), `switch`, `router`, `wan-port`. [All of them by name](components/README.md). |
 | [`components/apps/`](components/apps) | DHCP, DNS and mDNS servers, an HTTP server, client and load balancer, ping, traceroute, UDP echo. |
 | [`compositions/`](compositions) | `wac` files that plug apps into a netstack to make a node. |
 | [`wit/`](wit) | The contracts. `wasmnet:link` is the wire; everything else stands on it. |
