@@ -63,16 +63,12 @@ impl ControlHandler for Reconfigure {
                 .collect();
             let answer = self.guest.call_reconfigure(acc, now, config).await?;
             let answer = match answer {
-                Ok(()) => {
-                    // From now on the device reads its new configuration.
-                    let new = call.config().clone();
-                    acc.with(|mut s| s.get().config = new);
-                    Ok(())
-                }
+                Ok(()) => Ok(()),
                 Err(reconfigure::Refusal::Restart(m)) => Err(Refusal::Restart(m)),
                 Err(reconfigure::Refusal::Invalid(m)) => Err(Refusal::Invalid(m)),
             };
-            call.finish(answer);
+            // On `ok` the device reads its new configuration from now on.
+            acc.with(|mut s| call.finish_serving(answer, &mut s.get().config));
             Ok(())
         }))
     }

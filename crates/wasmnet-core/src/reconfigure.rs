@@ -122,6 +122,16 @@ impl ReconfigureCall {
         *self.answer.0.lock().unwrap_or_else(PoisonError::into_inner) = Some(answer);
     }
 
+    /// [`finish`](Self::finish) for a backend: on `ok`, `served` (the configuration the device's
+    /// `wasi:config/store` serves) becomes the new one first, so the device reads it from then
+    /// on; after a refusal it keeps the old one.
+    pub fn finish_serving(self, answer: Result<(), Refusal>, served: &mut DeviceConfig) {
+        if answer.is_ok() {
+            served.clone_from(&self.config);
+        }
+        self.finish(answer);
+    }
+
     /// `call` as a reconfiguration, or `call` back if it is another kind of control call.
     pub fn downcast(
         call: Box<dyn ControlCall>,
