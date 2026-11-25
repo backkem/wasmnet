@@ -27,7 +27,7 @@ use wasmnet_core::{ImportServer, Interface, Served, VirtualClock};
 pub const NOTES: &str = "wasmnet-test:pad/notes@0.1.0";
 
 /// The most bytes one device's notes hold; an append past it answers `full`.
-pub const MAX_BYTES: u64 = 64 << 20;
+pub const MAX_BYTES: u64 = 256 << 20;
 
 /// A device's options for the pad (`DeviceOptions::ext`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -79,9 +79,18 @@ fn lock(n: &Shared) -> MutexGuard<'_, Notes> {
 #[derive(Default)]
 pub struct Pad {
     devices: BTreeMap<String, Shared>,
+    /// Faults armed by device name ([`Pad::fault_at`]), for devices whose options cannot say.
+    faults: BTreeMap<String, u32>,
 }
 
 impl Pad {
+    /// Arms a fault for the device called `name`: its `n`-th append faults it (as
+    /// [`PadOptions::fault_at`], which wins when both are set).
+    pub fn fault_at(mut self, name: impl Into<String>, n: u32) -> Self {
+        self.faults.insert(name.into(), n);
+        self
+    }
+
     /// The interface every backend links for it.
     pub fn interfaces() -> Vec<Interface> {
         vec![
@@ -138,7 +147,8 @@ impl NetworkExtension for Pad {
                 .options
                 .ext
                 .get::<PadOptions>()
-                .and_then(|o| o.fault_at);
+                .and_then(|o| o.fault_at)
+                .or_else(|| self.faults.get(setup.name).copied());
         }
         ext.serve(
             NOTES,

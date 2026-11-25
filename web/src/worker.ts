@@ -23,7 +23,7 @@ export interface Init {
   seed: string;
   simulator: WebAssembly.Module;
   components: Record<string, ComponentSource>;
-  scenario?: 'example' | 'controls' | 'runtime';
+  scenario?: 'example' | 'controls' | 'runtime' | 'portable' | 'portable-cost';
 }
 
 export interface Done {
@@ -181,6 +181,11 @@ async function runtime(net: Network): Promise<Record<string, string>> {
 
 serveRun<Init, Done>(async (init, ctx) => {
   const net = await Network.create(init.simulator, { seed: BigInt(init.seed), components: init.components });
+  if (init.scenario === 'portable' || init.scenario === 'portable-cost') {
+    const t0 = performance.now();
+    const notes = init.scenario === 'portable' ? await portable(net) : await portableCost(net);
+    return { outcome: notes.outcome as Outcome, links: [], ms: Math.round(performance.now() - t0), notes: notes.notes };
+  }
   if (init.scenario === 'runtime') {
     const notes = await runtime(net);
     ctx.running();
@@ -242,3 +247,64 @@ serveRun<Init, Done>(async (init, ctx) => {
 });
 
 void self;
+
+/** A device's journalled events, one line each: `<at> <device> <kind> k=v ...`. */
+function eventLines(entries: JournalEntry[], kinds: RegExp): string {
+  return entries
+    .filter((e): e is Extract<JournalEntry, { record: 'event' }> => e.record === 'event' && kinds.test(e.kind))
+    .map((e) => `${e.at} ${e.device} ${e.kind} ${e.fields.map(([k, v]) => `${k}=${v}`).join(' ')}`)
+    .join('\n');
+}
+
+/**
+ * The `portable` scenario: a portable extension in the page. The simulator is an embedder's own
+ * build with the test fixture `wasmnet-pad` installed (`crates/wasmnet-web/examples/pad_page.rs`),
+ * whose interface the binding links from its names alone. The same network as the native test
+ * `page_scenario_native` (`crates/wasmnet-host/tests/portable.rs`): the page test compares the
+ * lines. `p` moves 1 MiB through the interface and is stopped, started, crashed and started;
+ * `q` is faulted inside its third append; `r`, a controller's device, is recreated, removed and
+ * created again.
+ */
+async function portable(net: Network): Promise<{ outcome: unknown; notes: Record<string, string> }> {
+  net.setCatalog(['pad_probe']);
+  await net.device('p', 'pad_probe', { period: '10ms', big: '1048576' }, { crashAlone: true });
+  await net.device('q', 'pad_probe', { period: '10ms' }, { crashAlone: true });
+  const spec = (period: string) => hex(cbor({ component: 'pad_probe', config: { period } }));
+  await net.device(
+    'ctl',
+    'infra_script',
+    {
+      'step.0': `0ms apply r ${spec('10ms')}`,
+      'step.1': `45ms apply r ${spec('20ms')}`,
+      'step.2': '70ms remove r',
+      'step.3': `80ms apply r ${spec('10ms')}`,
+    },
+    { infra: true },
+  );
+  const ms = (n: number) => BigInt(n) * 1_000_000n;
+  net.op({ kind: 'stop-device', device: 'p', at: ms(55) });
+  net.op({ kind: 'start-device', device: 'p', at: ms(60) });
+  net.op({ kind: 'crash-device', device: 'p', message: 'operator crash', at: ms(85) });
+  net.op({ kind: 'start-device', device: 'p', at: ms(90) });
+  const entries: JournalEntry[] = [];
+  const outcome = await net.run({ deadline: ms(120), onJournal: (e) => entries.push(...e) });
+  return { outcome, notes: { lines: eventLines(entries, /^(pad-|device-)/) } };
+}
+
+/**
+ * The `portable-cost` scenario: what a big `list<u8>` costs through the page's half of a
+ * portable call (jco's lowering, the binding's encoding, the boundary, the server). A device
+ * appends 4 MiB once, then 31 times; the difference over 30 is the cost of one append.
+ */
+async function portableCost(net: Network): Promise<{ outcome: unknown; notes: Record<string, string> }> {
+  const time = async (name: string, reps: number) => {
+    await net.device(name, 'pad_probe', { period: '1000ms', big: String(4 << 20), reps: String(reps) });
+    const t0 = performance.now();
+    await net.run({ deadline: BigInt(name === 'one' ? 1_000_000 : 2_000_000) });
+    return performance.now() - t0;
+  };
+  const one = await time('one', 1);
+  const many = await time('many', 31);
+  const outcome = { one, many };
+  return { outcome, notes: { oneMs: one.toFixed(1), manyMs: many.toFixed(1), perAppendMs: ((many - one) / 30).toFixed(2) } };
+}

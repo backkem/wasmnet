@@ -63,12 +63,13 @@
 pub mod codec;
 pub mod host;
 pub mod infra;
+pub mod install;
 pub mod network;
 pub mod ops;
 pub mod runtime;
 
 #[cfg(target_arch = "wasm32")]
-mod ffi;
+pub(crate) mod ffi;
 
 pub use host::{CallEnd, Instance, JsHost};
 pub use network::{Network, RunOutcome};

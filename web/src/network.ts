@@ -139,6 +139,12 @@ interface Exports {
   wn_insecure_seed(dev: number, out: number): void;
   wn_timer(dev: number, at: bigint): number;
   wn_call_done(dev: number, call: number, end: number, msg: number, len: number): void;
+  // Portable interfaces extensions serve (crates/wasmnet-web/src/ffi.rs).
+  wn_import(dev: number, call: number, len: number): number;
+  wn_import_drop(dev: number, name: number, len: number, handle: number): void;
+  wn_interfaces(): number;
+  // An embedder's own build of this module (`wasmnet_web::install!`) sets its installer here.
+  wn_install?(): void;
 }
 
 /** The parts of a transpiled device's exports this file calls (jco camel-cases names). */
@@ -169,6 +175,10 @@ const INFRA: Record<string, string[]> = {
 const INFRA_WAITS: Record<string, string[]> = { changes: ['wait', 'waitAny'] };
 
 const kebab = (s: string) => s.replace(/[A-Z]/g, (c) => `-${c.toLowerCase()}`);
+const camel = (s: string) => s.replace(/-([a-z0-9])/g, (_, c: string) => c.toUpperCase());
+const pascal = (s: string) => camel(s).replace(/^[a-z]/, (c) => c.toUpperCase());
+/** Marks a resource class's construction from a handle the server answered (not the WIT constructor). */
+const FROM_HANDLE = Symbol('from handle');
 
 /** A `result`'s `err` that jco threw as a `ComponentError`: its payload. Anything else is a trap, thrown on. */
 function errPayload(err: unknown): unknown {
@@ -244,6 +254,7 @@ export class Network {
     this.x = wrapped as unknown as Exports;
     this.sources = { ...options.components };
     this.supply = options.supply;
+    this.x.wn_install?.();
     if (this.x.wn_network_new(U64(BigInt(options.seed))) !== 0) throw new Error(this.resultText());
   }
 
@@ -679,6 +690,79 @@ export class Network {
     return new Promise((resolve) => this.waits.set(id, resolve)).then((reply) => settle(reply as codec.InfraReply));
   }
 
+  /** One call of a portable interface (`interface#function`), served by the simulator; its error is thrown, as jco expects. */
+  private portable(dev: number, call: string, args: unknown[]): unknown {
+    touch();
+    const len = this.withBytes(codec.encodeInfraCall(call, args), (p, l) => this.x.wn_import(dev, p, l));
+    const reply = codec.decodeInfraReply(this.result(len));
+    if ('value' in reply) return reply.value;
+    if ('error' in reply) throw { payload: reply.error };
+    throw new Error(reply.failed);
+  }
+
+  /**
+   * The imports of the portable interfaces the simulator's extensions serve, built from their
+   * names alone (`wn_interfaces`): a function per function, calling `wn_import`; a class per
+   * resource, per device, whose instances carry the server's handle (they extend
+   * `codec.ResourceHandle`, so they cross as handles); a handle the server answers comes back
+   * as an instance of its class, at the top of an answer or inside an `option`.
+   */
+  private portableImports(dev: number): Imports {
+    const reply = codec.decodeInfraReply(this.result(this.x.wn_interfaces()));
+    const interfaces = ('value' in reply ? reply.value : []) as { name: string; functions: string[]; resources: string[] }[];
+    const classes = new Map<string, new (...args: unknown[]) => codec.ResourceHandle>();
+    const wrap = (v: unknown): unknown => {
+      if (v instanceof codec.ResourceHandle) {
+        const cls = classes.get(v.resource);
+        return cls ? new cls(FROM_HANDLE, v.handle) : v;
+      }
+      return v;
+    };
+    const out: Imports = {};
+    for (const i of interfaces) {
+      const obj: Record<string, unknown> = {};
+      const self = this;
+      for (const r of i.resources) {
+        const ctor = i.functions.includes(`[constructor]${r}`) ? `${i.name}#[constructor]${r}` : null;
+        // jco constructs it for the WIT constructor (`new Note(name)`): the server makes the note.
+        const cls = class extends codec.ResourceHandle {
+          constructor(...args: unknown[]) {
+            const made = args[0] === FROM_HANDLE ? args[1] : ctor ? (self.portable(dev, ctor, args) as codec.ResourceHandle).handle : undefined;
+            if (typeof made !== 'number') throw new Error(`${r} has no constructor`);
+            super(r, made);
+          }
+        };
+        Object.defineProperty(cls, 'name', { value: pascal(r) });
+        const dispose = function (this: codec.ResourceHandle) {
+          self.withBytes(encoder.encode(`${i.name}#${r}`), (p, l) => self.x.wn_import_drop(dev, p, l, this.handle));
+        };
+        const proto = cls.prototype as unknown as Record<symbol, unknown>;
+        proto[Symbol.for('dispose')] = dispose;
+        const symbolDispose = (Symbol as { dispose?: symbol }).dispose;
+        if (symbolDispose) proto[symbolDispose] = dispose;
+        classes.set(r, cls);
+        obj[pascal(r)] = cls;
+      }
+      for (const f of i.functions) {
+        const call = (args: unknown[]) => wrap(this.portable(dev, `${i.name}#${f}`, args));
+        const m = /^\[(constructor|method|static)\]([^.]+)(?:\.(.+))?$/.exec(f);
+        if (!m) {
+          obj[camel(f)] = (...args: unknown[]) => call(args);
+          continue;
+        }
+        const [, kind, res, name] = m;
+        const cls = classes.get(res!) as unknown as { prototype: Record<string, unknown> } & Record<string, unknown>;
+        if (!cls) continue;
+        if (kind === 'method') cls.prototype[camel(name!)] = function (this: codec.ResourceHandle, ...args: unknown[]) {
+          return call([this, ...args]);
+        };
+        else if (kind === 'static') cls[camel(name!)] = (...args: unknown[]) => call(args);
+      }
+      out[i.name.split('@')[0]!] = obj;
+    }
+    return out;
+  }
+
   private imports(dev: number): Imports {
     const x = this.x;
     const infra: Imports = { 'wasmnet:infra/types': {} };
@@ -691,6 +775,7 @@ export class Network {
     return {
       ...wasiImports(this.world(dev)),
       ...infra,
+      ...this.portableImports(dev),
       'wasmnet:link/types': {},
       'wasmnet:link/wire': {
         transmit: (port: number, frame: Uint8Array) => {

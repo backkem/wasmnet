@@ -577,6 +577,29 @@ fn web(args: &[String]) -> Result<()> {
                     "wasm32-unknown-unknown",
                 ]),
         )?;
+        // The test fixture of portable extensions: its probe (an example component) and the
+        // simulator with its extension installed (an embedder's own build of the module).
+        let cargo = || Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
+        run(cargo().current_dir(&root).args([
+            "build",
+            "--release",
+            "-p",
+            "wasmnet-clock-probe",
+            "--example",
+            "pad-probe",
+            "--target",
+            "wasm32-wasip2",
+        ]))?;
+        run(cargo().current_dir(&root).args([
+            "build",
+            "--release",
+            "-p",
+            "wasmnet-web",
+            "--example",
+            "pad-page",
+            "--target",
+            "wasm32-unknown-unknown",
+        ]))?;
     }
     // A fresh install when there is none, or when the lockfile changed since the last one.
     let installed = web.join("node_modules").join(".package-lock.json");

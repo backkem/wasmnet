@@ -1938,6 +1938,7 @@ dependencies = [
  "wasmnet-core",
  "wasmnet-det-cbor",
  "wasmnet-host",
+ "wasmnet-pad",
  "wasmnet-wire",
  "wasmtime-wasi",
 ]

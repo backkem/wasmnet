@@ -65,7 +65,7 @@ use std::sync::Once;
 
 use wasmnet_core::{DeviceConfig, DeviceId, LinkId, Nanos, Refusal};
 
-use crate::codec;
+use crate::codec::{self, Value};
 use crate::host::{CallEnd, Instance, JsHost};
 use crate::infra::Reply;
 use crate::network::Network;
@@ -139,7 +139,8 @@ fn status(code: i32) -> Result<(), String> {
 
 /// The JavaScript side (a ZST: everything goes through the imports).
 #[derive(Clone, Copy)]
-struct Js;
+/// The browser host: the page's JavaScript, through the module's imports.
+pub struct Js;
 
 impl JsHost for Js {
     fn instantiate(
@@ -414,7 +415,8 @@ pub extern "C" fn wn_network_new(seed: u64) -> i32 {
     });
     let replaced = NETWORK.with(|n| match n.try_borrow_mut() {
         Ok(mut guard) => {
-            let network = Network::new(Js, seed);
+            let mut network = Network::new(Js, seed);
+            crate::install::run(network.sim_mut());
             let registry = network.registry().clone();
             // The old network (if any) is dropped here, before its successor is published.
             *guard = Some(network);
@@ -823,6 +825,51 @@ pub extern "C" fn wn_infra_wait(dev: u32, call: *const u8, len: usize) -> i32 {
         }
     }
 }
+/// One call of a portable interface device `dev` imports (an `infra call` message whose
+/// function is `interface#function`), served at once by the server an extension gave the
+/// device: leaves an `infra reply` in the result and answers its length. A device-side export.
+#[unsafe(no_mangle)]
+pub extern "C" fn wn_import(dev: u32, call: *const u8, len: usize) -> i32 {
+    let reply = match codec::decode_infra_call(bytes(call, len)) {
+        Ok((function, args)) => match registry() {
+            Some(r) => r.import(dev, &function, args),
+            None => Reply::Failed("no network".to_owned()),
+        },
+        Err(e) => Reply::Failed(format!("import call: {e}")),
+    };
+    set_result(codec::encode_infra_reply(&reply))
+}
+
+/// Device `dev` dropped its handle `handle` to `interface#resource` (UTF-8 at `name`). A
+/// device-side export.
+#[unsafe(no_mangle)]
+pub extern "C" fn wn_import_drop(dev: u32, name: *const u8, len: usize, handle: u32) {
+    if let (Some(r), Ok(name)) = (registry(), std::str::from_utf8(bytes(name, len))) {
+        r.import_drop(dev, name, handle);
+    }
+}
+
+/// The portable interfaces the network's extensions serve, for the page to link: an `infra
+/// reply` whose value is a list of records `{name, functions, resources}`; its length.
+#[unsafe(no_mangle)]
+pub extern "C" fn wn_interfaces() -> i32 {
+    let list =
+        NETWORK.with_borrow(|n| n.as_ref().map(|n| n.sim().interfaces()).unwrap_or_default());
+    let strs = |v: Vec<String>| Value::List(v.into_iter().map(Value::Str).collect());
+    let value = Value::List(
+        list.into_iter()
+            .map(|i| {
+                Value::record(vec![
+                    ("name", Value::Str(i.name)),
+                    ("functions", strs(i.functions)),
+                    ("resources", strs(i.resources)),
+                ])
+            })
+            .collect(),
+    );
+    set_result(codec::encode_infra_reply(&Reply::Value(value)))
+}
+
 // ---- the devices' imports ----------------------------------------------------------------
 
 /// The wall clock (`wasi:clocks` wall-clock `now`): the network's epoch plus virtual time, in ns

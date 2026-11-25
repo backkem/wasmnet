@@ -141,10 +141,10 @@ impl Wasm {
         let mut config = Config::new();
         config.wasm_component_model(true);
         let engine = Engine::new(&config).expect("engine");
-        let components = ["router", "switch", "infra_script"]
+        let components = ["router", "switch", "infra_script", "pad_probe"]
             .into_iter()
             .map(|name| {
-                let path = support::built().path(name);
+                let path = file_of(name);
                 let c = Component::from_file(&engine, &path)
                     .unwrap_or_else(|e| panic!("{}: {e:?}", path.display()));
                 (name.to_owned(), c)
@@ -185,10 +185,15 @@ impl Wasm {
             };
             let bare = name.split('@').next().unwrap_or(name);
             let served = ["wasmnet:link/wire", "wasmnet:link/log", "wasi:config/store"];
-            if !served.contains(&bare) && !bare.starts_with("wasmnet:infra/") {
+            let portable = PORTABLE.with(|p| p.iter().any(|i| i.name == name));
+            if !served.contains(&bare) && !bare.starts_with("wasmnet:infra/") && !portable {
                 continue;
             }
             let mut li = l.instance(name).expect("instance");
+            if let Some(i) = PORTABLE.with(|p| p.iter().find(|i| i.name == name).cloned()) {
+                link_portable(&mut li, &i);
+                continue;
+            }
             for (fname, item) in instance.exports(&self.engine) {
                 let ComponentItem::ComponentFunc(_) = item.ty else {
                     continue;
@@ -665,11 +670,9 @@ struct Native(wasmnet_host::Network<'static>);
 
 impl Native {
     fn new(seed: u64) -> Self {
-        let b = support::built();
-        let mut net = wasmnet_host::Network::new(&b.host, seed);
-        net.set_component_resolver(Box::new(move |name, instantiate| {
-            instantiate(&b.load(name))
-        }));
+        let mut net = wasmnet_host::Network::new(portable_host(), seed);
+        net.add_extension(pad());
+        net.set_component_resolver(Box::new(move |name, instantiate| instantiate(&load(name))));
         net.set_infra_catalog(CATALOG.map(String::from).to_vec());
         Self(net)
     }
@@ -683,7 +686,7 @@ impl Backend for Native {
         config: DeviceConfig,
         options: DeviceOptions,
     ) -> DeviceId {
-        let c = support::built().load(component);
+        let c = load(component);
         self.0
             .device_with_options(name, &c, config, options)
             .expect("device")
@@ -720,6 +723,7 @@ impl Web {
         let wasm = Wasm::new(seed);
         let mut net = wasmnet_web::Network::new(wasm.clone(), seed);
         REGISTRY.set(Some(net.registry().clone()));
+        net.sim_mut().add_extension(pad());
         net.sim_mut()
             .set_infra_catalog(CATALOG.map(String::from).to_vec());
         Self(net)
@@ -1249,4 +1253,232 @@ fn supplied_components_run_and_are_refused_alike() {
     for r in &refusals {
         assert!(r.contains(&words) && r.contains("wasi:sockets/"), "{r}");
     }
+}
+
+// ---- portable extensions ------------------------------------------------------------------
+
+wasmnet_host::portable_adapter!({
+    name: PadAdapter,
+    path: "../../wit/test-pad",
+    world: "wasmnet-test:pad/user",
+});
+
+thread_local! {
+    /// The portable interfaces the page links (what `wn_interfaces` tells it).
+    static PORTABLE: Vec<wasmnet_core::Interface> = wasmnet_pad::Pad::interfaces();
+}
+
+/// The fixture as both backends install it: the third append of `q` faults it.
+fn pad() -> wasmnet_pad::Pad {
+    wasmnet_pad::Pad::default().fault_at("q", 3)
+}
+
+/// The file of a component key (`pad_probe` is an example).
+fn file_of(name: &str) -> std::path::PathBuf {
+    if name == "pad_probe" {
+        static BUILT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        BUILT.get_or_init(|| {
+            let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+            let ok = std::process::Command::new(env!("CARGO"))
+                .current_dir(&root)
+                .args(["build", "--release", "--target", "wasm32-wasip2"])
+                .args(["-p", "wasmnet-clock-probe", "--example", "pad-probe"])
+                .status()
+                .expect("spawn cargo")
+                .success();
+            assert!(ok, "building pad-probe failed");
+        });
+        return support::built().path("examples/pad_probe");
+    }
+    support::built().path(name)
+}
+
+/// The native backend's host: with the fixture's generated adapter.
+fn portable_host() -> &'static wasmnet_host::Host {
+    static HOST: std::sync::OnceLock<wasmnet_host::Host> = std::sync::OnceLock::new();
+    HOST.get_or_init(|| {
+        wasmnet_host::Host::builder()
+            .extension(PadAdapter)
+            .build()
+            .expect("host")
+    })
+}
+
+fn load(name: &str) -> Component {
+    portable_host().load(file_of(name)).expect("load")
+}
+
+/// A resource's dynamic type on this side: one per name, as the page makes a class per name.
+fn resource_type(name: &str) -> u32 {
+    name.bytes().fold(0x811c_9dc5_u32, |h, b| {
+        (h ^ u32::from(b)).wrapping_mul(0x0100_0193)
+    })
+}
+
+/// Links a portable interface the way the page does: from its names alone, every call through
+/// the boundary's encoding to the registry (`wn_import`), resources as the server's handles.
+fn link_portable(
+    li: &mut wasmnet_host::wasmtime::component::LinkerInstance<'_, State>,
+    i: &wasmnet_core::Interface,
+) {
+    use wasmnet_host::wasmtime::component::{ResourceDynamic, ResourceType};
+    for r in &i.resources {
+        let drop_name = format!("{}#{r}", i.name);
+        li.resource(
+            r,
+            ResourceType::host_dynamic(resource_type(r)),
+            move |s, rep| {
+                registry().import_drop(s.data().dev, &drop_name, rep);
+                Ok(())
+            },
+        )
+        .expect("resource");
+    }
+    for f in &i.functions {
+        let call = format!("{}#{f}", i.name);
+        li.func_new(f, move |mut s, ty, args, out| {
+            let params: Vec<Type> = ty.params().map(|(_, t)| t).collect();
+            let mut values = Vec::new();
+            for (a, t) in args.iter().zip(&params) {
+                values.push(match (a, t) {
+                    (Val::Resource(r), Type::Own(rt) | Type::Borrow(rt)) => {
+                        let name = PORTABLE
+                            .with(|p| {
+                                p.iter()
+                                    .flat_map(|i| i.resources.clone())
+                                    .find(|n| ResourceType::host_dynamic(resource_type(n)) == *rt)
+                            })
+                            .expect("a known resource");
+                        let r = ResourceDynamic::try_from_resource_any(*r, &mut s)?;
+                        Value::Resource(name, r.rep())
+                    }
+                    (a, t) => to_value(a, t),
+                });
+            }
+            let wire = codec::encode_infra_call(&call, &values);
+            let (call, values) = codec::decode_infra_call(&wire).expect("call");
+            let dev = s.data().dev;
+            let reply = registry().import(dev, &call, values);
+            let reply =
+                codec::decode_infra_reply(&codec::encode_infra_reply(&reply)).expect("reply");
+            let Some(result) = ty.results().next() else {
+                return Ok(());
+            };
+            out[0] = match (reply, &result) {
+                (Reply::Value(v), Type::Result(r)) => Val::Result(Ok(match r.ok() {
+                    Some(t) => Some(Box::new(lift_portable(v, &t, &mut s)?)),
+                    None => None,
+                })),
+                (Reply::Error(v), Type::Result(r)) => Val::Result(Err(match r.err() {
+                    Some(t) => Some(Box::new(lift_portable(v, &t, &mut s)?)),
+                    None => None,
+                })),
+                (Reply::Value(v), t) => lift_portable(v, t, &mut s)?,
+                (Reply::Failed(m), _) => {
+                    return Err(wasmnet_host::wasmtime::format_err!("{m}"));
+                }
+                (reply, _) => {
+                    return Err(wasmnet_host::wasmtime::format_err!("{call}: {reply:?}"));
+                }
+            };
+            Ok(())
+        })
+        .expect("function");
+    }
+}
+
+/// An answer in the function's own types, with owned resources made from the server's handles.
+fn lift_portable(
+    v: Value,
+    t: &Type,
+    s: &mut wasmnet_host::wasmtime::StoreContextMut<'_, State>,
+) -> wasmnet_host::wasmtime::Result<Val> {
+    use wasmnet_host::wasmtime::component::ResourceDynamic;
+    Ok(match (v, t) {
+        (Value::Resource(name, h), Type::Own(_)) => Val::Resource(
+            ResourceDynamic::new_own(h, resource_type(&name)).try_into_resource_any(&mut *s)?,
+        ),
+        (Value::None, Type::Option(_)) => Val::Option(None),
+        (Value::Some(v), Type::Option(o)) => {
+            Val::Option(Some(Box::new(lift_portable(*v, &o.ty(), s)?)))
+        }
+        (Value::Tuple(items) | Value::List(items), Type::Tuple(tt)) => Val::Tuple(
+            items
+                .into_iter()
+                .zip(tt.types())
+                .map(|(v, t)| lift_portable(v, &t, s))
+                .collect::<wasmnet_host::wasmtime::Result<_>>()?,
+        ),
+        (Value::Record(fields), Type::Record(r)) => {
+            let mut fields: BTreeMap<String, Value> = fields.into_iter().collect();
+            Val::Record(
+                r.fields()
+                    .map(|f| {
+                        let v = fields.remove(f.name).unwrap_or(Value::None);
+                        Ok((f.name.to_owned(), lift_portable(v, &f.ty, s)?))
+                    })
+                    .collect::<wasmnet_host::wasmtime::Result<_>>()?,
+            )
+        }
+        (v, t) => to_val(v, t),
+    })
+}
+
+fn portable_scenario(net: &mut dyn Backend) -> Seen {
+    let alone = DeviceOptions::default().crash_alone(true);
+    net.add(
+        "p",
+        "pad_probe",
+        config(&[("period", "10ms"), ("big", "1048576")]),
+        alone.clone(),
+    );
+    net.add("q", "pad_probe", config(&[("period", "10ms")]), alone);
+    for (at, op) in [
+        (55, Op::stop_device("p")),
+        (60, Op::start_device("p")),
+        (85, Op::crash_device("p", "operator crash")),
+        (90, Op::start_device("p")),
+    ] {
+        net.op(op, Placement::StartOf(at * MS));
+    }
+    net.run_to(120 * MS);
+    seen(
+        net,
+        Vec::new(),
+        &[
+            "pad-boot",
+            "pad-big",
+            "pad-names",
+            "pad-append",
+            "pad-error",
+            "pad-fault",
+            "pad-cleared",
+            "device-crashed",
+            "device-started",
+            "device-stopped",
+        ],
+    )
+}
+
+#[test]
+fn a_portable_extension_is_served_alike() {
+    on_both(|net| {
+        let s = portable_scenario(net);
+        assert_eq!(
+            field(&s, "pad-big", "size"),
+            ["1048576", "2097152", "1048576"],
+            "{s:?}"
+        );
+        assert_eq!(
+            field(&s, "device-crashed", "message"),
+            ["pad: append 3 failed", "operator crash"],
+            "{s:?}"
+        );
+        assert_eq!(
+            field(&s, "pad-boot", "boots"),
+            ["0", "0", "1", "0"],
+            "{s:?}"
+        );
+        s
+    });
 }

@@ -58,6 +58,10 @@ struct DeviceState {
     env: Vec<(String, String)>,
     /// `wasmnet:infra`, if the network granted it.
     infra: Option<InfraEnd>,
+    /// The servers of the portable interfaces the network's extensions gave it.
+    servers: Vec<(String, std::sync::Arc<dyn wasmnet_core::ImportServer>)>,
+    /// Where a server's fault leaves its message (the crash record).
+    status: wasmnet_core::Status,
     stdout: OutputCapture,
     stderr: OutputCapture,
     entropy: DeviceEntropy,
@@ -213,6 +217,62 @@ impl Registry {
     /// `wasi:cli/environment.get-environment`, in order.
     pub fn env(&self, dev: u32) -> Vec<(String, String)> {
         self.with_device(dev, |d| d.env.clone()).unwrap_or_default()
+    }
+
+    /// One call of a portable interface the device imports (`interface#function`, the
+    /// function by its component-model name), served by the server the network's extensions
+    /// gave the device ([`wasmnet_core::DeviceExt::serve`]), at once. A fault leaves its
+    /// message for the device's crash record and comes back as [`Reply::Failed`], which
+    /// JavaScript raises as a trap.
+    pub fn import(&self, dev: u32, call: &str, args: Vec<Value>) -> Reply {
+        use wasmnet_core::Served;
+        let Some((interface, function)) = call.split_once('#') else {
+            return Reply::Failed(format!("not `interface#function`: {call}"));
+        };
+        let found = self.with_device(dev, |d| {
+            let server = d
+                .servers
+                .iter()
+                .find(|(i, _)| i == interface)
+                .map(|(_, s)| s.clone());
+            (server, d.status.clone())
+        });
+        let Some((server, status)) = found else {
+            return Reply::Failed(format!("no device {dev}"));
+        };
+        // The server is called outside the registry: it may journal, or reach other state.
+        let served = match server {
+            Some(server) => server.call(interface, function, args),
+            None => Served::Fault(format!(
+                "{interface} is not served to this device (no extension gave it a server)"
+            )),
+        };
+        match served {
+            Served::Ok(v) => Reply::Value(v),
+            Served::Err(v) => Reply::Error(v),
+            Served::Fault(message) => {
+                status.set_fault(message.clone());
+                Reply::Failed(message)
+            }
+        }
+    }
+
+    /// The device dropped its handle `handle` to `interface#resource`.
+    pub fn import_drop(&self, dev: u32, resource: &str, handle: u32) {
+        let Some((interface, res)) = resource.split_once('#') else {
+            return;
+        };
+        let server = self
+            .with_device(dev, |d| {
+                d.servers
+                    .iter()
+                    .find(|(i, _)| i == interface)
+                    .map(|(_, s)| s.clone())
+            })
+            .flatten();
+        if let Some(server) = server {
+            server.drop_resource(interface, res, handle);
+        }
     }
 
     /// One `wasmnet:infra` call of the device (`devices.apply`, ...; [`infra::FUNCTIONS`]),
@@ -382,6 +442,12 @@ impl<H: JsHost + Clone + Unpin + 'static> Runtime for JsRuntime<H> {
                     argv: wasmnet_core::argv(&ctx.name, &ctx.args),
                     env: ctx.env.clone(),
                     infra: ctx.infra.clone(),
+                    servers: ctx
+                        .ext
+                        .servers()
+                        .map(|(i, s)| (i.to_owned(), s.clone()))
+                        .collect(),
+                    status: ctx.status.clone(),
                     stdout: ctx.stdout.clone(),
                     stderr: ctx.stderr.clone(),
                     entropy: DeviceEntropy::new(ctx.seed, &ctx.name),

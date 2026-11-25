@@ -13,6 +13,8 @@ import type { Done, Init, Progress } from './worker.js';
  */
 interface Assets {
   simulator: { file: string; bytes: number };
+  /** The simulator built with the test fixture `wasmnet-pad` in it (an embedder's own build), when the build made one. */
+  extended?: { file: string; bytes: number };
   components: Record<string, { module: string; moduleBytes: number; coreModules: { file: string; path: string; bytes: number }[]; imports: string[]; digest: string }>;
 }
 
@@ -87,8 +89,10 @@ function showCaptures(links: Done['links']): void {
   }
 }
 
+let assets: Assets;
+
 async function load(): Promise<{ simulator: WebAssembly.Module; components: Record<string, ComponentSource> }> {
-  const assets = (await (await fetch('assets.json')).json()) as Assets;
+  assets = (await (await fetch('assets.json')).json()) as Assets;
   // Each distinct core module is downloaded and compiled once (both nodes share a netstack).
   const cores = new Map<string, { bytes: number; module?: Promise<WebAssembly.Module> }>();
   for (const c of Object.values(assets.components)) for (const f of c.coreModules) cores.set(f.path, { bytes: f.bytes });
@@ -135,8 +139,12 @@ async function main(): Promise<void> {
   const plain = (v: unknown) => JSON.parse(JSON.stringify(v, (_k, x: unknown) => (typeof x === 'bigint' ? String(x) : x)));
   (window as { wasmnetScenario?: unknown }).wasmnetScenario = async (scenario: Init['scenario'], seed = '42') => {
     const journal: JournalEntry[] = [];
+    // The portable-extension scenarios run on the simulator with the test fixture in it.
+    const portable = scenario === 'portable' || scenario === 'portable-cost';
+    if (portable && !assets.extended) throw new Error('this build has no simulator with the test fixture');
+    const simulator = portable ? await WebAssembly.compileStreaming(fetch(assets.extended!.file)) : loaded.simulator;
     const run = runInWorker<Init, Done>(new URL('worker.js', import.meta.url), {
-      init: { seed, scenario, ...loaded },
+      init: { seed, scenario, ...loaded, simulator },
       timeoutMs: 120_000,
       onMessage: (p) => journal.push(...(p as Progress).entries),
     });

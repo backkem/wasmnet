@@ -4,7 +4,8 @@
 //!
 //! On its first poll it counts its boots in the note `boot` (found with `note.find`, one byte
 //! appended per boot), journals `pad-boot {boots, notes, bytes}`, and with `big` in its config
-//! (bytes) appends that many bytes to the note `big` and reads the last 16 back
+//! (bytes) appends that many bytes (`reps` times, default once) to the note `big` and reads the
+//! last 16 back
 //! (`pad-big {size, tail, state}`), then journals the device's note names (`pad-names`). Then
 //! every `period` (default 10ms) it appends 64 bytes to the note `log`: `pad-append {size}`, or
 //! `pad-error {error}`.
@@ -80,7 +81,14 @@ fn boot() {
     if big > 0 {
         let note = Note::new("big");
         let value: Vec<u8> = (0..big).map(|i| (i % 251) as u8).collect();
-        match note.append(&value) {
+        let mut appended = Ok(0);
+        for _ in 0..number("reps", 1).max(1) {
+            appended = note.append(&value);
+            if appended.is_err() {
+                break;
+            }
+        }
+        match appended {
             Ok(size) => {
                 let tail = note.read(size.saturating_sub(16), 16);
                 let state = format!("{:?}", note.info().state);

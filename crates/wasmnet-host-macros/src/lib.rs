@@ -492,7 +492,7 @@ impl Gen<'_> {
     }
 
     /// An expression turning `v` (a `Value`) into `Result<T, String>`, `T` being `ty`'s Rust type.
-    fn from_value(&self, v: TokenStream, ty: &Type) -> R<TokenStream> {
+    fn value_to(&self, v: TokenStream, ty: &Type) -> R<TokenStream> {
         let want = |what: &str| {
             let what = what.to_owned();
             quote!(other => Err(::std::format!("want {}, got {:?}", #what, other)))
@@ -529,7 +529,7 @@ impl Gen<'_> {
                             let fi = ident(&rust_ident(&f.name));
                             let wit = &f.name;
                             let inner = self
-                                .from_value(quote!(m.remove(#wit).unwrap_or(Value::None)), &f.ty)?;
+                                .value_to(quote!(m.remove(#wit).unwrap_or(Value::None)), &f.ty)?;
                             fields.push(quote!(#fi: (#inner).map_err(|e| ::std::format!("{}: {}", #wit, e))?));
                         }
                         let w = want("a record");
@@ -549,7 +549,7 @@ impl Gen<'_> {
                             let wit = &c.name;
                             arms.push(match &c.ty {
                                 Some(t) => {
-                                    let inner = self.from_value(
+                                    let inner = self.value_to(
                                         quote!(*p.ok_or_else(
                                             || ::std::format!("{} without its payload", #wit)
                                         )?),
@@ -582,14 +582,14 @@ impl Gen<'_> {
                         })
                     }
                     TypeDefKind::Option(t) => {
-                        let inner = self.from_value(quote!(x), t)?;
+                        let inner = self.value_to(quote!(x), t)?;
                         quote!(match (#v).into_option() { None => Ok(None), Some(x) => (#inner).map(Some) })
                     }
                     TypeDefKind::Result(r) => {
                         let arm = |t: Option<&Type>| -> R<TokenStream> {
                             Ok(match t {
                                 Some(t) => {
-                                    let inner = self.from_value(
+                                    let inner = self.value_to(
                                         quote!(*p.ok_or("a result without its payload")?),
                                         t,
                                     )?;
@@ -619,7 +619,7 @@ impl Gen<'_> {
                             .iter()
                             .map(|t| {
                                 let inner =
-                                    self.from_value(quote!(it.next().ok_or("a short tuple")?), t)?;
+                                    self.value_to(quote!(it.next().ok_or("a short tuple")?), t)?;
                                 Ok(quote!((#inner)?))
                             })
                             .collect::<R<Vec<_>>>()?;
@@ -637,7 +637,7 @@ impl Gen<'_> {
                         quote!(match #v { Value::Bytes(b) => Ok(b), #w })
                     }
                     TypeDefKind::List(t) => {
-                        let inner = self.from_value(quote!(x), t)?;
+                        let inner = self.value_to(quote!(x), t)?;
                         let w = want("a list");
                         quote!(match #v {
                             Value::List(items) => items.into_iter().map(|x| #inner).collect::<::std::result::Result<::std::vec::Vec<_>, ::std::string::String>>(),
@@ -698,7 +698,7 @@ impl Gen<'_> {
                 let side = |t: Option<&Type>| -> R<TokenStream> {
                     Ok(match t {
                         Some(t) => {
-                            let inner = self.from_value(quote!(v), t)?;
+                            let inner = self.value_to(quote!(v), t)?;
                             quote!((#inner).map_err(#bad)?)
                         }
                         None => quote!({
@@ -715,7 +715,7 @@ impl Gen<'_> {
                 })
             }
             Some(t) => {
-                let inner = self.from_value(quote!(v), t)?;
+                let inner = self.value_to(quote!(v), t)?;
                 quote!(match served {
                     ::wasmnet_host::sim::Served::Ok(v) => Ok((#inner).map_err(#bad)?),
                     other => Err(::wasmnet_host::portable::bad_answer(#iface, #wit, &::std::format!("{:?}", other))),

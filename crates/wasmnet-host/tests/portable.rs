@@ -200,3 +200,114 @@ fn a_portable_extension_serves_hears_and_faults_alike_at_two_seeds() {
         assert!(runs[0] == runs[1], "seed {seed}: the rerun differs");
     }
 }
+
+/// The page test's portable-extension scenario, natively: `p` (1 MiB through the interface,
+/// stopped, started, crashed, started), `q` (its third append faults it, armed by the
+/// extension's name rule, as the page's installer arms it), and `r`, a controller's device
+/// recreated, removed and created again. Writes the lines the page must match to
+/// `target/pad-native.txt` (the page test reads it with `NATIVE_PAD`).
+#[test]
+fn page_scenario_native() {
+    let w = world();
+    let mut net = Network::new(&w.host, 42);
+    net.add_extension(Pad::default().fault_at("q", 3));
+    net.set_component_resolver(Box::new(move |name, instantiate| match name {
+        "pad_probe" => instantiate(&w.probe),
+        other => Err(sim::Error::Refused(format!("no component {other}"))),
+    }));
+    net.set_infra_catalog(vec!["pad_probe".to_owned()]);
+    let alone = DeviceOptions::default().crash_alone(true);
+    net.device_with_options(
+        "p",
+        &w.probe,
+        config(&[("period", "10ms"), ("big", "1048576")]),
+        alone.clone(),
+    )
+    .unwrap();
+    net.device_with_options("q", &w.probe, config(&[("period", "10ms")]), alone)
+        .unwrap();
+    let spec = |period: &str| {
+        let bytes = Cbor::Map(vec![
+            (Cbor::text("component"), Cbor::text("pad_probe")),
+            (
+                Cbor::text("config"),
+                Cbor::Map(vec![(Cbor::text("period"), Cbor::text(period))]),
+            ),
+        ])
+        .encode();
+        bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
+    };
+    let steps = [
+        ("step.0", format!("0ms apply r {}", spec("10ms"))),
+        ("step.1", format!("45ms apply r {}", spec("20ms"))),
+        ("step.2", "70ms remove r".to_owned()),
+        ("step.3", format!("80ms apply r {}", spec("10ms"))),
+    ];
+    let cfg: Vec<(&str, &str)> = steps.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let ctl = w.host.load(built().path("infra_script")).unwrap();
+    net.device_with_options(
+        "ctl",
+        &ctl,
+        config(&cfg),
+        DeviceOptions::default().infra(true),
+    )
+    .unwrap();
+    for (at, op) in [
+        (55, Op::stop_device("p")),
+        (60, Op::start_device("p")),
+        (85, Op::crash_device("p", "operator crash")),
+        (90, Op::start_device("p")),
+    ] {
+        net.add_op(op, Placement::StartOf(at * MS)).unwrap();
+    }
+    net.run_until(120 * MS)
+        .unwrap_or_else(|e| panic!("{e}\n{}", transcript(&net.journal())));
+    let text = lines(&net.journal()) + "\n";
+    let out = built().target.join("pad-native.txt");
+    std::fs::write(&out, &text).unwrap();
+    assert!(
+        text.contains("q device-crashed message=pad: append 3 failed"),
+        "{text}"
+    );
+}
+
+/// What a big `list<u8>` costs through the generated adapter (wall time, printed): `reps`
+/// appends of `size` bytes, against one. Ignored by default; run it optimised with
+/// `--ignored --nocapture`.
+#[test]
+#[ignore]
+fn adapter_cost() {
+    let w = world();
+    let run = |size: u64, reps: u64| {
+        let mut best = std::time::Duration::MAX;
+        for _ in 0..3 {
+            let mut net = Network::new(&w.host, 1);
+            net.add_extension(Pad::default());
+            let cfg = config(&[
+                ("period", "1000ms"),
+                ("big", &size.to_string()),
+                ("reps", &reps.to_string()),
+            ]);
+            net.device_with_options(
+                "c",
+                &w.probe,
+                cfg,
+                DeviceOptions::default().fuel_per_instant(1 << 40),
+            )
+            .unwrap();
+            let t = std::time::Instant::now();
+            net.run_until(MS).unwrap();
+            best = best.min(t.elapsed());
+            assert_eq!(events(&net.journal(), "c", "pad-big").len(), 1);
+        }
+        best
+    };
+    for size in [4u64 << 20, 16 << 20] {
+        let (one, many) = (run(size, 1), run(size, 9));
+        println!(
+            "{} MiB: 1 append {one:?}, 9 appends {many:?}: {:?} per append",
+            size >> 20,
+            (many - one) / 8
+        );
+    }
+}

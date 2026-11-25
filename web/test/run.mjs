@@ -233,6 +233,27 @@ await step('devices created while the network runs: controllers, a restart, devi
   return { refused: r.notes.refused, memory: r.notes.memory, peakMemory: r.notes.peakMemory, badOp: r.notes.badOp, events: steps[7].kinds, rule: `${steps['on.0'].event} seq ${steps['on.0'].seq}`, running: running.map((e) => `${e.at} ${fieldsOf(e).name}`), supplied: supRunning.map((e) => `${e.at} ${fieldsOf(e).name}`), routes: steps[2].text, fetched: done[0].at };
 });
 
+await step('a portable extension in the page: an embedder-built simulator serves its interface, a resource and 1 MiB, faults and life events', async () => {
+  const r = await page.evaluate(() => window.wasmnetScenario('portable', '42'));
+  const got = r.notes.lines;
+  for (const want of ['p pad-big size=1048576 tail=85868788898a8b8c8d8e8f9091929394 state=State::Written', 'q device-crashed message=pad: append 3 failed', 'r pad-boot boots=1', 'r pad-dropped notes=2', 'p pad-cleared notes=3']) {
+    if (!got.includes(want)) throw new Error(`no "${want}" in:\n${got}`);
+  }
+  // NATIVE_PAD: the same network natively (`page_scenario_native`): the same lines.
+  if (process.env.NATIVE_PAD) {
+    const [a, b] = [fs.readFileSync(process.env.NATIVE_PAD, 'utf8').trimEnd().split('\n'), got.split('\n')];
+    for (let i = 0; i < Math.max(a.length, b.length); i++) {
+      if (a[i] !== b[i]) throw new Error(`line ${i + 1}: native ${JSON.stringify(a[i])}, page ${JSON.stringify(b[i])}\npage:\n${got}`);
+    }
+  }
+  return { lines: got.split('\n').length, native: Boolean(process.env.NATIVE_PAD) };
+});
+
+await step('a portable call carries 4 MiB through the page', async () => {
+  const r = await page.evaluate(() => window.wasmnetScenario('portable-cost', '42'));
+  return r.notes;
+});
+
 if (process.env.NATIVE_JOURNAL) {
   await step('agrees with the native example', async () => {
     // The native example prints `<t> ns  <device> <kind> k=v ...` for events and

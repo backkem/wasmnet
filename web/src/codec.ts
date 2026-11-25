@@ -376,6 +376,7 @@ export function writeValue(w: Writer, v: unknown): void {
   }
   else if (typeof v === 'bigint') w.u8(4).u64(v);
   else if (typeof v === 'string') w.u8(5).str(v);
+  else if (v instanceof ResourceHandle) w.u8(12).str(v.resource).u32(v.handle);
   else if (v instanceof Uint8Array) w.u8(6).raw(v);
   else if (Array.isArray(v)) {
     w.u8(7).u32(v.length);
@@ -390,6 +391,18 @@ export function writeValue(w: Writer, v: unknown): void {
     w.u8(9).u32(entries.length);
     for (const [k, x] of entries) writeValue(w.str(k.replace(/[A-Z]/g, (c) => `-${c.toLowerCase()}`)), x);
   } else throw new Error(`a value of type ${typeof v} cannot cross`);
+}
+
+/**
+ * A resource of a portable interface as it crosses the boundary: its WIT name and the handle
+ * its server chose. The page makes one class per resource that extends this, so the instances
+ * jco hands back to the device are of that class (`network.ts`, `portableImports`).
+ */
+export class ResourceHandle {
+  constructor(
+    readonly resource: string,
+    readonly handle: number,
+  ) {}
 }
 
 /** Reads a value in the shape jco expects back. */
@@ -432,6 +445,8 @@ export function readValue(r: Reader): unknown {
     }
     case 11:
       return r.str();
+    case 12:
+      return new ResourceHandle(r.str(), r.u32());
     default:
       throw new Error(`malformed value: kind ${kind}`);
   }

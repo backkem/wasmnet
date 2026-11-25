@@ -34,9 +34,15 @@ const release = join(target, 'wasm32-wasip2', 'release');
 const simulator = join(target, 'wasm32-unknown-unknown', 'release', 'wasmnet_web.wasm');
 
 /** The devices the example and its test scenarios use, by the key the Worker names them with. */
-const COMPONENTS = ['switch', 'node-http-server', 'node-http-get', 'router', 'infra_script', 'node-replicas'];
+const COMPONENTS = ['switch', 'node-http-server', 'node-http-get', 'router', 'infra_script', 'node-replicas', 'pad_probe'];
+/** Components built as examples (`components/clock-probe/examples`): their files live in `examples/`. */
+const EXAMPLES = ['pad_probe'];
+const wasmOf = (stem) => join(release, ...(EXAMPLES.includes(stem) ? ['examples'] : []), `${stem}.wasm`);
+// The simulator with the test fixture `wasmnet-pad` installed: an embedder's own build of the module
+// (`crates/wasmnet-web/examples/pad_page.rs`), for the page test's portable-extension steps.
+const extended = join(target, 'wasm32-unknown-unknown', 'release', 'examples', 'pad_page.wasm');
 
-const missing = [simulator, ...COMPONENTS.map((c) => join(release, `${c}.wasm`))].filter((p) => !existsSync(p));
+const missing = [simulator, ...COMPONENTS.map(wasmOf)].filter((p) => !existsSync(p));
 if (missing.length > 0) {
   console.error(`build: missing ${missing.map((p) => relative(web, p)).join(', ')}`);
   console.error('run `cargo xtask build` and `cargo build -p wasmnet-web --target wasm32-unknown-unknown --release` first (or `cargo xtask web`)');
@@ -70,13 +76,17 @@ const assets = {
   simulator: { file: 'wasmnet_web.wasm', bytes: statSync(simulator).size },
   components: {},
 };
+if (existsSync(extended)) {
+  cpSync(extended, join(out, 'wasmnet_web_pad.wasm'));
+  assets.extended = { file: 'wasmnet_web_pad.wasm', bytes: statSync(extended).size };
+}
 
 for (const stem of COMPONENTS) {
   const dir = join(out, 'components', stem);
   const t0 = performance.now();
   // As `codelib-web transpile <wasm> -o <dir> --name <stem> --no-wasi-async`: WASI 0.2's
   // blocking functions stay synchronous imports (the kit's virtual world never blocks them).
-  const manifest = await transpile(join(release, `${stem}.wasm`), { outDir: dir, name: stem, noWasiAsync: true });
+  const manifest = await transpile(wasmOf(stem), { outDir: dir, name: stem, noWasiAsync: true });
   rmSync(join(dir, 'interfaces'), { recursive: true, force: true });
   rmSync(join(dir, `${stem}.d.ts`), { force: true });
   // Core modules move to cores/<content hash>.wasm: both nodes embed the same netstack, which
@@ -92,7 +102,7 @@ for (const stem of COMPONENTS) {
   });
   // Its import names (`ComponentSource.imports`): the simulator refuses a component that
   // imports `wasmnet:infra` for a device without the grant before the page instantiates it.
-  const wit = execFileSync('wasm-tools', ['component', 'wit', join(release, `${stem}.wasm`)], { encoding: 'utf8' });
+  const wit = execFileSync('wasm-tools', ['component', 'wit', wasmOf(stem)], { encoding: 'utf8' });
   const imports = [...wit.matchAll(/^\s*import ([\w-]+:[^;\s]+);$/gm)].map((m) => m[1]);
   assets.components[stem] = {
     module: `components/${stem}/${manifest.module}`,
