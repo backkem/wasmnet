@@ -28,6 +28,7 @@ use wasmnet_det_cbor as det_cbor;
 use det_cbor::Value;
 
 use crate::clock::{Nanos, VirtualClock};
+use crate::commands::DeviceCommand;
 use crate::config::DeviceConfig;
 use crate::journal::{Journal, JournalEnd, Record, Stream};
 use crate::network::DeviceOptions;
@@ -129,6 +130,8 @@ pub(crate) enum Verb {
     Start,
     Stop,
     Remove,
+    /// A command into the device's `wasmnet:control/commands` export.
+    Control(DeviceCommand),
 }
 
 impl Verb {
@@ -138,8 +141,22 @@ impl Verb {
             Verb::Start => "start",
             Verb::Stop => "stop",
             Verb::Remove => "remove",
+            Verb::Control(_) => "control",
         }
     }
+}
+
+/// The longest command argument `devices.control` takes.
+pub const MAX_COMMAND_ARGUMENT: usize = 64 << 10;
+
+/// Whether `command` can name a command: 1-63 lowercase ASCII letters, digits and `-`, starting
+/// with a letter (`route-add`).
+pub fn valid_command(command: &str) -> bool {
+    (1..=63).contains(&command.len())
+        && command.starts_with(|c: char| c.is_ascii_lowercase())
+        && command
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
 /// One derived request (`Event::Derived(index)`).
@@ -449,6 +466,43 @@ impl Infra {
         }
     }
 
+    /// The device answered the command of derived request `index` (a `control`), at the
+    /// current instant and in the device's own processing context. A refusal is the device's
+    /// `message` and an `infra-failed` on the caller, like a request the network refused.
+    pub(crate) fn command_answered(&self, index: usize, answer: &Result<String, String>) {
+        let Err(message) = answer else {
+            return;
+        };
+        let at = self.clock.now();
+        let Some(req) = self.state().requests.get(index).cloned() else {
+            return;
+        };
+        if let Some(item) = self.state().items.get_mut(&req.name)
+            && item.uid == req.uid
+        {
+            item.message = Some(message.clone());
+        }
+        self.journal_failed(&req, message.clone(), at);
+    }
+
+    fn journal_failed(&self, req: &Request, message: String, at: Nanos) {
+        JournalEnd {
+            journal: self.journal.clone(),
+            device: req.caller.clone(),
+        }
+        .push(
+            at,
+            Record::Event {
+                kind: "infra-failed".to_owned(),
+                fields: vec![
+                    ("verb".to_owned(), req.verb.name().to_owned()),
+                    ("name".to_owned(), req.name.clone()),
+                    ("message".to_owned(), message),
+                ],
+            },
+        );
+    }
+
     /// Derived request `index` applied (`error`: refused, with why). Journals `infra-failed` on
     /// the caller for a refusal.
     pub(crate) fn applied(&self, index: usize, error: Option<String>, at: Nanos) {
@@ -479,21 +533,7 @@ impl Infra {
         }
         drop(s);
         if let Some(message) = error {
-            JournalEnd {
-                journal: self.journal.clone(),
-                device: req.caller.clone(),
-            }
-            .push(
-                at,
-                Record::Event {
-                    kind: "infra-failed".to_owned(),
-                    fields: vec![
-                        ("verb".to_owned(), req.verb.name().to_owned()),
-                        ("name".to_owned(), req.name),
-                        ("message".to_owned(), message),
-                    ],
-                },
-            );
+            self.journal_failed(&req, message, at);
         }
     }
 
@@ -966,6 +1006,76 @@ impl InfraEnd {
         Ok((true, true))
     }
 
+    /// `devices.control`: queues `command` with `argument` for the device's
+    /// `wasmnet:control/commands` export (`crate::commands`). Idempotent by request id only.
+    pub fn control(
+        &self,
+        request_id: Option<String>,
+        name: &str,
+        command: &str,
+        argument: &str,
+    ) -> Result<DeviceView, InfraError> {
+        let args = format!("control {name} {command} {argument:?}");
+        if let Some(r) = self.recorded(&request_id, &args) {
+            return match r? {
+                Answer::Device(a) => a,
+                _ => Err(InfraError::Conflict(
+                    "request id reused by another verb".into(),
+                )),
+            };
+        }
+        let answer = self.control_now(name, command, argument);
+        self.record(&request_id, args, Answer::Device(answer.clone()));
+        if answer.is_ok() {
+            let mut f = vec![("name", name.to_owned()), ("command", command.to_owned())];
+            if let Some(id) = request_id {
+                f.push(("request", id));
+            }
+            self.journal("infra-control", f);
+        }
+        answer
+    }
+
+    fn control_now(
+        &self,
+        name: &str,
+        command: &str,
+        argument: &str,
+    ) -> Result<DeviceView, InfraError> {
+        self.mutable()?;
+        if !valid_command(command) {
+            return Err(InfraError::Invalid(format!(
+                "command `{command}`: 1-63 lowercase letters, digits and `-`, from a letter"
+            )));
+        }
+        if argument.len() > MAX_COMMAND_ARGUMENT {
+            return Err(InfraError::Invalid(format!(
+                "a command argument is at most {MAX_COMMAND_ARGUMENT} bytes"
+            )));
+        }
+        let now = self.infra.clock.now();
+        let mut s = self.infra.state();
+        self.infra.refresh(&mut s);
+        let item = self
+            .own(&s, name)?
+            .cloned()
+            .ok_or_else(|| InfraError::NotFound(format!("no device `{name}`")))?;
+        let heading = item.target.unwrap_or(item.phase);
+        if !matches!(heading, Phase::Running | Phase::Pending) {
+            return Err(InfraError::Invalid(format!(
+                "`{name}` is not running (a command needs a running device)"
+            )));
+        }
+        let req = Request {
+            caller: self.device.clone(),
+            name: name.to_owned(),
+            verb: Verb::Control(DeviceCommand::new(command, argument)),
+            uid: item.uid.clone(),
+        };
+        self.queue(&mut s, req, now, Phase::Running);
+        Ok(s.items[name].view(name))
+    }
+
     /// `devices.get`.
     pub fn get(&self, name: &str) -> Result<DeviceView, InfraError> {
         self.infra.get(name)
@@ -1401,5 +1511,118 @@ mod tests {
             !ctl.remove(None, "web-1").unwrap(),
             "removing what is gone is a no-op"
         );
+    }
+
+    /// `control`: only on the caller's own running (or about to run) devices, queued like the
+    /// other mutations, answered from the record on a retry by id.
+    #[test]
+    fn commands_queue_for_the_callers_running_devices() {
+        let clock = VirtualClock::new(std::time::Duration::ZERO);
+        let infra = Infra::new(clock.clone(), Journal::new(clock.clone()));
+        let end = |device: &str| InfraEnd {
+            infra: infra.clone(),
+            device: device.to_owned(),
+        };
+        let (ctl, other) = (end("ctl"), end("other"));
+        let spec_of = |c: &str| spec_value(c, &DeviceConfig::new(), DeviceOptions::default(), None);
+        infra.added("ctl", spec_of("node:ctl"), 0, None);
+        infra.added("sw", spec_of("switch"), 0, None);
+        let d = ctl.apply(None, "r1", vec![], &spec("router")).unwrap().0;
+        // A command right after the apply queues behind the creation.
+        let v = ctl
+            .control(
+                Some("c1".into()),
+                "r1",
+                "route-add",
+                "10.0.3.0/24 via 10.0.2.2",
+            )
+            .expect("queued for a pending device");
+        assert_eq!(v.target, Some(Phase::Running));
+        assert_eq!(clock.pending_events(), 2);
+        let req = infra.request(1).expect("request 1");
+        assert!(matches!(&req.verb, Verb::Control(c) if c.command == "route-add"));
+        assert_eq!(req.uid, d.uid);
+        // A retry by id is answered from the record; the same id with other arguments is a
+        // conflict; without an id every call queues.
+        assert_eq!(
+            ctl.control(
+                Some("c1".into()),
+                "r1",
+                "route-add",
+                "10.0.3.0/24 via 10.0.2.2"
+            ),
+            Ok(v)
+        );
+        assert!(matches!(
+            ctl.control(Some("c1".into()), "r1", "route-remove", "10.0.3.0/24"),
+            Err(InfraError::Conflict(_))
+        ));
+        assert_eq!(clock.pending_events(), 2);
+        ctl.control(None, "r1", "routes", "").unwrap();
+        assert_eq!(clock.pending_events(), 3);
+        // Only the caller's own devices, never itself, only well-formed commands.
+        for (who, name, command, argument) in [
+            (&other, "r1", "routes", ""),
+            (&ctl, "sw", "routes", ""),
+            (&ctl, "ctl", "routes", ""),
+        ] {
+            assert!(
+                matches!(
+                    who.control(None, name, command, argument),
+                    Err(InfraError::Denied(_))
+                ),
+                "{name}"
+            );
+        }
+        assert!(matches!(
+            ctl.control(None, "nope", "routes", ""),
+            Err(InfraError::NotFound(_))
+        ));
+        let long = "x".repeat(MAX_COMMAND_ARGUMENT + 1);
+        for (command, argument) in [
+            ("", ""),
+            ("Route", ""),
+            ("-x", ""),
+            ("routes", long.as_str()),
+        ] {
+            assert!(
+                matches!(
+                    ctl.control(None, "r1", command, argument),
+                    Err(InfraError::Invalid(_))
+                ),
+                "{command:?}"
+            );
+        }
+        // The device ran, then stopped: no commands for it.
+        infra.added("r1", vec![], 0, Some(0));
+        for n in 0..3 {
+            infra.applied(n, None, 0);
+        }
+        ctl.stop(None, "r1", 0).unwrap();
+        assert!(matches!(
+            ctl.control(None, "r1", "routes", ""),
+            Err(InfraError::Invalid(_))
+        ));
+        // A refusal from the device: the device's message and `infra-failed` on the caller.
+        infra.command_answered(1, &Err("10.0.1.0/24 is connected".into()));
+        assert_eq!(
+            ctl.get("r1").unwrap().message.as_deref(),
+            Some("10.0.1.0/24 is connected")
+        );
+        let failed: Vec<_> = infra
+            .journal
+            .entries_from(0)
+            .into_iter()
+            .filter(|e| matches!(&e.record, Record::Event { kind, .. } if kind == "infra-failed"))
+            .collect();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].device, "ctl");
+        let controls = infra
+            .journal
+            .entries_from(0)
+            .into_iter()
+            .filter(|e| matches!(&e.record, Record::Event { kind, .. } if kind == "infra-control"))
+            .count();
+        assert_eq!(controls, 2, "the retry was not journalled again");
     }
 }

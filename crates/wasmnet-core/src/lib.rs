@@ -49,8 +49,13 @@
 //! [`LinkKind`], [`ext::ControlCall`] with [`Control`], [`ext::ExtOp`] with [`ExtensionOp`],
 //! [`ExtOptions`], [`ExtValue`], [`DeviceExt`]), registered with [`Network::add_extension`],
 //! [`Network::register_cable`] and called through [`Network::control`] or [`Op`]; plus
-//! [`TransmitHook`]. Their ordering rules are `docs/design/runtime-and-extensions.md`. None of
-//! these traits has an implementation in this repository.
+//! [`TransmitHook`]. Their ordering rules are `docs/design/runtime-and-extensions.md`. The
+//! control-call traits have one implementation here, [`commands`]; the others none.
+//!
+//! **Device commands**: [`commands`] ([`DeviceCommand`], [`CommandCall`]): text commands into a
+//! device's `wasmnet:control/commands` export (a router's `route-add`), between runs
+//! ([`Network::command`]), as an operator event ([`Op::Control`]) or from an in-world
+//! controller (`wasmnet:infra/devices.control`). See `docs/design/topology-and-infra.md`.
 //!
 //! **Embedder surface, unstable** marks what is public for embedders that build tooling on the
 //! core (operator events, multi-site runs, extension points): it works and is tested, but it
@@ -59,7 +64,7 @@
 //! Module map: `clock` (virtual time + the event queue), `exec` (executors), `device` (a
 //! device's command inbox and call status), `link` (patch panel), `network` (builder API and the
 //! [`Runtime`] trait), `ext` (extension points: network extensions, cable kinds, control calls,
-//! extension ops), `journal` (device log records), `output` (captured stdout/stderr), `input`
+//! extension ops), `commands` (device commands), `journal` (device log records), `output` (captured stdout/stderr), `input`
 //! (stdin), `config` (device configuration), `rng` (seeded PRNG), `pcap` (a small pcap-ng
 //! reader), `digest` (causal digests), `infra` (`wasmnet:infra`), `sites` (multi-site runs).
 //! `clock`, `exec`, `device`, `link`, `network`, `output`, `input`, `config` and `rng` are
@@ -70,6 +75,7 @@
 #![deny(unsafe_code)]
 
 mod clock;
+pub mod commands;
 mod config;
 mod device;
 pub mod digest;
@@ -92,6 +98,7 @@ use std::time::Duration;
 pub use clock::{
     Ctx, EventKey, HOST_DEVICE, KEY_DEPTH, KeyLevel, Nanos, Origin, Sleep, Tag, VirtualClock,
 };
+pub use commands::{COMMANDS_EXPORT, CommandAnswer, CommandCall, DeviceCommand};
 pub use config::DeviceConfig;
 pub use device::{Command, CostMeter, CountersReply, DeviceCost, Inbox, Snapshot, Status};
 pub use digest::Digest;

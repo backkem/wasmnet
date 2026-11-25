@@ -113,6 +113,19 @@ impl devices::Host for HostState {
         end.remove(request_id, &name).map_err(error)
     }
 
+    fn control(
+        &mut self,
+        request_id: Option<String>,
+        name: String,
+        command: String,
+        argument: String,
+    ) -> Result<types::Device, types::Error> {
+        let end = self.infra.as_ref().ok_or_else(ungranted)?;
+        end.control(request_id, &name, &command, &argument)
+            .map(device)
+            .map_err(error)
+    }
+
     fn get(&mut self, name: String) -> Result<types::Device, types::Error> {
         let end = self.infra.as_ref().ok_or_else(ungranted)?;
         end.get(&name).map(device).map_err(error)

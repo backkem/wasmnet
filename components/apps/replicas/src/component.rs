@@ -21,7 +21,7 @@ wit_bindgen::generate!({
         package app:replicas;
         world replicas {
             include wasmnet:app/app@0.1.0;
-            import wasmnet:infra/devices@0.1.0;
+            import wasmnet:infra/devices@0.1.1;
         }
     ",
     path: [

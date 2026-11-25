@@ -1,7 +1,7 @@
 /// The operational infrastructure API for **in-world controllers**: a device the embedder grants
 /// this interface (`DeviceOptions::infra`), such as the `replicas` controller app, creates,
-/// starts, stops, removes, lists, watches and reads the logs of sibling devices while the world
-/// runs.
+/// starts, stops, removes, sends commands to, lists, watches and reads the logs of sibling
+/// devices while the world runs.
 ///
 /// **Every mutation is a derived operator event.** A call never changes the world inside the
 /// call: it validates, records what was asked (the resource shows it as its `target`), journals
@@ -34,7 +34,10 @@
 ///
 /// No other system's types cross this interface: a controller translates whatever it speaks
 /// into these specs.
-package wasmnet:infra@0.1.0;
+///
+/// Versions: 0.1.1 added `devices.control`. A component built against 0.1.0 still links, since
+/// an addition keeps the `0.1` line compatible.
+package wasmnet:infra@0.1.1;
 
 interface types {
     /// Virtual time in nanoseconds since the simulation started.
@@ -126,7 +129,8 @@ interface types {
         conflict(string),
         /// No such device.
         not-found(string),
-        /// A malformed spec, name, selector or stream.
+        /// A malformed spec, name, selector, stream or command, or a command for a device that
+        /// is not running.
         invalid(string),
         /// Not this caller's to change (another owner, the caller itself), or a spec that
         /// would grant authority (`infra`); also every call from a device that was not
@@ -139,11 +143,11 @@ interface types {
 /// stamps everything with virtual time. Arguments and results are owned by the caller (lists
 /// are copied across the boundary).
 ///
-/// Mutations (`apply`, `start`, `stop`, `remove`) take an optional `request-id`: the host keeps
-/// the last 256 answers per caller, so a retry with the same id and arguments is answered from
-/// the record and never applied twice; the same id with other arguments is a `conflict`. Every
-/// mutation is idempotent by name besides: asking for what is already true (or already queued)
-/// queues nothing.
+/// Mutations (`apply`, `start`, `stop`, `remove`, `control`) take an optional `request-id`: the
+/// host keeps the last 256 answers per caller, so a retry with the same id and arguments is
+/// answered from the record and never applied twice; the same id with other arguments is a
+/// `conflict`. Every mutation but `control` is idempotent by name besides: asking for what is
+/// already true (or already queued) queues nothing.
 interface devices {
     use types.{instant, rv, labels, phase, device, change, log-line, applied, error};
 
@@ -169,6 +173,27 @@ interface devices {
     /// queued for it (so `stop` with a grace period, then `remove`, removes it after the grace
     /// period). `false`: there was no such device (a successful no-op).
     remove: func(request-id: option<string>, name: string) -> result<bool, error>;
+
+    /// Sends `command` with `argument` to the `wasmnet:control/commands` export of a device this
+    /// caller created (a router's `route-add` with `10.0.3.0/24 via 10.0.2.2`), which changes it
+    /// in place: its frames in flight, its state, its links and their captures stay, as they
+    /// would not if it were recreated.
+    ///
+    /// - Like every mutation it only records and queues: the command runs in the device when the
+    ///   derived event applies, at `now` and after any request still queued for the device (so an
+    ///   `apply` followed by a `control` reaches the new device), and the device is polled at that
+    ///   instant after it. Returns the device as asked for (`target`: `running`).
+    /// - The device's answer is not returned. A refusal (the device's `err`, or a device that
+    ///   stopped meanwhile or takes no commands) is journalled on the caller as
+    ///   `infra-failed {verb: control, name, message}` at the instant it is known, and shown as
+    ///   the device's `message`; what a command did is in the device's own journal.
+    /// - Idempotent by request id only: without one, every call sends the command again, so a
+    ///   device's commands should be idempotent themselves (the router's are).
+    /// - Fails with `not-found` for no such device; `denied` for a device another owner or the
+    ///   network's description has, or the caller itself; `invalid` for a command that is not
+    ///   1 to 63 lowercase letters, digits and `-` starting with a letter, an argument over
+    ///   64 KiB, or a device that is not running or about to run.
+    control: func(request-id: option<string>, name: string, command: string, argument: string) -> result<device, error>;
 
     /// One device (including one still `pending`).
     get: func(name: string) -> result<device, error>;

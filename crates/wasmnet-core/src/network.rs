@@ -446,6 +446,29 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
         out
     }
 
+    /// Runs `command` with `argument` in the device's `wasmnet:control/commands` export
+    /// ([`crate::commands`]) and returns its answer: `ok` text or its refusal. `Ok(None)`: the
+    /// device takes no commands.
+    ///
+    /// A control call like [`control`](Self::control): at the network's current instant,
+    /// between runs, without moving virtual time; the device's `poll` at this instant follows
+    /// in the next run.
+    pub fn command(
+        &mut self,
+        device: DeviceId,
+        command: &str,
+        argument: &str,
+    ) -> Result<Option<std::result::Result<String, String>>> {
+        let call = crate::commands::CommandCall::new(crate::commands::DeviceCommand::new(
+            command, argument,
+        ));
+        let answer = call.answer_slot();
+        if !self.control(device, Box::new(call))? {
+            return Ok(None);
+        }
+        Ok(answer.get())
+    }
+
     /// The optional exports the device's backend serves control calls for.
     pub fn device_exports(&self, device: DeviceId) -> &[String] {
         &self.devices[device.0].exports
@@ -917,6 +940,20 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
             }
             Verb::Remove if phase.is_some() => {
                 self.apply_change(None, Op::RemoveDevice { device: name }, at)
+            }
+            // Served in this event's rounds; the device's refusal reaches the table from its
+            // answer (`CommandCall::finish`).
+            Verb::Control(command) => {
+                let id = self
+                    .live_device(&name)
+                    .filter(|_| phase == Some(DevicePhase::Running))
+                    .ok_or_else(|| format!("`{name}` is not running"))?;
+                self.require_export(id, crate::commands::COMMANDS_EXPORT)
+                    .map_err(|e| e.to_string())?;
+                let call =
+                    crate::commands::CommandCall::derived(command.clone(), self.infra.clone(), n);
+                OpTarget::control(self, None, id, Box::new(call));
+                Ok(())
             }
             _ => Ok(()),
         }

@@ -74,9 +74,16 @@ impl Runtime for Host {
             .transpose()
             .map_err(runtime_error)?;
         let has_counters = counters.is_some();
-        // Optional exports the extensions serve control calls for.
+        // Optional exports control calls go to: device commands, served by the host itself,
+        // then those the extensions serve.
         let mut exports = Vec::new();
-        let mut controls = Vec::new();
+        let mut controls: Vec<Box<dyn crate::extension::ControlHandler>> = Vec::new();
+        if let Some(c) = crate::control::Commands::find(&pre, &mut store, &instance, &ctx.clock)
+            .map_err(runtime_error)?
+        {
+            exports.push(wasmnet_core::COMMANDS_EXPORT.to_owned());
+            controls.push(Box::new(c));
+        }
         for e in self.extension_hooks() {
             if let Some((export, handler)) = e
                 .instance_ready(&pre, &mut store, &instance)
