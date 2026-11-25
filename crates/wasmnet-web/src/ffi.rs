@@ -50,7 +50,7 @@
 //! | `js_timer_fire(timer)` | the virtual timer `timer` (from `wn_timer`) is due: resolve the guest's wait |
 //! | `js_invoke(dev, now: u64, command, len, argument, len) -> i32` | `commands.invoke`; answers a `command` message (the device's `ok` or refusal), or a negative error (a trap) |
 //! | `js_reconfigure(dev, now: u64, config, len) -> i32` | `reconfigure.reconfigure` with a `config` message; answers a `reconfigured` message, or a negative error |
-//! | `js_wait_done(wait, rv: u64)` | the `changes.wait` call `wait` (from `wn_infra_wait`) ended with `rv`: resolve the guest's call |
+//! | `js_wait_done(wait, reply, len)` | the waiting call `wait` (`changes.wait`, `changes.wait-any`; from `wn_infra_wait`) is answered with an `infra reply`: resolve (or reject) the guest's call |
 //! | `js_imports(component, len) -> i32` | the component's import names, if known: answers an `imports` message (asked before it is instantiated, for the grant check) |
 //! | `js_release(dev)` | device `dev`'s instance is gone (stopped, crashed, removed): drop it |
 //! | `js_compile(digest, len, bytes, len) -> i32` | make a supplied component instantiable as `digest` (the core checked it already); 0, or a negative error. May suspend (JSPI) |
@@ -91,7 +91,7 @@ mod js {
             argument_len: usize,
         ) -> i32;
         pub fn js_reconfigure(dev: u32, now: u64, config: *const u8, config_len: usize) -> i32;
-        pub fn js_wait_done(wait: u32, rv: u64);
+        pub fn js_wait_done(wait: u32, reply: *const u8, reply_len: usize);
         pub fn js_imports(component: *const u8, component_len: usize) -> i32;
         pub fn js_release(dev: u32);
         pub fn js_compile(
@@ -232,9 +232,10 @@ impl JsHost for Js {
         codec::decode_reconfigured(&bytes).map_err(|e| format!("reconfigure answer: {e}"))
     }
 
-    fn wait_done(&self, wait: u32, rv: u64) {
-        // SAFETY: plain values.
-        unsafe { js::js_wait_done(wait, rv) }
+    fn wait_done(&self, wait: u32, reply: &Reply) {
+        let reply = codec::encode_infra_reply(reply);
+        // SAFETY: `reply` is live for the duration of the call; JavaScript only reads it.
+        unsafe { js::js_wait_done(wait, reply.as_ptr(), reply.len()) }
     }
 
     fn imports(&self, component: &str) -> Option<Vec<String>> {
@@ -754,15 +755,16 @@ pub extern "C" fn wn_infra(dev: u32, call: *const u8, len: usize) -> i32 {
     set_result(codec::encode_infra_reply(&reply))
 }
 
-/// `changes.wait` of device `dev` (an `infra call` message for `changes.wait`): answers a wait
-/// id (`js_wait_done(id, rv)` comes when it ends, during a later step), or -1 with an
+/// A waiting call of device `dev` (an `infra call` message for `changes.wait` or
+/// `changes.wait-any`): answers a wait id (`js_wait_done(id, reply)` brings its answer, during a
+/// later step), or -1 with an
 /// `infra reply` in the result (answered at once: a refusal). Wakes the device. A device-side
 /// export.
 #[unsafe(no_mangle)]
 pub extern "C" fn wn_infra_wait(dev: u32, call: *const u8, len: usize) -> i32 {
     let started = match codec::decode_infra_call(bytes(call, len)) {
-        Ok((_, args)) => match registry() {
-            Some(r) => r.infra_wait(dev, &args),
+        Ok((function, args)) => match registry() {
+            Some(r) => r.infra_wait(dev, &function, &args),
             None => Err(Reply::Failed("no network".to_owned())),
         },
         Err(e) => Err(Reply::Failed(format!("infra call: {e}"))),

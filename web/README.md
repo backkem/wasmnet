@@ -70,7 +70,8 @@ scenario (the switch programmed by command between runs and by an operator event
 answering with its arguments and an environment variable; `window.wasmnetScenario`) and checks
 the answers, the switch's events and the page the client fetched, runs the `runtime` scenario
 (devices created while the network runs: an `infra-script` controller creating, commanding and
-restarting a router, a `replicas` controller woken by `changes.wait`, one that supplies a
+restarting a router and reading its events, a `replicas` controller woken by `changes.wait-any`,
+one that supplies a
 component fetched from a store node, and an ungranted `wasmnet:infra` importer refused), and
 checks the message a browser without JSPI gets. With `NATIVE_JOURNAL` pointing at the native example's output
 (`cargo run -p wasmnet-host --example http > target/http-native.txt`) it also checks that every

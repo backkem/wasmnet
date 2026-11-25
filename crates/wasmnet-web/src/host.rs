@@ -135,11 +135,11 @@ pub trait JsHost {
         let _ = (dev, now, config);
         Err("this host serves no wasmnet:reconfigure".to_owned())
     }
-    /// The `changes.wait` call `wait` (from [`crate::Registry::infra_wait`]) ended with the
-    /// resource version `rv`: resolve the guest's call. The default does nothing (a host whose
-    /// devices never wait).
-    fn wait_done(&self, wait: u32, rv: u64) {
-        let _ = (wait, rv);
+    /// The waiting call `wait` (`changes.wait`, `changes.wait-any`; from
+    /// [`crate::Registry::infra_wait`]) is answered with `reply`: resolve the guest's call. The
+    /// default does nothing (a host whose devices never wait).
+    fn wait_done(&self, wait: u32, reply: &crate::infra::Reply) {
+        let _ = (wait, reply);
     }
     /// The import names of `component` (`wasmnet:infra/devices@0.1.2`, ...), if JavaScript knows
     /// them, asked before it is instantiated: the core refuses a component that imports

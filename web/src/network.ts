@@ -160,6 +160,9 @@ const INFRA: Record<string, string[]> = {
   events: ['read', 'arm'],
 };
 
+/** The functions of `wasmnet:infra` that wait (async in WIT): the simulator answers them later. */
+const INFRA_WAITS: Record<string, string[]> = { changes: ['wait', 'waitAny'] };
+
 const kebab = (s: string) => s.replace(/[A-Z]/g, (c) => `-${c.toLowerCase()}`);
 
 /** A `result`'s `err` that jco threw as a `ComponentError`: its payload. Anything else is a trap, thrown on. */
@@ -221,7 +224,7 @@ export class Network {
   /** Virtual timers by the simulator's id: the guest's wake-up. */
   private readonly timers = new Map<number, () => void>();
   /** `changes.wait` calls by the simulator's id: their promise's resolution. */
-  private readonly waits = new Map<number, (rv: bigint) => void>();
+  private readonly waits = new Map<number, (reply: codec.InfraReply) => void>();
   private journalNext = 0;
   private panicked: string | null = null;
 
@@ -428,11 +431,11 @@ export class Network {
           return self.fail(err);
         }
       },
-      js_wait_done: (wait: number, rv: bigint) => {
+      js_wait_done: (wait: number, ptr: number, len: number) => {
         const self = n();
         const done = self.waits.get(wait);
         self.waits.delete(wait);
-        done?.(U64(rv));
+        done?.(codec.decodeInfraReply(self.view(ptr, len).slice()));
       },
       js_panic: (ptr: number, len: number) => {
         const self = n();
@@ -624,14 +627,17 @@ export class Network {
     throw new Error(reply.failed);
   }
 
-  /** `changes.wait`: resolves when the simulator says (during a later step). */
-  private infraWait(dev: number, args: unknown[]): Promise<bigint> {
+  /** A `wasmnet:infra` call that waits (`changes.wait`, `changes.wait-any`): settles when the simulator answers it (during a later step). */
+  private infraWait(dev: number, fn: string, args: unknown[]): Promise<unknown> {
     touch();
-    const id = this.withBytes(codec.encodeInfraCall('changes.wait', args), (p, l) => this.x.wn_infra_wait(dev, p, l));
-    if (id >= 0) return new Promise((resolve) => this.waits.set(id, resolve));
-    const reply = codec.decodeInfraReply(this.result());
-    if ('error' in reply) return Promise.reject({ payload: reply.error });
-    return Promise.reject(new Error('failed' in reply ? reply.failed : 'changes.wait'));
+    const settle = (reply: codec.InfraReply): Promise<unknown> => {
+      if ('value' in reply) return Promise.resolve(reply.value);
+      if ('error' in reply) return Promise.reject({ payload: reply.error });
+      return Promise.reject(new Error(reply.failed));
+    };
+    const id = this.withBytes(codec.encodeInfraCall(fn, args), (p, l) => this.x.wn_infra_wait(dev, p, l));
+    if (id < 0) return settle(codec.decodeInfraReply(this.result()));
+    return new Promise((resolve) => this.waits.set(id, resolve)).then((reply) => settle(reply as codec.InfraReply));
   }
 
   private imports(dev: number): Imports {
@@ -640,7 +646,9 @@ export class Network {
     for (const [iface, fns] of Object.entries(INFRA)) {
       infra[`wasmnet:infra/${iface}`] = Object.fromEntries(fns.map((f) => [f, (...args: unknown[]) => this.infra(dev, `${iface}.${kebab(f)}`, args)]));
     }
-    infra['wasmnet:infra/changes'] = { wait: (...args: unknown[]) => this.infraWait(dev, args) };
+    for (const [iface, fns] of Object.entries(INFRA_WAITS)) {
+      infra[`wasmnet:infra/${iface}`] = Object.fromEntries(fns.map((f) => [f, (...args: unknown[]) => this.infraWait(dev, `${iface}.${kebab(f)}`, args)]));
+    }
     return {
       ...wasiImports(this.world(dev)),
       ...infra,

@@ -62,7 +62,8 @@ const hex = (bytes: number[]) => bytes.map((b) => b.toString(16).padStart(2, '0'
 /**
  * The `runtime` scenario: devices the network creates while it runs. An `infra-script`
  * controller creates a router, commands it, stops it, starts it again (a fresh instance) and
- * commands it once more; a `replicas` controller (an async app, woken by `changes.wait`) keeps
+ * commands it once more, and reads its events (`events.read`, a rule armed with `events.arm`); a
+ * `replicas` controller (an async app, woken by `changes.wait-any`) keeps
  * two web servers running, and a client fetches from one of them; a second `replicas` fetches a
  * component's bytes from a store node, supplies them and runs two instances by digest. Every one
  * of those devices is instantiated by the page when the simulator asks for it.
@@ -87,8 +88,13 @@ async function runtime(net: Network): Promise<Record<string, string>> {
     '4ms start r1',
     '5ms id=q2 control r1 route-add 10.0.3.0/24 via 10.0.2.2',
     '6ms answer q2',
+    // The router's events (`wasmnet:infra/events.read`).
+    '7ms events r1 route-*',
   ];
-  await net.device('ctl', 'infra_script', Object.fromEntries(steps.map((s, n) => [`step.${n}`, s])), { infra: true, infraPrefix: 'r' });
+  // A rule: each `route-added` of r1 makes the controller read r1's events (`events.read`, then
+  // `events.arm` for the next one).
+  const rules = { 'on.0': 'r1 route-added : events r1 route-added' };
+  await net.device('ctl', 'infra_script', { ...Object.fromEntries(steps.map((s, n) => [`step.${n}`, s])), ...rules }, { infra: true, infraPrefix: 'r' });
   const rep = await net.device(
     'rep',
     'node-replicas',

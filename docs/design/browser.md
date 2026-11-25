@@ -45,8 +45,8 @@ A device's imports, all served without a real clock, real entropy or the network
 | `wasi:cli` stdout and stderr | the device's captures (`wn_output`) |
 | `wasi:cli/environment` | the device's `argv` (its name, then `DeviceOptions::args`) and `env` (`wn_args`, `wn_env`), read when the guest asks |
 | `wasmnet:link/wire`, `wasmnet:link/log` | `wn_transmit`, `wn_log`, `wn_event` |
-| `wasmnet:infra/{devices,components}` | `wn_infra`: the call's name and its arguments as generic values, answered by the core's `infra::Calls` |
-| `wasmnet:infra/changes.wait` | `wn_infra_wait`: a wait the device's actor polls; `js_wait_done` resolves it |
+| `wasmnet:infra/{devices,components,events}` | `wn_infra`: the call's name and its arguments as generic values, answered by the core's `infra::Calls` |
+| `wasmnet:infra/changes.{wait,wait-any}` | `wn_infra_wait`: one wait mechanism for both, a future of the core's (`infra::Calls::wait`, `wait_any`) that the device's actor polls; `js_wait_done` brings its answer, encoded like any other |
 
 And the device's optional exports, which the simulator calls like `receive`:
 `wasmnet:control/commands` (`js_invoke`, for `Network::command`, `Op::Control` and a
@@ -208,10 +208,13 @@ switch in place and restarts a router, a controller that follows the events of a
 created (`events.read`, `events.arm`), a controller that supplies components (one runs, one is
 no component, one does not link), and a device's arguments and environment. On the browser side wasmtime stands
 in for the page: it runs the components and serves their imports through the registry and the
-boundary's encoding, as `network.ts` does, so every line of Rust a browser runs is exercised.
+boundary's encoding, as `network.ts` does. It hosts stepped devices only, so the Rust a browser
+runs for async components (their `start`, apps and the waits `changes.wait` and `wait-any`) is
+exercised by the page test instead.
 The page's own test (`web/test`) then has to prove only the TypeScript, in headless Chromium:
 a command, an operator event, a server that reads its arguments and environment, and devices
 created while the network runs (an `infra-script` controller creating, commanding and
-restarting a router; a `replicas` controller woken by `changes.wait`; a second one that fetches
+restarting a router and following its events (`events.read`, `events.arm`); a `replicas` controller
+woken by `changes.wait-any`; a second one that fetches
 a component's bytes, supplies them and runs two instances from the page's own transpile; an
 ungranted importer refused).

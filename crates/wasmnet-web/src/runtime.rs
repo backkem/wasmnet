@@ -21,7 +21,7 @@ use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 
 use wasmnet_core::ext::ControlCall;
-use wasmnet_core::infra::{Calls, ChangeWait};
+use wasmnet_core::infra::Calls;
 use wasmnet_core::{
     COMMANDS_EXPORT, Command, CommandCall, DeviceConfig, DeviceContext, DeviceEntropy,
     DeviceInstance, Fault, Inbox, InfraEnd, JournalEnd, Level, Nanos, OutputCapture,
@@ -65,7 +65,7 @@ struct DeviceState {
     waker: Option<Waker>,
     completions: VecDeque<(u32, CallEnd)>,
     new_timers: Vec<(u32, Nanos)>,
-    new_waits: Vec<(u32, ChangeWait)>,
+    new_waits: Vec<(u32, infra::Wait)>,
 }
 
 #[derive(Default)]
@@ -216,14 +216,14 @@ impl Registry {
         }
     }
 
-    /// `changes.wait(selector, since, deadline)` of the device: a wait id, whose end
-    /// [`JsHost::wait_done`] reports (during a later step), or the answer at once. Wakes the
-    /// device.
-    pub fn infra_wait(&self, dev: u32, args: &[Value]) -> Result<u32, Reply> {
+    /// A waiting `wasmnet:infra` call of the device (`changes.wait`, `changes.wait-any`;
+    /// [`infra::WAITS`]): a wait id, whose answer [`JsHost::wait_done`] delivers (during a later
+    /// step), or the answer at once. Wakes the device.
+    pub fn infra_wait(&self, dev: u32, function: &str, args: &[Value]) -> Result<u32, Reply> {
         let Some(end) = self.with_device(dev, |d| d.infra.clone()) else {
             return Err(Reply::Failed(format!("no device {dev}")));
         };
-        let wait = infra::start_wait(Calls::new(end.as_ref()), args)?;
+        let wait = infra::start_wait(Calls::new(end.as_ref()), function, args)?;
         let id = {
             let mut inner = self.inner.borrow_mut();
             let id = inner.next_wait;
@@ -486,7 +486,7 @@ struct Actor<H: JsHost> {
     /// In-flight async calls: JavaScript call id -> (status id, kind).
     calls: BTreeMap<u32, (u64, CallKind)>,
     timers: Vec<(u32, Pin<Box<Sleep>>)>,
-    waits: Vec<(u32, Pin<Box<ChangeWait>>)>,
+    waits: Vec<(u32, infra::Wait)>,
 }
 
 impl<H: JsHost> Actor<H> {
@@ -586,7 +586,7 @@ impl<H: JsHost> Actor<H> {
             self.timers.push((id, Box::pin(self.clock.sleep_until(at))));
         }
         for (id, wait) in new_waits {
-            self.waits.push((id, Box::pin(wait)));
+            self.waits.push((id, wait));
         }
         let mut i = 0;
         while i < self.timers.len() {
@@ -600,9 +600,9 @@ impl<H: JsHost> Actor<H> {
         }
         let mut i = 0;
         while i < self.waits.len() {
-            if let Poll::Ready(rv) = self.waits[i].1.as_mut().poll(cx) {
+            if let Poll::Ready(reply) = self.waits[i].1.as_mut().poll(cx) {
                 let (id, _) = self.waits.remove(i);
-                self.host.wait_done(id, rv);
+                self.host.wait_done(id, &reply);
                 progress = true;
             } else {
                 i += 1;

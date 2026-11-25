@@ -6,8 +6,8 @@
 //! name.
 
 use wasmnet_core::infra::{
-    Calls, Change, ChangeKind, ChangeWait, CommandAnswer, DeviceView, EventPage, Follow,
-    InfraError, LogLine, Phase, Ready, TableSince,
+    Calls, Change, ChangeKind, CommandAnswer, DeviceView, EventPage, Follow, InfraError, LogLine,
+    Phase, Ready, TableSince,
 };
 use wasmnet_core::supply::StoredComponent;
 
@@ -47,7 +47,7 @@ pub const FUNCTIONS: &[&str] = &[
 ];
 
 /// Serves `function` (`devices.apply`, ... as in [`FUNCTIONS`]) with `args` from `calls`.
-/// `changes.wait` is not served here: it waits ([`start_wait`]).
+/// The functions that wait are not served here ([`start_wait`]).
 pub fn serve(calls: Calls<'_>, function: &str, args: &[Value]) -> Reply {
     match call(calls, function, &Args(args)) {
         Ok(reply) => reply,
@@ -55,24 +55,43 @@ pub fn serve(calls: Calls<'_>, function: &str, args: &[Value]) -> Reply {
     }
 }
 
-/// Starts `changes.wait(selector, since, deadline)` for the caller: the future to await, or
-/// the call's answer at once (a refusal, malformed arguments).
-pub fn start_wait(calls: Calls<'_>, args: &[Value]) -> Result<ChangeWait, Reply> {
-    let a = Args(args);
-    let parsed = (|| -> Result<_, String> {
-        a.arity(3)?;
-        Ok((a.pairs(0)?, a.u64(1)?, a.opt_u64(2)?))
-    })();
-    let (selector, since, deadline) =
-        parsed.map_err(|m| Reply::Failed(format!("wasmnet:infra/changes.wait: {m}")))?;
-    calls
-        .wait(selector, since, deadline)
-        .map_err(|e| Reply::Error(error(e)))
-}
+/// A wait a device started (`changes.wait` or `changes.wait-any`): the future that answers the
+/// call once the core says the wait is over. One mechanism for both: the actor polls it and
+/// hands its [`Reply`] to JavaScript ([`crate::JsHost::wait_done`]).
+pub type Wait = std::pin::Pin<Box<dyn std::future::Future<Output = Reply>>>;
 
-/// A wait's answer: the latest resource version of the caller's view.
-pub fn wait_reply(rv: u64) -> Reply {
-    Reply::Value(Value::U64(rv))
+/// The functions [`start_wait`] answers: the ones that wait.
+pub const WAITS: &[&str] = &["changes.wait", "changes.wait-any"];
+
+/// Starts `function` (one of [`WAITS`]) with `args` for the caller: the wait, or the call's
+/// answer at once (a refusal, malformed arguments).
+pub fn start_wait(calls: Calls<'_>, function: &str, args: &[Value]) -> Result<Wait, Reply> {
+    let a = Args(args);
+    let failed = |m: String| Reply::Failed(format!("wasmnet:infra/{function}: {m}"));
+    let refused = |e: InfraError| Reply::Error(error(e));
+    match function {
+        "changes.wait" => {
+            let (selector, since, deadline) = (|| -> Result<_, String> {
+                a.arity(3)?;
+                Ok((a.pairs(0)?, a.u64(1)?, a.opt_u64(2)?))
+            })()
+            .map_err(failed)?;
+            let wait = calls.wait(selector, since, deadline).map_err(refused)?;
+            Ok(Box::pin(
+                async move { Reply::Value(Value::U64(wait.await)) },
+            ))
+        }
+        "changes.wait-any" => {
+            let (table, follows, deadline) = (|| -> Result<_, String> {
+                a.arity(3)?;
+                Ok((a.table(0)?, a.follows(1)?, a.opt_u64(2)?))
+            })()
+            .map_err(failed)?;
+            let wait = calls.wait_any(table, follows, deadline).map_err(refused)?;
+            Ok(Box::pin(async move { Reply::Value(ready(wait.await)) }))
+        }
+        other => Err(Reply::Failed(format!("no waiting function `{other}`"))),
+    }
 }
 
 fn call(calls: Calls<'_>, function: &str, a: &Args<'_>) -> Result<Reply, String> {
@@ -498,7 +517,19 @@ mod tests {
             Reply::Value(Value::Tuple(vec![Value::U64(0), Value::List(vec![])]))
         );
         assert!(matches!(
-            start_wait(calls, &[Value::List(vec![]), Value::U64(0), Value::None]),
+            start_wait(
+                calls,
+                "changes.wait",
+                &[Value::List(vec![]), Value::U64(0), Value::None]
+            ),
+            Err(Reply::Error(_))
+        ));
+        assert!(matches!(
+            start_wait(
+                calls,
+                "changes.wait-any",
+                &[Value::None, Value::List(vec![]), Value::None]
+            ),
             Err(Reply::Error(_))
         ));
         let read = [

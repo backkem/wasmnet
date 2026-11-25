@@ -180,7 +180,7 @@ await step('what an embedder controls: commands, arguments and environment', asy
   return { answers: a, switchEvents: unblocked.map((e) => `${e.at} ${e.kind}`), body: fieldsOf(responses[0])['body-fnv'] };
 });
 
-await step('devices created while the network runs: controllers, a restart, changes.wait, a supplied component', async () => {
+await step('devices created while the network runs: controllers, a restart, device events, changes.wait-any, a supplied component', async () => {
   const r = await page.evaluate(() => window.wasmnetScenario('runtime', '42'));
   if (r.outcome.kind !== 'deadline') throw new Error(`outcome ${JSON.stringify(r.outcome)}`);
   // An ungranted importer of wasmnet:infra is refused before it is instantiated.
@@ -188,12 +188,16 @@ await step('devices created while the network runs: controllers, a restart, chan
   // The infra-script controller: the router it created answers, stops, starts again (a fresh
   // instance the page made on demand) and answers again.
   const steps = Object.fromEntries(events(r, 'infra-script', 'ctl').map((e) => [fieldsOf(e).step, fieldsOf(e)]));
-  const want = { 0: 'ok', 1: 'ok', 2: 'ok', 3: 'ok', 4: 'ok', 5: 'ok', 6: 'ok' };
+  const want = { 0: 'ok', 1: 'ok', 2: 'ok', 3: 'ok', 4: 'ok', 5: 'ok', 6: 'ok', 7: 'ok', 'on.0': 'ok' };
   for (const [n, result] of Object.entries(want)) {
     if (steps[n]?.result !== result) throw new Error(`step ${n}: ${JSON.stringify(steps[n])}`);
   }
   if (!steps[2].text.includes('10.0.1.0/24')) throw new Error(`routes: ${steps[2].text}`);
   if (!steps[6].text.includes('added')) throw new Error(`route-add: ${steps[6].text}`);
+  // wasmnet:infra/events: the read at 7 ms, and the rule's read in answer to route-added (armed
+  // with events.arm after every poll).
+  if (!steps[7].kinds.split(',').includes('route-added')) throw new Error(`events: ${JSON.stringify(steps[7])}`);
+  if (!steps['on.0'].kinds.split(',').includes('route-added')) throw new Error(`rule: ${JSON.stringify(steps['on.0'])}`);
   for (const kind of ['device-added', 'device-stopped', 'device-started']) {
     if (events(r, kind, 'r1').length !== 1) throw new Error(`r1 ${kind}: ${events(r, kind, 'r1').length}`);
   }
@@ -203,7 +207,7 @@ await step('devices created while the network runs: controllers, a restart, chan
     if (events(r, 'device-added', name).length !== 1) throw new Error(`${name} was not created`);
   }
   const running = events(r, 'replicas-observed', 'rep').filter((e) => fieldsOf(e).phase === 'running');
-  // Its period is 10 s: seeing them running within the run means changes.wait woke it.
+  // Its period is 10 s: seeing them running within the run means changes.wait-any woke it.
   if (running.length < 2) throw new Error(`replicas-observed running: ${JSON.stringify(running)}`);
   const done = events(r, 'http-get-done', 'client');
   if (done.length !== 1 || fieldsOf(done[0]).status !== '200') throw new Error(`http-get-done ${JSON.stringify(done)}`);
@@ -215,7 +219,7 @@ await step('devices created while the network runs: controllers, a restart, chan
   }
   const supRunning = events(r, 'replicas-observed', 'sup').filter((e) => fieldsOf(e).phase === 'running');
   if (supRunning.length < 2) throw new Error(`sup replicas-observed running: ${JSON.stringify(supRunning)}`);
-  return { refused: r.notes.refused, running: running.map((e) => `${e.at} ${fieldsOf(e).name}`), supplied: supRunning.map((e) => `${e.at} ${fieldsOf(e).name}`), routes: steps[2].text, fetched: done[0].at };
+  return { refused: r.notes.refused, events: steps[7].kinds, rule: `${steps['on.0'].event} seq ${steps['on.0'].seq}`, running: running.map((e) => `${e.at} ${fieldsOf(e).name}`), supplied: supRunning.map((e) => `${e.at} ${fieldsOf(e).name}`), routes: steps[2].text, fetched: done[0].at };
 });
 
 if (process.env.NATIVE_JOURNAL) {
