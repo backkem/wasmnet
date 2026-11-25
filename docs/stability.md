@@ -32,6 +32,8 @@ fuel per instant, `Network::link_stats` read between runs with `LinkStats::since
 link's series (`SeriesOptions`, `Network::link_series`), and what links record
 (`CaptureOptions`, `Network::set_capture_defaults`, `LinkMut::capture`, `FrameRecord::len`) with
 the `wasmnet-link-end/1` end descriptions (`pcap::LinkEnd`) ([design/links.md](design/links.md)).
+So is a netstack with several ports and static routes, its `port<N>.*`, `ports` and `routes`
+keys (`crates/wasmnet-host/tests/multihomed.rs`, [design/netstack.md](design/netstack.md)).
 
 ## Embedder surface, unstable
 

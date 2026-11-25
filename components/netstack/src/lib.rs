@@ -48,7 +48,10 @@
 //! The component exports `wasmnet:link/device`, `lifecycle` and `counters`
 //! (world `counted-async-device`), plus `wasi:sockets/{types,ip-name-lookup}`,
 //! `wasmnet:sockets-ext/{tcp,udp,multicast,interfaces,icmp}` and `wasmnet:netstack/state`:
-//! * `ports()` answers one port, `eth0`, with the configured (or seeded) MAC and the IP MTU.
+//! * `ports()` answers one port, `eth0`, or one per configured port (`eth1`, ...), each with its
+//!   configured (or seeded) MAC and IP MTU. Each port is a smoltcp interface of its own, with its
+//!   own socket set ([`sockets`]); the route table ([`route`]) picks the port of everything the
+//!   node sends, and nothing is forwarded between ports.
 //! * `start()` builds the [`Stack`] and spawns **one** long-lived driver task, then returns.
 //! * `receive()` only pushes the frame into the stack's rx queue and wakes the driver (push in).
 //! * The driver polls the stack, hands every produced frame to `wire.transmit` (push out), and
@@ -85,7 +88,8 @@
 //! classification for diagnostics), [`mcast`] (the multicast deadline), [`dhcp`] (the
 //! DHCP client), [`resolver`] (the stub DNS resolver), [`udp`]
 //! (app UDP sockets), [`tcp`] (app TCP sockets), [`icmp`] (app ICMP echo sockets),
-//! [`names`] (name lookup), [`debug`] (typed reads for debuggers) and [`stack`].
+//! [`names`] (name lookup), [`route`] (static routes and the route lookup), [`sockets`] (one
+//! smoltcp socket set per port), [`debug`] (typed reads for debuggers) and [`stack`].
 //!
 //! # Embedding
 //!

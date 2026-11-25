@@ -57,6 +57,7 @@ built as `node-<name>.wasm`. The node has one config. It holds the netstack's ke
 | [`udp-echo-client.wac`](../../compositions/udp-echo-client.wac) | `udp-echo-client` |
 | [`udp-echo-server.wac`](../../compositions/udp-echo-server.wac) | `udp-echo-server` |
 | [`udp-punch.wac`](../../compositions/udp-punch.wac) | `udp-punch` (test fixture) |
+| [`web-get.wac`](../../compositions/web-get.wac) | `http-server`, `http-get` |
 
 ### Invalid configuration
 
@@ -115,8 +116,9 @@ for the same seed.
 
 ## Netstack
 
-The TCP/IP stack of every node (smoltcp over Ethernet), with one port, `eth0`. It serves
-`wasi:sockets` to the node's apps.
+The TCP/IP stack of every node (smoltcp over Ethernet), with one port, `eth0`, or several
+(`eth0` to `eth15`, [below](#several-ports-and-static-routes)). It serves `wasi:sockets` to the
+node's apps.
 
 Source of truth: `Config::from_pairs` in
 [components/netstack/src/config.rs](../../components/netstack/src/config.rs). It reads the
@@ -136,6 +138,44 @@ under `app.`.
 | `ipv6-gateway` | IPv6 address | none | The default IPv6 gateway (a link-local address is allowed). Not unspecified or multicast. |
 | `hop-limit` | integer, 1..=255 | `64` | IPv4 TTL / IPv6 hop limit of unicast packets. |
 | `multicast-hop-limit` | integer, 1..=255 | `1` | TTL / hop limit for multicast destinations; also the default of the `wasmnet:sockets-ext/multicast` hop limit. |
+
+The keys from `mac` to `ipv6-gateway` are port 0's (`eth0`); `hop-limit` and
+`multicast-hop-limit` are the node's.
+
+### Several ports and static routes
+
+A node is a multi-homed host when it has more than one port: each port has its own MAC, MTU,
+addresses, neighbours, multicast memberships and DHCP client, the route table picks the port of
+everything the node sends, and nothing is forwarded between ports
+([netstack.md](netstack.md#several-ports-and-static-routes)).
+
+| Key | Value | Default | Meaning |
+|---|---|---|---|
+| `port<N>.mac`, `.mtu`, `.ipv4`, `.ipv4-gateway`, `.ipv6`, `.ipv6-link-local`, `.ipv6-gateway` | as the unprefixed keys above | as above; a missing MAC is drawn from the seeded RNG, port by port | Port N's keys, with N in 0..=15 written without leading zeros (`port01` is unknown). The unprefixed keys are port 0's: `port0.ipv4` is `ipv4`, and giving both is an error. `port<N>.ipv4 = dhcp` runs a DHCP client on that port (`hostname` is sent by every one). Two ports may not have the same MAC or address. A gateway key adds a default route out of its port. |
+| `ports` | integer, 1..=16 | one more than the highest configured `port<N>` | Number of ports. It may add unconfigured ports (with only their link-local address); a configured `port<N>` with `N >= ports` is an error. |
+| `routes` | comma-separated list of routes (see below), at most 32 | none | Static routes. |
+
+**Route syntax**, the router's ([Router](#router)) with a next hop always:
+
+```text
+<destination> via <next-hop> [port <n>]
+```
+
+* `<destination>` is a prefix such as `10.0.3.0/24` or `fd00:3::/64` with no host bits set, or
+  `default`: `0.0.0.0/0` or `::/0` by the family of `via`.
+* `via` is required (the netstack has no on-link routes without a next hop) and must be a
+  unicast address of the destination's family.
+* Without `port`, the next hop must lie inside a port's static prefix; the lowest such port is
+  used. On a node with one port every route is port 0's, so `default via fe80::1` needs no
+  `port` there; on a node with several, a link-local next hop or one on a DHCP port needs it.
+* A route inside a static prefix of its own port is refused (that port reaches it on-link). A
+  second route to the same prefix out of the same port is refused, and so is an IPv4 default
+  route out of a port whose IPv4 comes from DHCP (the lease sets it).
+
+The route table holds every port's connected prefixes, then the static routes (`routes` in the
+order listed, then the gateway keys' default routes, port by port), then each DHCP lease's
+default route; the longest prefix wins, and the first in that order among equals. Example:
+`routes = "10.0.3.0/24 via 10.0.2.254, default via fd00:1::fe"`.
 
 ### Name lookup, DHCP and DNS
 

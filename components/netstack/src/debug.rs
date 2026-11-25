@@ -3,10 +3,12 @@
 //! paths and no encoding: an embedder maps these onto its own contract (for example an
 //! inspection interface).
 //!
-//! The reads themselves are [`Stack`] methods ([`Stack::interface`], [`Stack::dns_servers`],
-//! [`Stack::udp_sockets`], [`Stack::tcp_sockets`], [`Stack::icmp_sockets`],
-//! [`Stack::neighbors`], [`Stack::counters`]); inside a running component, [`with_stack`] lends
-//! the driver's stack to a closure and [`counters`] answers what the `counters` export answers.
+//! The reads themselves are [`Stack`] methods ([`Stack::interface`] (port 0) and
+//! [`Stack::interfaces`] (every port), [`Stack::dns_servers`], [`Stack::udp_sockets`],
+//! [`Stack::tcp_sockets`], [`Stack::icmp_sockets`], [`Stack::neighbors`] (port 0) and
+//! [`Stack::neighbors_on`], [`Stack::counters`] and [`Stack::port_counters`]); inside a running
+//! component, [`with_stack`] lends the driver's stack to a closure and [`counters`] answers what
+//! the `counters` export answers.
 //! Reads never change the stack.
 
 use std::net::SocketAddr;

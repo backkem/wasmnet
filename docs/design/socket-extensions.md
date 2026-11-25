@@ -54,3 +54,16 @@ The package ([wit/sockets-ext/sockets-ext.wit](../../wit/sockets-ext/sockets-ext
 The package only grows by adding interfaces and functions, so a newer provider serves older
 importers; a composition can re-export an interface under an older version name when an importer
 asks for one.
+
+## Interface indexes in wasmnet's netstack
+
+The netstack's port N (`eth<N>`) is interface index N + 1: `list-interfaces` lists every port in
+that order, and the index is what `join-multicast-group`, `leave-multicast-group` and
+`set-multicast-interface` take and what an IPv6 socket address's `scope-id` names. 0 is the
+default everywhere an index is taken: for a membership or an outgoing group datagram, the port
+of the family's first default route, else the lowest port with an address of the family (on a
+node with one port, `eth0`). An index above the number of ports is `invalid-argument`. On a node
+with several ports, a link-local source the netstack reports (a datagram's sender, an accepted
+connection's peer) carries its port's index as its scope id; a node with one port reports 0.
+The netstack's routing and binding rules are in
+[netstack.md](netstack.md#several-ports-and-static-routes).

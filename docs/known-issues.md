@@ -66,6 +66,17 @@ here so that nobody has to find these the hard way. Each entry names where the c
 
 ## The netstack
 
+- **`mdns-responder` answers on `eth0` only.** It joins and answers on interface 1; on a
+  node with several ports, a question that arrives on another port goes unanswered. Answering
+  on the port a question came in on, with that port's addresses (RFC 6762 §6.2), needs the
+  arrival interface of a datagram, which `wasi:sockets` does not report (POSIX:
+  `IP_PKTINFO`). The netstack's own one-shot queries do ask on every port.
+- **A multi-homed node is a strong host** ([design/netstack.md](design/netstack.md#several-ports-and-static-routes)):
+  it accepts a packet only on the port that holds its destination, and a socket bound to an
+  address sends only by that address's port. Linux is a weak host; software that counts on
+  reaching one port's address through another port does not work. A wildcard TCP listener's
+  backlog counts per port, and an IPv6 link-local destination without a scope id leaves by the
+  lowest port.
 - **An IGMP or MLD query makes the driver poll every millisecond** for the length of the
   response window. It costs processor time only: results and captures are the same.
 - **TCP loss recovery still ends in a timeout where duplicate ACKs cannot help** (a loss

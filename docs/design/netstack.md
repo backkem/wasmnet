@@ -1,7 +1,8 @@
 # The netstack
 
 The netstack ([components/netstack](../../components/netstack)) is a smoltcp 0.14 IP stack over
-`Medium::Ethernet`, packaged as an async device with one port, `eth0`. It speaks ARP, NDP,
+`Medium::Ethernet`, packaged as an async device with one port, `eth0`, or several (`eth0`,
+`eth1`, ...: [below](#several-ports-and-static-routes)). It speaks ARP, NDP,
 IPv4, IPv6, ICMP, IGMP, MLD, UDP and TCP on the wire, and exports `wasi:sockets@0.3.0` and
 `wasmnet:sockets-ext` to the apps composed with it (world `wasmnet:netstack/netstack`,
 [wit/netstack/netstack.wit](../../wit/netstack/netstack.wit)). The guarantee: the stack's logic
@@ -12,15 +13,16 @@ same frames, and a node replays byte for byte under the same seed.
 ```text
   app ── wasi:sockets / sockets-ext ──┐            (calls run in the app's task)
                                       ▼
-  receive ─► rx queue ─►  Stack (smoltcp Interface + SocketSet, our tables)
+  receive ─► rx queue ─►  Stack (per port: smoltcp Interface + SocketSet; routes, our tables)
                                       │  poll(now) → frames, logs, events
                     driver task ──────┘─► wire.transmit, log, wait-until(next wakeup)
 ```
 
 ## One driver task
 
-`ports()` answers `eth0` with the configured MAC (or one drawn from the seeded `wasi:random`)
-and the IP MTU. `start()` builds the `Stack` and spawns **one** driver task with
+`ports()` answers `eth0` (and `eth1`, ... on a node with several ports) with the configured MAC
+(or one drawn from the seeded `wasi:random`, port by port) and the IP MTU. `start()` builds the
+`Stack` and spawns **one** driver task with
 `wit_bindgen::spawn_local`, then returns. `receive()` pushes the frame into the stack's rx queue
 and wakes the driver; `poll()` always answers `none`.
 
@@ -198,6 +200,112 @@ AAAA queries in parallel over UDP 53, one server at a time, `resolver.timeout` p
 with one-shot mDNS queries, DNS servers or not. The keys are in
 [configuration.md](configuration.md).
 
+## Several ports and static routes
+
+A node may have up to 16 ports ([configuration.md](configuration.md#several-ports-and-static-routes)):
+`port<N>.*` keys give each its MAC, MTU and addresses (static, or `ipv4 = dhcp` on any port),
+the unprefixed keys are port 0's, and `routes` adds static routes in the router's syntax. A node
+with one port is exactly what it was before: the same frames, counters, log lines and draws
+from `wasi:random`.
+
+**One smoltcp interface per port.** smoltcp's `Interface` is one interface: one hardware
+address, one device, one neighbour cache, one route table, one set of multicast memberships. A
+multi-homed host needs all of those per link, so each port is an `Interface` over its own
+queue device. The alternatives were worse:
+
+- one interface whose device multiplexes the ports would need one MAC for every port, could
+  not tell which port an ARP request or a multicast report belongs on, and would mix the
+  neighbours of different links in one cache;
+- a patch teaching smoltcp several links would have to reach into its egress (a socket
+  dispatches by the interface's routes and source addresses), its ingress (the first DHCP
+  socket in the set takes every DHCP reply) and its neighbour handling: a large change to a
+  vendored library for what the netstack can do above it.
+
+**One socket set per port.** A smoltcp interface sends whatever any socket in the set it polls
+has queued, by its own routes and from its own addresses, and hands every arriving packet to the
+sockets of that set. Two interfaces sharing one set would both send a socket's segments. So
+each port has its own `SocketSet`, a socket lives in exactly one of them, and a handle names
+the port with the slot ([src/sockets.rs](../../components/netstack/src/sockets.rs)). An app
+socket that is not tied to one port has a smoltcp socket on every port:
+
+- **UDP and ICMP echo sockets** bound to the unspecified address (explicitly, or implicitly on
+  the first `send`) get one smoltcp socket per port, so they receive on every port; `receive`
+  takes the family demultiplexer's datagrams first, then each port's socket in port order. A
+  socket bound to one of the node's addresses gets one, on that address's port.
+- **TCP listeners** on the unspecified address keep their backlog of LISTEN sockets on every
+  port (the backlog counts per port); a listener on an address only on its port. An accepted
+  connection stays in the set of the port it arrived on. **`connect`** creates its socket on the
+  port the route picks.
+
+**The route table** ([src/route.rs](../../components/netstack/src/route.rs)) picks the port of
+everything the node sends. It holds, in this order: a connected route per address of every port
+(every port's link-local address brings `fe80::/64`), as the addresses are right now; the
+`routes` items in the order listed, then the gateway keys' default routes, port by port; then
+the default route of each DHCP lease that names a router, port by port. The lookup is a
+longest-prefix match, and among routes of the same length the first in that order wins, so a
+connected route beats a static one and the lowest port wins a tie between ports. A destination
+no route covers is `remote-unreachable` (`ENETUNREACH`). Inside the chosen port, smoltcp picks
+the next hop: each port's interface holds that port's static routes and its lease's default,
+and sends on-link what lies in one of its own prefixes (so a static route inside its own port's
+static prefix is refused at config time: it would never be used).
+
+**Sources and binds: the strong host model** (RFC 1122 §3.3.4.2, Windows' default; Linux is a
+weak host):
+
+- An unbound or wildcard socket's packets leave by the route's port, and smoltcp picks the
+  source address among that port's addresses: for IPv6 RFC 6724's candidate set and rule 2
+  (the scope of a link-local or multicast destination) and rule 8 (longest matching prefix);
+  for IPv4 the port's address in the destination's subnet, else its first. Rules 3 to 7
+  (deprecated, home, interface, label and temporary preferences) have nothing to choose from:
+  the outgoing interface is already fixed, and a port has at most one IPv4 address, a
+  link-local and one global IPv6 address.
+- A socket bound to one of the node's addresses sends only by that address's port, with only
+  that port's routes; a destination they do not cover is `remote-unreachable`.
+- A packet is accepted only on the port that holds its destination address: a packet for
+  `eth1`'s address that arrives on `eth0` is dropped.
+- **No forwarding.** A packet for an address the node does not have is dropped, whichever port
+  it came in on. Forwarding is the router's job.
+- An IPv6 link-local destination is ambiguous on a node with several ports: its scope id (the
+  `wasi:sockets` address's `scope-id`, the interface index) picks the port, and without one the
+  route table does (the lowest port). On such a node a datagram from a link-local source and an
+  accepted connection from one carry their port's index as the scope id, so an answer to them
+  leaves by the same port. A node with one port reports scope 0, as before.
+
+**Multicast.** A membership belongs to a socket and an interface index (`wasmnet:sockets-ext`
+indexes: port N is index N + 1, 0 the default). Each port's interface joins the groups its
+sockets want there, and sends its own IGMP and MLD reports. A datagram to a group (or to
+`255.255.255.255`) leaves by the socket's `multicast-interface`, else the family's default
+port: the port of the family's first default route, else the lowest port with an address of the
+family. Multicast loopback is per port. The resolver's one-shot mDNS queries ask on every port
+with an address of their family.
+
+**Per port**, besides the interface: the neighbour tables and their bounds, the multicast
+deadline, the carrier, the DHCP client, and ICMP errors (an error counts only on the port that
+holds its destination; path MTU discovery compares against that port's MTU). On a node with
+several ports, the events the stack journals for one port (`arp-resolved`, `ndp-resolved`,
+`icmp-error-received`, `path-mtu-lowered`, `multicast-joined`, `multicast-left`, `dhcp-*`) carry
+a `port` field (`eth1`), and the log line at start lists every port and the static routes. The
+DNS servers are the `dns` key's, else every lease's, port by port; a single-label name gets the
+first lease's domain.
+
+**Counters** keep their names and order: frame, neighbour, ICMP error and DHCP counts are sums
+over the ports, and on a node with one port they are its port's. A node with several ports
+also lists each port's own counters (`eth<N>.rx-frames`, `.rx-bytes`, `.tx-frames`,
+`.tx-bytes`, `.arp-resolved`, `.ndp-resolved`, `.multicast-queries`, `.icmp-errors-received`,
+`.multicast-groups`, `.dhcp-bound`, `.neighbors-evicted`), after the driver's.
+
+**Snapshots** save every port (format version 4); a restore needs a stack built with the same
+ports, MACs and addresses.
+
+Tested in the pure multi-node simulation
+([src/sim_tests/multi.rs](../../components/netstack/src/sim_tests/multi.rs): replies and
+neighbours per port, no forwarding, binds across ports for UDP and TCP, routes, next hops and
+source addresses, a join on one port, snapshots), against a reference for the longest-prefix
+match under random tables ([src/route.rs](../../components/netstack/src/route.rs)), and end to
+end with real nodes ([crates/wasmnet-host/tests/multihomed.rs](../../crates/wasmnet-host/tests/multihomed.rs):
+a host on a LAN, by DHCP, and on a static second segment serves both and fetches through
+either router by its routes).
+
 ## smoltcp, patched
 
 smoltcp is vendored in [third_party/smoltcp](../../third_party/smoltcp) with six patches,
@@ -218,6 +326,8 @@ workaround in use.
 
 ## Limits
 
-One port per stack. No IP fragmentation, no TCP fallback for truncated DNS answers. smoltcp
+At most 16 ports and 32 static routes; a host never forwards between its ports, and has no
+policy routing, metrics or on-link routes without a next hop. No IP fragmentation, no TCP
+fallback for truncated DNS answers. smoltcp
 keeps time in microseconds, so link latencies below 1 µs collapse into one instant. The IPv4
 identification field is always 0.

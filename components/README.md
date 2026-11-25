@@ -81,3 +81,4 @@ A node is the netstack plus the apps in its composition, `compositions/<name>.wa
 | `node-udp-echo-client` | `netstack`, `udp-echo-client` |
 | `node-udp-echo-server` | `netstack`, `udp-echo-server` |
 | `node-udp-punch` | `netstack`, `udp-punch` |
+| `node-web-get` | `netstack`, `http-server`, `http-get` |
