@@ -25,8 +25,9 @@ A refused change (a name taken, a port in use, an unknown component) becomes the
 - **Add.** The component comes from the network's component resolver
   (`Network::set_component_resolver`), which turns a catalog name into a component. Without a
   resolver, `add_op` refuses `AddDevice` and `StartDevice` at once. The new device gets the next
-  index. Its cables are connected in the same op, before it first runs, like a cable plugged in
-  before power-on.
+  index, and its creator's next number in event keys
+  ([event-order.md](event-order.md#devices-created-while-the-network-runs)). Its cables are
+  connected in the same op, before it first runs, like a cable plugged in before power-on.
 - **Stop.** The device's store is dropped and its links go down, so their far ends see the
   carrier drop. Its name, ports and links stay.
 - **Start.** A fresh instance of the same component and config in the same slot; the links its
@@ -70,13 +71,30 @@ caller itself), and cannot grant `infra` to them.
 
 **Calls are derived operator events.** The sim core keeps a device table (`wasmnet_core::Infra`)
 with every device by name: uid, generation, labels, owner, spec, phase and its change log. A
-resource version is the ordinal of a change in this table. A mutation never changes the world
-inside the call: it validates, records what was asked, journals `infra-<verb>` on the caller
-when something changed, and queues a derived event with an ordinary causal key in the caller's
-own processing context, at `now` (a graceful stop at `now + grace`; never before a request
-already queued for the same device), like a frame sent with zero latency. The network
-applies it like a topology op in that event's processing context. A refusal is journalled as
-`infra-failed` on the caller and shown on the device, never the network's failure.
+mutation never changes the world inside the call: it validates, records what was asked,
+journals `infra-<verb>` on the caller when something changed, and queues a derived event with
+an ordinary causal key in the caller's own processing context, at `now` (a graceful stop at
+`now + grace`; never before a request already queued for the same device), like a frame sent
+with zero latency. The network applies it like a topology op in that event's processing
+context. A refusal is journalled as `infra-failed` on the caller and shown on the device,
+never the network's failure.
+
+**What a controller sees.** A controller reads its own view of the table: the network's own
+devices (those it was built with and those operator events added) and the devices it created,
+not other controllers' devices. A resource version is the ordinal of a change in that view, so
+a controller's versions count only the changes it sees (`Infra::list_for` and
+`Infra::watch_for` show a tool the same; `Infra::list` and `Infra::watch` read the whole table,
+with its own ordinals). Only the devices controllers created follow their apps' exits
+(`apps`, and a `modified` change); the network's own devices keep an empty `apps`. `logs`
+answers only for the caller's own devices (`denied` for the network's, `not-found` for
+another controller's). These rules keep the view the same when the network is split over
+sites, where a site's journal holds only its own devices ([sites.md](sites.md)). A mutation of
+a name another controller owns is still refused (`conflict` for `apply`, `denied` otherwise).
+
+**Name prefixes.** `DeviceOptions::infra_prefix` limits a controller to names that start with
+it: any other name is `denied` to every mutation. No two controllers' prefixes may overlap
+(one a prefix of the other; `Error::Refused` when the second is added). Controllers on more
+than one site of a split network need one each.
 
 **Determinism.** The world stays a function of how the embedder built the network, its
 operator events and its seed: a rerun runs the controller again, which makes the same calls at
@@ -89,8 +107,16 @@ only that device (its links go down), journals `device-crashed` with a one-line 
 shows it as `crashed`; `start` runs it again. A trap anywhere else still fails the whole
 network.
 
-In a split (multi-site) network every mutation answers `denied` once a remote device exists;
-reads work as usual ([sites.md](sites.md)).
+**Split networks.** A controller works in a split (multi-site) network on its own site: its
+devices and their cables stay there. A creation cabled to a device of another site fails the
+split run when it applies (`Error::Refused`, deterministic), and WAN links are never created
+while a network runs ([sites.md](sites.md#in-world-controllers)).
+
+**Devices it creates are numbered by creator.** Every device has a number in event keys and
+record tags; a device created while the network runs gets its creator's next number
+([event-order.md](event-order.md#devices-created-while-the-network-runs)), so its uid and the
+event order do not depend on what other creators did. With one creator the numbers are the
+devices' indices.
 
 ## Commands into a running device
 
@@ -137,8 +163,8 @@ device that stopped meanwhile or takes no commands) is journalled on the caller 
 the device gave it, and shown as the device's `message`; what the command did is in the
 device's own journal (`route-added`). A retry with the same request id and arguments is
 answered from the record and not sent again; without a request id, every call sends the
-command, so commands should be idempotent (the router's are). In a split network it is
-`denied`, like every mutation.
+command, so commands should be idempotent (the router's are). In a split network it reaches
+the controller's own devices, which are on its site.
 
 The package went from `wasmnet:infra@0.1.0` to `0.1.1`: an addition, so a component built
 against 0.1.0 still links (wasmtime matches `0.1.x` imports semver-compatibly).
@@ -149,8 +175,8 @@ a controller with a script: a stepped device with no ports that makes `apply`, `
 [crates/wasmnet-host/tests/routes.rs](../../crates/wasmnet-host/tests/routes.rs) uses to change
 the routes of a router it created while traffic crosses it.
 
-**Not covered yet.** Commands in a split network (operator events and infra mutations are
-refused there; the site-sync format would have to carry a command and its answer). Changing a
+**Not covered yet.** Commands to a device of another site (a controller's own devices are on its
+site; a timed `Op::Control` is applied by the device's site, [sites.md](sites.md)). Changing a
 device's configuration in place through infra (`apply` with a new spec still recreates it),
 and `wire` and `unwire` verbs for controllers. A NAT or a packet filter would take its rules
 through the same `commands` export, with no change to the host, the core or `wasmnet:infra`.

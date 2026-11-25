@@ -35,12 +35,12 @@ compared lexicographically, one `KeyLevel` per nesting step:
 | `K(cause)` | for `popped`: the key of the event being processed when this one was queued |
 | `slot` | `setup`: the setup step (creating device `i` is step `i`; a scripted link change gets the number of devices created so far plus its own index among link changes); `control`: the device; `operator`: the operator event's index; otherwise 0 |
 | `round` | the executor's round within the cause (1-based; 0 is the dispatch of the cause itself) |
-| `device` | the device whose activity queued it (`HOST_DEVICE` for the simulator itself) |
+| `device` | the number of the device whose activity queued it (`HOST_DEVICE` for the simulator itself; below) |
 | `idx` | how many events this `(cause, round, device)` queued before this one |
 
 `init` is the executor's first round, before any event fired; `control` is a control call
 between runs (`Network::counters`, `Network::control`). Within one event the executor polls
-devices round by round, in device order, until a round finds no work. That makes `K` equal to
+devices round by round, in order of their numbers, until a round finds no work. That makes `K` equal to
 the insertion order of a single global counter (the two give byte-identical runs), while it
 depends only on the history of the devices involved.
 
@@ -104,5 +104,43 @@ if there is one, and may return a verdict of its own, which applies only when no
 A hook must be deterministic for a run to replay; a caller that records every verdict that
 changed a frame as a frame rule can replay the run without the hook.
 
-A split (multi-site) network refuses operator events: `add_op` returns `Error::Refused` once
-the network has a remote device, because the site-sync wire format carries no pre number.
+A split (multi-site) network takes only timed operator events at a device (`StartOf` and `EndOf`:
+stdin, a control call, an injected frame), whose keys are a single level with no pre number;
+every site adds the same ones in the same order, and the device's site applies each
+([sites.md](sites.md)). Operator events anchored before an event stay refused there
+(`Error::Refused`): the site-sync wire format carries no pre number.
+
+## Devices created while the network runs
+
+A device's **number** is what keys and tags call `device` (and what digests hash), and the
+executor polls devices in number order. A device the network was built with has its index as
+its number. A device created while the network runs (an operator event, a controller's
+request, or the builder API after such a creation) gets its **creator's** next number:
+
+```text
+number = D + c · CREATOR_RANGE + n
+```
+
+`D` is the number of devices when the first one was created while the network ran,
+`CREATOR_RANGE` is 2^20, `c` is the creator's rank (the devices granted `infra` among the first
+`D`, in order, then the embedder, then controllers added later in the order they first create)
+and `n` counts the creator's earlier creations, recreations included. A creator out of numbers
+gets a refusal (the op fails, or `infra-failed`), the same in every run. The number depends only
+on the creator's own history, so every site of a split network computes it without knowing
+what other sites created, and the unsplit network computes the same. The device's *index*
+(`DeviceId`, what records name) stays its position in creation order; a split network's merge
+renumbers the sites' own indices by the tags of their creations ([sites.md](sites.md)).
+
+**When only the first-ranked creator creates** (the first controller, or the embedder in a
+network without controllers), the number of its `n`-th device is `D + n`, exactly its index:
+such networks order and digest everything as they did when numbers were indices. **Otherwise**
+some created devices get numbers that differ from their indices: with several creators, every
+one but the first-ranked one's; and the embedder's in a network that also has a controller,
+even one that creates nothing. That changes the digests of every
+key whose causal chain passes through such a device: the uids of devices created later in that
+chain, `fr:` frame-rule digests and anything else named by a digest. A guest that puts a uid on
+the wire changes its captures too. It changes the event order only where two such devices of
+different creators act in the same round of the same event and were created in the opposite
+order to their creators' ranks: a link changing state between them, or one event or control
+call that touches both. Ordinary traffic wakes one device per event, so it never does. Records
+(indices, journal text) do not change.

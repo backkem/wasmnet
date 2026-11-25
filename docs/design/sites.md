@@ -13,8 +13,15 @@ be a site.
   ([links.md](links.md)). Time is virtual, in nanoseconds.
 - A **site** runs a subset of the devices; every device runs on exactly one site. Every site
   builds the whole network in the same order, the other sites' devices as placeholders
-  (`Network::remote_device`), so device and link numbers and event keys are the same
-  everywhere.
+  (`Network::remote_device`, or `Network::remote_device_with` with the device's config and
+  options, which a network with controllers needs: below), so device and link numbers and
+  event keys are the same everywhere.
+- Devices and links created while the network runs (by an in-world controller, below) exist
+  only on their creator's site, at the next index there. Their **number** in event keys and
+  record tags does not depend on the split: creator `c`'s `n`-th creation is number
+  `D + c · CREATOR_RANGE + n` ([event-order.md](event-order.md#devices-created-while-the-network-runs)).
+  Their indices in the records are site-local; the merge renumbers them into the unsplit
+  network's order.
 - A link whose ends are on different sites is a **WAN link**. The smallest WAN-link latency is
   the **lookahead** `L`, which must be > 0 (`SiteSync::new` panics on 0).
 - A scripted link change whose both ends are on the other site is not scheduled here, but
@@ -26,12 +33,44 @@ be a site.
   `wasmnet:wan` WIT package ([wit/wan/wan.wit](../../wit/wan/wan.wit)) describes a carrier
   component; this repository contains none.
 
+## In-world controllers
+
+A controller (`DeviceOptions::infra`, [topology-and-infra.md](topology-and-infra.md)) works in
+a split network as long as everything it changes stays on its own site: `apply`, `start`,
+`stop`, `remove` and `control` of its own devices, with cables to devices of its own site. A
+split run then gives exactly the unsplit records, the controller's view of the device table
+included (`crates/wasmnet-host/tests/infra_sites.rs`, with one controller and with one on each
+site). What makes it work:
+
+- **One table on every site.** Placeholders enter the device table with their description
+  (`remote_device_with`), at the same position and with the same uid as in the unsplit table.
+  A controller sees the network's own devices and the ones it created, and its resource
+  versions count only what it sees; both are the same split or not, because a controller and
+  its devices always share a site. The table follows app exits only of devices a controller
+  created, and `logs` answers only for them, since a site's journal has only its own devices.
+- **Numbers by creator**, as above: the uids of created devices (digests of keys) and the
+  order of events agree without the sites knowing of each other's creations.
+- **Names cannot collide.** Controllers on more than one site must each have an
+  `infra_prefix` (no two overlapping); a controller creates and changes only names under its
+  own. A network without prefixes is refused when the second site's controller is added
+  (`Error::Refused`, on both sites).
+- **Locality is checked when a creation applies.** A cable to a device of another site (a
+  placeholder, or a name under another site's controller's prefix) fails the split run with
+  `Error::Refused` at that derived event: the same site, instant and message on every rerun.
+  The unsplit network would have wired it, so no answer on one site could match.
+
 What does not cross sites:
 
-- **Operator events.** `Network::add_op` returns `Error::Refused` once the network has a remote
-  device ([event-order.md](event-order.md)).
-- **`wasmnet:infra` mutations.** Once a remote device exists, every mutating call answers
-  `denied`; reads still work ([topology-and-infra.md](topology-and-infra.md)).
+- **Cables of created devices to another site**, and **WAN links created while the network
+  runs**: refused as above. A new WAN link would need both sites to agree on it, exchange its
+  ports and perhaps shrink the lookahead.
+- **Most operator events.** `Network::add_op` takes only timed operator events at a device
+  (`StartOf` or `EndOf`: `Op::Stdin`, `Op::Control`, `Op::Inject`) once the network has a
+  remote device, and refuses the rest (`Error::Refused`): topology ops, link changes, and
+  events anchored before another event, whose pre number is not on the wire
+  ([event-order.md](event-order.md)). Every site must add the same operator events in the same
+  order; an op at another site's device takes its index and key but is not queued, and stays
+  `Pending` there. `OpState::Applied::events` counts only the site's own events.
 - **Cables.** A cable ([runtime-and-extensions.md](runtime-and-extensions.md)) between two
   devices of the same site works as usual. A message sent on a cable whose other end is on the
   other site is dropped and counted in that link's `LinkStats::dropped_down`; nothing refuses
@@ -44,6 +83,12 @@ state change) is tagged with the processing context it was made in and its posit
 Merging the two sites' records by tag (`sites::merge`) gives the single-site order. The pcap of
 a WAN link is rebuilt from both halves: the sender records a frame outbound at transmit time,
 the receiver inbound at arrival time.
+
+The devices and links a site created while the network ran carry the tag of the processing
+context that created them (`Network::created_devices`, `Network::created_links`). The merge
+keeps the setup indices, sorts every creation of both sites by that tag (the unsplit creation
+order) and renumbers each site's own indices in the frame log, the link transitions and the
+links' ends to match; `Merged::devices` and `Merged::link_infos` name them.
 
 ## Lockstep
 
@@ -110,7 +155,8 @@ key := uv depth (1..32), then depth x level, level i:
 `frame_id` is the frame's index in the sender's frame log (the receiver reports its fate in the
 merged result). `generation` is the link's down-count at transmit time: a frame in flight when
 the link went down is lost on arrival. The origin codes are `setup` 0, `init` 1, `popped` 2,
-`control` 3, `operator` 4 (never sent: operator events do not cross sites).
+`control` 3, `operator` 4 (the key of a timed operator event placed at the end of an
+instant, or of what it caused).
 
 **SYNC (type 3)**, the null message:
 
@@ -129,6 +175,9 @@ outcome   u8 0 (quiescent): uv at, strings parked, strings daemons
           u8 1 (deadline):  uv at, uv pending_events
           u8 2 (failed):    uv at, string message
 uv now | uv count, count x uv device                      (the sender's own devices)
+uv setup_devices                                         (devices the network was built with)
+uv count, count x { uv device, string name, tag }        (devices it created while running)
+uv count, count x { uv link, tag }                       (links it created while running)
 uv count, count x { tag, uv at, string device, entry }    (journal)
      entry := u8 0 (log): u8 level (trace 0 ... error 4), string message
             | u8 1 (event): string kind, uv n, n x { string key, string value }
@@ -154,8 +203,11 @@ tag     := u8 origin, u8 has_cause (0|1), [key, then uv pre per level], uv slot,
 The stats pairs are frames, bytes, dropped while down, oversize, lost, dropped at a full
 transmit queue and lost to seeded loss, each per end.
 
-Version 2 added the impairments, the last two stats pairs and drop reason 3 to RECORDS; the
-other messages are as in version 1. A site refuses a message of another version.
+Version 2 added the impairments, the last two stats pairs, drop reason 3 and the devices and
+links created while the network ran to RECORDS; the other messages are as in version 1. A
+RECORDS message's device and link indices below the setup counts are the same on both sites;
+the others are the sender's own. The links a site did not create are the setup links, the
+same list on both sites. A site refuses a message of another version.
 
 ## Impaired links
 

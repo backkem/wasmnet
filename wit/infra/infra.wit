@@ -15,8 +15,9 @@
 ///
 /// **No new authority.** The host serves this interface only to devices whose
 /// `DeviceOptions::infra` is set, and refuses to instantiate any other component that imports
-/// it. It reaches no host resource. A controller may change only the devices it created (`owner`); it reads every
-/// device. A device spec it applies can grant nothing (no `infra`).
+/// it. It reaches no host resource. A controller may change only the devices it created (`owner`); it
+/// reads the network's own devices and the ones it created, not other controllers' (its view of
+/// the table). A device spec it applies can grant nothing (no `infra`).
 ///
 /// Specs are CBOR (deterministic encoding): a device as the embedder describes it, without its
 /// name, plus its cables:
@@ -43,9 +44,10 @@ interface types {
     /// Virtual time in nanoseconds since the simulation started.
     type instant = u64;
 
-    /// A resource version: the ordinal of the last change to the world's device table that
-    /// touched a device (1 for the first change; 0: nothing has changed yet). The list's `rv`
-    /// is the latest change. Monotonic within a run, the same on every replay.
+    /// A resource version: the ordinal of the last change that touched a device, among the
+    /// changes in the caller's view of the world's device table (1 for the first change; 0:
+    /// nothing has changed yet). The list's `rv` is the latest change. Monotonic within a run,
+    /// the same on every replay, and the same when the world is split over sites.
     type rv = u64;
 
     /// Labels: `(key, value)` pairs, sorted by key, keys unique.
@@ -89,7 +91,8 @@ interface types {
         target: option<phase>,
         /// When it entered its phase.
         since: instant,
-        /// Its apps that returned, by name: `ok` or `error` (a composed node's `app-exit`).
+        /// Its apps that returned, by name: `ok` or `error` (a composed node's `app-exit`). Only
+        /// devices a controller created list them; the network's own devices list none.
         apps: list<tuple<string, string>>,
         /// Why the last request about it failed, if it did.
         message: option<string>,
@@ -133,8 +136,8 @@ interface types {
         /// is not running.
         invalid(string),
         /// Not this caller's to change (another owner, the caller itself), or a spec that
-        /// would grant authority (`infra`); also every call from a device that was not
-        /// granted this interface, and every mutation in a split (multi-site) network.
+        /// would grant authority (`infra`), or a name outside the caller's name prefix; also every
+        /// call from a device that was not granted this interface.
         denied(string),
     }
 }
@@ -195,11 +198,11 @@ interface devices {
     ///   64 KiB, or a device that is not running or about to run.
     control: func(request-id: option<string>, name: string, command: string, argument: string) -> result<device, error>;
 
-    /// One device (including one still `pending`).
+    /// One device of the caller's view (including one still `pending`).
     get: func(name: string) -> result<device, error>;
 
-    /// Every device whose labels include all of `selector`'s pairs (an empty selector: every
-    /// device), sorted by name, with the latest `rv` (pass it to `watch` to see what changes
+    /// Every device of the caller's view whose labels include all of `selector`'s pairs (an
+    /// empty selector: every one), sorted by name, with the latest `rv` (pass it to `watch` to see what changes
     /// next).
     %list: func(selector: labels) -> tuple<rv, list<device>>;
 
@@ -210,7 +213,8 @@ interface devices {
     watch: func(selector: labels, since: rv, max: u32) -> tuple<rv, list<change>>;
 
     /// The last `tail` lines (0: all) the device wrote to `stream` (`stdout` or `stderr`) at or
-    /// after `since`, oldest first. Needs the device's `DeviceOptions::journal_stdio` (otherwise none).
+    /// after `since`, oldest first, of a device the caller created (`denied` for the network's own
+    /// devices). Needs the device's `DeviceOptions::journal_stdio` (otherwise none).
     logs: func(name: string, %stream: string, since: instant, tail: u32) -> result<list<log-line>, error>;
 }
 

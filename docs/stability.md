@@ -25,7 +25,7 @@ versions without notice. Rustdoc and the design notes mark it **embedder surface
   which change a link's impairments while the network runs;
 - multi-site runs (`wasmnet_core::sites` and the `Network` methods for them) and the
   `wasmnet:wan` carrier contract (the site-sync wire format is at version 2 since impairments
-  were added to its link records);
+  and the devices and links created while a network runs were added to its records);
 - the extension points (`wasmnet_core::ext`, `HostExtension`, `ControlHandler`,
   `HostBuilder::unmetered_engine` and `Host::load_unmetered`);
 - the netstack's snapshot interface (`wasmnet:netstack/state`, `snapshot.paused`);
