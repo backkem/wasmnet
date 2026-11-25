@@ -13,7 +13,7 @@ import type { Done, Init, Progress } from './worker.js';
  */
 interface Assets {
   simulator: { file: string; bytes: number };
-  components: Record<string, { module: string; moduleBytes: number; coreModules: { file: string; path: string; bytes: number }[] }>;
+  components: Record<string, { module: string; moduleBytes: number; coreModules: { file: string; path: string; bytes: number }[]; imports: string[] }>;
 }
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
@@ -104,7 +104,7 @@ async function load(): Promise<{ simulator: WebAssembly.Module; components: Reco
   const entries = await Promise.all(
     Object.entries(assets.components).map(async ([key, c]) => {
       const compiled = await Promise.all(c.coreModules.map(async (f) => [f.file, await compile(f.path)] as const));
-      return [key, { url: new URL(c.module, document.baseURI).href, modules: Object.fromEntries(compiled) }] as const;
+      return [key, { url: new URL(c.module, document.baseURI).href, modules: Object.fromEntries(compiled), imports: c.imports }] as const;
     }),
   );
   return { simulator: await simulator, components: Object.fromEntries(entries) };
@@ -142,7 +142,7 @@ async function main(): Promise<void> {
     });
     const outcome = await run.outcome;
     if (outcome.status !== 'ok') throw new Error(`the run ended ${outcome.status}`);
-    return plain({ journal, outcome: outcome.value.outcome, answers: outcome.value.answers ?? null });
+    return plain({ journal, outcome: outcome.value.outcome, answers: outcome.value.answers ?? null, notes: outcome.value.notes ?? null });
   };
 
   runButton.addEventListener('click', async () => {

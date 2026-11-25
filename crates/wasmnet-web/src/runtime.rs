@@ -45,6 +45,9 @@ pub enum Entropy {
 }
 
 struct DeviceState {
+    /// Which instantiation of the device this is (a stopped device that starts again is a new
+    /// one): calls of an older instance's guest, still settling in JavaScript, never reach it.
+    generation: u64,
     clock: VirtualClock,
     wire: Wire,
     journal: JournalEnd,
@@ -72,6 +75,7 @@ struct Inner {
     devices: BTreeMap<u32, DeviceState>,
     next_timer: u32,
     next_wait: u32,
+    next_generation: u64,
     /// Something reached an actor from JavaScript since the last [`Registry::take_dirty`].
     dirty: bool,
     /// Calls for devices that do not exist: counted, never fatal.
@@ -114,6 +118,21 @@ impl Registry {
     /// Uses `clock` for [`now`](Self::now) and [`wall_now_ns`](Self::wall_now_ns).
     pub(crate) fn set_clock(&self, clock: VirtualClock) {
         self.inner.borrow_mut().clock = Some(clock);
+    }
+
+    /// Forgets device `dev` if it is still instantiation `generation` (its actor is gone: the
+    /// device stopped, crashed or was removed). Calls for it are orphans from then on.
+    /// Answers whether it was (a newer instance of the device may have replaced it already).
+    fn retire(&self, dev: u32, generation: u64) -> bool {
+        let mut inner = self.inner.borrow_mut();
+        let current = inner
+            .devices
+            .get(&dev)
+            .is_some_and(|d| d.generation == generation);
+        if current {
+            inner.devices.remove(&dev);
+        }
+        current
     }
 
     /// Forgets device `dev` (its instantiation failed).
@@ -325,10 +344,20 @@ impl<H: JsHost + Clone + Unpin + 'static> Runtime for JsRuntime<H> {
             message: format!("too many devices for `{}`", ctx.name),
             detail: None,
         })?;
+        // The core's rule, as on wasmtime: a component that imports `wasmnet:infra` is refused
+        // for a device without the grant, before JavaScript instantiates anything. JavaScript
+        // reports the component's imports if it knows them.
+        if let Some(imports) = self.host.imports(component) {
+            wasmnet_core::infra::require_grant(&ctx.name, &imports, ctx.infra.is_some())
+                .map_err(wasmnet_core::Error::Refused)?;
+        }
+        let generation;
         {
             // Registered before JavaScript instantiates, so imports used meanwhile are served.
             let mut inner = self.registry.inner.borrow_mut();
             inner.clock.get_or_insert_with(|| ctx.clock.clone());
+            generation = inner.next_generation;
+            inner.next_generation += 1;
             inner.devices.insert(
                 dev,
                 DeviceState {
@@ -346,6 +375,7 @@ impl<H: JsHost + Clone + Unpin + 'static> Runtime for JsRuntime<H> {
                     completions: VecDeque::new(),
                     new_timers: Vec::new(),
                     new_waits: Vec::new(),
+                    generation,
                 },
             );
         }
@@ -374,6 +404,7 @@ impl<H: JsHost + Clone + Unpin + 'static> Runtime for JsRuntime<H> {
             host: self.host.clone(),
             registry: self.registry.clone(),
             dev,
+            generation,
             clock: ctx.clock,
             journal: ctx.journal,
             inbox: ctx.inbox,
@@ -404,10 +435,12 @@ enum CallKind {
 
 /// One device's actor: `start()` first, then the apps' `run`s as daemons, then inbox commands as
 /// sync JavaScript calls; plus the device's virtual timers and `changes.wait`s.
-struct Actor<H> {
+struct Actor<H: JsHost> {
     host: H,
     registry: Registry,
     dev: u32,
+    /// Its instantiation of the device ([`DeviceState::generation`]).
+    generation: u64,
     clock: VirtualClock,
     journal: JournalEnd,
     inbox: Inbox,
@@ -618,5 +651,16 @@ impl<H: JsHost + Unpin> Future for Actor<H> {
             !this.timers.is_empty() || !this.calls.is_empty() || !this.waits.is_empty(),
         );
         Poll::Pending
+    }
+}
+
+impl<H: JsHost> Drop for Actor<H> {
+    /// The device's instance is gone (it stopped, crashed or was removed, or the network was
+    /// dropped): what its guest still calls is an orphan from now on, and JavaScript lets go of
+    /// the instance.
+    fn drop(&mut self) {
+        if self.registry.retire(self.dev, self.generation) {
+            self.host.release(self.dev);
+        }
     }
 }

@@ -32,8 +32,8 @@ const target = process.env.CARGO_TARGET_DIR ? resolve(process.env.CARGO_TARGET_D
 const release = join(target, 'wasm32-wasip2', 'release');
 const simulator = join(target, 'wasm32-unknown-unknown', 'release', 'wasmnet_web.wasm');
 
-/** The devices the example uses, by the key the Worker names them with. */
-const COMPONENTS = ['switch', 'node-http-server', 'node-http-get'];
+/** The devices the example and its test scenarios use, by the key the Worker names them with. */
+const COMPONENTS = ['switch', 'node-http-server', 'node-http-get', 'router', 'infra_script', 'node-replicas'];
 
 const missing = [simulator, ...COMPONENTS.map((c) => join(release, `${c}.wasm`))].filter((p) => !existsSync(p));
 if (missing.length > 0) {
@@ -89,10 +89,15 @@ for (const stem of COMPONENTS) {
     rmSync(join(dir, file));
     return { file, path, bytes: bytes.length };
   });
+  // Its import names (`ComponentSource.imports`): the simulator refuses a component that
+  // imports `wasmnet:infra` for a device without the grant before the page instantiates it.
+  const wit = execFileSync('wasm-tools', ['component', 'wit', join(release, `${stem}.wasm`)], { encoding: 'utf8' });
+  const imports = [...wit.matchAll(/^\s*import ([\w-]+:[^;\s]+);$/gm)].map((m) => m[1]);
   assets.components[stem] = {
     module: `components/${stem}/${manifest.module}`,
     moduleBytes: statSync(join(dir, manifest.module)).size,
     coreModules,
+    imports,
   };
   const patches = manifest.patches.map((p) => `${p.name}x${p.count}`).join(' ');
   console.log(`  ${stem.padEnd(18)} ${manifest.coreModules.length} core modules, ${Math.round(performance.now() - t0)} ms; patches: ${patches || '(none)'}`);

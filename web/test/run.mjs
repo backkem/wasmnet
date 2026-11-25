@@ -180,6 +180,36 @@ await step('what an embedder controls: commands, arguments and environment', asy
   return { answers: a, switchEvents: unblocked.map((e) => `${e.at} ${e.kind}`), body: fieldsOf(responses[0])['body-fnv'] };
 });
 
+await step('devices created while the network runs: controllers, a restart, changes.wait', async () => {
+  const r = await page.evaluate(() => window.wasmnetScenario('runtime', '42'));
+  if (r.outcome.kind !== 'deadline') throw new Error(`outcome ${JSON.stringify(r.outcome)}`);
+  // An ungranted importer of wasmnet:infra is refused before it is instantiated.
+  if (!r.notes?.refused?.includes('imports wasmnet:infra, but the network does not grant it')) throw new Error(`refused: ${JSON.stringify(r.notes)}`);
+  // The infra-script controller: the router it created answers, stops, starts again (a fresh
+  // instance the page made on demand) and answers again.
+  const steps = Object.fromEntries(events(r, 'infra-script', 'ctl').map((e) => [fieldsOf(e).step, fieldsOf(e)]));
+  const want = { 0: 'ok', 1: 'ok', 2: 'ok', 3: 'ok', 4: 'ok', 5: 'ok', 6: 'ok' };
+  for (const [n, result] of Object.entries(want)) {
+    if (steps[n]?.result !== result) throw new Error(`step ${n}: ${JSON.stringify(steps[n])}`);
+  }
+  if (!steps[2].text.includes('10.0.1.0/24')) throw new Error(`routes: ${steps[2].text}`);
+  if (!steps[6].text.includes('added')) throw new Error(`route-add: ${steps[6].text}`);
+  for (const kind of ['device-added', 'device-stopped', 'device-started']) {
+    if (events(r, kind, 'r1').length !== 1) throw new Error(`r1 ${kind}: ${events(r, kind, 'r1').length}`);
+  }
+  if (events(r, 'route-added', 'r1').length !== 1) throw new Error('no route-added on the restarted router');
+  // The replicas controller (an async app) made its two servers, and a client fetched from one.
+  for (const name of ['web-1', 'web-2']) {
+    if (events(r, 'device-added', name).length !== 1) throw new Error(`${name} was not created`);
+  }
+  const running = events(r, 'replicas-observed', 'rep').filter((e) => fieldsOf(e).phase === 'running');
+  // Its period is 10 s: seeing them running within the run means changes.wait woke it.
+  if (running.length < 2) throw new Error(`replicas-observed running: ${JSON.stringify(running)}`);
+  const done = events(r, 'http-get-done', 'client');
+  if (done.length !== 1 || fieldsOf(done[0]).status !== '200') throw new Error(`http-get-done ${JSON.stringify(done)}`);
+  return { refused: r.notes.refused, running: running.map((e) => `${e.at} ${fieldsOf(e).name}`), routes: steps[2].text, fetched: done[0].at };
+});
+
 if (process.env.NATIVE_JOURNAL) {
   await step('agrees with the native example', async () => {
     // The native example prints `<t> ns  <device> <kind> k=v ...` for events and

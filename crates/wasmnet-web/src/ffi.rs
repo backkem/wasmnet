@@ -51,6 +51,8 @@
 //! | `js_invoke(dev, now: u64, command, len, argument, len) -> i32` | `commands.invoke`; answers a `command` message (the device's `ok` or refusal), or a negative error (a trap) |
 //! | `js_reconfigure(dev, now: u64, config, len) -> i32` | `reconfigure.reconfigure` with a `config` message; answers a `reconfigured` message, or a negative error |
 //! | `js_wait_done(wait, rv: u64)` | the `changes.wait` call `wait` (from `wn_infra_wait`) ended with `rv`: resolve the guest's call |
+//! | `js_imports(component, len) -> i32` | the component's import names, if known: answers an `imports` message (asked before it is instantiated, for the grant check) |
+//! | `js_release(dev)` | device `dev`'s instance is gone (stopped, crashed, removed): drop it |
 //! | `js_panic(msg, len)` | a panic's message, before the module traps |
 
 #![allow(unsafe_code)] // FFI exports and imports; every unsafe block is commented.
@@ -89,6 +91,8 @@ mod js {
         ) -> i32;
         pub fn js_reconfigure(dev: u32, now: u64, config: *const u8, config_len: usize) -> i32;
         pub fn js_wait_done(wait: u32, rv: u64);
+        pub fn js_imports(component: *const u8, component_len: usize) -> i32;
+        pub fn js_release(dev: u32);
         pub fn js_panic(msg: *const u8, len: usize);
     }
 }
@@ -224,6 +228,19 @@ impl JsHost for Js {
     fn wait_done(&self, wait: u32, rv: u64) {
         // SAFETY: plain values.
         unsafe { js::js_wait_done(wait, rv) }
+    }
+
+    fn imports(&self, component: &str) -> Option<Vec<String>> {
+        // SAFETY: `component` is live for the duration of the call; JavaScript only reads it.
+        let len = unsafe { js::js_imports(component.as_ptr(), component.len()) };
+        // JavaScript failing to say is the same as not knowing: nothing is refused here.
+        let bytes = answer(len).ok()?;
+        codec::decode_imports(&bytes).ok().flatten()
+    }
+
+    fn release(&self, dev: u32) {
+        // SAFETY: a plain value.
+        unsafe { js::js_release(dev) }
     }
 }
 
@@ -597,6 +614,21 @@ pub extern "C" fn wn_stdout(dev: u32, stderr: u32) -> i32 {
     match read {
         Ok(Some(out)) => set_result(out),
         Ok(None) => fail(format!("no device {dev}")),
+        Err(e) => fail(e),
+    }
+}
+
+/// The components in-world controllers may create devices from (`devices.apply`), by the keys
+/// JavaScript instantiates them by: a `list<str>` message. Answers 0, or -1 with the message
+/// in the result. Never calls JavaScript.
+#[unsafe(no_mangle)]
+pub extern "C" fn wn_set_catalog(names: *const u8, len: usize) -> i32 {
+    let names = match codec::decode_strs(bytes(names, len)) {
+        Ok(n) => n,
+        Err(e) => return fail(format!("catalog: {e}")),
+    };
+    match with_network(|n| n.sim_mut().set_infra_catalog(names)) {
+        Ok(()) => 0,
         Err(e) => fail(e),
     }
 }

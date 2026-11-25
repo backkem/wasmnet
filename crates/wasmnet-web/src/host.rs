@@ -141,4 +141,19 @@ pub trait JsHost {
     fn wait_done(&self, wait: u32, rv: u64) {
         let _ = (wait, rv);
     }
+    /// The import names of `component` (`wasmnet:infra/devices@0.1.2`, ...), if JavaScript knows
+    /// them, asked before it is instantiated: the core refuses a component that imports
+    /// `wasmnet:infra` for a device without the grant ([`wasmnet_core::infra::require_grant`]).
+    /// The default: unknown, so nothing is refused here and every infra call of an ungranted
+    /// device is `denied` instead.
+    fn imports(&self, component: &str) -> Option<Vec<String>> {
+        let _ = component;
+        None
+    }
+    /// Device `dev`'s instance is gone (stopped, crashed, removed, or its network dropped):
+    /// JavaScript drops it. A later instantiation of the same `dev` is a new instance. The
+    /// default does nothing.
+    fn release(&self, dev: u32) {
+        let _ = dev;
+    }
 }

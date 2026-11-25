@@ -37,6 +37,13 @@ export interface ComponentSource {
   url: string;
   /** Its core modules, compiled, by file name (see the kit's `compileModules`). */
   modules?: Record<string, WebAssembly.Module>;
+  /**
+   * The component's import names (`wasmnet:infra/devices@0.1.2`, ...), if known: the simulator
+   * then refuses a component that imports `wasmnet:infra` for a device without the grant before
+   * it is instantiated, as the native host does. Without them every infra call of such a device
+   * is `denied` instead.
+   */
+  imports?: string[];
 }
 
 export interface NetworkOptions {
@@ -82,24 +89,25 @@ interface Exports {
   wn_result_ptr(): number;
   wn_result_len(): number;
   wn_network_new(seed: bigint): number;
-  wn_add_device(name: number, nameLen: number, component: number, componentLen: number, config: number, configLen: number, options: number, optionsLen: number): number;
-  wn_command(dev: number, command: number, commandLen: number, argument: number, argumentLen: number): number;
+  wn_add_device(name: number, nameLen: number, component: number, componentLen: number, config: number, configLen: number, options: number, optionsLen: number): Promise<number>;
+  wn_command(dev: number, command: number, commandLen: number, argument: number, argumentLen: number): Promise<number>;
+  wn_set_catalog(names: number, len: number): number;
   wn_schedule_command(dev: number, at: bigint, command: number, commandLen: number, argument: number, argumentLen: number): number;
   wn_args(dev: number): number;
   wn_env(dev: number): number;
   wn_infra(dev: number, call: number, len: number): number;
   wn_infra_wait(dev: number, call: number, len: number): number;
   wn_link(devA: number, portA: number, devB: number, portB: number, latency: bigint): number;
-  wn_step(until: bigint): number;
+  wn_step(until: bigint): Promise<number>;
   wn_take_dirty(): number;
   wn_next_event(): bigint;
   wn_now(): bigint;
-  wn_finish(deadline: bigint): number;
+  wn_finish(deadline: bigint): Promise<number>;
   wn_journal(from: number): number;
   wn_link_count(): number;
   wn_link_name(link: number): number;
   wn_pcap(link: number): number;
-  wn_counters(dev: number): number;
+  wn_counters(dev: number): Promise<number>;
   wn_stdout(dev: number, stderr: number): number;
   wn_wall_now(): bigint;
   wn_transmit(dev: number, port: number, frame: number, len: number): void;
@@ -170,6 +178,23 @@ function isPromise(v: unknown): v is Promise<unknown> {
   return typeof (v as { then?: unknown } | null)?.then === 'function';
 }
 
+/**
+ * WebAssembly JSPI, which the page needs anyway (jco's async runtime does). The simulator's
+ * exports that run or add devices (`wn_add_device`, `wn_step`, `wn_finish`, `wn_command`,
+ * `wn_counters`) are `promising`, and `js_instantiate` is `Suspending`: a device the network
+ * creates while it runs (an operator event, a controller's `apply` or `start`) is instantiated
+ * on demand, and the step waits for it. V8 suspends at every `Suspending` call, even one that
+ * answers at once, so every export that may reach `js_instantiate` must be `promising`.
+ */
+type AnyFn = (...args: never[]) => unknown;
+const jspi = WebAssembly as unknown as {
+  Suspending: new (f: AnyFn) => AnyFn;
+  promising: (f: AnyFn) => AnyFn;
+};
+
+/** The exports that may wait for a `Suspending` import: wrapped with `promising`. */
+const PROMISING = ['wn_add_device', 'wn_step', 'wn_finish', 'wn_command', 'wn_counters'] as const;
+
 export class Network {
   private readonly x: Exports;
   private readonly sources: Record<string, ComponentSource>;
@@ -187,8 +212,11 @@ export class Network {
   private panicked: string | null = null;
 
   private constructor(instance: WebAssembly.Instance, options: NetworkOptions) {
-    this.x = instance.exports as unknown as Exports;
-    this.sources = options.components;
+    const raw = instance.exports as unknown as Record<string, AnyFn>;
+    const wrapped: Record<string, unknown> = { ...raw };
+    for (const name of PROMISING) wrapped[name] = jspi.promising(raw[name]!);
+    this.x = wrapped as unknown as Exports;
+    this.sources = { ...options.components };
     if (this.x.wn_network_new(U64(BigInt(options.seed))) !== 0) throw new Error(this.resultText());
   }
 
@@ -220,6 +248,17 @@ export class Network {
     this.view(ptr, bytes.length).set(bytes);
     try {
       return f(ptr, bytes.length);
+    } finally {
+      this.x.wn_free(ptr, bytes.length);
+    }
+  }
+
+  /** `withBytes` for an export that may wait (`promising`): the bytes live until it answers. */
+  private async withBytesAsync<T>(bytes: Uint8Array, f: (ptr: number, len: number) => Promise<T>): Promise<T> {
+    const ptr = this.x.wn_alloc(bytes.length);
+    this.view(ptr, bytes.length).set(bytes);
+    try {
+      return await f(ptr, bytes.length);
     } finally {
       this.x.wn_free(ptr, bytes.length);
     }
@@ -262,7 +301,17 @@ export class Network {
         self.stash = new Uint8Array();
       },
       js_stash_len: () => n().stash.length,
-      js_instantiate: (dev: number, ptr: number, len: number) => n().claim(dev, ptr, len),
+      // A number when `device()` prepared the instance, a promise when the network creates the
+      // device while it runs: then the step waits (JSPI) while it is instantiated.
+      js_instantiate: new jspi.Suspending(((dev: number, ptr: number, len: number) => n().claim(dev, ptr, len)) as AnyFn),
+      js_imports: (ptr: number, len: number) => {
+        const self = n();
+        const key = decoder.decode(self.view(ptr, len));
+        return self.put(codec.encodeImports(self.sources[key]?.imports));
+      },
+      js_release: (dev: number) => {
+        delete n().instances[dev];
+      },
       js_receive: (dev: number, port: number, now: bigint, ptr: number, len: number) => {
         const self = n();
         try {
@@ -403,17 +452,50 @@ export class Network {
     this.withBytes(encoder.encode(text), (p, l) => this.x.wn_call_done(dev, call, end, p, l));
   }
 
-  /** `js_instantiate`: hands the instance `device()` prepared to the simulator. */
-  private claim(dev: number, ptr: number, len: number): number {
+  /**
+   * `js_instantiate`: hands the instance `device()` prepared to the simulator, or (a device the
+   * network creates while it runs) instantiates the component it names now and answers once it
+   * exists. Which device, from what, and when is the simulator's decision.
+   */
+  private claim(dev: number, ptr: number, len: number): number | Promise<number> {
+    let plan: ReturnType<typeof codec.decodePlan>;
     try {
-      const plan = codec.decodePlan(this.view(ptr, len).slice());
-      const p = this.pending;
-      if (!p || p.index !== dev || p.instance.component !== plan.component) {
-        throw new Error(`device ${dev} (${plan.name}): no instance prepared for it`);
-      }
+      plan = codec.decodePlan(this.view(ptr, len).slice());
+    } catch (err) {
+      return this.fail(err);
+    }
+    const p = this.pending;
+    if (p && p.index === dev && p.instance.component === plan.component) {
       this.pending = null;
-      this.instances[dev] = p.instance;
-      const { root, apps } = p.instance;
+      return this.answer(dev, p.instance);
+    }
+    return this.load(dev, plan.name, plan.component).then(
+      (instance) => this.answer(dev, instance),
+      (err: unknown) => this.fail(err),
+    );
+  }
+
+  /** Instantiates `component` as device `dev` called `name`, its imports served for `dev`. */
+  private async load(dev: number, name: string, component: string): Promise<Instance> {
+    const source = this.sources[component];
+    if (!source) throw new Error(`no component ${component} (known: ${Object.keys(this.sources).join(', ')})`);
+    const loaded = await instantiate(source.url, this.imports(dev), source.modules ? { modules: source.modules } : {});
+    const root = loaded.exports as unknown as Root;
+    // A composed node exports one `app-<name>` instance per app; the kit lists them by WIT name
+    // (`app-http-get#run`), whatever jco keys them by.
+    const apps = loaded
+      .exportNames('app-')
+      .filter((n) => n.endsWith('#run'))
+      .map((n) => ({ name: n.slice('app-'.length, -'#run'.length), run: loaded.exportFn(n) as () => Promise<unknown> }))
+      .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+    return { name, component, root, apps };
+  }
+
+  /** The `instance` message for device `dev`'s instance: its ports and what it exports. */
+  private answer(dev: number, instance: Instance): number {
+    try {
+      this.instances[dev] = instance;
+      const { root, apps } = instance;
       const ports = this.sync(root.device.ports(), 'ports');
       return this.put(
         codec.encodeInstance(
@@ -552,26 +634,17 @@ export class Network {
    * `DeviceOptions`).
    */
   async device(name: string, component: string, config: Record<string, string> = {}, options: DeviceOptions = {}): Promise<Device> {
-    const source = this.sources[component];
-    if (!source) throw new Error(`no component ${component} (known: ${Object.keys(this.sources).join(', ')})`);
+    // The device's index: the network numbers devices in creation order, and every device it
+    // created (also while running) has its slot here.
     const index = this.instances.length;
-    const loaded = await instantiate(source.url, this.imports(index), source.modules ? { modules: source.modules } : {});
-    const root = loaded.exports as unknown as Root;
-    // A composed node exports one `app-<name>` instance per app; the kit lists them by WIT name
-    // (`app-http-get#run`), whatever jco keys them by.
-    const apps = loaded
-      .exportNames('app-')
-      .filter((n) => n.endsWith('#run'))
-      .map((n) => ({ name: n.slice('app-'.length, -'#run'.length), run: loaded.exportFn(n) as () => Promise<unknown> }))
-      .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
-    this.pending = { index, instance: { name, component, root, apps } };
+    this.pending = { index, instance: await this.load(index, name, component) };
     const pairs = Object.entries(config).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
     const n = encoder.encode(name);
     const c = encoder.encode(component);
-    const got = this.withBytes(n, (np, nl) =>
-      this.withBytes(c, (cp, cl) =>
-        this.withBytes(codec.encodeConfig(pairs), (gp, gl) =>
-          this.withBytes(codec.encodeOptions(options), (op, ol) => this.x.wn_add_device(np, nl, cp, cl, gp, gl, op, ol)),
+    const got = await this.withBytesAsync(n, (np, nl) =>
+      this.withBytesAsync(c, (cp, cl) =>
+        this.withBytesAsync(codec.encodeConfig(pairs), (gp, gl) =>
+          this.withBytesAsync(codec.encodeOptions(options), (op, ol) => this.x.wn_add_device(np, nl, cp, cl, gp, gl, op, ol)),
         ),
       ),
     );
@@ -583,6 +656,16 @@ export class Network {
     return { index: got, name, port: (port) => ({ device: got, port }) };
   }
 
+  /**
+   * The components in-world controllers may create devices from (`devices.apply`), by their keys
+   * in `options.components`: a controller's spec names one of them, and the page instantiates it
+   * when the network asks.
+   */
+  setCatalog(components: readonly string[]): void {
+    const got = this.withBytes(new codec.Writer().strs(components).finish(), (p, l) => this.x.wn_set_catalog(p, l));
+    if (got < 0) throw new Error(this.resultText());
+  }
+
   /** Wires two ports with a point-to-point link of one-way `latency` (virtual ns). */
   link(a: PortRef, b: PortRef, latency: bigint | number): Link {
     const got = this.x.wn_link(a.device, a.port, b.device, b.port, U64(BigInt(latency)));
@@ -591,8 +674,8 @@ export class Network {
   }
 
   /** One step: every event at or before `until`. False once a device crashed. */
-  private step(until: bigint): boolean {
-    const r = this.x.wn_step(until);
+  private async step(until: bigint): Promise<boolean> {
+    const r = await this.x.wn_step(until);
     if (r < 0) throw new Error(this.resultText());
     return r === 1;
   }
@@ -609,21 +692,21 @@ export class Network {
       const fresh = this.journalFrom(this.journalNext);
       if (fresh.length > 0) onJournal(fresh);
     };
-    let ok = this.step(U64(this.x.wn_now()));
+    let ok = await this.step(U64(this.x.wn_now()));
     while (ok) {
       report();
       await settle();
       if (this.panicked !== null) break;
       if (this.x.wn_take_dirty() !== 0) {
-        ok = this.step(U64(this.x.wn_now()));
+        ok = await this.step(U64(this.x.wn_now()));
         continue;
       }
       const next = this.x.wn_next_event();
       if (next < 0n || (deadline !== undefined && next > deadline)) break;
-      ok = this.step(next);
+      ok = await this.step(next);
     }
     if (this.panicked !== null) throw new Error(`the simulator panicked: ${this.panicked}`);
-    const len = this.x.wn_finish(deadline === undefined ? -1n : BigInt.asIntN(64, deadline));
+    const len = await this.x.wn_finish(deadline === undefined ? -1n : BigInt.asIntN(64, deadline));
     if (len < 0) throw new Error(this.resultText());
     const outcome = codec.decodeOutcome(this.result(len));
     report();
@@ -669,9 +752,9 @@ export class Network {
   }
 
   /** The device's counters (`wasmnet:link/counters`), or null if it exports none. */
-  counters(device: Device | number): [string, bigint][] | null {
+  async counters(device: Device | number): Promise<[string, bigint][] | null> {
     const dev = typeof device === 'number' ? device : device.index;
-    const len = this.x.wn_counters(dev);
+    const len = await this.x.wn_counters(dev);
     if (len === -2) return null;
     if (len < 0) throw new Error(this.resultText());
     return codec.decodeCounters(this.result(len));
@@ -682,10 +765,10 @@ export class Network {
    * between runs: its answer, or null if the device takes no commands. Throws if the device
    * trapped (the network failed) or refused the call (a paused device).
    */
-  command(device: Device | number, command: string, argument = ''): CommandAnswer | null {
+  async command(device: Device | number, command: string, argument = ''): Promise<CommandAnswer | null> {
     const dev = typeof device === 'number' ? device : device.index;
-    const len = this.withBytes(encoder.encode(command), (cp, cl) =>
-      this.withBytes(encoder.encode(argument), (ap, al) => this.x.wn_command(dev, cp, cl, ap, al)),
+    const len = await this.withBytesAsync(encoder.encode(command), (cp, cl) =>
+      this.withBytesAsync(encoder.encode(argument), (ap, al) => this.x.wn_command(dev, cp, cl, ap, al)),
     );
     if (len === -2) return null;
     if (len < 0) throw new Error(this.resultText());

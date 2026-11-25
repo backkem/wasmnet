@@ -943,6 +943,11 @@ fn controller(net: &mut dyn Backend) -> Seen {
         format!("5ms apply s1 {}", hex(&s1_aging)),
         "6ms id=p control s1 paths".to_owned(),
         "7ms answer p".to_owned(),
+        // A restart: a fresh instance of the router, made while the network runs.
+        "8ms stop r1".to_owned(),
+        "9ms start r1".to_owned(),
+        "10ms id=q3 control r1 routes".to_owned(),
+        "11ms answer q3".to_owned(),
     ];
     let script = steps
         .iter()
@@ -952,7 +957,7 @@ fn controller(net: &mut dyn Backend) -> Seen {
     let mut options = DeviceOptions::default();
     options.infra = true;
     net.add("ctl", "infra_script", script, options);
-    net.run_to(10 * MS);
+    net.run_to(15 * MS);
     seen(
         net,
         Vec::new(),
@@ -963,6 +968,8 @@ fn controller(net: &mut dyn Backend) -> Seen {
             "device-reconfigured",
             "device-added",
             "infra-failed",
+            "device-stopped",
+            "device-started",
         ],
     )
 }
@@ -983,6 +990,16 @@ fn a_controller_commands_and_reconfigures_alike() {
                 .any(|e| e.2 == "device-reconfigured" && e.1 == "s1"),
             "the switch took its new config in place: {s:#?}"
         );
+        // The restart: stopped, started as a fresh instance, and answering again.
+        assert_eq!(&results[12..], ["ok", "ok", "ok", "ok"], "{s:#?}");
+        for kind in ["device-stopped", "device-started"] {
+            let n = s
+                .events
+                .iter()
+                .filter(|e| e.2 == kind && e.1 == "r1")
+                .count();
+            assert_eq!(n, 1, "{kind}: {s:#?}");
+        }
         s
     });
 }

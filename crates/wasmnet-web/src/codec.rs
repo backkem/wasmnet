@@ -33,7 +33,9 @@
 //!            list<str> args, pairs env, str infra prefix (empty: none), u8 cascade (0 keep,
 //!            1 stop, 2 remove), opt infra max devices, opt memory, opt fuel per instant
 //!            (opt = u8 0, or u8 1 then u64)
-//! strs       (out of wn_args)       list<str>: argv, the device's name first
+//! strs       (out of wn_args; into wn_set_catalog)   list<str>: argv, the device's name first;
+//!            the catalog's component names
+//! imports    (from js_imports)      u8 0 unknown, or u8 1 then list<str>: a component's import names
 //! pairs      (out of wn_env)        pairs, in order
 //! command    (from js_invoke, out of wn_command)   u8 0 ok, 1 refused; str text
 //! reconfigured (from js_reconfigure)  u8 0 ok, 1 restart, 2 invalid; str message (empty for ok)
@@ -357,6 +359,30 @@ pub fn encode_strs<S: AsRef<str>>(items: &[S]) -> Vec<u8> {
 /// Reads a `list<str>` message.
 pub fn decode_strs(bytes: &[u8]) -> Result<Vec<String>, DecodeError> {
     whole(bytes, |r| r.strs())
+}
+
+/// The `imports` message (from `js_imports`): a component's import names, or `None` when
+/// JavaScript does not know them.
+pub fn encode_imports(imports: Option<&[String]>) -> Vec<u8> {
+    match imports {
+        Some(names) => Writer::new().u8(1).strs(names).finish(),
+        None => Writer::new().u8(0).finish(),
+    }
+}
+
+/// Reads an `imports` message.
+pub fn decode_imports(bytes: &[u8]) -> Result<Option<Vec<String>>, DecodeError> {
+    whole(bytes, |r| {
+        let at = r.at;
+        match r.u8()? {
+            0 => Ok(None),
+            1 => Ok(Some(r.strs()?)),
+            _ => Err(DecodeError {
+                at,
+                what: "imports",
+            }),
+        }
+    })
 }
 
 /// The `pairs` message in the given order (out of `wn_env`): a device's environment.

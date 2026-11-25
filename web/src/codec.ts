@@ -393,3 +393,8 @@ export function decodeInfraReply(bytes: Uint8Array): InfraReply {
     return { failed: r.str() };
   });
 }
+
+/** The `imports` message (from `js_imports`): a component's import names, if known. */
+export function encodeImports(imports: readonly string[] | undefined): Uint8Array {
+  return imports === undefined ? new Writer().u8(0).finish() : new Writer().u8(1).strs(imports).finish();
+}
