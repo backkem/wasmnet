@@ -1,11 +1,14 @@
 //! The patch panel: point-to-point links between device ports, with latency, carrier (up/down),
-//! an MTU, pcap taps and a frame log.
+//! an MTU, per-direction impairments (a rate with a bounded transmit queue, seeded loss and
+//! jitter), pcap taps and a frame log.
 //!
 //! `wire.transmit` lands here. It never calls into a device. A frame on an unwired port, on a
-//! down link or with a payload over the link MTU is dropped and counted. Otherwise it is tapped
-//! as *outbound* on the sender's end and a delivery is queued at `now + latency`. When the
-//! executor fires that delivery, the frame is tapped as *inbound* on the receiver's end and goes
-//! to the receiver's inbox, unless the link went down in the meantime (then it is lost).
+//! down link, with a payload over the link MTU or that finds its direction's transmit queue full
+//! is dropped and counted. Otherwise it is tapped as *outbound* on the sender's end and, unless
+//! the direction's seeded loss takes it, a delivery is queued at its arrival time (`now +
+//! latency` without impairments). When the executor fires that delivery, the frame is tapped as
+//! *inbound* on the receiver's end and goes to the receiver's inbox, unless the link went down in
+//! the meantime (then it is lost). The model is described in `docs/design/links.md`.
 //!
 //! Each link has one pcap-ng capture with one interface per end (`<device>:<port>`), so a link's
 //! file shows what each NIC saw and when, with direction flags and virtual-ns timestamps. The
@@ -15,7 +18,7 @@
 //! behaviour like a PHY's maximum frame size, not networking logic.
 
 use std::any::Any;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use wasmnet_wire::{Direction, EthernetFrame, InterfaceId, MacAddr, PcapNgEncoder};
@@ -25,6 +28,7 @@ use crate::digest::{self, Digest};
 use crate::ext::{CableKind, CableModel, CableSend, Carry, ExtValue};
 use crate::journal::{Journal, JournalEntry};
 use crate::network::{DeviceId, LinkId, PortRef};
+use crate::rng::{SimRng, derive_seed};
 
 /// `shb_userappl` in every capture.
 const PCAP_USER_APPL: &str = "wasmnet";
@@ -56,6 +60,106 @@ pub struct LinkStats {
     pub oversize: [u64; 2],
     /// Frames that were in flight when the link went down (tapped outbound, never delivered).
     pub lost: [u64; 2],
+    /// Frames that found the direction's transmit queue full (never on the wire).
+    pub dropped_queue: [u64; 2],
+    /// Frames the direction's seeded loss took (tapped outbound, never delivered).
+    pub lost_random: [u64; 2],
+}
+
+/// [`Impairments::queue`] unless set: Linux's default `txqueuelen`.
+pub const DEFAULT_QUEUE: u32 = 1000;
+
+/// One million: the [`Impairments::loss_ppm`] of a direction that loses every frame.
+pub const PPM: u32 = 1_000_000;
+
+/// How one direction of a link carries frames beyond its latency (`docs/design/links.md`). The
+/// default changes nothing: no rate, no loss, no jitter, and no random numbers drawn.
+///
+/// ```
+/// # use wasmnet_core::Impairments;
+/// // 10 Mbit/s, at most 64 frames waiting, 1 % loss, up to 50 µs of jitter.
+/// let slow = Impairments::default()
+///     .rate(10_000_000)
+///     .queue(64)
+///     .loss_ppm(10_000)
+///     .jitter(50_000);
+/// assert!(!slow.is_off());
+/// assert!(Impairments::default().is_off());
+/// // A 1514-byte frame takes 1211.2 µs at 10 Mbit/s, rounded up to the nanosecond.
+/// assert_eq!(slow.serialisation(1514), 1_211_200);
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Impairments {
+    /// Bits per second; 0: unlimited (no serialisation delay, so no queue either). A frame of
+    /// `n` bytes (as transmitted: header and payload, no preamble or FCS) occupies the
+    /// transmitter for `ceil(n * 8 * 10^9 / rate)` ns.
+    pub rate: u64,
+    /// Frames that may wait behind the one being serialised; one more is dropped (tail drop).
+    /// A frame that finds the transmitter idle is never dropped. Default [`DEFAULT_QUEUE`].
+    pub queue: u32,
+    /// The probability that a frame is lost on the wire, in parts per million (values above
+    /// [`PPM`] count as [`PPM`]). 0 and [`PPM`] draw no random numbers.
+    pub loss_ppm: u32,
+    /// The largest extra delay in ns: each frame waits a uniform draw from `[0, jitter]` on top
+    /// of the latency, and never arrives before the frame transmitted before it.
+    pub jitter: Nanos,
+}
+
+impl Default for Impairments {
+    fn default() -> Self {
+        Self {
+            rate: 0,
+            queue: DEFAULT_QUEUE,
+            loss_ppm: 0,
+            jitter: 0,
+        }
+    }
+}
+
+impl Impairments {
+    /// With a rate in bits per second (0: unlimited).
+    pub const fn rate(mut self, bits_per_second: u64) -> Self {
+        self.rate = bits_per_second;
+        self
+    }
+
+    /// With a transmit queue of `frames` (waiting behind the one being serialised).
+    pub const fn queue(mut self, frames: u32) -> Self {
+        self.queue = frames;
+        self
+    }
+
+    /// With a loss probability in parts per million (`10_000` is 1 %).
+    pub const fn loss_ppm(mut self, ppm: u32) -> Self {
+        self.loss_ppm = ppm;
+        self
+    }
+
+    /// With up to `ns` of jitter.
+    pub const fn jitter(mut self, ns: Nanos) -> Self {
+        self.jitter = ns;
+        self
+    }
+
+    /// No rate, no loss and no jitter: the direction behaves as a plain link (the queue bound
+    /// alone changes nothing).
+    pub const fn is_off(&self) -> bool {
+        self.rate == 0 && self.loss_ppm == 0 && self.jitter == 0
+    }
+
+    /// How long a frame of `len` bytes occupies the transmitter, in ns (0 without a rate).
+    pub const fn serialisation(&self, len: usize) -> Nanos {
+        if self.rate == 0 {
+            return 0;
+        }
+        let bits = len as u128 * 8 * 1_000_000_000;
+        let ns = bits.div_ceil(self.rate as u128);
+        if ns > Nanos::MAX as u128 {
+            Nanos::MAX
+        } else {
+            ns as Nanos
+        }
+    }
 }
 
 /// Static and current properties of a link.
@@ -75,6 +179,9 @@ pub struct LinkInfo {
     pub removed: bool,
     /// What it carries: Ethernet frames, or a cable's messages.
     pub kind: LinkKind,
+    /// Each direction's impairments, indexed by the sending end (0 = `a`, 1 = `b`). Cables
+    /// ignore them.
+    pub impairments: [Impairments; 2],
 }
 
 /// What a link carries. A cable kind is a registered [`CableModel`] that names its
@@ -122,15 +229,18 @@ pub enum DropReason {
     Oversize,
     /// An operator dropped it: a frame rule, or a [`TransmitHook`]'s verdict.
     Operator,
+    /// Its direction's transmit queue was full ([`Impairments::queue`]).
+    QueueFull,
 }
 
 impl DropReason {
-    /// `link-down`, `oversize` or `operator`.
+    /// `link-down`, `oversize`, `operator` or `queue-full`.
     pub fn as_str(self) -> &'static str {
         match self {
             DropReason::LinkDown => "link-down",
             DropReason::Oversize => "oversize",
             DropReason::Operator => "operator",
+            DropReason::QueueFull => "queue-full",
         }
     }
 }
@@ -173,7 +283,8 @@ pub enum FrameFate {
     InFlight,
     /// Arrived at the peer at this instant.
     Delivered { at: Nanos },
-    /// The link went down while the frame was in flight.
+    /// It entered the wire but never arrived: the link went down while it was in flight, or
+    /// its direction's seeded loss took it.
     Lost,
     /// Never entered the wire.
     Dropped(DropReason),
@@ -278,6 +389,8 @@ struct PanelState {
     arrivals: Vec<RemoteArrival>,
     /// Operator frame rules by transmission digest.
     rules: BTreeMap<Digest, FrameAction>,
+    /// The network's seed: the links' loss and jitter streams derive from it.
+    seed: u64,
 }
 
 struct DeviceEntry {
@@ -306,12 +419,108 @@ struct Link {
     kind: LinkKind,
     /// A cable's state, kept for its model ([`CableModel::new_link`]).
     cable: Option<Box<dyn Any + Send>>,
+    /// Each direction's impairments and their state, by sending end.
+    lanes: [Lane; 2],
 }
 
 impl Link {
     fn port_ref(&self, end: usize) -> PortRef {
         let (device, port) = self.ends[end];
         DeviceId(device).port(port)
+    }
+}
+
+/// One direction of a link: its impairments, its transmitter and its random streams.
+#[derive(Default)]
+struct Lane {
+    imp: Impairments,
+    /// When the transmitter finishes the last frame it accepted.
+    busy_until: Nanos,
+    /// When each accepted frame that had to wait reaches the transmitter, in order: those
+    /// after `now` are the queue.
+    waiting: VecDeque<Nanos>,
+    /// The arrival time of the last frame queued for delivery.
+    last_arrival: Nanos,
+    /// The loss and jitter streams, created on their first draw.
+    loss: Option<SimRng>,
+    jitter: Option<SimRng>,
+}
+
+/// What a direction's impairments do to one frame.
+enum Shaped {
+    /// The transmit queue was full: never on the wire.
+    QueueFull,
+    /// On the wire, then lost.
+    Lost,
+    /// On the wire, arriving at this instant (before an operator delay).
+    Arrive(Nanos),
+}
+
+/// A uniform draw from `0..n` (`n > 0`): the high half of a 64 x 64-bit product.
+fn below(rng: &mut SimRng, n: u64) -> u64 {
+    ((u128::from(rng.next_u64()) * u128::from(n)) >> 64) as u64
+}
+
+impl Lane {
+    /// The queue, serialisation, loss and jitter for a frame of `len` bytes handed to this
+    /// direction at `now`, on a link of `latency`. The streams derive from the network seed,
+    /// the link's name and the sending end.
+    fn shape(
+        &mut self,
+        now: Nanos,
+        len: usize,
+        latency: Nanos,
+        (seed, link, end): (u64, &str, usize),
+    ) -> Shaped {
+        // Frames wait only while the transmitter is busy.
+        if self.busy_until > now {
+            while self.waiting.front().is_some_and(|&start| start <= now) {
+                self.waiting.pop_front();
+            }
+            if self.waiting.len() >= self.imp.queue as usize {
+                return Shaped::QueueFull;
+            }
+        }
+        let start = now.max(self.busy_until);
+        if start > now {
+            self.waiting.push_back(start);
+        }
+        let finish = start.saturating_add(self.imp.serialisation(len));
+        self.busy_until = finish;
+        let stream =
+            |what: &str| SimRng::from_seed(derive_seed(seed, link, &format!("link-{what}-{end}")));
+        // Every frame on the wire draws its jitter, lost or not, so the loss never shifts it.
+        let jitter = match self.imp.jitter {
+            0 => None,
+            j => {
+                let rng = self.jitter.get_or_insert_with(|| stream("jitter"));
+                Some(below(rng, j.saturating_add(1)))
+            }
+        };
+        let lost = match self.imp.loss_ppm.min(PPM) {
+            0 => false,
+            PPM => true,
+            p => {
+                let rng = self.loss.get_or_insert_with(|| stream("loss"));
+                below(rng, u64::from(PPM)) < u64::from(p)
+            }
+        };
+        if lost {
+            return Shaped::Lost;
+        }
+        let mut at = finish.saturating_add(latency);
+        if let Some(j) = jitter {
+            // Jitter never reorders: no earlier than the frame before.
+            at = at.saturating_add(j).max(self.last_arrival);
+        }
+        self.last_arrival = at;
+        Shaped::Arrive(at)
+    }
+
+    /// The link went down at `at`: what waited is lost, and the transmitter is idle.
+    fn flush(&mut self, at: Nanos) {
+        self.busy_until = self.busy_until.min(at);
+        self.waiting.clear();
     }
 }
 
@@ -334,6 +543,12 @@ impl Panel {
             dropped: 0,
         });
         s.devices.len() - 1
+    }
+
+    /// A panel whose links' loss and jitter streams derive from `seed`.
+    pub(crate) fn with_seed(self, seed: u64) -> Self {
+        self.state().seed = seed;
+        self
     }
 
     pub(crate) fn ports(&self, device: DeviceIdx) -> Vec<PortInfo> {
@@ -394,6 +609,7 @@ impl Panel {
             pcap,
             ifaces,
             stats: LinkStats::default(),
+            lanes: Default::default(),
         });
         s.ends.insert(a, (id, 0));
         s.ends.insert(b, (id, 1));
@@ -469,6 +685,17 @@ impl Panel {
         self.state().links[link].mtu = mtu;
     }
 
+    /// Sets the impairments of the direction sent from end `from` (`None`: both directions),
+    /// for frames transmitted from now on. Frames already queued keep their schedule.
+    pub(crate) fn set_impairments(&self, link: usize, from: Option<usize>, imp: Impairments) {
+        let mut s = self.state();
+        for (end, lane) in s.links[link].lanes.iter_mut().enumerate() {
+            if from.is_none_or(|f| f == end) {
+                lane.imp = imp;
+            }
+        }
+    }
+
     /// Adds (or replaces) the operator rule for the transmission with this digest.
     pub(crate) fn set_rule(&self, digest: Digest, action: FrameAction) {
         self.state().rules.insert(digest, action);
@@ -496,6 +723,9 @@ impl Panel {
         l.up = up;
         if !up {
             l.generation += 1;
+            for lane in &mut l.lanes {
+                lane.flush(at);
+            }
         }
         let ends = l.ends;
         s.transition_tags.push(clock.tag());
@@ -573,6 +803,7 @@ impl Panel {
             up: l.up,
             removed: l.removed,
             kind: l.kind,
+            impairments: [l.lanes[0].imp, l.lanes[1].imp],
         }
     }
 
@@ -801,7 +1032,9 @@ impl Panel {
             return;
         }
         let tag = clock.tag();
+        let seed = s.seed;
         let link = &mut s.links[link_id];
+        let mut shaped = Shaped::Arrive(now.saturating_add(link.latency));
         let drop_reason = if dropped {
             Some(DropReason::Operator)
         } else if !link.up {
@@ -811,14 +1044,30 @@ impl Panel {
             link.stats.oversize[end] += 1;
             Some(DropReason::Oversize)
         } else {
-            None
+            // The direction's queue, rate, loss and jitter. A plain direction (never shaped,
+            // so never busy) keeps `now + latency` and draws nothing.
+            let lane = &mut link.lanes[end];
+            if !lane.imp.is_off() || lane.busy_until > now {
+                shaped = lane.shape(now, frame.len(), link.latency, (seed, &link.name, end));
+            }
+            if matches!(shaped, Shaped::QueueFull) {
+                link.stats.dropped_queue[end] += 1;
+                Some(DropReason::QueueFull)
+            } else {
+                None
+            }
         };
+        let lost = matches!(shaped, Shaped::Lost);
         let record = FrameRecord {
             link: LinkId(link_id),
             from: link.port_ref(end),
             to: link.port_ref(to_end),
             sent_at: now,
-            fate: drop_reason.map_or(FrameFate::InFlight, FrameFate::Dropped),
+            fate: match drop_reason {
+                Some(reason) => FrameFate::Dropped(reason),
+                None if lost => FrameFate::Lost,
+                None => FrameFate::InFlight,
+            },
             bytes: frame.clone(),
         };
         if drop_reason.is_some() {
@@ -832,8 +1081,14 @@ impl Panel {
             .write_packet_directed(link.ifaces[end], now, &frame, Direction::Outbound);
         link.stats.frames[end] += 1;
         link.stats.bytes[end] += frame.len() as u64;
+        if lost {
+            link.stats.lost_random[end] += 1;
+        }
         let (peer, peer_port) = link.ends[to_end];
-        let at = now.saturating_add(link.latency).saturating_add(delay);
+        let at = match shaped {
+            Shaped::Arrive(at) => at.saturating_add(delay),
+            Shaped::Lost | Shaped::QueueFull => now,
+        };
         let generation = link.generation;
         s.frames.push(record);
         s.frame_tags.push(tag.clone());
@@ -848,6 +1103,11 @@ impl Panel {
                 inbound: false,
                 bytes: frame.clone(),
             });
+            if lost {
+                // Lost on the wire: this site's half of the capture has it, the peer gets
+                // nothing.
+                return;
+            }
             let key = clock.remote_key(at);
             s.outbox.push(RemoteFrame {
                 key,
@@ -862,6 +1122,9 @@ impl Panel {
             return;
         }
         drop(s);
+        if lost {
+            return;
+        }
         clock.schedule_delivery(
             at,
             Delivery {
@@ -1052,5 +1315,211 @@ mod tests {
         assert_eq!((f.from, f.to), (DeviceId(1).port(1), DeviceId(0).port(0)));
         let cap = crate::pcap::parse(&panel.pcap(link)).unwrap();
         assert_eq!(cap.packets.len(), 2);
+    }
+
+    // ---- impairments (docs/design/links.md) ----
+
+    /// Every delivery left in the queue, in pop order: `(arrival, frame-log index)`.
+    fn drain(clock: &VirtualClock) -> Vec<(Nanos, usize)> {
+        std::iter::from_fn(|| next_delivery(clock))
+            .map(|(at, d)| (at, d.frame_id))
+            .collect()
+    }
+
+    /// Whether the direction sent from `end` has created a random stream.
+    fn drew(panel: &Panel, link: usize, end: usize) -> bool {
+        let s = panel.state();
+        let lane = &s.links[link].lanes[end];
+        lane.loss.is_some() || lane.jitter.is_some()
+    }
+
+    #[test]
+    fn a_rate_serialises_frames_and_a_full_queue_drops_at_the_tail() {
+        let (clock, panel, link) = panel();
+        // 8 Mbit/s: one byte per µs. A 100-byte frame occupies the transmitter for 100 µs.
+        let imp = Impairments::default().rate(8_000_000).queue(2);
+        assert_eq!(imp.serialisation(100), 100_000);
+        panel.set_impairments(link, Some(0), imp);
+        for _ in 0..5 {
+            panel.transmit(&clock, 0, 0, frame(86));
+        }
+        // b -> a is not impaired: it arrives after the latency alone.
+        panel.transmit(&clock, 1, 1, frame(86));
+        let fates: Vec<_> = panel.frames().iter().map(|f| f.fate).collect();
+        let full = FrameFate::Dropped(DropReason::QueueFull);
+        assert_eq!(fates[3..5], [full, full], "one on the wire, two waiting");
+        let stats = panel.link_stats(link);
+        assert_eq!(stats.frames, [3, 1]);
+        assert_eq!(stats.dropped_queue, [2, 0]);
+        assert!(!drew(&panel, link, 0), "a rate alone draws nothing");
+
+        // Each frame arrives at (its turn at the transmitter) + 100 µs + latency.
+        let first = next_delivery(&clock).unwrap();
+        assert_eq!((first.0, first.1.frame_id), (10, 5));
+        let second = next_delivery(&clock).unwrap();
+        assert_eq!((second.0, second.1.frame_id), (100_010, 0));
+        // At 100.01 µs frame 1 is on the transmitter and frame 2 waits: room for one more,
+        // which waits for frame 2 to finish at 300 µs; the next one is dropped.
+        panel.transmit(&clock, 0, 0, frame(86));
+        panel.transmit(&clock, 0, 0, frame(86));
+        assert_eq!(
+            drain(&clock),
+            [(200_010, 1), (300_010, 2), (400_010, 6)],
+            "FIFO, back to back"
+        );
+        assert_eq!(panel.frames()[7].fate, full);
+        // Dropped frames never entered the wire: 5 outbound records (4 a -> b, 1 b -> a).
+        let cap = crate::pcap::parse(&panel.pcap(link)).unwrap();
+        assert_eq!(cap.packets.len(), 5);
+    }
+
+    #[test]
+    fn a_link_going_down_empties_the_queue() {
+        let (clock, panel, link) = panel();
+        let imp = Impairments::default().rate(8_000_000).queue(1);
+        panel.set_impairments(link, None, imp);
+        panel.transmit(&clock, 0, 0, frame(86));
+        panel.transmit(&clock, 0, 0, frame(86));
+        panel.set_up(&clock, 0, link, false);
+        panel.set_up(&clock, 0, link, true);
+        // The transmitter is idle again: no queue drop, and this frame goes first.
+        panel.transmit(&clock, 0, 0, frame(86));
+        assert_eq!(panel.link_stats(link).dropped_queue, [0, 0]);
+        let mut arrivals = drain(&clock);
+        arrivals.sort();
+        assert_eq!(arrivals, [(100_010, 0), (100_010, 2), (200_010, 1)]);
+    }
+
+    /// The fates of `n` frames a -> b at t = 0 with `imp`, in a network seeded with `seed`,
+    /// after `extra` unrelated links were wired first.
+    fn fates(seed: u64, imp: Impairments, n: usize, extra: usize) -> (Vec<FrameFate>, LinkStats) {
+        let clock = VirtualClock::new(Duration::ZERO);
+        let panel = Panel::default().with_seed(seed);
+        for i in 0..extra {
+            let ports = vec![port(0, 1500), port(1, 1500)];
+            let d = panel.add_device(&format!("x{i}"), ports, false);
+            panel.connect((d, 0), (d, 1), 5).unwrap();
+        }
+        let a = panel.add_device("a", vec![port(0, 1500)], false);
+        let b = panel.add_device("b", vec![port(1, 1500)], false);
+        let link = panel.connect((a, 0), (b, 1), 10).unwrap();
+        panel.set_impairments(link, Some(0), imp);
+        for _ in 0..n {
+            panel.transmit(&clock, a, 0, frame(46));
+        }
+        let delivered = drain(&clock).len();
+        let stats = panel.link_stats(link);
+        assert_eq!(delivered as u64 + stats.lost_random[0], n as u64);
+        (panel.frames().iter().map(|f| f.fate).collect(), stats)
+    }
+
+    #[test]
+    fn loss_replays_by_seed_and_is_exact_at_zero_and_one() {
+        const N: usize = 10_000;
+        let ten_percent = Impairments::default().loss_ppm(100_000);
+        let (run, stats) = fates(42, ten_percent, N, 0);
+        let lost = stats.lost_random[0];
+        // Binomial(10 000, 0.1): mean 1000, sigma 30; this bound is 5 sigma.
+        assert!((850..=1150).contains(&lost), "lost {lost} of {N}");
+        assert_eq!(stats.frames[0], N as u64, "lost frames entered the wire");
+        let marked = run.iter().filter(|&&f| f == FrameFate::Lost).count() as u64;
+        assert_eq!(marked, lost);
+        assert_eq!(fates(42, ten_percent, N, 0).0, run, "the same seed replays");
+        assert_eq!(
+            fates(42, ten_percent, N, 3).0,
+            run,
+            "links wired before it do not shift its stream"
+        );
+        assert_ne!(fates(43, ten_percent, N, 0).0, run, "another seed differs");
+
+        let (none, stats) = fates(42, Impairments::default().loss_ppm(0), N, 0);
+        assert!(none.iter().all(|&f| f == FrameFate::InFlight));
+        assert_eq!(stats.lost_random[0], 0);
+        let (all, stats) = fates(42, Impairments::default().loss_ppm(PPM), N, 0);
+        assert!(all.iter().all(|&f| f == FrameFate::Lost));
+        assert_eq!(stats.lost_random[0], N as u64);
+        let (_, stats) = fates(42, Impairments::default().loss_ppm(u32::MAX), 10, 0);
+        assert_eq!(
+            stats.lost_random[0], 10,
+            "above one million counts as one million"
+        );
+    }
+
+    #[test]
+    fn zero_and_full_loss_draw_no_random_numbers() {
+        for ppm in [0, PPM] {
+            let (clock, panel, link) = panel();
+            panel.set_impairments(link, None, Impairments::default().loss_ppm(ppm));
+            panel.transmit(&clock, 0, 0, frame(10));
+            assert!(!drew(&panel, link, 0), "loss {ppm} ppm");
+        }
+        let (clock, panel, link) = panel();
+        panel.set_impairments(link, Some(0), Impairments::default().loss_ppm(1));
+        panel.transmit(&clock, 0, 0, frame(10));
+        panel.transmit(&clock, 1, 1, frame(10));
+        assert!(drew(&panel, link, 0));
+        assert!(!drew(&panel, link, 1), "the plain direction draws nothing");
+    }
+
+    #[test]
+    fn jitter_stays_in_bounds_and_never_reorders() {
+        const N: u64 = 2_000;
+        const LATENCY: Nanos = 10;
+        const JITTER: Nanos = 1_000;
+        let (clock, panel, link) = panel();
+        panel.set_impairments(link, Some(0), Impairments::default().jitter(JITTER));
+        // One frame every 100 ns: ten times closer than the jitter, so independent draws
+        // would reorder them.
+        for i in 0..N {
+            clock.advance_to(i * 100);
+            panel.transmit(&clock, 0, 0, frame(10));
+        }
+        let arrivals = drain(&clock);
+        assert_eq!(arrivals.len(), N as usize);
+        let frames = panel.frames();
+        let mut extra = Vec::new();
+        for (k, &(at, id)) in arrivals.iter().enumerate() {
+            assert_eq!(id, k, "in transmit order");
+            let sent = frames[id].sent_at;
+            assert!(at >= sent + LATENCY, "frame {id} early: {at}");
+            assert!(at <= sent + LATENCY + JITTER, "frame {id} late: {at}");
+            extra.push(at - sent - LATENCY);
+        }
+        assert!(arrivals.windows(2).all(|w| w[0].0 <= w[1].0));
+        let (min, max) = (extra.iter().min().unwrap(), extra.iter().max().unwrap());
+        // Keeping the order lifts small draws (the frame before, 100 ns earlier, is often
+        // later), but the delays still span the range.
+        assert!(
+            *min < 250 && *max > 900,
+            "the delays cover the range: {min}..{max}"
+        );
+    }
+
+    #[test]
+    fn jitter_with_a_rate_comes_after_the_queue() {
+        let (clock, panel, link) = panel();
+        let imp = Impairments::default().rate(8_000_000).jitter(50_000);
+        panel.set_impairments(link, Some(0), imp);
+        for _ in 0..50 {
+            panel.transmit(&clock, 0, 0, frame(86));
+        }
+        for (k, &(at, id)) in drain(&clock).iter().enumerate() {
+            assert_eq!(id, k);
+            // Frame k finishes serialising at (k + 1) * 100 µs.
+            let base = (k as u64 + 1) * 100_000 + 10;
+            assert!((base..=base + 50_000).contains(&at), "frame {k} at {at}");
+        }
+    }
+
+    #[test]
+    fn a_plain_link_is_unchanged() {
+        let (clock, panel, link) = panel();
+        panel.set_impairments(link, None, Impairments::default().queue(0));
+        for _ in 0..3 {
+            panel.transmit(&clock, 0, 0, frame(10));
+        }
+        assert_eq!(drain(&clock), [(10, 0), (10, 1), (10, 2)]);
+        assert!(!drew(&panel, link, 0));
+        assert_eq!(panel.link_info(link).impairments[1].queue, 0);
     }
 }

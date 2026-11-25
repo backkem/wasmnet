@@ -27,8 +27,8 @@ use wasmnet_wire::{Direction, PcapNgEncoder};
 use crate::clock::{Ctx, EventKey, KeyLevel, Nanos, Origin, Tag};
 use crate::journal::{JournalEntry, Level, Record, Stream};
 use crate::link::{
-    DropReason, FrameFate, FrameRecord, LinkInfo, LinkKind, LinkStats, LinkTransition, PortInfo,
-    RemoteArrival, RemoteFrame, Tap,
+    DropReason, FrameFate, FrameRecord, Impairments, LinkInfo, LinkKind, LinkStats, LinkTransition,
+    PortInfo, RemoteArrival, RemoteFrame, Tap,
 };
 use crate::network::{DeviceId, LinkId, Network, PortRef, Runtime};
 use crate::{Outcome, Result};
@@ -65,7 +65,7 @@ pub enum Msg {
 /// The first bytes of every message, then the format version.
 pub const MAGIC: [u8; 3] = *b"WNS";
 /// The wire format version this implementation speaks.
-pub const VERSION: u8 = 1;
+pub const VERSION: u8 = 2;
 
 /// A message that could not be decoded, or a handshake that does not fit this site.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -347,6 +347,7 @@ impl Writer {
                     DropReason::LinkDown => 0,
                     DropReason::Oversize => 1,
                     DropReason::Operator => 2,
+                    DropReason::QueueFull => 3,
                 });
             }
         }
@@ -456,12 +457,20 @@ impl Writer {
             self.flag(info.removed);
             // The kind's stable code: 0 for Ethernet, a cable kind's registered code.
             self.u8(info.kind.code());
+            for imp in &info.impairments {
+                self.uv(imp.rate);
+                self.uv(u64::from(imp.queue));
+                self.uv(u64::from(imp.loss_ppm));
+                self.uv(imp.jitter);
+            }
             for pair in [
                 stats.frames,
                 stats.bytes,
                 stats.dropped_down,
                 stats.oversize,
                 stats.lost,
+                stats.dropped_queue,
+                stats.lost_random,
             ] {
                 self.uv(pair[0]);
                 self.uv(pair[1]);
@@ -528,6 +537,7 @@ impl Reader<'_> {
                 0 => DropReason::LinkDown,
                 1 => DropReason::Oversize,
                 2 => DropReason::Operator,
+                3 => DropReason::QueueFull,
                 _ => return Err(self.err("bad drop reason")),
             }),
             _ => return Err(self.err("bad frame fate")),
@@ -651,7 +661,7 @@ impl Reader<'_> {
         let n = self.usize()?;
         let mut links = Vec::new();
         for _ in 0..n {
-            let info = LinkInfo {
+            let mut info = LinkInfo {
                 name: self.string()?,
                 ends: [self.port_ref()?, self.port_ref()?],
                 latency: self.uv()?,
@@ -659,18 +669,37 @@ impl Reader<'_> {
                 up: self.flag()?,
                 removed: self.flag()?,
                 kind: LinkKind::from_code(self.u8()?),
+                impairments: [Impairments::default(); 2],
             };
-            let mut pairs = [[0u64; 2]; 5];
+            for imp in &mut info.impairments {
+                *imp = Impairments {
+                    rate: self.uv()?,
+                    queue: self.u32()?,
+                    loss_ppm: self.u32()?,
+                    jitter: self.uv()?,
+                };
+            }
+            let mut pairs = [[0u64; 2]; 7];
             for p in &mut pairs {
                 *p = [self.uv()?, self.uv()?];
             }
-            let [frames, bytes, dropped_down, oversize, lost] = pairs;
+            let [
+                frames,
+                bytes,
+                dropped_down,
+                oversize,
+                lost,
+                dropped_queue,
+                lost_random,
+            ] = pairs;
             let stats = LinkStats {
                 frames,
                 bytes,
                 dropped_down,
                 oversize,
                 lost,
+                dropped_queue,
+                lost_random,
             };
             links.push((info, stats, self.bytes()?.to_vec()));
         }
@@ -1188,6 +1217,8 @@ pub fn merge(
                         add(&mut stats.dropped_down[e], t.dropped_down[e]);
                         add(&mut stats.oversize[e], t.oversize[e]);
                         add(&mut stats.lost[e], t.lost[e]);
+                        add(&mut stats.dropped_queue[e], t.dropped_queue[e]);
+                        add(&mut stats.lost_random[e], t.lost_random[e]);
                     }
                 }
                 let mut taps: Vec<&Tap> = sites
@@ -1382,6 +1413,7 @@ mod tests {
                 FrameFate::Delivered { at: 7 },
                 FrameFate::Lost,
                 FrameFate::Dropped(DropReason::Oversize),
+                FrameFate::Dropped(DropReason::QueueFull),
             ]
             .into_iter()
             .enumerate()
@@ -1428,6 +1460,14 @@ mod tests {
                     up: true,
                     removed: false,
                     kind: LinkKind::from_code(2),
+                    impairments: [
+                        Impairments::default()
+                            .rate(10_000_000)
+                            .queue(64)
+                            .loss_ppm(10_000)
+                            .jitter(50_000),
+                        Impairments::default(),
+                    ],
                 },
                 LinkStats {
                     frames: [1, 2],
@@ -1435,6 +1475,8 @@ mod tests {
                     dropped_down: [5, 6],
                     oversize: [7, 8],
                     lost: [9, 10],
+                    dropped_queue: [11, 12],
+                    lost_random: [13, 14],
                 },
                 vec![0x0a, 0x0d, 0x0d, 0x0a],
             )],

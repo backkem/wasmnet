@@ -25,7 +25,7 @@ use crate::link::{
     ConnectError, FrameRecord, LinkInfo, LinkStats, LinkTransition, Panel, PortInfo, RemoteArrival,
     RemoteFrame, Tap, Wire,
 };
-use crate::link::{FrameAction, LinkKind, TransmitHook};
+use crate::link::{FrameAction, Impairments, LinkKind, TransmitHook};
 use crate::output::OutputCapture;
 use crate::{Error, Guard, Outcome, Result, SimConfig};
 use wasmnet_wire::MacAddr;
@@ -188,6 +188,26 @@ impl LinkMut<'_> {
         self
     }
 
+    /// Sets both directions' impairments (`docs/design/links.md`): a rate with a bounded
+    /// transmit queue, seeded loss and jitter. They apply to frames transmitted from now on.
+    pub fn impair(self, impairments: Impairments) -> Self {
+        self.panel.set_impairments(self.id.0, None, impairments);
+        self
+    }
+
+    /// Sets the impairments of the direction that `port`, one of the link's two ends, sends
+    /// in. Panics if `port` is not an end of this link.
+    pub fn impair_from(self, port: PortRef, impairments: Impairments) -> Self {
+        let ends = self.panel.link_info(self.id.0).ends;
+        let end = ends
+            .iter()
+            .position(|&e| e == port)
+            .unwrap_or_else(|| panic!("{port:?} is not an end of this link ({ends:?})"));
+        self.panel
+            .set_impairments(self.id.0, Some(end), impairments);
+        self
+    }
+
     /// Sets what it carries: a cable kind ([`CableModel`]) has no pcap and no frame log; its
     /// model decides what each message does and records. Set it before the first transmission.
     pub fn kind(self, kind: LinkKind) -> Self {
@@ -314,7 +334,9 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
     pub fn with_config(runtime: &'r R, config: SimConfig, guard: Guard) -> Self {
         let clock = VirtualClock::new(config.wall_epoch);
         let journal = Journal::new(clock.clone());
-        let panel = Panel::default().with_journal(journal.clone());
+        let panel = Panel::default()
+            .with_journal(journal.clone())
+            .with_seed(config.seed);
         let infra = Infra::new(clock.clone(), journal.clone());
         let mut network = Self {
             runtime,
@@ -1107,6 +1129,31 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
                     .clone();
                 self.journal_event(&device, at, "link-changed", fields);
             }
+            Op::ImpairNamed {
+                link,
+                from,
+                impairments: imp,
+            } => {
+                let l = self.live_link(&link)?;
+                check_end(from).map_err(|e| e.to_string())?;
+                self.panel.set_impairments(l, from, imp);
+                let mut fields = vec![("link", link.clone())];
+                if let Some(end) = from {
+                    let e = self.panel.link_info(l).ends[end];
+                    let name = &self.devices[e.device.0].name;
+                    fields.push(("from", format!("{name}:{}", e.port)));
+                }
+                fields.extend([
+                    ("rate-bps", imp.rate.to_string()),
+                    ("queue", imp.queue.to_string()),
+                    ("loss-ppm", imp.loss_ppm.to_string()),
+                    ("jitter-ns", imp.jitter.to_string()),
+                ]);
+                let device = self.devices[self.panel.link_info(l).ends[0].device.0]
+                    .name
+                    .clone();
+                self.journal_event(&device, at, "link-changed", fields);
+            }
             Op::Unwire { link } => {
                 let l = self.live_link(&link)?;
                 let device = self.devices[self.panel.link_info(l).ends[0].device.0]
@@ -1289,7 +1336,8 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
     /// The link's pcap-ng capture so far: one interface per end (`<device>:<port>`), every frame
     /// recorded outbound on the sender's interface at transmit time and inbound on the
     /// receiver's interface at arrival time. Timestamps are virtual nanoseconds. Frames dropped
-    /// at transmit (link down, oversize) are not in it; lost ones appear outbound only.
+    /// at transmit (link down, oversize, a full transmit queue) are not in it; lost ones (in
+    /// flight when the link went down, or taken by its seeded loss) appear outbound only.
     pub fn pcap(&self, link: LinkId) -> Vec<u8> {
         self.panel.pcap(link.0)
     }
@@ -1656,6 +1704,18 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
         let core = match op {
             Op::LinkState { link, up } => CoreOp::LinkState { link: link.0, up },
             Op::Latency { link, ns } => CoreOp::Latency { link: link.0, ns },
+            Op::Impair {
+                link,
+                from,
+                impairments,
+            } => {
+                check_end(from)?;
+                CoreOp::Impair {
+                    link: link.0,
+                    from,
+                    impairments,
+                }
+            }
             Op::Inject { from, bytes } => CoreOp::Inject {
                 device: from.device.0,
                 port: from.port,
@@ -1674,6 +1734,9 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
             }
             op => {
                 debug_assert!(op.is_network_op());
+                if let Op::ImpairNamed { from, .. } = op {
+                    check_end(from)?;
+                }
                 if matches!(op, Op::AddDevice { .. } | Op::StartDevice { .. })
                     && self.resolver.is_none()
                 {
@@ -1818,6 +1881,14 @@ pub enum Op {
     LinkState { link: LinkId, up: bool },
     /// A link's one-way latency, for frames transmitted from then on.
     Latency { link: LinkId, ns: Nanos },
+    /// A link's impairments (`docs/design/links.md`), for frames transmitted from then on: the
+    /// direction sent from end `from` (0: `a`, 1: `b`, as in [`LinkInfo::ends`]), or both with
+    /// `None`. Frames already queued keep their schedule.
+    Impair {
+        link: LinkId,
+        from: Option<usize>,
+        impairments: Impairments,
+    },
     /// A frame transmitted from a port, as if its device had sent it.
     Inject { from: PortRef, bytes: Vec<u8> },
     /// Bytes for the device's stdin, appended at the op's instant ([`crate::InputQueue`]).
@@ -1865,6 +1936,13 @@ pub enum Op {
         up: Option<bool>,
         latency: Option<Nanos>,
     },
+    /// [`Op::Impair`] on the link called `link` when the op applies (one that an earlier op
+    /// wires); journalled as `link-changed`.
+    ImpairNamed {
+        link: String,
+        from: Option<usize>,
+        impairments: Impairments,
+    },
     /// [`Op::Stdin`] into the device called `device` when the op applies (a device that an
     /// earlier op creates).
     StdinNamed { device: String, bytes: Vec<u8> },
@@ -1887,6 +1965,7 @@ impl Op {
                 | Op::Wire { .. }
                 | Op::Unwire { .. }
                 | Op::SetLink { .. }
+                | Op::ImpairNamed { .. }
                 | Op::StdinNamed { .. }
                 | Op::ControlNamed { .. }
                 | Op::Extension(_)
@@ -1948,6 +2027,16 @@ pub enum Placement {
 
 fn placement_is_timed(key: &EventKey) -> bool {
     key.levels[0].pre == 0
+}
+
+/// Refuses a link end other than 0, 1 or both (`None`).
+fn check_end(from: Option<usize>) -> Result<()> {
+    match from {
+        Some(end) if end > 1 => Err(Error::Refused(format!(
+            "a link has ends 0 and 1, not {end}"
+        ))),
+        _ => Ok(()),
+    }
 }
 
 /// Converts and checks a device's `ports()` answer: unique ids and 6-byte MACs.

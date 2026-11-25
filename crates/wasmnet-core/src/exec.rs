@@ -178,6 +178,12 @@ pub enum CoreOp {
     LinkState { link: usize, up: bool },
     /// A link's one-way latency, for frames transmitted from then on.
     Latency { link: usize, ns: Nanos },
+    /// A link's impairments, for frames transmitted from then on (one direction or both).
+    Impair {
+        link: usize,
+        from: Option<usize>,
+        impairments: crate::link::Impairments,
+    },
     /// A frame transmitted on `(device, port)` as if the device had sent it.
     Inject {
         device: usize,
@@ -705,6 +711,11 @@ impl Executor {
                 }
             }
             CoreOp::Latency { link, ns } => self.panel.set_latency(link, ns),
+            CoreOp::Impair {
+                link,
+                from,
+                impairments,
+            } => self.panel.set_impairments(link, from, impairments),
             CoreOp::Inject {
                 device,
                 port,

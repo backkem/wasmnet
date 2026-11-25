@@ -19,10 +19,11 @@
 //! `Network` is this [`Network`] with wasmtime as its runtime):
 //! [`Network`] (`device*`, `link`, `schedule_link_state`, `run_until_quiescent`, `run_until`,
 //! `journal`, `pcap`, `frames`, `counters`), [`DeviceConfig`], [`DeviceOptions`], [`DeviceId`],
-//! [`PortRef`], [`LinkId`], [`LinkMut`], [`SimConfig`], [`Guard`], [`Outcome`], [`Error`], the
-//! records ([`JournalEntry`], [`Record`], [`FrameRecord`], [`FrameFate`], [`LinkStats`],
-//! [`LinkTransition`]) and [`pcap`] to read captures back. Changing a running network
-//! (**operator events: embedder surface, unstable**):
+//! [`PortRef`], [`LinkId`], [`LinkMut`] (with a link's [`Impairments`]: rate, transmit queue,
+//! seeded loss and jitter, `docs/design/links.md`), [`SimConfig`], [`Guard`], [`Outcome`],
+//! [`Error`], the records ([`JournalEntry`], [`Record`], [`FrameRecord`], [`FrameFate`],
+//! [`LinkStats`], [`LinkTransition`]) and [`pcap`] to read captures back. Changing a running
+//! network (**operator events: embedder surface, unstable**):
 //! [`Op`] and [`Placement`] through [`Network::add_op`], [`OpState`], [`Network::run_stoppable`]
 //! with [`Boundary`] and [`Step`], frame rules ([`FrameAction`], [`Digest`]) and
 //! [`Network::set_component_resolver`] for dynamic topology. The event order these follow,
@@ -100,8 +101,9 @@ pub use infra::{Infra, InfraEnd};
 pub use input::InputQueue;
 pub use journal::{JournalEnd, JournalEntry, Level, Record, Stream};
 pub use link::{
-    DropReason, FrameAction, FrameFate, FrameRecord, LinkInfo, LinkKind, LinkStats, LinkTransition,
-    PortInfo, RemoteArrival, RemoteFrame, Tap, Transmit, TransmitHook, Wire,
+    DEFAULT_QUEUE, DropReason, FrameAction, FrameFate, FrameRecord, Impairments, LinkInfo,
+    LinkKind, LinkStats, LinkTransition, PPM, PortInfo, RemoteArrival, RemoteFrame, Tap, Transmit,
+    TransmitHook, Wire,
 };
 pub use network::{
     Cable, ComponentResolver, DeclaredPort, DeviceContext, DeviceId, DeviceInstance, DeviceOptions,
