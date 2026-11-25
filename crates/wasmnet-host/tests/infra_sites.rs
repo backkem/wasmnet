@@ -311,6 +311,63 @@ fn two_controllers(extra: [Option<String>; 2], prefixes: bool) -> Plan {
     }
 }
 
+/// A `replicas` controller on site 0 that waits on `changes.wait` (`wake`): it keeps two
+/// `node:http-get` instances, each fetching twice from `server` on site 1 across the WAN link
+/// and then exiting. Its own creations and the instances' exits wake it.
+fn waking_controller() -> Plan {
+    Plan {
+        devices: vec![
+            switch("sw-a", "6", 0),
+            Dev {
+                name: "ctl",
+                file: "node-replicas",
+                component: "node:replicas",
+                config: config(&[
+                    ("mac", "02:00:00:00:01:05"),
+                    ("ipv4", "10.0.0.5/24"),
+                    ("app.replicas.replicas", "2"),
+                    ("app.replicas.period", "1s"),
+                    ("app.replicas.wake", "true"),
+                    ("app.replicas.prefix", "get"),
+                    ("app.replicas.template.component", "node:http-get"),
+                    ("app.replicas.template.config.mac", "02:00:00:00:01:{n+10}"),
+                    ("app.replicas.template.config.ipv4", "10.0.0.{n+10}/24"),
+                    (
+                        "app.replicas.template.config.app.http-get.url",
+                        "http://10.0.0.50/",
+                    ),
+                    ("app.replicas.template.config.app.http-get.start", "50ms"),
+                    (
+                        "app.replicas.template.config.app.http-get.interval",
+                        "100ms",
+                    ),
+                    ("app.replicas.template.config.app.http-get.repeat", "2"),
+                    ("app.replicas.template.wire.0.port", "0"),
+                    ("app.replicas.template.wire.0.to", "sw-a"),
+                ]),
+                options: infra(None),
+                site: 0,
+            },
+            switch("sw-b", "4", 1),
+            Dev {
+                name: "server",
+                file: "node-http-server",
+                component: "node:http-server",
+                config: config(&[("mac", "02:00:00:00:02:50"), ("ipv4", "10.0.0.50/24")]),
+                options: DeviceOptions::default(),
+                site: 1,
+            },
+        ],
+        links: vec![
+            ((0, 0), (2, 0), WAN),
+            ((1, 0), (0, 1), 100 * US),
+            ((3, 0), (2, 1), 100 * US),
+        ],
+        ops: Vec::new(),
+        deadline: 3_000 * MS,
+    }
+}
+
 // ---- running a plan ----
 
 /// The devices of `plan` as site `site` builds them (`None`: the unsplit network): its own,
@@ -879,4 +936,43 @@ fn controllers_on_two_sites_need_name_prefixes() {
         field(&results[0], "result").contains("outside this controller's names"),
         "{results:?}"
     );
+}
+
+/// A controller woken by `changes.wait` (its own creations, its instances' exits) wakes at the
+/// same positions split and unsplit.
+#[test]
+fn a_waking_controller_matches_the_unsplit_run() {
+    let plan = waking_controller();
+    for seed in [42, 7] {
+        let whole = run_whole(&plan, seed);
+        let log = transcript(&whole.journal);
+        for get in ["get-1", "get-2"] {
+            let exits = events(&whole.journal, get, "app-exit");
+            assert_eq!(exits.len(), 1, "seed {seed}, {get}:\n{log}");
+        }
+        // Each exit is observed at once, not at the next period: in the same instant.
+        let exit_at: Vec<Nanos> = whole
+            .journal
+            .iter()
+            .filter(|e| matches!(&e.record, wasmnet_host::Record::Event { kind, .. } if kind == "app-exit"))
+            .map(|e| e.at)
+            .collect();
+        for at in &exit_at {
+            assert!(
+                whole.journal.iter().any(|e| e.at == *at
+                    && e.device == "ctl"
+                    && matches!(&e.record, wasmnet_host::Record::Event { kind, fields }
+                        if kind == "replicas-observed"
+                            && fields.iter().any(|(k, v)| k == "change" && v == "modified"))),
+                "seed {seed}: an exit at {at} is observed then:\n{log}"
+            );
+        }
+        let split = run_split(&plan, seed).unwrap_or_else(|e| panic!("seed {seed}: {e:?}"));
+        assert_same(&whole, &split, &format!("seed {seed}"));
+        let again = run_split(&plan, seed).unwrap_or_else(|e| panic!("seed {seed}: {e:?}"));
+        assert_eq!(
+            split, again,
+            "seed {seed}: the split rerun is byte-identical"
+        );
+    }
 }
