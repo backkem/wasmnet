@@ -1337,7 +1337,7 @@ impl InfraEnd {
 
     /// `devices.control-answer`: the answer to the command this controller sent with
     /// `request_id` (`None` while the command has not run yet). `not-found` for an id it never
-    /// sent a command with, or one more than [`ANSWERS_KEPT`] commands ago.
+    /// sent a command with, or one more than 256 commands ago.
     pub fn control_answer(&self, request_id: &str) -> Result<Option<CommandAnswer>, InfraError> {
         let s = self.infra.state();
         let sent = s
