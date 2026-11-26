@@ -12,6 +12,11 @@
 //! - `wn_pad_sequence`: an embedder's own network: a fresh one with a seed it computes
 //!   (`wasmnet_web::install::new_network`), devices added from Rust and run in steps, with a
 //!   wait in the page's own `Suspending` import `pad_page.pause` between them.
+//!
+//! The module imports `pad_page.stamp` (a number in, a number out) and `pad_page.pause` (the
+//! same, wrapped in `WebAssembly.Suspending`): a page that loads it supplies both in
+//! `NetworkOptions.imports`, as the page test's Worker does (`web/src/worker.ts`); without them
+//! the module does not instantiate.
 
 #[cfg(target_arch = "wasm32")]
 fn install(network: &mut wasmnet_web::install::PageNetwork) {
