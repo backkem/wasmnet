@@ -354,7 +354,8 @@ page's simulator module by the embedder's own build ([browser.md](browser.md#an-
 
 **What the WIT may use.** `bool`, unsigned integers, `string`, records, variants, enums,
 options, results, tuples, lists (`list<u8>` as bytes) and resources with constructors,
-methods and static functions. Signed integers, floats, `char`, flags, streams, futures and
+methods and static functions, and type aliases of any of these, which cross as what they name
+(`type id = u32` as a `u32`). Signed integers, floats, `char`, flags, streams, futures and
 async functions are refused at compile time by the adapter: the page's boundary does not
 carry them yet ([known-issues.md](../known-issues.md#the-embedder-surface)).
 

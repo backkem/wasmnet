@@ -21,9 +21,10 @@
 //!
 //! Supported WIT: `bool`, unsigned integers, `string`, records, variants, enums, options,
 //! results, tuples, lists (`list<u8>` as bytes) and resources (own and borrow; constructors,
-//! methods and static functions). Signed integers, floats, `char`, flags, streams, futures and
-//! async functions are refused with a compile error: the browser boundary does not carry them
-//! yet.
+//! methods and static functions), and type aliases of any of these (`type id = u32` crosses as
+//! a `u32`, a list of an alias of `u8` as bytes). Signed integers, floats, `char`, flags,
+//! streams, futures and async functions are refused with a compile error: the browser boundary
+//! does not carry them yet.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -377,6 +378,25 @@ impl Gen<'_> {
         id
     }
 
+    /// Follows type aliases to what they name, a primitive included (`type id = u32` is `u32`):
+    /// bindgen gives an alias the Rust type of what it names, and the browser boundary carries
+    /// it as that.
+    fn peel(&self, ty: &Type) -> Type {
+        let mut ty = *ty;
+        while let Type::Id(id) = ty {
+            match self.resolve.types[id].kind {
+                TypeDefKind::Type(next) => ty = next,
+                _ => break,
+            }
+        }
+        ty
+    }
+
+    /// Whether `ty` is `u8`, through aliases: a list of it crosses as bytes.
+    fn is_byte(&self, ty: &Type) -> bool {
+        self.peel(ty) == Type::U8
+    }
+
     fn named_path(&self, id: TypeId) -> R<TokenStream> {
         let t = &self.resolve.types[id];
         let TypeOwner::Interface(iid) = t.owner else {
@@ -406,7 +426,7 @@ impl Gen<'_> {
 
     /// The Rust type bindgen gives `ty`.
     fn rust_type(&self, ty: &Type) -> R<TokenStream> {
-        Ok(match ty {
+        Ok(match &self.peel(ty) {
             Type::Bool => quote!(bool),
             Type::U8 => quote!(u8),
             Type::U16 => quote!(u16),
@@ -465,7 +485,7 @@ impl Gen<'_> {
 
     /// An expression turning `e` (of `ty`'s Rust type) into a `Value`.
     fn to_value(&self, e: TokenStream, ty: &Type) -> R<TokenStream> {
-        Ok(match ty {
+        Ok(match &self.peel(ty) {
             Type::Bool => quote!(Value::Bool(#e)),
             Type::U8 | Type::U16 => quote!(Value::U32(u32::from(#e))),
             Type::U32 => quote!(Value::U32(#e)),
@@ -543,7 +563,7 @@ impl Gen<'_> {
                             .collect::<R<Vec<_>>>()?;
                         quote!({ let (#(#names,)*) = #e; Value::Tuple(::std::vec![#(#vals),*]) })
                     }
-                    TypeDefKind::List(Type::U8) => quote!(Value::Bytes(#e)),
+                    TypeDefKind::List(t) if self.is_byte(t) => quote!(Value::Bytes(#e)),
                     TypeDefKind::List(t) => {
                         let inner = self.to_value(quote!(x), t)?;
                         quote!(Value::List((#e).into_iter().map(|x| #inner).collect()))
@@ -565,6 +585,7 @@ impl Gen<'_> {
             let what = what.to_owned();
             quote!(other => Err(::std::format!("want {}, got {:?}", #what, other)))
         };
+        let ty = &self.peel(ty);
         Ok(match ty {
             Type::Bool => {
                 let w = want("a bool");
@@ -700,7 +721,7 @@ impl Gen<'_> {
                             #w
                         })
                     }
-                    TypeDefKind::List(Type::U8) => {
+                    TypeDefKind::List(t) if self.is_byte(t) => {
                         let w = want("bytes");
                         quote!(match #v { Value::Bytes(b) => Ok(b), #w })
                     }
