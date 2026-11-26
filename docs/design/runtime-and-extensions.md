@@ -113,7 +113,9 @@ much). The backend reports fuel at each look into the store and names the instan
 consumed under (`CostMeter::add_fuel_at`), so guest work that is only seen at the next
 instant's first look still counts in its own. Instantiation and `ports()` run on a budget of
 their own and are in neither figure. Without metering (the browser backend, `fuel(false)`, an
-unmetered component) both are 0.
+unmetered component) both are 0. Work inside a device's fuel span is in neither figure
+([below](#portable-extensions)): with it a controller may inspect a device without changing what
+it costs.
 
 **Choosing `fuel_per_instant`.** Run the workload once with a generous budget and read the
 devices' `peak_fuel`: a budget at or above it lets that run through unchanged (fuel never
@@ -155,7 +157,7 @@ these figures say nothing about how fast a native build is.
 | `ExtOp` | `Op::Extension(ExtensionOp::new(op))` | when the operator event applies, in its own processing context |
 | `Action` | `Network::register_action(name, closure)`, called by `Op::Action` | when the operator event applies, in its own processing context, after its `action` record |
 | `HostExtension` | `Host::with_extension`, `Host::with_extensions` | at engine build, linking, store creation and device instantiation |
-| Portable imports: `NetworkExtension::interfaces`, `DeviceExt::serve`, `ImportServer` | the extension, with the network; its wasmtime adapter (`portable_adapter!`) with the host; nothing in a page | the server is called inside the device's own call, at the current instant ([below](#portable-extensions)) |
+| Portable imports: `NetworkExtension::interfaces`, `DeviceExt::serve`, `ImportServer`, `DeviceExt::fuel_span` | the extension, with the network; its wasmtime adapter (`portable_adapter!`) with the host; nothing in a page | the server is called inside the device's own call, at the current instant ([below](#portable-extensions)) |
 | Portable exports: `ControlCall::{target, invocation}`, `ExportCall`, `ExportRequest` | `Network::invoke`, `Op::Control`, `OpContext::control`; typed on wasmtime by `portable_adapter!` with a world that exports the interface | inside the device's event loop, at the current instant ([below](#portable-exports)) |
 
 All of them are in [crates/wasmnet-core/src/ext.rs](../../crates/wasmnet-core/src/ext.rs), except
@@ -378,6 +380,58 @@ were added: `device_setup`, `device_life` and the servers' records follow it on 
 call (copying an argument in, the server reading the bytes out of the device's memory) is not
 metered. On wasmtime a 16 MiB write costs the device about what a 16-byte one does (3 566
 against 3 014 units of fuel in `portable_exports.rs`); in a page fuel is not metered at all.
+Inside a fuel span (below) the device's own code costs it nothing either.
+
+**Work that costs the device nothing: its fuel span.** A server that lets a controller work on
+a stopped device (a debugger's `hold`: the device calls it at a stop, the server blocks while a
+controller reads and writes, which runs device code, and the stop may span several such calls)
+must leave the device with the fuel it had, or being inspected changes the run: the inspection's
+fuel would come out of the device's budget for that instant, and a large one would make it run
+out. Each device has one `FuelSpan` per incarnation (`DeviceExt::fuel_span`; the server keeps a
+clone from `device_setup`), shared by all its servers:
+
+- `begin()` opens a span at the current instant, `end()` closes it, `is_open()` reads it. A
+  second `begin` while one is open answers `false` and changes nothing (the span keeps the fuel
+  it saved); one `end` closes it, whoever opened it. There is no nesting.
+- On wasmtime, when a span ends the device's fuel is what it was when it began, whatever device
+  code ran in between: its own code between two calls of a server, and export calls others made
+  into it between its calls (an `ExportRequest` op, `Network::invoke`). While it is open the
+  device runs on an allowance of its own: its fuel per instant, set when the span opens and again
+  at every look the backend takes (each served call, each round of its actor), so no step of an
+  inspection is limited by what the device had left, and a runaway one still traps.
+- A change made inside a served call applies when the call returns to the device; one made
+  anywhere else (an operator event, an embedder action, between runs) at the device's next round,
+  before it runs any code.
+- A span lasts at most to the end of its instant: at a later one it is closed, and the device's
+  fuel is that instant's budget, as always. A stop, crash or removal closes it for good (the core
+  retires the handle before any extension hears of it); a device started again has a new handle.
+- The costs: what runs in a span is in neither `fuel` nor `peak_fuel`, so they are the same with
+  and without the inspection, on every run. `calls` and `polls` do count the controller's calls,
+  and so does the poll cap (`Guard::max_polls_per_instant`): a span spares fuel only. Memory is
+  the device's: an export call that allocates may grow it (`memory`, `peak_memory`).
+- In a page, with `fuel(false)` and for an unmetered component, nothing is metered and a span
+  changes nothing; its state (`begin`, `end`, `is_open`) is the core's and reads the same on
+  every backend.
+
+The shape is a pair on a handle, not a guard that lasts until the server's call returns: on
+wasmtime no device code runs inside a served call (the device's actor is inside the call, so
+nothing else reaches the device until it returns), so such a guard would cover nothing. The work
+to spare is what the device and others run between the server's calls.
+
+What a server must not do with it: open a span for anything but a stop the device makes to be
+inspected, or leave it open past the stop. Everything the device does while a span is open is
+free, its own work included (a frame it receives at that instant, the rest of its call after a
+`begin`), so a span is not a way to give a device unmetered work of its own; the close at the end
+of the instant only bounds the damage.
+
+The per-instant budget is unchanged for devices that use no span: the book that refills and
+accounts fuel is the same code, and a network without spans keeps its records and costs.
+`crates/wasmnet-host/tests/portable_fuel.rs` has the cases: a controller's 50 export calls during
+a span leave the journal and the costs of the run without them (and with a budget the calls would
+exhaust, the spanned run is unchanged while the unspanned one runs out of fuel); the device code
+between a `begin` and an `end` in one call is not counted; a span left open closes with its
+instant; a stop, crash and removal close it. `a_fuel_span_reads_alike` in
+`crates/wasmnet-web/tests/parity.rs` checks that its state reads the same on both backends.
 
 **A worked example: the test fixture `wasmnet-pad`** ([crates/wasmnet-pad](../../crates/wasmnet-pad),
 `wit/test-pad/pad.wit`). Each device keeps named notes:

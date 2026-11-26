@@ -68,6 +68,8 @@ versions without notice. Rustdoc and the design notes mark it **embedder surface
 - portable extensions ([design/runtime-and-extensions.md](design/runtime-and-extensions.md#portable-extensions)):
   `Interface`, `ImportServer`, `Served`, `DeviceExt::serve`, `NetworkExtension::interfaces`,
   `Status::set_fault`, `DeviceLife::replaced`, `DeviceSetup::seed`, `Network::add_boxed_extension`,
+  a device's fuel span (`FuelSpan`, `DeviceExt::fuel_span`; the wasmtime adapter's calls take the
+  store, `wasmnet_host::portable::call(store, ..)`),
   the value model `wasmnet_core::value`, `wasmnet_host::portable` with `portable_adapter!`, and in
   a page `wn_import`, `wn_import_drop`, `wn_interfaces` and an embedder's own page module
   (`wasmnet_web::install`, `install!`, `export!`, `install::with_network`, and in the binding
