@@ -62,7 +62,7 @@ An app never runs alone: a composition plugs it into a netstack
 | `clock-probe` | `wasmnet-clock-probe` | `clock-probe.wasm` | A command that samples every source of time and entropy it can reach. |
 | `infra-script` | `wasmnet-infra-script` | `infra-script.wasm` | A device with no ports that makes scripted `wasmnet:infra` calls at set times and in answer to the events of devices it created; its commands set variables its calls use. |
 | `reflector` | `wasmnet-reflector` | `reflector.wasm` | Echoes frames back out of the port they came in on. |
-| `store-adapter` | `wasmnet-store-adapter` | `store_adapter.wasm` | An adapter in front of a device: serves a storage contract of the device's own (`wit/test-store`: byte keys, objects by hash) over its disks (`crates/wasmnet-disk`), keys in an order-preserving encoding. |
+| `store-adapter` | `wasmnet-store-adapter` | `store-adapter.wasm` | An adapter in front of a device: serves a storage contract of the device's own (`wit/test-store`: byte keys, objects by hash) over its disks (`crates/wasmnet-disk`), keys in an order-preserving encoding. |
 | `udp-punch` | `wasmnet-udp-punch` | `udp-punch.wasm` | An app (in `components/apps`): UDP hole punching between two peers through a rendezvous server, for the NAT tests. |
 
 ## Nodes
