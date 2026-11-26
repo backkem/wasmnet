@@ -74,7 +74,11 @@ versions without notice. Rustdoc and the design notes mark it **embedder surface
   `NetworkOptions.imports` and `Network.callExport`), and networks in sequence on one module
   instance (`install::new_network`, `wasmnet_web::Network::replace`, `JsHost::network_replaced`,
   the import `js_network_replaced`, and in the binding `Network.reset`,
-  [design/browser.md](design/browser.md#networks-in-sequence)); extension options and operator events from
+  [design/browser.md](design/browser.md#networks-in-sequence)), a device's descriptor in the
+  binding's per-device hooks (`DeviceDescriptor` with its clock, `deviceImports(device)`,
+  `instantiateCore(module, imports, device)`), and devices whose exports answer with a promise
+  (`ComponentSource.suspends`, `Instance::suspends`, the `_suspending` imports,
+  [design/browser.md](design/browser.md#exports-that-answer-with-a-promise)); extension options and operator events from
   generic values (`ExtOption`, `ExtOpParser`, `NetworkExtension::{options, check_options, ops}`,
   `Network::{parse_option, set_option, option_keys, parse_op}`, `ExtOptions::set_value`,
   `Op::ExtensionAt` and `Op::ExtensionAtNamed`, `OpContext::device`, a spec's extension keys, the

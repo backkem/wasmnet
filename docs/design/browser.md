@@ -266,12 +266,68 @@ page test measures that (`jspiSuspendingNs`, a call through a `Suspending` impor
 at once, against `jspiPlainNs`, a plain import): 63 ns against 4.8 ns per call in headless
 Chromium, small beside the call itself.
 
-**Per-device imports and the kit's hooks.** `NetworkOptions.deviceImports({ index, name,
-component })` gives one device's component extra imports, asked each time it is instantiated and
-merged over the binding's own (by unversioned interface name): a capability the embedder serves
-in JavaScript to the devices it chooses, in this page only. `NetworkOptions.compile` and
+**Per-device imports and the kit's hooks.** `NetworkOptions.deviceImports(device)` gives one
+device's component extra imports, asked each time it is instantiated and merged over the
+binding's own (by unversioned interface name): a capability the embedder serves in JavaScript to
+the devices it chooses, in this page only. `NetworkOptions.compile` and
 `NetworkOptions.instantiateCore` are the kit's hooks, passed through (the binding still sees every
-core instance to count the device's memories).
+core instance to count the device's memories). Both `deviceImports` and `instantiateCore` get the
+device's descriptor (`DeviceDescriptor`: `index`, `name`, `component` and its clock, below);
+`instantiateCore(module, imports, device)` is called for every core module of the device, in the
+order its component instantiates them, so a code tier serving one device can keep that device's
+own instances (the instance exporting its memory and table) and instantiate more modules against
+them.
+
+**A device's clock in its own imports.** The descriptor carries the device's virtual clock:
+`now()`, `timer(at, wake)` and `sleepUntil(at)` (`timer` as a promise). It is the timer table
+the device's own WASI timers use, so an import can answer at a later virtual instant: a WASI 0.3
+async function served per device returns `device.sleepUntil(called + latency).then(...)`, and the
+guest's call completes at exactly that instant (an HTTP client whose response arrives one
+configured latency after the request). The rules are the binding's own timers':
+
+- `wake` runs inside the simulator's step, when the device's actor serves its timers at that
+  instant; two timers of one device due at one instant fire in the order they were set, and the
+  devices of one round in their order. So a run repeats itself: the page test's step "a device's
+  own import answers at a later virtual instant" runs the example with the client's `wait-for`
+  served this way, twice, and requires equal records and every answer at its instant.
+- From `wake` an import records what is due and resolves promises; the guest's code waiting on
+  them runs when the event loop settles, at the same instant. It may call the descriptor's
+  functions again (a further timer), never a `Network` method (a step is running).
+- An instant already past fires at the device's next poll. A timer belongs to its network: one
+  set before `reset` never fires.
+
+This is the page's per-device form of what the portable extensions do not have yet: a served call
+that completes at a later virtual instant ([runtime-and-extensions.md](runtime-and-extensions.md#portable-extensions),
+"an answer that depends on later events"). A portable form would let a server answer later
+through a timer on the device's virtual clock, which both backends already serve (here the
+registry's timers, which this descriptor uses); nothing here is in its way, and an embedder who
+needs the same on wasmtime waits for that form.
+
+## Exports that answer with a promise
+
+A composition can have sync device exports that wait: an input adapter composed in front of a
+netstack, whose `receive` calls a sibling that may block, transpiled with JSPI so that the export
+returns a promise. A device made from such a component is called through `Suspending` imports
+(`js_receive_suspending`, `js_link_state_suspending`, `js_poll_suspending`,
+`js_counters_suspending`; `ports()` inside `js_instantiate`, which suspends already): the call
+waits for the promise, driving the event loop as `js_export` does, and the step goes on once it
+is answered. A device is called so when its `ComponentSource.suspends` says so, or when its
+`ports()` answers with a promise (the `instance` message's `suspends` flag); every other device
+is called through the plain imports, which refuse a promise as before, so a network without such
+devices costs what it did. Every simulator export that may reach those calls (`wn_step`,
+`wn_finish`, `wn_add_device`, `wn_command`, `wn_invoke`, `wn_counters`) is `promising` already.
+
+- **Deterministic.** While the export is pending the simulator is suspended inside the step: no
+  event is popped, no other device is called, virtual time does not move. What may run is the
+  guests' own JavaScript work already queued in the kit's loop (an async node's task woken
+  earlier in the step), as it would run between steps; its calls into the simulator are served at
+  that instant like any call from JavaScript. That order is the kit's and the same on every run:
+  the page test's step "a device whose exports answer with a promise" runs the example with its
+  switch wrapped so (every frame through it waits), twice, and requires equal records.
+- **Replaced networks.** A replacement is refused while a step runs, so no export of a replaced
+  network is pending when it goes.
+- **Cost.** The page test's step "what a frame-heavy run costs in the page" fetches 2 MB through
+  the switch (some 5,900 frames), with the plain switch and with the wrapped one.
 
 ## An embedder's own page module
 

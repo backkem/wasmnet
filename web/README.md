@@ -84,7 +84,12 @@ component fetched from a store node, and an ungranted `wasmnet:infra` importer r
 networks in sequence on one module instance (the `sequence` scenario: a network replaced in
 mid-run by `Network.reset`, then the example twice, each equal to the example on a fresh page at
 that seed; `pad-sequence`: an embedder's export that opens its own network, against `pad-fresh`),
-and checks the message a browser without JSPI gets. With `NATIVE_JOURNAL` pointing at the native example's output
+measures a frame-heavy run (`frames`: a 2 MB fetch, with the plain switch and with the switch
+called through `Suspending` imports, `frames-suspending`), runs a per-device import that answers
+through the device's clock (`device-clock`: the client's `wait-for` served one latency later, and
+whose core modules `instantiateCore` saw) and a device whose exports answer with a promise
+(`device-suspends`: the switch wrapped so), each twice with equal records, and checks the message
+a browser without JSPI gets. With `NATIVE_JOURNAL` pointing at the native example's output
 (`cargo run -p wasmnet-host --example http > target/http-native.txt`) it also checks that every
 journal line of the native run appears in the browser run, at the same virtual time, and compares
 the captures in `target/http/`. `.github/workflows/pages.yml` does all of this and deploys
