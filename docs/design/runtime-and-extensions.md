@@ -156,7 +156,7 @@ these figures say nothing about how fast a native build is.
 | `Action` | `Network::register_action(name, closure)`, called by `Op::Action` | when the operator event applies, in its own processing context, after its `action` record |
 | `HostExtension` | `Host::with_extension`, `Host::with_extensions` | at engine build, linking, store creation and device instantiation |
 | Portable imports: `NetworkExtension::interfaces`, `DeviceExt::serve`, `ImportServer` | the extension, with the network; its wasmtime adapter (`portable_adapter!`) with the host; nothing in a page | the server is called inside the device's own call, at the current instant ([below](#portable-extensions)) |
-| Portable exports: `ControlCall::invocation`, `ExportCall`, `ExportRequest` | `Network::invoke`, `Op::Control`, `OpContext::control`; typed on wasmtime by `portable_adapter!` with a world that exports the interface | inside the device's event loop, at the current instant ([below](#portable-exports)) |
+| Portable exports: `ControlCall::{target, invocation}`, `ExportCall`, `ExportRequest` | `Network::invoke`, `Op::Control`, `OpContext::control`; typed on wasmtime by `portable_adapter!` with a world that exports the interface | inside the device's event loop, at the current instant ([below](#portable-exports)) |
 
 All of them are in [crates/wasmnet-core/src/ext.rs](../../crates/wasmnet-core/src/ext.rs), except
 `HostExtension` and its `ControlHandler`
@@ -418,12 +418,21 @@ control call. `ExportCall::reschedule(true)` lets a call move a stepped device's
 and sorted, the same list on both backends (`wasmnet:link/device` included), so a caller can
 ask before it calls.
 
-**Underneath.** `ControlCall` has two methods with defaults: `invocation(now)` (the call as a
-call of one export function by name, or `None`) and `invoked(answer, config)` (the device's
-answer; `config` is what its `wasi:config/store` serves, which a reconfiguration taken in place
-replaces). Commands (`CommandCall`: `invoke(now, command, argument)`) and reconfiguration
-(`ReconfigureCall`: `reconfigure(now, config)`) implement them, which is how a page serves
-them: it has no code of its own for either.
+**Underneath.** `ControlCall` has three methods with defaults: `target()` (the export function
+the call calls, as interface and function names, or `None`), `invocation(now)` (the call as
+that function's `Invocation`, with its arguments, or `None`) and `invoked(answer, config)` (the
+device's answer; `config` is what its `wasi:config/store` serves, which a reconfiguration taken
+in place replaces). Commands (`CommandCall`: `invoke(now, command, argument)`) and
+reconfiguration (`ReconfigureCall`: `reconfigure(now, config)`) implement them, which is how a
+page serves them: it has no code of its own for either. A handler reads `target` first and gives
+a call that is not its own back untouched; the one that serves it takes `invocation` once
+(`&mut self`), so a call may move its arguments out instead of copying them. `ExportCall` does:
+the bytes of a `Network::invoke` write reach the backend in the buffer the caller gave
+(`an_export_call_moves_its_arguments` in the core's tests). On the typed wasmtime path they move
+on from there by reading of the generated code: the adapter turns `Value::Bytes(b)` into the
+binding's `Vec<u8>` by moving `b`, and wasmtime copies it once, into the device's memory. An
+operator event (`ExportRequest`) makes a fresh call, and so a copy of its arguments, each time
+it applies; the dynamic path builds a `Val` per byte.
 
 - **On wasmtime** the first handler that takes the call serves it: the host's own for commands
   and reconfiguration (typed, as before), then the extensions' (`HostExtension::instance_ready`),

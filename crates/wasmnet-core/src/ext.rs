@@ -435,10 +435,23 @@ pub trait ControlCall: Any + Send + fmt::Debug {
     /// No backend serves it: answer with the extension's own refusal.
     fn unsupported(self: Box<Self>);
 
-    /// The call as a call of one export function by name, with its arguments at `now`: how a
-    /// backend that calls exports by name (a page) serves it ([`Invocation`]). `None` (the
-    /// default): only a backend's own handler serves it.
-    fn invocation(&self, now: Nanos) -> Option<Invocation> {
+    /// The export function this call is a call of, by name: its interface without a version
+    /// and the function's name in it, as [`Invocation`] names them. A handler checks it before
+    /// it takes the call's [`invocation`](Self::invocation), and gives the call back untouched
+    /// when it is not one of its functions. `None` (the default): only a backend's own handler
+    /// serves it.
+    fn target(&self) -> Option<(&str, &str)> {
+        None
+    }
+
+    /// The call as a call of its [`target`](Self::target), with its arguments at `now`: how a
+    /// backend that calls exports by name (a page, or a typed adapter on wasmtime) serves it
+    /// ([`Invocation`]). The handler that serves the call takes it once, after `target`
+    /// matched, then answers through [`invoked`](Self::invoked) or
+    /// [`unsupported`](Self::unsupported): the call may move its arguments out (a large byte
+    /// argument is not copied), so a second call may answer `None`. `None` (the default): only
+    /// a backend's own handler serves it.
+    fn invocation(&mut self, now: Nanos) -> Option<Invocation> {
         let _ = now;
         None
     }
@@ -454,7 +467,8 @@ pub trait ControlCall: Any + Send + fmt::Debug {
 }
 
 /// A call of one export function of a device by name: what a control call is to a backend that
-/// calls exports by name ([`ControlCall::invocation`]). `interface` is the export's name without
+/// calls exports by name ([`ControlCall::invocation`]); it owns its arguments, which a backend
+/// moves on into the device's call. `interface` is the export's name without
 /// a version (`wasmnet:control/commands`), as [`crate::Network::device_exports`] lists it;
 /// `function` its name in the interface (`invoke`).
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -227,7 +227,7 @@ fn expand(input: &Input) -> R<TokenStream> {
         links.push(link);
         decls.push(decl);
     }
-    let (export_fields, export_finds, export_arms, export_names) = g.exports()?;
+    let (export_fields, export_finds, (export_selects, export_arms), export_names) = g.exports()?;
     let name = &input.name;
     let module = format_ident!("__{}", name.to_string().to_snake_case());
     let paths: Vec<String> = input.paths.iter().map(LitStr::value).collect();
@@ -302,11 +302,22 @@ fn expand(input: &Input) -> R<TokenStream> {
                     acc: &'a ::wasmnet_host::wasmtime::component::Accessor<::wasmnet_host::HostState>,
                     call: ::std::boxed::Box<dyn ::wasmnet_host::sim::ext::ControlCall>,
                 ) -> ::std::result::Result<::wasmnet_host::ControlFuture<'a>, ::std::boxed::Box<dyn ::wasmnet_host::sim::ext::ControlCall>> {
+                    // Which function, by name, before the call is taken: one that is not this
+                    // adapter's goes back untouched to the next handler.
+                    let which: ::std::option::Option<usize> = match call.target() {
+                        #(#export_selects)*
+                        _ => ::std::option::Option::None,
+                    };
+                    let ::std::option::Option::Some(which) = which else {
+                        return Err(call);
+                    };
+                    let mut call = call;
+                    // The arguments move out of the call into the device's (no copy here).
                     let ::std::option::Option::Some(inv) = call.invocation(::wasmnet_host::portable::now(acc)) else {
                         return Err(call);
                     };
                     let mut args = inv.args.into_iter();
-                    match (inv.interface.as_str(), inv.function.as_str()) {
+                    match which {
                         #(#export_arms)*
                         _ => Err(call),
                     }
@@ -746,19 +757,20 @@ impl Gen<'_> {
     }
 
     /// The exported interfaces' handler parts: its fields, how each is found in an instance,
-    /// the match arms that call each function, and the interfaces' names (without a version)
-    /// with whether the instance has them.
+    /// the match arms that pick a function by a call's target (to its number) and those that
+    /// call it (by its number), and the interfaces' names (without a version) with whether the
+    /// instance has them.
     #[allow(clippy::type_complexity)]
     fn exports(
         &self,
     ) -> R<(
         Vec<TokenStream>,
         Vec<TokenStream>,
-        Vec<TokenStream>,
+        (Vec<TokenStream>, Vec<TokenStream>),
         Vec<TokenStream>,
     )> {
-        let (mut fields, mut finds, mut arms, mut names) =
-            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let (mut fields, mut finds, mut selects, mut arms, mut names) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
         for &iid in &self.exported {
             let i = &self.resolve.interfaces[iid];
             let full = self.resolve.id_of(iid).ok_or("an unnamed interface")?;
@@ -835,9 +847,13 @@ impl Gen<'_> {
                         quote!(Ok(#v))
                     }
                 };
+                let k = arms.len();
+                selects.push(quote! {
+                    ::std::option::Option::Some((#iname, #wit)) if self.#f.is_some() => ::std::option::Option::Some(#k),
+                });
                 arms.push(quote! {
-                    (#iname, #wit) if self.#f.is_some() => {
-                        let g = self.#f.as_ref().expect("checked above");
+                    #k => {
+                        let g = self.#f.as_ref().expect("checked by its target");
                         #(#convs)*
                         Ok(::std::boxed::Box::pin(async move {
                             #(#checks)*
@@ -850,7 +866,7 @@ impl Gen<'_> {
                 });
             }
         }
-        Ok((fields, finds, arms, names))
+        Ok((fields, finds, (selects, arms), names))
     }
     /// One function's trait method.
     fn method(&self, iface: &str, f: &Function) -> R<TokenStream> {

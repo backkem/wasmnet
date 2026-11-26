@@ -191,8 +191,12 @@ impl ControlCall for CommandCall {
         )));
     }
 
+    fn target(&self) -> Option<(&str, &str)> {
+        Some((COMMANDS_EXPORT, "invoke"))
+    }
+
     /// `invoke(now, command, argument)`.
-    fn invocation(&self, now: crate::Nanos) -> Option<crate::ext::Invocation> {
+    fn invocation(&mut self, now: crate::Nanos) -> Option<crate::ext::Invocation> {
         use crate::value::Value;
         Some(crate::ext::Invocation::new(
             COMMANDS_EXPORT,

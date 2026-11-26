@@ -610,7 +610,11 @@ impl<H: JsHost> Actor<H> {
     /// A control call into one of the device's exports, by name ([`ControlCall::invocation`]):
     /// commands, configuration changes in place and any other export, one way. A trap is the
     /// device's fault; a call it has no export for is refused by the call's own words.
-    fn control(&mut self, call: Box<dyn ControlCall>, now: Nanos) -> Result<(), Fault> {
+    fn control(&mut self, mut call: Box<dyn ControlCall>, now: Nanos) -> Result<(), Fault> {
+        if call.target().is_none() {
+            call.unsupported();
+            return Ok(());
+        }
         let Some(invocation) = call.invocation(now) else {
             call.unsupported();
             return Ok(());

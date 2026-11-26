@@ -168,8 +168,12 @@ impl ControlCall for ReconfigureCall {
         ))));
     }
 
+    fn target(&self) -> Option<(&str, &str)> {
+        Some((RECONFIGURE_EXPORT, "reconfigure"))
+    }
+
     /// `reconfigure(now, config)`, every key of the new config as a `(key, value)` pair.
-    fn invocation(&self, now: crate::Nanos) -> Option<crate::ext::Invocation> {
+    fn invocation(&mut self, now: crate::Nanos) -> Option<crate::ext::Invocation> {
         use crate::value::Value;
         let pairs = self
             .config

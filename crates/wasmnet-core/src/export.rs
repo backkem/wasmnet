@@ -59,6 +59,8 @@ impl ControlAnswer for ExportAnswer {
 pub struct ExportCall {
     name: String,
     invocation: Invocation,
+    /// Its arguments were taken ([`ControlCall::invocation`]).
+    taken: bool,
     reschedule: bool,
     answer: Arc<ExportAnswer>,
 }
@@ -78,6 +80,7 @@ impl ExportCall {
         Self {
             name: format!("{}#{}", invocation.interface, invocation.function),
             invocation,
+            taken: false,
             reschedule: false,
             answer: Arc::default(),
         }
@@ -129,8 +132,22 @@ impl ControlCall for ExportCall {
         )));
     }
 
-    fn invocation(&self, _now: Nanos) -> Option<Invocation> {
-        Some(self.invocation.clone())
+    fn target(&self) -> Option<(&str, &str)> {
+        Some((&self.invocation.interface, &self.invocation.function))
+    }
+
+    /// The invocation, its arguments moved out of the call (not copied); the call keeps its
+    /// names. A second call answers `None`.
+    fn invocation(&mut self, _now: Nanos) -> Option<Invocation> {
+        if self.taken {
+            return None;
+        }
+        self.taken = true;
+        Some(Invocation::new(
+            self.invocation.interface.clone(),
+            self.invocation.function.clone(),
+            std::mem::take(&mut self.invocation.args),
+        ))
     }
 
     fn invoked(self: Box<Self>, answer: Answered, _config: &mut crate::DeviceConfig) {
@@ -215,12 +232,43 @@ mod tests {
         assert_eq!(call.name(), "example:pad/inspect#count");
         assert_eq!(call.export(), "example:pad/inspect");
         assert!(!call.may_reschedule());
+        let mut call = call;
+        assert_eq!(call.target(), Some(("example:pad/inspect", "count")));
         assert_eq!(call.invocation(5), Some(inv));
+        assert_eq!(call.invocation(5), None, "taken once");
         let call = ExportCall::downcast(call).expect("an export call");
         let slot = call.answer_slot();
         let mut config = crate::DeviceConfig::new();
         call.invoked(Ok(Value::U32(3)), &mut config);
         assert_eq!(slot.get(), Some(Ok(Ok(Value::U32(3)))));
         assert_eq!(unversioned("a:b/c@0.1.0"), "a:b/c");
+    }
+
+    /// The bytes of an argument move out of the call: the invocation a backend takes holds the
+    /// very buffer the caller gave (no copy of a large write).
+    #[test]
+    fn an_export_call_moves_its_arguments() {
+        let bytes = vec![7u8; 1 << 20];
+        let at = bytes.as_ptr();
+        let mut call = ExportCall::new(Invocation::new(
+            "example:pad/inspect",
+            "write",
+            vec![Value::str("x"), Value::Bytes(bytes)],
+        ));
+        let inv = call.invocation(0).expect("an invocation");
+        match &inv.args[1] {
+            Value::Bytes(b) => assert_eq!(b.as_ptr(), at),
+            other => panic!("{other:?}"),
+        }
+        // The call still names itself and answers.
+        assert_eq!(call.export(), "example:pad/inspect");
+        let slot = call.answer_slot();
+        Box::new(call).unsupported();
+        assert_eq!(
+            slot.get(),
+            Some(Err(
+                "this device's backend does not serve example:pad/inspect#write".to_owned()
+            ))
+        );
     }
 }

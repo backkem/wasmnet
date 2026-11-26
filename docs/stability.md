@@ -85,7 +85,7 @@ versions without notice. Rustdoc and the design notes mark it **embedder surface
   page's `extension` ops and `wasmnet_web::ops::op_in`),
   and `Network::register_cable` refusing a kind twice, `Network::try_add_extension` (and
   `try_add_boxed_extension`) refusing a second declaration of an option key or op kind; portable
-  exports (`ControlCall::{invocation, invoked}`, `Invocation`, `wasmnet_core::export`:
+  exports (`ControlCall::{target, invocation, invoked}`, `Invocation`, `wasmnet_core::export`:
   `ExportCall`, `ExportRequest`, `ExportAnswer`, `Answered`, `plain`, `unversioned`;
   `Network::invoke`, `device_exports` listing every exported interface, `portable_adapter!` on a
   world that exports interfaces, `wasmnet_host::portable::{now, invoked}`, in a page

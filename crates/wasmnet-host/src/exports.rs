@@ -70,15 +70,16 @@ impl ControlHandler for Exports {
         acc: &'a Accessor<HostState>,
         call: Box<dyn ControlCall>,
     ) -> Result<ControlFuture<'a>, Box<dyn ControlCall>> {
-        let Some(invocation) = call.invocation(now(acc)) else {
-            return Err(call);
-        };
-        let Some(func) = self
-            .funcs
-            .get(&invocation.interface)
-            .and_then(|f| f.get(&invocation.function))
+        // Checked by name first: a call this device has no function for goes back untouched.
+        let Some(func) = call
+            .target()
+            .and_then(|(i, f)| self.funcs.get(i).and_then(|fs| fs.get(f)))
             .copied()
         else {
+            return Err(call);
+        };
+        let mut call = call;
+        let Some(invocation) = call.invocation(now(acc)) else {
             return Err(call);
         };
         Ok(Box::pin(async move {
