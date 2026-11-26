@@ -1,0 +1,63 @@
+package wasmnet-test:aliases@0.1.0;
+
+/// Type aliases of what a portable interface carries (`tests/portable_aliases.rs`): of
+/// primitives, of an alias, of strings, bytes, options, tuples, records and results. Nothing
+/// implements these; the adapter generated for them must compile.
+interface types {
+    type id = u32;
+    type id-again = id;
+    type label = string;
+    type byte = u8;
+    type blob = list<u8>;
+    type maybe = option<id>;
+    type pair = tuple<id-again, label>;
+    type answer = result<id, label>;
+
+    record entry {
+        id: id-again,
+        label: label,
+        data: list<byte>,
+        tags: list<label>,
+        pair: pair,
+    }
+
+    type entry-again = entry;
+
+    variant outcome {
+        done(id-again),
+        failed(label),
+    }
+}
+
+/// Imported: every alias as an argument and as a result, alone and inside other types.
+interface calls {
+    use types.{id, id-again, label, byte, blob, maybe, pair, answer, entry-again, outcome};
+
+    put: func(id: id-again, label: label, data: blob, raw: list<byte>) -> answer;
+    get: func(id: id) -> maybe;
+    pairs: func(ids: list<id>, labels: list<label>) -> list<pair>;
+    echo: func(e: entry-again) -> entry-again;
+    next: func() -> id-again;
+    name: func() -> label;
+    bytes: func() -> list<byte>;
+    settle: func(o: outcome) -> option<outcome>;
+}
+
+/// Exported: the same, called by name.
+interface shown {
+    use types.{id, id-again, label, byte, blob, maybe, pair, answer, entry-again, outcome};
+
+    put: func(id: id-again, label: label, data: blob, raw: list<byte>) -> answer;
+    get: func(id: id) -> maybe;
+    pairs: func(ids: list<id>, labels: list<label>) -> list<pair>;
+    echo: func(e: entry-again) -> entry-again;
+    next: func() -> id-again;
+    name: func() -> label;
+    bytes: func() -> list<byte>;
+    settle: func(o: outcome) -> option<outcome>;
+}
+
+world aliases {
+    import calls;
+    export shown;
+}
