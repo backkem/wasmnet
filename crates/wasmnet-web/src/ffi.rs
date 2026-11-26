@@ -2,8 +2,11 @@
 //!
 //! # Conventions
 //!
-//! * One module instance holds at most one network (`wn_network_new` replaces it). Device
-//!   indices (`dev`) are the network's creation order: the first device added is 0.
+//! * One module instance holds at most one network at a time. `wn_network_new` replaces it
+//!   (as does an embedder's `install::new_network`), and tells JavaScript with
+//!   `js_network_replaced`: from then on the old network's guests are JavaScript's to refuse,
+//!   since device indices start at 0 again. Device indices (`dev`) are the network's creation
+//!   order: the first device added is 0.
 //! * Bytes cross as `(ptr, len)` in this module's memory. JavaScript allocates what it passes in
 //!   with [`wn_alloc`] and frees it with [`wn_free`] once the call returned; this module never
 //!   keeps a pointer past the call that received it.
@@ -56,6 +59,7 @@
 //! | `js_memory(dev) -> i64` | the bytes device `dev`'s linear memories hold now, all together; -1 unknown |
 //! | `js_stdin_ready(dev)` | bytes for device `dev`'s stdin arrived (`wn_stdin` has them): a waiting read may go on |
 //! | `js_compile(digest, len, bytes, len) -> i32` | make a supplied component instantiable as `digest` (the core checked it already); 0, or a negative error. May suspend (JSPI) |
+//! | `js_network_replaced(seed: u64)` | the network was replaced by an empty one with `seed` (`wn_network_new` on a module that has one, or an embedder's `install::new_network`): drop what is kept of the old network and refuse its guests' calls from now on |
 //! | `js_panic(msg, len)` | a panic's message, before the module traps |
 
 #![allow(unsafe_code)] // FFI exports and imports; every unsafe block is commented.
@@ -97,6 +101,7 @@ mod js {
             bytes: *const u8,
             bytes_len: usize,
         ) -> i32;
+        pub fn js_network_replaced(seed: u64);
         pub fn js_panic(msg: *const u8, len: usize);
     }
 }
@@ -250,6 +255,11 @@ impl JsHost for Js {
             js::js_compile(digest.as_ptr(), digest.len(), bytes.as_ptr(), bytes.len())
         })
     }
+
+    fn network_replaced(&self, seed: u64) {
+        // SAFETY: a plain value.
+        unsafe { js::js_network_replaced(seed) }
+    }
 }
 
 thread_local! {
@@ -263,6 +273,8 @@ thread_local! {
 #[derive(Default)]
 struct State {
     registry: Option<Registry>,
+    /// The network's portable interfaces, as `wn_interfaces` answers them.
+    interfaces: Vec<u8>,
     result: Vec<u8>,
 }
 
@@ -377,11 +389,21 @@ pub extern "C" fn wn_result_len() -> usize {
 
 // ---- the network -------------------------------------------------------------------------
 
-/// Creates an empty network with `seed`, replacing (and dropping) the previous one: JavaScript
-/// drops the old devices' instances first. Answers 0, or -1 (message in the result) when a
-/// network export is still running. Never calls JavaScript.
+/// Creates an empty network with `seed`, or replaces the module's network with one
+/// ([`Network::replace`]: the old devices are released, then `js_network_replaced(seed)` tells
+/// JavaScript to drop what it kept of the old network, then the new one is made). The installer
+/// runs on it. Answers 0, or -1 (message in the result) when a network export is still running.
+/// Calls no JavaScript but `js_release` and `js_network_replaced`, and only when it replaces.
 #[unsafe(no_mangle)]
 pub extern "C" fn wn_network_new(seed: u64) -> i32 {
+    match new_network(seed) {
+        Ok(()) => 0,
+        Err(e) => fail(e),
+    }
+}
+
+/// `wn_network_new`, also for an embedder's own export ([`crate::install::new_network`]).
+pub(crate) fn new_network(seed: u64) -> Result<(), String> {
     static HOOK: Once = Once::new();
     HOOK.call_once(|| {
         std::panic::set_hook(Box::new(|info| {
@@ -390,24 +412,26 @@ pub extern "C" fn wn_network_new(seed: u64) -> i32 {
             unsafe { js::js_panic(msg.as_ptr(), msg.len()) }
         }));
     });
-    let replaced = NETWORK.with(|n| match n.try_borrow_mut() {
-        Ok(mut guard) => {
-            let mut network = Network::new(Js, seed);
-            crate::install::run(network.sim_mut());
-            let registry = network.registry().clone();
-            // The old network (if any) is dropped here, before its successor is published.
-            *guard = Some(network);
-            Ok(registry)
-        }
-        Err(_) => Err(()),
+    let made = NETWORK.with(|n| {
+        let mut guard = n
+            .try_borrow_mut()
+            .map_err(|_| "refused: a network call is still running".to_owned())?;
+        let network = match guard.as_mut() {
+            Some(network) => {
+                network.replace(seed);
+                network
+            }
+            None => guard.insert(Network::new(Js, seed)),
+        };
+        crate::install::run(network.sim_mut());
+        Ok::<_, String>((network.registry().clone(), interfaces_of(network)))
     });
-    match replaced {
-        Ok(registry) => {
-            STATE.with_borrow_mut(|s| s.registry = Some(registry));
-            0
-        }
-        Err(()) => fail("refused: a network call is still running"),
-    }
+    let (registry, interfaces) = made?;
+    STATE.with_borrow_mut(|s| {
+        s.registry = Some(registry);
+        s.interfaces = interfaces;
+    });
+    Ok(())
 }
 
 /// Adds a device called `name` (UTF-8 at `name`), made from `component` (a key JavaScript
@@ -912,14 +936,28 @@ pub extern "C" fn wn_import_drop(dev: u32, name: *const u8, len: usize, handle: 
 }
 
 /// The portable interfaces the network's extensions serve, for the page to link: an `infra
-/// reply` whose value is a list of records `{name, functions, resources}`; its length.
+/// reply` whose value is a list of records `{name, functions, resources}`; its length. Read when
+/// the network was made, so it may be asked at any time, also inside a step.
 #[unsafe(no_mangle)]
 pub extern "C" fn wn_interfaces() -> i32 {
-    let list =
-        NETWORK.with_borrow(|n| n.as_ref().map(|n| n.sim().interfaces()).unwrap_or_default());
+    let reply = STATE.with_borrow(|s| s.interfaces.clone());
+    if reply.is_empty() {
+        // No network yet: none.
+        return set_result(codec::encode_infra_reply(&Reply::Value(Value::List(
+            Vec::new(),
+        ))));
+    }
+    set_result(reply)
+}
+
+/// The `wn_interfaces` answer for a network just made.
+fn interfaces_of(network: &Network<Js>) -> Vec<u8> {
     let strs = |v: Vec<String>| Value::List(v.into_iter().map(Value::Str).collect());
     let value = Value::List(
-        list.into_iter()
+        network
+            .sim()
+            .interfaces()
+            .into_iter()
             .map(|i| {
                 Value::record(vec![
                     ("name", Value::Str(i.name)),
@@ -929,7 +967,7 @@ pub extern "C" fn wn_interfaces() -> i32 {
             })
             .collect(),
     );
-    set_result(codec::encode_infra_reply(&Reply::Value(value)))
+    codec::encode_infra_reply(&Reply::Value(value))
 }
 
 // ---- the devices' imports ----------------------------------------------------------------

@@ -73,6 +73,20 @@ pub fn with_network<R>(f: impl FnOnce(&mut PageNetwork) -> R) -> Option<R> {
     crate::ffi::with_sim(f)
 }
 
+/// Replaces the network on this module instance with an empty one with `seed`, from an
+/// embedder's own export: what the page's `Network.reset(seed)` does, by the same code. The old
+/// network's devices are released and the page drops everything it kept of that network
+/// (instances, timers, waits, stdin reads, its journal cursor) before the new one exists; the
+/// installer runs on the new one, and the page reads its interfaces again. What lives on the
+/// module instance survives: the installer, the embedder's own state, the page's components and
+/// their compiled modules. Refused while a network export runs, also from inside
+/// [`with_network`]. Devices added afterwards, through [`with_network`], are instantiated by the
+/// page (the export must then be called `promising`, as `js_instantiate` suspends).
+#[cfg(target_arch = "wasm32")]
+pub fn new_network(seed: u64) -> Result<(), String> {
+    crate::ffi::new_network(seed)
+}
+
 /// What an embedder's export answers ([`export!`](crate::export!)): bytes in the module's result
 /// buffer, which the page reads with `Network.callExport`.
 #[cfg(target_arch = "wasm32")]

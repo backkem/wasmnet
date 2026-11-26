@@ -180,4 +180,13 @@ pub trait JsHost {
         let _ = (digest, bytes);
         Err("this page runs no supplied components".to_owned())
     }
+    /// The network was replaced ([`crate::Network::replace`]): the old one is gone (its devices
+    /// were released first) and an empty one with `seed` follows, numbering its devices from 0
+    /// again. JavaScript drops everything it kept for the old network (instances, timers, waits,
+    /// stdin reads, its journal cursor, the interfaces it read) and from now on refuses the old
+    /// guests' calls, which would otherwise reach the new network's devices of the same index.
+    /// The default does nothing.
+    fn network_replaced(&self, seed: u64) {
+        let _ = seed;
+    }
 }

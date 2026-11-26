@@ -129,7 +129,8 @@ impl Device {
 #[derive(Clone)]
 struct Wasm {
     engine: Engine,
-    seed: u64,
+    /// The network's seed, for its devices' entropy (a replacement sets it again).
+    seed: Rc<std::cell::Cell<u64>>,
     /// By key; a supplied component under its digest ([`JsHost::compile`]).
     components: Rc<RefCell<BTreeMap<String, Component>>>,
     devices: Rc<RefCell<BTreeMap<u32, Device>>>,
@@ -158,7 +159,7 @@ impl Wasm {
         .collect();
         Self {
             engine,
-            seed,
+            seed: Rc::new(std::cell::Cell::new(seed)),
             components: Rc::new(RefCell::new(components)),
             devices: Rc::default(),
             now: Now(Arc::default()),
@@ -442,7 +443,7 @@ impl JsHost for Wasm {
             .ok_or_else(|| format!("no component {component}"))?;
         let c = &c;
         let registry = registry();
-        let entropy = DeviceEntropy::new(self.seed, name);
+        let entropy = DeviceEntropy::new(self.seed.get(), name);
         let insecure_seed = entropy.insecure_seed_u128();
         let mut b = WasiCtxBuilder::new();
         b.args(&registry.args(dev))
@@ -639,6 +640,13 @@ impl JsHost for Wasm {
             Reply::Failed(_) => Ok(None),
         }
     }
+
+    /// What `network.ts` does: the old network's instances go, and the next devices' entropy
+    /// comes from `seed`.
+    fn network_replaced(&self, seed: u64) {
+        self.devices.borrow_mut().clear();
+        self.seed.set(seed);
+    }
 }
 
 // ---- one scenario, two backends ------------------------------------------------------------
@@ -766,14 +774,26 @@ struct Web(wasmnet_web::Network<Wasm>);
 
 impl Web {
     fn new(seed: u64) -> Self {
-        let wasm = Wasm::new(seed);
-        let mut net = wasmnet_web::Network::new(wasm.clone(), seed);
+        let mut web = Self(wasmnet_web::Network::new(Wasm::new(seed), seed));
+        web.install();
+        web
+    }
+
+    /// What a page module's installer does on every network it makes (`wn_install`), and the
+    /// registry the device-side calls go to.
+    fn install(&mut self) {
+        let net = &mut self.0;
         REGISTRY.set(Some(net.registry().clone()));
         net.sim_mut().add_extension(pad());
         net.sim_mut().add_extension(wasmnet_disk::Disks::default());
         net.sim_mut()
             .set_infra_catalog(CATALOG.map(String::from).to_vec());
-        Self(net)
+    }
+
+    /// The network replaced by an empty one with `seed`, as `wn_network_new` does it.
+    fn replace(&mut self, seed: u64) {
+        self.0.replace(seed);
+        self.install();
     }
 }
 
@@ -2036,4 +2056,71 @@ fn disk_faults_by_name_from_plain_objects_apply_alike() {
         );
         s
     });
+}
+
+// ---- networks in sequence -----------------------------------------------------------------
+
+/// Two pad probes, one faulted inside its third append: what the replacement tests run.
+fn pads(net: &mut dyn Backend) {
+    let options = DeviceOptions::default().crash_alone(true);
+    net.add(
+        "p",
+        "pad_probe",
+        config(&[("period", "10ms")]),
+        options.clone(),
+    );
+    let mut faulty = options;
+    faulty
+        .ext
+        .set(wasmnet_pad::PadOptions::default().fault_at(3));
+    net.add("q", "pad_probe", config(&[("period", "15ms")]), faulty);
+}
+
+/// The browser backend's half of a page's networks in sequence: a network replaced in the middle
+/// of its run (devices with pending deadlines, a disk with an unsynced tail, a controller between
+/// its steps) leaves nothing in the next one. The next one's journal is a fresh network's at its
+/// seed, twice; the old network's registry finds no device any more, so an old guest's late call
+/// reaches nothing; and the host is told before the new network exists.
+#[test]
+fn a_network_replaced_in_mid_run_leaves_no_trace() {
+    let seed = 9;
+    let mut fresh = Web::new(seed);
+    pads(&mut fresh);
+    fresh.run_to(60 * MS);
+    let want = fresh.journal();
+    assert!(
+        want.iter()
+            .any(|e| matches!(&e.record, Record::Event { kind, .. } if kind == "pad-append")),
+        "{want:?}"
+    );
+
+    let mut web = Web::new(3);
+    let _ = disks(&mut web);
+    let mut options = DeviceOptions::default().crash_alone(true);
+    options.ext.set(wasmnet_disk::DiskOptions::new(vec![
+        wasmnet_disk::DiskSpec::new("log").durability(wasmnet_disk::Durability::OnSync),
+    ]));
+    web.add("late", "disk_probe", config(&[("period", "10ms")]), options);
+    web.run_to(105 * MS);
+    let before = web.journal().len();
+    assert!(before > 0);
+    let old = web.0.registry().clone();
+    for _ in 0..2 {
+        web.replace(seed);
+        assert!(web.journal().is_empty(), "{:?}", web.journal());
+        assert!(web.0.sim().op_states().is_empty());
+        // What the old devices still call reaches no device of the new network.
+        let orphans = old.orphans();
+        old.log(0, wasmnet_core::Level::Info, "late".into());
+        old.transmit(1, 0, vec![0; 64]);
+        assert_eq!(old.orphans(), orphans + 2);
+        pads(&mut web);
+        web.run_to(60 * MS);
+        assert_eq!(web.journal(), want);
+        assert_eq!(
+            web.disk_digest("p", "state"),
+            None,
+            "the old network's disks went with it"
+        );
+    }
 }

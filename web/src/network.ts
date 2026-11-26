@@ -20,7 +20,8 @@
 //
 // The boundary is documented in crates/wasmnet-web/src/ffi.rs (exports `wn_*`, imports
 // `wasmnet_js.*`, who allocates, re-entry) and codec.rs (the encodings). One `Network` per
-// Worker: jco's runtime and the kit's event loop are global, so a fresh run is a fresh Worker.
+// Worker: jco's runtime and the kit's event loop are global. It runs one network at a time;
+// `reset(seed)` replaces it with a fresh one (docs/design/browser.md, "Networks in sequence").
 
 import { instantiate, unversioned, type Imports } from './codelib-web/dist/load.js';
 import { settle, touch, until } from './codelib-web/dist/loop.js';
@@ -271,9 +272,29 @@ const jspi = WebAssembly as unknown as {
 /** The exports that may wait for a `Suspending` import: wrapped with `promising`. */
 const PROMISING = ['wn_add_device', 'wn_step', 'wn_finish', 'wn_command', 'wn_invoke', 'wn_counters'] as const;
 
+/**
+ * The exports a device's guest reaches (its imports call them), by device index. A guest of a
+ * network that was replaced must not reach them: its index now names a device of the next
+ * network. Those that answer something throw for it; those that only report are dropped.
+ */
+const DEVICE_ANSWERS = ['wn_now', 'wn_wall_now', 'wn_random_u64', 'wn_random_fill', 'wn_insecure_seed', 'wn_config_get', 'wn_config_all', 'wn_args', 'wn_env', 'wn_stdin', 'wn_infra', 'wn_infra_wait', 'wn_import', 'wn_timer'] as const;
+const DEVICE_REPORTS = ['wn_transmit', 'wn_log', 'wn_event', 'wn_output', 'wn_import_drop', 'wn_call_done'] as const;
+const REPLACED = 'the network this device belonged to was replaced';
+
 export class Network {
   private readonly x: Exports;
-  private readonly sources: Record<string, ComponentSource>;
+  /** The components `NetworkOptions` named: what a fresh network starts with. */
+  private readonly components: Record<string, ComponentSource>;
+  /** Those and, by digest, the components controllers of this network supplied. */
+  private sources: Record<string, ComponentSource>;
+  /**
+   * Which network of this module instance is current: every device's imports and every async
+   * call carry the generation they were made in, and nothing of an older one reaches the
+   * simulator (`reset`).
+   */
+  private generation = 0;
+  /** The device-side exports as the current generation's guests see them (`deviceSide`). */
+  private guarded: { generation: number; x: Exports } | null = null;
   private readonly options: Pick<NetworkOptions, 'deviceImports' | 'compile' | 'instantiateCore'>;
   private readonly supply: NetworkOptions['supply'];
   /** Devices by index; a slot is filled while `wn_add_device` asks for it. */
@@ -293,8 +314,11 @@ export class Network {
   /** The simulator module's exports as they are (`callExport`). */
   private readonly raw: Record<string, AnyFn>;
   private readonly promisingExports = new Map<string, AnyFn>();
-  /** The portable interfaces the simulator's extensions serve (`wn_interfaces`, read at creation). */
-  private interfaces: PortableInterface[] = [];
+  /**
+   * The portable interfaces the current network's extensions serve (`wn_interfaces`, which the
+   * simulator answers at any time, also inside a step); read again after a replacement.
+   */
+  private interfaces: PortableInterface[] | null = null;
 
   private constructor(instance: WebAssembly.Instance, options: NetworkOptions) {
     const raw = instance.exports as unknown as Record<string, AnyFn>;
@@ -302,15 +326,85 @@ export class Network {
     const wrapped: Record<string, unknown> = { ...raw };
     for (const name of PROMISING) wrapped[name] = jspi.promising(raw[name]!);
     this.x = wrapped as unknown as Exports;
+    this.components = { ...options.components };
     this.sources = { ...options.components };
     this.options = { deviceImports: options.deviceImports, compile: options.compile, instantiateCore: options.instantiateCore };
     this.supply = options.supply;
     this.x.wn_install?.();
     if (this.x.wn_network_new(U64(BigInt(options.seed))) !== 0) throw new Error(this.resultText());
-    // The portable interfaces the installed extensions serve: read once, here, since devices are
-    // also instantiated inside a step, when the simulator cannot be asked.
-    const served = codec.decodeInfraReply(this.result(this.x.wn_interfaces()));
-    this.interfaces = ('value' in served ? served.value : []) as PortableInterface[];
+  }
+
+  /**
+   * Replaces this module instance's network with an empty one with `seed`, as a fresh page would
+   * have it: the installer runs again, devices are numbered from 0 and the journal starts empty.
+   * Everything of the old network goes (its devices, links, journal, captures, operator events,
+   * catalog and supply admission, and the components its controllers supplied); its guests'
+   * pending work never reaches the new one (their timers and waits are dropped, a stdin read ends,
+   * a call of theirs is refused). What belongs to the module instance stays: the simulator, the
+   * installer and the embedder's own state in it, `NetworkOptions` and the components' compiled
+   * modules. Refused while a network call runs (a step, a device being added): finish the run
+   * first. An embedder's own export does the same with `wasmnet_web::install::new_network`.
+   */
+  reset(seed: bigint | number): void {
+    if (this.x.wn_network_new(U64(BigInt(seed))) !== 0) throw new Error(this.resultText());
+  }
+
+  /** `js_network_replaced`: drops everything kept for the old network (one implementation for `reset` and an embedder's export). */
+  private replaced(): void {
+    this.generation += 1;
+    this.guarded = null;
+    this.instances.length = 0;
+    this.pending = null;
+    this.stash = new Uint8Array();
+    this.timers.clear();
+    this.waits.clear();
+    const reads = [...this.stdinWaiters.values()];
+    this.stdinWaiters.clear();
+    this.journalNext = 0;
+    this.interfaces = null;
+    this.sources = { ...this.components };
+    // A waiting stdin read is patient work for the kit's loop: end it, so that nothing of the
+    // old network is left pending (its read sees the end of stdin, without asking the simulator).
+    for (const wake of reads) wake();
+  }
+
+  /** Throws when the network was replaced since `generation`. */
+  private current(generation: number, what: string): void {
+    if (generation !== this.generation) throw new Error(`the network was replaced while ${what}`);
+  }
+
+  /**
+   * The device-side exports for the guests of the current network: each refuses (or drops) a
+   * call once that network was replaced, so a late call of an old guest never reaches the device
+   * of the same index in the next one.
+   */
+  private deviceSide(): Exports {
+    if (this.guarded?.generation === this.generation) return this.guarded.x;
+    const generation = this.generation;
+    const live = () => generation === this.generation;
+    const x: Record<string, unknown> = { ...this.x };
+    for (const name of DEVICE_ANSWERS) {
+      const f = this.x[name] as unknown as AnyFn;
+      x[name] = (...args: never[]) => {
+        if (!live()) throw new Error(REPLACED);
+        return f(...args);
+      };
+    }
+    for (const name of DEVICE_REPORTS) {
+      const f = this.x[name] as unknown as AnyFn;
+      x[name] = (...args: never[]) => (live() ? f(...args) : undefined);
+    }
+    this.guarded = { generation, x: x as unknown as Exports };
+    return this.guarded.x;
+  }
+
+  /** The current network's portable interfaces (read on first use after it was made). */
+  private servedInterfaces(): PortableInterface[] {
+    if (this.interfaces === null) {
+      const served = codec.decodeInfraReply(this.result(this.x.wn_interfaces()));
+      this.interfaces = ('value' in served ? served.value : []) as PortableInterface[];
+    }
+    return this.interfaces;
   }
 
   /**
@@ -544,6 +638,9 @@ export class Network {
         self.waits.delete(wait);
         done?.(codec.decodeInfraReply(self.view(ptr, len).slice()));
       },
+      js_network_replaced: (_seed: bigint) => {
+        n()?.replaced();
+      },
       js_panic: (ptr: number, len: number) => {
         const self = n();
         self.panicked = decoder.decode(self.view(ptr, len));
@@ -560,22 +657,24 @@ export class Network {
 
   /** Reports an async export call's end to the simulator: 0 ok, 1 an app's `err`, 2 a trap. */
   private track(dev: number, call: number, p: Promise<unknown>, app: boolean): void {
+    // Its end belongs to the network it started in: dropped if that one was replaced meanwhile.
+    const x = this.deviceSide();
     p.then(
       () => {
         touch();
-        this.callDone(dev, call, 0, '');
+        this.callDone(x, dev, call, 0, '');
       },
       (err: unknown) => {
         touch();
         // jco throws a returned `result::err` as a ComponentError; anything else is a trap.
         const appError = app && (err as { constructor?: { name?: string } } | null)?.constructor?.name === 'ComponentError';
-        this.callDone(dev, call, appError ? 1 : 2, appError ? '' : message(err));
+        this.callDone(x, dev, call, appError ? 1 : 2, appError ? '' : message(err));
       },
     );
   }
 
-  private callDone(dev: number, call: number, end: number, text: string): void {
-    this.withBytes(encoder.encode(text), (p, l) => this.x.wn_call_done(dev, call, end, p, l));
+  private callDone(x: Exports, dev: number, call: number, end: number, text: string): void {
+    this.withBytes(encoder.encode(text), (p, l) => x.wn_call_done(dev, call, end, p, l));
   }
 
   /**
@@ -692,7 +791,9 @@ export class Network {
 
   /** Device `dev`'s world, as the kit's WASI reads it: everything from the simulator. */
   private world(dev: number): World {
-    const x = this.x;
+    // The device-side exports of this network only (`deviceSide`): an old guest's call is refused.
+    const x = this.deviceSide();
+    const generation = this.generation;
     const self = this;
     const stream = (s: RandomStream) => (s === 'secure' ? 0 : 1);
     const output = (stderr: number) => (bytes: Uint8Array) => {
@@ -704,7 +805,8 @@ export class Network {
       wallNow: () => U64(x.wn_wall_now()),
       timer: (at, wake) => {
         touch();
-        this.timers.set(x.wn_timer(dev, at), wake);
+        // A timer of a replaced network's guest never fires.
+        if (generation === this.generation) this.timers.set(x.wn_timer(dev, at), wake);
       },
       randomU64: (s) => U64(x.wn_random_u64(dev, stream(s))),
       randomFill: (s, out) => {
@@ -747,8 +849,10 @@ export class Network {
       },
       // What `Op::Stdin` wrote, queued by the simulator; a read with nothing queued waits for
       // more (the kit treats that promise as patient: under a virtual clock input may never come).
+      // A replaced network's guest reads the end of its stdin (`undefined`), asking nothing.
       stdin: () => {
-        const read = (): Uint8Array | Promise<Uint8Array> => {
+        const read = (): Uint8Array | undefined | Promise<Uint8Array | undefined> => {
+          if (generation !== self.generation) return undefined;
           const chunk = self.result(x.wn_stdin(dev));
           return chunk.length > 0 ? chunk : new Promise<void>((wake) => self.stdinWaiters.set(dev, wake)).then(read);
         };
@@ -758,9 +862,9 @@ export class Network {
   }
 
   /** One `wasmnet:infra` call, served by the simulator; its error is thrown, as jco expects. */
-  private infra(dev: number, fn: string, args: unknown[]): unknown {
+  private infra(x: Exports, dev: number, fn: string, args: unknown[]): unknown {
     touch();
-    const len = this.withBytes(codec.encodeInfraCall(fn, args), (p, l) => this.x.wn_infra(dev, p, l));
+    const len = this.withBytes(codec.encodeInfraCall(fn, args), (p, l) => x.wn_infra(dev, p, l));
     const reply = codec.decodeInfraReply(this.result(len));
     if ('value' in reply) return reply.value;
     if ('error' in reply) throw { payload: reply.error };
@@ -768,14 +872,14 @@ export class Network {
   }
 
   /** A `wasmnet:infra` call that waits (`changes.wait`, `changes.wait-any`): settles when the simulator answers it (during a later step). */
-  private infraWait(dev: number, fn: string, args: unknown[]): Promise<unknown> {
+  private infraWait(x: Exports, dev: number, fn: string, args: unknown[]): Promise<unknown> {
     touch();
     const settle = (reply: codec.InfraReply): Promise<unknown> => {
       if ('value' in reply) return Promise.resolve(reply.value);
       if ('error' in reply) return Promise.reject({ payload: reply.error });
       return Promise.reject(new Error(reply.failed));
     };
-    const id = this.withBytes(codec.encodeInfraCall(fn, args), (p, l) => this.x.wn_infra_wait(dev, p, l));
+    const id = this.withBytes(codec.encodeInfraCall(fn, args), (p, l) => x.wn_infra_wait(dev, p, l));
     if (id < 0) return settle(codec.decodeInfraReply(this.result()));
     return new Promise((resolve) => this.waits.set(id, resolve)).then((reply) => settle(reply as codec.InfraReply));
   }
@@ -808,9 +912,9 @@ export class Network {
   }
 
   /** One call of a portable interface (`interface#function`), served by the simulator; its error is thrown, as jco expects. */
-  private portable(dev: number, call: string, args: unknown[]): unknown {
+  private portable(x: Exports, dev: number, call: string, args: unknown[]): unknown {
     touch();
-    const len = this.withWriter(codec.infraCallWriter(call, args), (p, l) => this.x.wn_import(dev, p, l));
+    const len = this.withWriter(codec.infraCallWriter(call, args), (p, l) => x.wn_import(dev, p, l));
     const reply = codec.decodeInfraReply(this.result(len));
     if ('value' in reply) return reply.value;
     if ('error' in reply) throw { payload: reply.error };
@@ -824,8 +928,8 @@ export class Network {
    * `codec.ResourceHandle`, so they cross as handles); a handle the server answers comes back
    * as an instance of its class, at the top of an answer or inside an `option`.
    */
-  private portableImports(dev: number): Imports {
-    const interfaces = this.interfaces;
+  private portableImports(x: Exports, dev: number): Imports {
+    const interfaces = this.servedInterfaces();
     const classes = new Map<string, new (...args: unknown[]) => codec.ResourceHandle>();
     const wrap = (v: unknown): unknown => {
       if (v instanceof codec.ResourceHandle) {
@@ -843,14 +947,14 @@ export class Network {
         // jco constructs it for the WIT constructor (`new Note(name)`): the server makes the note.
         const cls = class extends codec.ResourceHandle {
           constructor(...args: unknown[]) {
-            const made = args[0] === FROM_HANDLE ? args[1] : ctor ? (self.portable(dev, ctor, args) as codec.ResourceHandle).handle : undefined;
+            const made = args[0] === FROM_HANDLE ? args[1] : ctor ? (self.portable(x, dev, ctor, args) as codec.ResourceHandle).handle : undefined;
             if (typeof made !== 'number') throw new Error(`${r} has no constructor`);
             super(r, made);
           }
         };
         Object.defineProperty(cls, 'name', { value: pascal(r) });
         const dispose = function (this: codec.ResourceHandle) {
-          self.withBytes(encoder.encode(`${i.name}#${r}`), (p, l) => self.x.wn_import_drop(dev, p, l, this.handle));
+          self.withBytes(encoder.encode(`${i.name}#${r}`), (p, l) => x.wn_import_drop(dev, p, l, this.handle));
         };
         const proto = cls.prototype as unknown as Record<symbol, unknown>;
         proto[Symbol.for('dispose')] = dispose;
@@ -860,7 +964,7 @@ export class Network {
         obj[pascal(r)] = cls;
       }
       for (const f of i.functions) {
-        const call = (args: unknown[]) => wrap(this.portable(dev, `${i.name}#${f}`, args));
+        const call = (args: unknown[]) => wrap(this.portable(x, dev, `${i.name}#${f}`, args));
         const m = /^\[(constructor|method|static)\]([^.]+)(?:\.(.+))?$/.exec(f);
         if (!m) {
           obj[camel(f)] = (...args: unknown[]) => call(args);
@@ -880,18 +984,19 @@ export class Network {
   }
 
   private imports(dev: number): Imports {
-    const x = this.x;
+    // The device-side exports of this network only (`deviceSide`): an old guest's call is refused.
+    const x = this.deviceSide();
     const infra: Imports = { 'wasmnet:infra/types': {} };
     for (const [iface, fns] of Object.entries(INFRA)) {
-      infra[`wasmnet:infra/${iface}`] = Object.fromEntries(fns.map((f) => [f, (...args: unknown[]) => this.infra(dev, `${iface}.${kebab(f)}`, args)]));
+      infra[`wasmnet:infra/${iface}`] = Object.fromEntries(fns.map((f) => [f, (...args: unknown[]) => this.infra(x, dev, `${iface}.${kebab(f)}`, args)]));
     }
     for (const [iface, fns] of Object.entries(INFRA_WAITS)) {
-      infra[`wasmnet:infra/${iface}`] = Object.fromEntries(fns.map((f) => [f, (...args: unknown[]) => this.infraWait(dev, `${iface}.${kebab(f)}`, args)]));
+      infra[`wasmnet:infra/${iface}`] = Object.fromEntries(fns.map((f) => [f, (...args: unknown[]) => this.infraWait(x, dev, `${iface}.${kebab(f)}`, args)]));
     }
     return {
       ...wasiImports(this.world(dev)),
       ...infra,
-      ...this.portableImports(dev),
+      ...this.portableImports(x, dev),
       'wasmnet:link/types': {},
       'wasmnet:link/wire': {
         transmit: (port: number, frame: Uint8Array) => {
@@ -925,7 +1030,10 @@ export class Network {
     // The device's index: the network numbers devices in creation order, and every device it
     // created (also while running) has its slot here.
     const index = this.instances.length;
-    this.pending = { index, instance: await this.load(index, name, component) };
+    const generation = this.generation;
+    const instance = await this.load(index, name, component);
+    this.current(generation, `${name} was being made`);
+    this.pending = { index, instance };
     const pairs = Object.entries(config).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
     const n = encoder.encode(name);
     const c = encoder.encode(component);
@@ -993,10 +1101,15 @@ export class Network {
       const fresh = this.journalFrom(this.journalNext);
       if (fresh.length > 0) onJournal(fresh);
     };
+    const generation = this.generation;
     let ok = await this.step(U64(this.x.wn_now()));
     while (ok) {
       report();
+      // `reset` between two steps (from `onJournal`, or anything that ran while this waited):
+      // this run's network is gone, and its guests' pending work is not this run's to settle.
+      this.current(generation, 'it ran');
       await settle();
+      this.current(generation, 'it ran');
       if (this.panicked !== null) break;
       if (this.x.wn_take_dirty() !== 0) {
         ok = await this.step(U64(this.x.wn_now()));

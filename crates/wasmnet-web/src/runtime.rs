@@ -406,6 +406,13 @@ impl<H: JsHost + Clone + Unpin + 'static> JsRuntime<H> {
     pub fn host(&self) -> &H {
         &self.host
     }
+
+    /// Forgets every device and supplied component (its network was dropped): what the runtime
+    /// still holds afterwards is its few empty maps.
+    pub(crate) fn forget(&self) {
+        self.registry.clear();
+        self.supplied.borrow_mut().clear();
+    }
 }
 
 impl<H: JsHost + Clone + Unpin + 'static> Runtime for JsRuntime<H> {

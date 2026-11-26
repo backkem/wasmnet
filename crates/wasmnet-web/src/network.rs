@@ -28,9 +28,10 @@ pub enum RunOutcome {
 
 /// A virtual network whose devices JavaScript supplies.
 ///
-/// The simulator borrows its runtime for its whole life, so [`Network::new`] leaks one small
-/// allocation (the runtime: the host handle and an empty registry); everything the devices
-/// hold is released when the network is dropped.
+/// The simulator borrows its runtime for its whole life, so [`Network::new`] (and each
+/// [`Network::replace`]) leaks one small allocation (the runtime: the host handle and an empty
+/// registry, about a hundred bytes); everything the devices hold is released when the network is
+/// dropped or replaced.
 pub struct Network<H: JsHost + Clone + Unpin + 'static> {
     runtime: &'static JsRuntime<H>,
     /// `Some` until dropped (it must go before the registry is emptied).
@@ -57,6 +58,21 @@ impl<H: JsHost + Clone + Unpin + 'static> Network<H> {
             failure: None,
             steps: 0,
         }
+    }
+
+    /// Replaces this network with an empty one with `seed`, on the same host: the old network's
+    /// devices are released ([`JsHost::release`]) and its state dropped, then the host is told
+    /// ([`JsHost::network_replaced`]), then the new network is made. Nothing of the old network
+    /// reaches the new one: a fresh registry serves the new devices (the old one's handles find
+    /// no device), and the host refuses the old guests' calls. What the embedder set up on the
+    /// old network (extensions, catalog, admission, a resolver) is set up again on the new one;
+    /// [`new`](Self::new)'s note on the runtime applies to each network.
+    pub fn replace(&mut self, seed: u64) {
+        let host = self.runtime.host().clone();
+        drop(self.sim.take());
+        self.runtime.forget();
+        host.network_replaced(seed);
+        *self = Self::new(host, seed);
     }
 
     fn sim_ref(&self) -> &wasmnet_core::Network<'static, JsRuntime<H>> {
