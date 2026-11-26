@@ -348,7 +348,7 @@ per list element made a 16 MiB value a hundred times slower and passed wasmtime'
 hostcall fuel at about 4 MiB.
 
 **In a page** nothing is generated: the binding reads the network's interfaces when it is
-created (`wn_interfaces`) and builds each device's imports from the names, a function per
+created, and again for each network that replaces it (`wn_interfaces`), and builds each device's imports from the names, a function per
 function (calling `wn_import`) and a class per resource. The extension is compiled into the
 page's simulator module by the embedder's own build ([browser.md](browser.md#an-embedders-own-page-module)).
 
@@ -462,3 +462,10 @@ loop runs from an embedder's own export on its module (`wn_pad_run` in
 [crates/wasmnet-pad/examples/pad_page.rs](../../crates/wasmnet-pad/examples/pad_page.rs), called
 `promising`); it does not let JavaScript settle between instants, so it suits stepped devices,
 while the binding's `run` serves async ones.
+
+**An embedder's own networks in a page.** An export of the embedder's module may also open the
+network it runs: `wasmnet_web::install::new_network(seed)` replaces the module's network with an
+empty one (the installer runs on it, the page drops everything of the old one), devices added
+through `with_network` are instantiated by the page from inside the export, and between steps
+the export may wait in a `Suspending` import of its own as long as it holds no borrow of the
+network (`wn_pad_sequence` in the same example; [browser.md](browser.md#networks-in-sequence)).

@@ -71,7 +71,10 @@ versions without notice. Rustdoc and the design notes mark it **embedder surface
   the value model `wasmnet_core::value`, `wasmnet_host::portable` with `portable_adapter!`, and in
   a page `wn_import`, `wn_import_drop`, `wn_interfaces` and an embedder's own page module
   (`wasmnet_web::install`, `install!`, `export!`, `install::with_network`, and in the binding
-  `NetworkOptions.imports` and `Network.callExport`); extension options and operator events from
+  `NetworkOptions.imports` and `Network.callExport`), and networks in sequence on one module
+  instance (`install::new_network`, `wasmnet_web::Network::replace`, `JsHost::network_replaced`,
+  the import `js_network_replaced`, and in the binding `Network.reset`,
+  [design/browser.md](design/browser.md#networks-in-sequence)); extension options and operator events from
   generic values (`ExtOption`, `ExtOpParser`, `NetworkExtension::{options, check_options, ops}`,
   `Network::{parse_option, set_option, option_keys, parse_op}`, `ExtOptions::set_value`,
   `Op::ExtensionAt` and `Op::ExtensionAtNamed`, `OpContext::device`, a spec's extension keys, the

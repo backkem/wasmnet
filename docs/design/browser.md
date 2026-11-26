@@ -155,9 +155,11 @@ checks the lines against the native example's output (`NATIVE_JOURNAL`, see
 [web/README.md](../../web/README.md)).
 
 Chromium only: jco's async runtime needs WebAssembly JSPI (`WebAssembly.Suspending`,
-`WebAssembly.promising`). The simulator runs in a Worker, one network per Worker, because jco's
-runtime and the kit's event loop are global; a page runs each network in a fresh Worker and can
-compile the core modules once and pass them in.
+`WebAssembly.promising`). The simulator runs in a Worker, one module instance per Worker,
+because jco's runtime and the kit's event loop are global; it holds one network at a time and
+runs networks in sequence ([below](#networks-in-sequence)). A page that wants a clean jco runtime
+as well runs each network in a fresh Worker, and can compile the core modules once and pass them
+in.
 
 ## Memory
 
@@ -305,12 +307,60 @@ what its extensions need from the page:
 - `NetworkOptions.imports` adds import modules beside `wasmnet_js`. A function that must wait for
   the page is passed wrapped in `WebAssembly.Suspending`, and the export that reaches it is
   called with `callExport(name, bytes, { promising: true })`, which answers a promise.
+- `wasmnet_web::install::new_network(seed)` replaces the module's network with an empty one
+  ([Networks in sequence](#networks-in-sequence)). An export that then adds devices through
+  `with_network` reaches the page's `js_instantiate`, which suspends: call it `promising`.
 
 **Options and ops from plain objects.** A device's options take the keys of the network's
 extensions as fields (`{ crashAlone: true, 'pad.fault-at': 3 }`), and an operator event of an
 extension's is `{ kind: 'extension', device, op, value, at }`, timed at `device`; the
 simulator hands each to the extension's parser (`NetworkExtension::options`, `ops`), and
 refuses a field or an `op` no extension declares.
+
+## Networks in sequence
+
+A module instance holds one network at a time and may run any number of them in sequence, each
+with its own seed. Two callers, one code path (`wn_network_new`, which calls
+`wasmnet_web::Network::replace` when the module has a network):
+
+- the binding: `Network.reset(seed)`, between runs;
+- an embedder's own export: `wasmnet_web::install::new_network(seed)`, for a module that keeps
+  state of its own across networks (a session serving a sequence of calls, whose next seed is
+  known only once it has read its input).
+
+A replacement releases the old network's devices (`js_release`), tells the page
+(`js_network_replaced`), makes the new network and runs the installer on it; the page reads the
+new network's interfaces when it next builds a device's imports. It is refused while a network
+export runs (a step, a device being added, an embedder's export inside `with_network`).
+
+| Per network: goes with it | Per module instance: stays |
+|---|---|
+| the core network: devices, links, journal, captures, operator events and their states, the device table, the extensions' state (the installer adds them again), the catalog, the supply admission and the components controllers supplied | the module, the installer, the embedder's own state in the module |
+| the registry: each device's clock, entropy, config, stdin queue, timers, waits and async calls | the runtime of each earlier network, empty (about a hundred bytes each: the simulator borrows its runtime for its whole life) |
+| in the page: the device instances, the instance waiting to be claimed, timers, waits, stdin reads, the journal cursor, the interfaces read, the sources of supplied components | in the page: `NetworkOptions` (the components and their compiled core modules, the import modules, the hooks), the kit's event loop and jco's runtime |
+
+**Nothing of the old network reaches the next one.** Device indices start at 0 again, so a late
+call of an old guest would name a device of the new network. The binding numbers its networks
+(a generation) and builds every device's imports for the generation they were made in: once it
+is over, a call the simulator would answer throws, a report (a frame, a log line, an async
+call's end) is dropped, a timer never fires, a stdin read sees the end of stdin (a waiting read
+is ended at the replacement, so the kit's loop has no patient work of the old network left), and
+a wait's answer can never come, because the waits and timers were dropped with their ids. A
+`run` or `device()` of the binding that was in progress across a `reset` throws. On the Rust
+side each network has a fresh registry: a handle of the old one finds no device.
+
+The page test's step "networks in sequence" replaces a network in the middle of a run
+(controllers waiting in `changes.wait-any`, servers in `accept`, timers pending), then runs the
+example twice on networks with one seed, and requires each run's journal, outcome and captures
+to equal the example's on a fresh page at that seed. Its next step does the same from an
+embedder's export (`wn_pad_sequence` in
+[crates/wasmnet-pad/examples/pad_page.rs](../../crates/wasmnet-pad/examples/pad_page.rs)): the
+export computes a seed, calls `new_network`, adds two devices through `with_network` (the page
+instantiates them from inside the export, which is called `promising`), and runs them in six
+steps, waiting in a `Suspending` import of its own between steps while it holds no borrow of the
+network; the new network's journal must equal a fresh page's at that seed.
+`crates/wasmnet-web/tests/parity.rs` (`a_network_replaced_in_mid_run_leaves_no_trace`) checks
+the Rust half natively.
 
 ## Sites and host extensions
 
