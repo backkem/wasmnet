@@ -8,7 +8,9 @@
 //!   message;
 //! - the extension hears the device's life: notes survive a stop and a start, a crash clears
 //!   them, a controller's recreation keeps them (`DeviceLife::replaced`), a removal drops them;
-//! - two seeds, and a rerun is byte-identical.
+//! - two seeds, and a rerun is byte-identical;
+//! - a server that blocks the calling thread (waiting for another thread) leaves the run as a
+//!   server that answers at once does.
 //!
 //! Needs `wac` and `wasm-tools` on `PATH` (see `support`).
 
@@ -16,7 +18,7 @@ mod support;
 
 use std::path::Path;
 use std::process::Command;
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 
 use support::{built, config, events, field, transcript};
 use wasmnet_det_cbor::Value as Cbor;
@@ -308,4 +310,147 @@ fn an_interface_without_a_server_faults_the_device() {
         field(&crashed[0], "message"),
         "wasmnet-test:pad/notes@0.1.0 is not served to this device (no extension gave it a server)"
     );
+}
+
+// ---- a server that blocks ------------------------------------------------------------------
+
+/// A server in front of the pad's: before it serves a call of the device, it asks another
+/// thread over a channel and waits for the answer (`waits`), or serves at once.
+struct Waiting {
+    inner: Arc<dyn sim::ImportServer>,
+    waits: Option<(Mutex<mpsc::Sender<String>>, Arc<Mutex<mpsc::Receiver<()>>>)>,
+    served: Arc<Mutex<Vec<String>>>,
+}
+
+impl sim::ImportServer for Waiting {
+    fn call(&self, interface: &str, function: &str, args: Vec<sim::value::Value>) -> sim::Served {
+        if let Some((ask, answer)) = &self.waits {
+            ask.lock().unwrap().send(function.to_owned()).unwrap();
+            answer.lock().unwrap().recv().unwrap();
+        }
+        self.served.lock().unwrap().push(function.to_owned());
+        self.inner.call(interface, function, args)
+    }
+
+    fn drop_resource(&self, interface: &str, resource: &str, handle: u32) {
+        self.inner.drop_resource(interface, resource, handle);
+    }
+}
+
+/// Puts a [`Waiting`] server in front of the pad's for every device (added after the pad).
+struct Gate {
+    waits: Option<(mpsc::Sender<String>, Arc<Mutex<mpsc::Receiver<()>>>)>,
+    served: Arc<Mutex<Vec<String>>>,
+}
+
+impl sim::NetworkExtension for Gate {
+    fn device_setup(&mut self, _setup: &sim::ext::DeviceSetup<'_>, ext: &mut sim::DeviceExt) {
+        let inner = ext
+            .server(wasmnet_pad::NOTES)
+            .expect("the pad's server")
+            .clone();
+        let waits = self
+            .waits
+            .as_ref()
+            .map(|(ask, answer)| (Mutex::new(ask.clone()), answer.clone()));
+        let served = self.served.clone();
+        ext.serve(
+            wasmnet_pad::NOTES,
+            Arc::new(Waiting {
+                inner,
+                waits,
+                served,
+            }),
+        );
+    }
+}
+
+/// A server may block the calling thread on wasmtime: here every call of the device waits for
+/// another thread's answer (which sleeps first, so the device's run really is held). The run
+/// is the one a server that answers at once gives: the same journal, frames and costs (but
+/// wall time), and the same calls served in the same order, through polls, an export call
+/// between runs and a stop and start.
+#[test]
+fn a_server_that_blocks_holds_the_run_without_changing_it() {
+    let run = |blocking: bool| {
+        let w = world();
+        let mut net = Network::new(&w.host, 9);
+        net.add_extension(Pad::default());
+        let served = Arc::new(Mutex::new(Vec::new()));
+        let mut helper = None;
+        let waits = blocking.then(|| {
+            let (ask, asked) = mpsc::channel::<String>();
+            let (answer, answered) = mpsc::channel::<()>();
+            helper = Some(std::thread::spawn(move || {
+                let mut seen = Vec::new();
+                // Ends when the network (and every server in it) is dropped.
+                while let Ok(function) = asked.recv() {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    seen.push(function);
+                    if answer.send(()).is_err() {
+                        break;
+                    }
+                }
+                seen
+            }));
+            (ask, Arc::new(Mutex::new(answered)))
+        });
+        net.add_extension(Gate {
+            waits,
+            served: served.clone(),
+        });
+        let p = net
+            .device_with_options(
+                "p",
+                &w.probe,
+                config(&[("period", "10ms"), ("big", "65536")]),
+                DeviceOptions::default(),
+            )
+            .unwrap();
+        for (at, op) in [(35, Op::stop_device("p")), (40, Op::start_device("p"))] {
+            net.add_op(op, Placement::StartOf(at * MS)).unwrap();
+        }
+        net.run_until(25 * MS).unwrap();
+        let written = net
+            .invoke(
+                p,
+                sim::Invocation::new(
+                    "wasmnet-test:pad/inspect",
+                    "write",
+                    vec![
+                        sim::value::Value::str("ext"),
+                        sim::value::Value::Bytes(vec![1; 4096]),
+                    ],
+                ),
+            )
+            .unwrap();
+        net.run_until(70 * MS).unwrap();
+        let cost = net.cost_of("p");
+        let out = (
+            transcript(&net.journal()),
+            net.frames(),
+            format!("{written:?}"),
+            (cost.fuel, cost.peak_fuel, cost.peak_fuel_at),
+            (cost.calls, cost.polls, cost.idle_polls),
+            served.lock().unwrap().clone(),
+        );
+        drop(net);
+        let asked = helper.map(|h| h.join().unwrap());
+        (out, asked)
+    };
+    let (at_once, none) = run(false);
+    let (blocked, asked) = run(true);
+    assert!(none.is_none());
+    let asked = asked.expect("the helper's list");
+    assert!(at_once.0 == blocked.0, "the journals differ");
+    assert!(at_once.1 == blocked.1, "the frames differ");
+    assert_eq!(at_once.2, blocked.2);
+    assert_eq!(at_once.3, blocked.3, "fuel");
+    assert_eq!(at_once.4, blocked.4, "calls and polls");
+    assert_eq!(at_once.5, blocked.5, "the calls served");
+    // Every call waited for the other thread, in the order the device made them.
+    assert_eq!(asked, blocked.5);
+    assert!(at_once.2.contains("Ok(Ok(U64(4096)))"), "{}", at_once.2);
+    assert!(at_once.0.contains("device-started"), "{}", at_once.0);
+    assert!(asked.len() > 10, "{asked:?}");
 }

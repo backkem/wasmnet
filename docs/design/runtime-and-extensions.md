@@ -363,9 +363,16 @@ carry them yet ([known-issues.md](../known-issues.md#the-embedder-surface)).
 through the `JournalEnd` its `device_setup` was given, at the instant its clock reads. It
 never waits: an answer that depends on later events (a wait) is not expressible yet. On
 wasmtime a server may block the calling thread (a debugger holding a device until a person
-answers), which stops that device's whole run; in a page it must not, since the page has one
-thread. The order of extensions is the order they were added: `device_setup`, `device_life`
-and the servers' records follow it on both backends.
+answers); in a page it must not, since the page has one thread. A blocked server holds up the
+whole network, not only its device: the network runs on that thread (a split network, the site
+that has the device). The executor sees nothing of the wait, which happens inside the device's
+call, so idle and deadlock detection, the journal, the frames and the costs are those of a
+server that answered at once; only the wall time (`Network::set_wall_clock`) shows it
+(`a_server_that_blocks_holds_the_run_without_changing_it` in
+`crates/wasmnet-host/tests/portable.rs`: every call waits for another thread, and the run
+equals one that did not). Whatever the server waits for must not need the network to move:
+nothing reaches the network until the call returns. The order of extensions is the order they
+were added: `device_setup`, `device_life` and the servers' records follow it on both backends.
 
 **What a served call costs the device.** Only its own code's fuel: what the host does for the
 call (copying an argument in, the server reading the bytes out of the device's memory) is not
