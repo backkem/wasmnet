@@ -116,6 +116,30 @@ pub struct LinkEnd {
     pub created_at: u64,
 }
 
+impl LinkEnd {
+    /// The description of end `end` (0 or 1) of `link`: `device:port` at this end,
+    /// `peer_device:peer_port` at the other, the link created at `created_at` ns.
+    pub fn new(
+        link: impl Into<String>,
+        end: usize,
+        device: impl Into<String>,
+        port: u32,
+        peer_device: impl Into<String>,
+        peer_port: u32,
+        created_at: u64,
+    ) -> Self {
+        Self {
+            link: link.into(),
+            end,
+            device: device.into(),
+            port,
+            peer_device: peer_device.into(),
+            peer_port,
+            created_at,
+        }
+    }
+}
+
 /// The first token of a [`LinkEnd`] description: its format and version.
 pub const LINK_END_FORMAT: &str = "wasmnet-link-end/1";
 

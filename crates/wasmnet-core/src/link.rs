@@ -698,16 +698,8 @@ fn capture_header(
         let (device, port) = names[end];
         let (peer_device, peer_port) = names[1 - end];
         let description = if capture.name_ends {
-            crate::pcap::LinkEnd {
-                link: link.to_owned(),
-                end,
-                device: device.to_owned(),
-                port,
-                peer_device: peer_device.to_owned(),
-                peer_port,
-                created_at,
-            }
-            .to_string()
+            crate::pcap::LinkEnd::new(link, end, device, port, peer_device, peer_port, created_at)
+                .to_string()
         } else {
             String::new()
         };
@@ -1972,14 +1964,8 @@ mod tests {
             .iter()
             .map(|i| crate::pcap::LinkEnd::parse(i.description.as_deref().unwrap()).unwrap())
             .collect();
-        let want = |end, device: &str, port, peer: &str, peer_port| crate::pcap::LinkEnd {
-            link: "a.0-b.1".to_owned(),
-            end,
-            device: device.to_owned(),
-            port,
-            peer_device: peer.to_owned(),
-            peer_port,
-            created_at: 5,
+        let want = |end, device: &str, port, peer: &str, peer_port| {
+            crate::pcap::LinkEnd::new("a.0-b.1", end, device, port, peer, peer_port, 5)
         };
         assert_eq!(ends, [want(0, "a", 0, "b", 1), want(1, "b", 1, "a", 0)]);
         assert_eq!(cap.interfaces[0].name.as_deref(), Some("a:0"));
