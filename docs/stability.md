@@ -57,7 +57,9 @@ versions without notice. Rustdoc and the design notes mark it **embedder surface
   `Op::ResumeDevice`, `Op::CrashDevice`, `DeviceOptions::crash_alone`, `Op::Action` with
   `Network::register_action`, and `NetworkExtension::device_life`
   (`crates/wasmnet-host/tests/faults.rs`);
-- multi-site runs (`wasmnet_core::sites` and the `Network` methods for them) and the
+- multi-site runs (the crate `wasmnet-sites`, and the `Network` methods it builds on:
+  `remote_device`, `run_before`, `take_outbox`, `check_remote`, `receive_remote`, `taps`, the
+  record tags, with `SyncError`) and the
   `wasmnet:wan` carrier contract (the site-sync wire format is at version 3 since the records
   carry frame lengths and capture options; version 2 added impairments
   and the devices and links created while a network runs were added to its records);
@@ -99,7 +101,8 @@ the change's commit says what to do. Nothing here changes silently: a change tha
 device observes changes a test that compares bytes in this repository first.
 
 Other parts of the tree, for reference: `crates/wasmnet-wire` (`no_std` wire helpers: MAC
-addresses, Ethernet, pcap-ng, DHCP and DNS codecs, DNS-SD's helpers), `crates/wasmnet-app-kit` (what an app needs: its
+addresses, Ethernet, pcap-ng encoding and the strict reader `wasmnet_wire::pcap` that
+`wasmnet_core::pcap` re-exports, DHCP and DNS codecs, DNS-SD's helpers), `crates/wasmnet-app-kit` (what an app needs: its
 bindings, and what the apps here share), and four test fixtures among the components
 (`blaster`, `reflector`, `clock-probe`, `infra-script`). `crates/wasmnet-artifacts` reads and
 writes the artifact manifest (its format is versioned by its `format` key, `wasmnet-artifacts/1`)
@@ -131,7 +134,14 @@ from outside the core, so a lost constructor fails the tests.
 - **Structs an embedder reads** (results, records, statistics and costs: `LinkStats`,
   `LinkInfo`, `DeviceCost`, `FrameRecord`, `Transmit`, `DeviceView`, `pcap::Capture`,
   `CommandOutput`, `DeviceEntropy`, ...) are `#[non_exhaustive]` too: read their fields, and destructure them
-  with `..`.
+  with `..`. Code that rebuilds records it carried elsewhere (a decoder, such as the site-sync
+  format in `wasmnet-sites`) builds them with a constructor and assigns the rest:
+  `LinkInfo::new(name, ends, latency, mtu)` (up, Ethernet, no impairments, the default
+  `CaptureOptions`, no notes), `FrameRecord::new(link, from, to, sent_at, fate, len, bytes)`,
+  `Tap::new(tag, link, end, at, inbound, len, bytes)`, `RemoteArrival::new(frame_id, fate)`,
+  `LinkTransition::new(at, link, up)`, `pcap::LinkEnd::new(link, end, device, port,
+  peer_device, peer_port, created_at)`, `JournalEntry::new` and `Outcome::quiescent` and
+  `deadline`; `LinkStats` from `Default`.
 - **Enums that may grow** (outcomes, events, phases, reasons, errors: `Outcome`,
   `DevicePhase`, `Cascade`, `FrameFate`, `FrameAction`, `OpState`, `Refusal`, `dns::RData`,
   `dhcp::MessageType`, the wire codecs' errors, `mdns::Event`, ...) are `#[non_exhaustive]`: a
@@ -152,13 +162,31 @@ from outside the core, so a lost constructor fails the tests.
 - **Closed on purpose.** Some types change only with a version, and then break on purpose:
   - what mirrors a versioned format or WIT record: `PortInfo` and `DeclaredPort` (the WIT
     `port-info`), the causal key (`EventKey`, `KeyLevel`, `Ctx`, `Tag`, `Origin`), the site-sync
-    messages (`sites::Msg`, `sites::Sync`, `RemoteFrame`), `infra::{Phase, ChangeKind,
+    messages (`wasmnet_sites::{Msg, Sync}`, `RemoteFrame`), `infra::{Phase, ChangeKind,
     InfraError}` (the `wasmnet:infra` enums), `journal::{Level, Stream}`, the DHCP and DNS
     messages (`dhcp::Message`, `dns::{Message, Question, Record}`), and the browser boundary's
     value model `wasmnet_core::value::Value` (re-exported as `wasmnet_web::codec::Value`),
     `wasmnet_core::Served` and `wasmnet_web::infra::Reply`;
   - what a caller must handle in full, so that a new case is a compile error where it must be
-    handled: a backend's `Command`, the stepping results `Step` and `sites::Step`, and
+    handled: a backend's `Command`, the stepping results `Step` and `wasmnet_sites::Step`, and
     `LinkKind` (Ethernet or a registered cable kind);
   - newtypes and plain pairs: `MacAddr`, `EtherType`, `Digest`, `DeviceId`, `LinkId`,
     `PortRef`, `CableKind`.
+
+## Moved paths
+
+Capabilities leave the core for crates of their own when they can be built on its public API
+(`CONTRIBUTING.md`). A moved item keeps its old path where the dependency direction allows a
+re-export, for one revision at least; a path that cannot be kept breaks once, and is listed
+here.
+
+| Old path | New path | Old path still works |
+|---|---|---|
+| `wasmnet_core::pcap::{parse, parse_header, Capture, Interface, Packet, PcapError, LinkEnd, LINK_END_FORMAT, Direction}` | `wasmnet_wire::pcap::*` | yes: `wasmnet_core::pcap` (and `wasmnet_host::pcap`) re-export it |
+| `wasmnet_core::pcap::{MAX_NOTES, MAX_NOTE_BYTES, check_notes}` | unchanged: the core's rule for a link's notes | yes |
+| `wasmnet_core::sites::*` | `wasmnet_sites::*` (crate `wasmnet-sites`) | no: the core cannot re-export a crate that depends on it |
+| `wasmnet_host::sim::sites::*` | `wasmnet_sites::*` | for one revision: `wasmnet_host::sim` re-exports the crate as `sites` |
+| `wasmnet_core::sites::SyncError` | `wasmnet_core::SyncError` (also `wasmnet_sites::SyncError`) | through `wasmnet_host::sim::sites::SyncError` for one revision |
+
+`Network::check_remote` was crate-private and is public (embedder surface) so that the driver
+can check a peer's frames. The wire format is unchanged at version 3.

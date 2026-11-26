@@ -35,8 +35,8 @@ For embedders:
   impairments (a rate with a bounded transmit queue, seeded loss and jitter).
 - [design/topology-and-infra.md](design/topology-and-infra.md): changing a network while it runs,
   and `wasmnet:infra` for in-world controllers.
-- [design/sites.md](design/sites.md): one network split over two simulators, and the site-sync
-  wire format.
+- [design/sites.md](design/sites.md): one network split over two simulators (`crates/wasmnet-sites`),
+  and the site-sync wire format.
 - [design/browser.md](design/browser.md): the same networks in a browser tab: the simulator on
   `wasm32`, devices transpiled with jco, the stepping protocol, and why a browser run repeats
   itself without matching the native run byte for byte.

@@ -71,6 +71,7 @@ The full version is [`crates/wasmnet-host/examples/http.rs`](crates/wasmnet-host
 |---|---|
 | [`crates/wasmnet-host`](crates/wasmnet-host) | Runs a network on wasmtime: one store per device, deterministic WASI. Start here. |
 | [`crates/wasmnet-core`](crates/wasmnet-core) | The simulator itself: devices and their lifecycle, virtual clock, event queue, patch panel, link model, pcap taps. No wasmtime. |
+| [`crates/wasmnet-sites`](crates/wasmnet-sites) | One network split over two simulators: the lockstep driver, its wire format, and the merge into what one simulator records. |
 | [`crates/wasmnet-web`](crates/wasmnet-web) | The simulator for a browser, with [`web/`](web): a TypeScript binding and the page behind the link above. |
 | [`crates/wasmnet-artifacts`](crates/wasmnet-artifacts) | A revision's components as files with hashes: their manifest, and fetching a pinned set from a directory or a registry. |
 | [`crates/wasmnet-disk`](crates/wasmnet-disk) | Disks for devices, opt-in: named ordered key-value stores behind `wasi:keyvalue`, with durability modes, faults, quotas and images, on every backend. |

@@ -1,7 +1,11 @@
 # Multi-site networks: the site-sync protocol (version 3)
 
-`wasmnet_core::sites` lets two simulators run **one network split into two sites** so that the
-result is byte for byte what one simulator would have produced (**multi-site equivalence**).
+The crate [`wasmnet-sites`](../../crates/wasmnet-sites) lets two simulators run **one network
+split into two sites** so that the result is byte for byte what one simulator would have
+produced (**multi-site equivalence**). It uses the core's public API only: the core keeps the
+remote-device hooks (`Network::remote_device`, `run_before`, `take_outbox`, `check_remote`,
+`receive_remote`, `taps` and the record tags), and the crate has the driver, the wire format
+and the merge.
 Nothing in the protocol is specific to wasmnet's runtime: a simulator that implements the event
 order of [event-order.md](event-order.md), the lockstep rule below and the messages below can
 be a site.
@@ -89,9 +93,9 @@ What does not cross sites:
 
 Each output record (a journal entry, a transmitted frame, a pcap record of a WAN link, a link
 state change) is tagged with the processing context it was made in and its position there.
-Merging the two sites' records by tag (`sites::merge`) gives the single-site order. The pcap of
-a WAN link is rebuilt from both halves: the sender records a frame outbound at transmit time,
-the receiver inbound at arrival time.
+Merging the two sites' records by tag (`wasmnet_sites::merge`) gives the single-site order.
+The pcap of a WAN link is rebuilt from both halves: the sender records a frame outbound at
+transmit time, the receiver inbound at arrival time.
 
 What crosses follows each link's capture options ([links.md](links.md#what-a-link-records)),
 which every site sets alike (they are part of building the network): a frame-log record or a
@@ -152,9 +156,10 @@ Every message is one carrier message:
 Integers are unsigned LEB128 (`uv`) unless noted. `bytes` is `uv length` then the bytes;
 `string` is `bytes` holding UTF-8. A message must be consumed exactly (no trailing bytes).
 
-**HELLO (type 1)**, sent by each site before anything else (`sites::hello`, applied with
-`sites::apply_hello`): its own devices' ports. A site can wire a WAN link only after the peer's
-HELLO, because a link checks that both ports are declared and takes the smaller of their MTUs.
+**HELLO (type 1)**, sent by each site before anything else (`wasmnet_sites::hello`,
+applied with `wasmnet_sites::apply_hello`): its own devices' ports. A site can wire a WAN link
+only after the peer's HELLO, because a link checks that both ports are declared and takes the
+smaller of their MTUs.
 
 ```text
 uv count, then count x { uv device, uv ports, ports x { uv id, string name,
@@ -245,7 +250,8 @@ the unsplit one (`crates/wasmnet-host/tests/impairments.rs`).
 
 ## Limits
 
-- Two sites only: `SiteSync` drives one peer, and `sites::merge` takes two sites' records.
+- Two sites only: `SiteSync` drives one peer, and `wasmnet_sites::merge` takes two sites'
+  records.
 - RECORDS carries the journal, frames, taps, transitions and links. A device's raw stdout and
   stderr bytes (`Network::stdout`) stay on its own site; only the lines of a device created with
   `DeviceOptions::journal_stdio` travel, as journal entries.

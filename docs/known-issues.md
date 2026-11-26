@@ -86,6 +86,12 @@ here so that nobody has to find these the hard way. Each entry names where the c
   timed ones at a device (stdin, a control call, an injected frame); topology ops, link
   changes and events anchored before another event are refused. `Network::command` reaches
   only the devices of its own site ([design/sites.md](design/sites.md)).
+- **The site-sync format names the core's enums by code.** `wasmnet-sites` encodes journal
+  records, frame fates, drop reasons and outcomes with codes of its own; these enums are
+  `#[non_exhaustive]`, so a variant the core adds later is not a compile error there:
+  `Msg::encode` panics on it, naming it, until the format gets a new version and a code for it.
+  `wasmnet-host` depends on `wasmnet-sites` only to keep the old path `sim::sites` for one
+  revision ([stability.md](stability.md#moved-paths)).
 - **`Network` is large.** About ninety methods on one type; the core and the embedder surface
   are told apart only by their doc comments.
 - **Capture notes come only from the embedder.** No operator event or `wasmnet:infra` call
