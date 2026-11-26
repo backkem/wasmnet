@@ -26,7 +26,7 @@ net.device_with_options("box", &component, config, options)?;
 ```
 
 The same declaration from a controller's spec or a page's plain object is the option key
-`disks`: a list of `{name, quota, durability, initial}`, all but `name` optional
+`disk.specs` (an extension's keys carry a dot, which keeps them apart from the core's): a list of `{name, quota, durability, initial}`, all but `name` optional
 (`durability` is `each-call` or `on-sync`, `initial` an image's bytes). `check_options`
 refuses a name declared twice, an empty name, a quota of 0 or past the network's total, and a
 bad image.
@@ -145,8 +145,11 @@ clear of it.
   `Host::builder().extension(DiskAdapter)`, then `network.add_extension(Disks::default())`.
 - **A page**: the embedder's own page module installs it
   ([crates/wasmnet-disk-page](../../crates/wasmnet-disk-page): `wasmnet_web::install!` with an
-  installer that adds `Disks`, plus exports to read digests and images and to load one); the
-  page links the four interfaces from their names.
+  installer that adds `Disks`, plus `wn_disk_digest`, `wn_disk_export` and `wn_disk_load` to
+  read digests and images and to load one, for `Network.callExport`); the page links the four
+  interfaces from their names. The page test's step "disks in the page" runs the native
+  `page_scenario_native` network in Chromium and requires its 72 journal lines and six digests
+  exactly.
 
 `crates/wasmnet-disk/tests/wasmtime.rs` runs the probe device
 ([components/clock-probe/examples/disk_probe.rs](../../components/clock-probe/examples/disk_probe.rs))
@@ -162,3 +165,84 @@ A filesystem is a component that exports `wasi:filesystem` and imports a disk, c
 of an app as the netstack is (inode and extent keys, `sync` under `sync` and `sync-data`); a
 block device is one key per block with an atomic `write` for multi-block updates. Neither needs
 anything of the host: both are guest code over the same imports.
+
+## Keep your own WIT, put an adapter in front
+
+A device that already has a storage contract of its own does not have to change its imports to
+use a disk. A small component exports that contract and imports the disk; composed in front of
+the device (`wac plug device.wasm --plug adapter.wasm`), it is the only part that names the
+disk, and an embedder that served the contract from host extensions can delete them without
+touching its devices.
+
+The worked example is [components/store-adapter](../../components/store-adapter): it exports
+`wasmnet-test:bytes-store` ([wit/test-store](../../wit/test-store/store.wit): records under
+**byte** keys with an atomic write and an ordered prefix scan, and objects keyed by a 32-byte
+hash with ranged reads) over the disks `state` and `objects`. The mapping is one call each way:
+
+| Device's call | Disk call |
+|---|---|
+| `state.get` | `bucket.get` |
+| `state.write` | `ordered.write` |
+| `state.scan` | `ordered.scan` with values |
+| `objects.keep` | `ordered.write` of one set (for a typed `full`) |
+| `objects.read` | `ordered.get-range` |
+| `objects.remove` | `bucket.delete` |
+| `objects.held` | `ordered.scan` without values |
+
+Byte keys become string keys in an encoding that keeps their byte order and their prefixes, so
+a scan of a byte prefix is a scan of the encoded prefix. Two were measured
+(`components/store-adapter/src/lib.rs`, `encoding_cost`, optimised, native):
+
+| Keys | Hex | Latin-1 (each byte as the code point of that number) |
+|---|---|---|
+| 32-byte hashes | 2.00 bytes per byte; encode 108 ns, decode 174 ns | 1.50 bytes per byte; encode 198 ns, decode 300 ns |
+| an ASCII prefix and a u64 | 2.00; encode 70 ns, decode 147 ns | 1.03; encode 78 ns, decode 151 ns |
+
+The adapter uses **Latin-1**: a quarter to a half fewer key bytes (which a quota counts), ASCII
+keys stay readable in an export, and its extra 100 ns per key is noise beside a call. Both are
+order- and prefix-preserving (a property test checks it); a key of at most 1,024 bytes fits the
+disk's 4,096-byte limit either way.
+
+What the adapter costs (`crates/wasmnet-disk/tests/adapter.rs`, `adapter_cost`, wasmtime,
+optimised; one write, through the adapter against the same write straight from the device to
+the disk):
+
+| Value | Through the adapter | Straight to the disk |
+|---|---|---|
+| 64 B | 2.6 µs | 1.5 µs |
+| 4 KiB | 7.1 µs | 2.4 µs |
+| 1 MiB | 1.09 ms | 0.21 ms |
+| 16 MiB | 17.6 ms | 16.2 ms |
+
+The difference is the value crossing one more component boundary (lowered into the adapter's
+memory and lifted out of it again) and the adapter's allocations; its size cost is the adapter
+component itself (120 KB, release build) and nothing per record.
+
+## Measurements
+
+On the maintainer's machine, optimised; the tests that print them are ignored by default.
+
+**A call** (`set` plus a 16-byte `get-range`, by value size):
+
+| Value | wasmtime (`tests/wasmtime.rs`, `call_cost`) | A page in Chromium (page test, "what a disk costs") |
+|---|---|---|
+| 64 B | 1.6 µs | 39 µs |
+| 4 KiB | 1.7 µs | 47 µs |
+| 1 MiB | 0.17 ms | 0.60 ms |
+| 16 MiB | 2.4 ms | 13.9 ms |
+
+**Digest and export** of one disk (`tests/measure.rs`; native, then the page's `wasm32`
+simulator for a 64 MiB disk of 64 KiB values):
+
+| Disk | Digest | Export (into memory) |
+|---|---|---|
+| 256 MiB in 64 KiB values | 0.11 s (2.3 GB/s) | 0.04 s (7 GB/s) |
+| 256 MiB in 4 KiB values | 0.12 s (2.2 GB/s) | 0.04 s (6.5 GB/s) |
+| 74 MiB in 64-byte values (a million records) | 0.10 s (0.75 GB/s) | 0.06 s (1.3 GB/s) |
+| 1 GiB in 64 KiB values | 0.45 s | |
+| 64 MiB in 64 KiB values, in the page | 181 ms (0.35 GB/s) | 43 ms (1.5 GB/s) |
+
+**Memory per stored byte** (key and value bytes requested from the allocator, natively;
+`tests/measure.rs`): 1.00 for 64 KiB values, 1.02 for 4 KiB values, 2.19 for 64-byte values
+with 14-byte keys. That is what the 64 bytes per record of quota accounting cover. In `wasm32`
+the pointers are half the size, so small records cost less there.
