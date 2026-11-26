@@ -15,7 +15,7 @@
 // the network runs.
 
 import { serveRun } from './codelib-web/dist/worker/index.js';
-import { Network, type CommandAnswer, type ComponentSource, type Device, type JournalEntry, type Outcome } from './network.js';
+import { Network, type CommandAnswer, type ComponentSource, type Device, type DeviceDescriptor, type JournalEntry, type Outcome } from './network.js';
 
 declare const self: DedicatedWorkerGlobalScope;
 
@@ -23,7 +23,7 @@ export interface Init {
   seed: string;
   simulator: WebAssembly.Module;
   components: Record<string, ComponentSource>;
-  scenario?: 'example' | 'controls' | 'runtime' | 'portable' | 'portable-cost' | 'exports' | 'disks' | 'disk-cost' | 'sequence' | 'pad-sequence' | 'pad-fresh' | 'frames';
+  scenario?: 'example' | 'controls' | 'runtime' | 'portable' | 'portable-cost' | 'exports' | 'disks' | 'disk-cost' | 'sequence' | 'pad-sequence' | 'pad-fresh' | 'frames' | 'frames-suspending' | 'device-clock' | 'device-suspends';
 }
 
 export interface Done {
@@ -185,12 +185,17 @@ const asked: string[] = [];
 const cores = { n: 0 };
 /** How often the embedder's export waited in its own `Suspending` import (`pad-sequence`). */
 const pauses = { n: 0 };
+/** A scenario's per-device imports (`device-clock`). */
+let deviceHook: ((device: DeviceDescriptor) => Record<string, Record<string, unknown>> | undefined) | null = null;
+/** Whose core modules `instantiateCore` was asked for, in order: `<index>:<name>`. */
+const coreSeen: string[] = [];
 
 serveRun<Init, Done>(async (init, ctx) => {
   // The fixture's simulator imports `pad_page.stamp` (an embedder's own import); other modules ignore it.
   const net = await Network.create(init.simulator, {
     seed: BigInt(init.seed),
-    components: init.components,
+    // The switch also as a device whose exports answer with a promise (`device-suspends`, `frames-suspending`).
+    components: { ...init.components, 'switch-suspending': suspendingSwitch(init.components) },
     imports: {
       pad_page: {
         stamp: (n: number) => n + 1,
@@ -206,10 +211,11 @@ serveRun<Init, Done>(async (init, ctx) => {
     // The per-device imports and the kit's core hook, passed through: what they were asked.
     deviceImports: (d) => {
       asked.push(`${d.name}:${d.component}`);
-      return undefined;
+      return deviceHook?.(d);
     },
-    instantiateCore: async (module, imports) => {
+    instantiateCore: async (module, imports, device) => {
       cores.n += 1;
+      coreSeen.push(`${device.index}:${device.name}`);
       return WebAssembly.instantiate(module, imports);
     },
   });
@@ -254,9 +260,14 @@ serveRun<Init, Done>(async (init, ctx) => {
     const notes = await sequence(net, BigInt(init.seed) + 1n);
     return { outcome: {} as Outcome, links: [], ms: Math.round(performance.now() - t0), notes };
   }
-  if (init.scenario === 'frames') {
-    const notes = await frames(net);
+  if (init.scenario === 'frames' || init.scenario === 'frames-suspending') {
+    const notes = await frames(net, init.scenario === 'frames' ? 'switch' : 'switch-suspending');
     return { outcome: {} as Outcome, links: [], ms: Number(notes.ms), notes };
+  }
+  if (init.scenario === 'device-clock' || init.scenario === 'device-suspends') {
+    const t0 = performance.now();
+    const notes = init.scenario === 'device-clock' ? await deviceClock(net) : await deviceSuspends(net);
+    return { outcome: {} as Outcome, links: [], ms: Math.round(performance.now() - t0), notes };
   }
   if (init.scenario === 'pad-sequence' || init.scenario === 'pad-fresh') {
     const t0 = performance.now();
@@ -577,8 +588,8 @@ async function diskCost(net: Network): Promise<{ outcome: unknown; notes: Record
   return { outcome: {}, notes };
 }
 
-/** The network of examples/http.rs (with `controls`: the server's arguments and environment in its page). */
-async function example(net: Network, controls: boolean): Promise<{ sw: Device; server: Device }> {
+/** The network of examples/http.rs (with `controls`: the server's arguments and environment in its page; `clientConfig`: more of the client's config). */
+async function example(net: Network, controls: boolean, clientConfig: Record<string, string> = {}): Promise<{ sw: Device; server: Device }> {
   const sw = await net.device('sw', 'switch', { ports: '4' });
   const page: Record<string, string> = controls ? { 'app.http-server.route.e.path': '/', 'app.http-server.route.e.body': '{args}|{env:GREETING}' } : {};
   const server = await net.device(
@@ -598,6 +609,7 @@ async function example(net: Network, controls: boolean): Promise<{ sw: Device; s
     'hosts.web': '10.0.0.1',
     'app.http-get.url': 'http://web/',
     'app.http-get.start': '1ms',
+    ...clientConfig,
   });
   net.link(server.port(0), sw.port(1), 150_000n);
   net.link(client.port(0), sw.port(2), 100_000n);
@@ -705,8 +717,8 @@ function packets(pcap: Uint8Array): number {
  * network fetches a 2 MB body (`/big?n=`) through the switch: some 4,000 frames. Reports the
  * frames on the wire, the run's wall time and frames per second.
  */
-async function frames(net: Network): Promise<Record<string, string>> {
-  const sw = await net.device('sw', 'switch', { ports: '4' });
+async function frames(net: Network, switchComponent: string): Promise<Record<string, string>> {
+  const sw = await net.device('sw', switchComponent, { ports: '4' });
   const server = await net.device('server', 'node-http-server', { mac: '02:00:00:00:00:01', ipv4: '10.0.0.1/24', 'app.http-server.listen': '0.0.0.0:80' });
   const client = await net.device('client', 'node-http-get', {
     mac: '02:00:00:00:00:02',
@@ -728,4 +740,80 @@ async function frames(net: Network): Promise<Record<string, string>> {
     framesPerSecond: ((n / ms) * 1000).toFixed(0),
     done: done && done.record === 'event' ? done.fields.map(([k, v]) => `${k}=${v}`).join(' ') : '',
   };
+}
+
+/**
+ * The switch's component wrapped so that its device exports answer with a promise, as a
+ * composition transpiled for JSPI does: a module that instantiates the switch's own transpile
+ * and wraps `ports`, `receive`, `poll` and `link-state` in async functions. Its `ports()` answers
+ * with a promise, so the binding calls it through the `Suspending` imports.
+ */
+function suspendingSwitch(components: Record<string, ComponentSource>): ComponentSource {
+  const sw = components.switch;
+  if (!sw) return { url: 'data:text/javascript,' };
+  const code = `import * as inner from ${JSON.stringify(new URL(sw.url, self.location.href).href)};
+const later = (f) => async (...args) => { await null; return f(...args); };
+export async function instantiate(getCoreModule, imports, instantiateCore) {
+  const exports = await inner.instantiate(getCoreModule, imports, instantiateCore);
+  const d = exports.device;
+  return { ...exports, device: { ports: later(d.ports), receive: later(d.receive), poll: later(d.poll), linkState: later(d.linkState) } };
+}
+`;
+  return { ...sw, url: URL.createObjectURL(new Blob([code], { type: 'text/javascript' })) };
+}
+
+/** What the HTTP client's `wait-for` was asked and when its answer came: `<called> +<d> due <at> fired <now>`. */
+const waits: string[] = [];
+/** The extra latency the embedder's `wait-for` adds (ns). */
+const LATENCY = 2_000_000n;
+
+/**
+ * The `device-clock` scenario: an import served to one device (`NetworkOptions.deviceImports`)
+ * that answers at a later virtual instant. The example's client, with a think time before its
+ * request (`request-delay`, a `wait-for`), gets its own `wasi:clocks/monotonic-clock.wait-for`,
+ * which answers `LATENCY` later than asked, through the descriptor's clock (`sleepUntil`), so its
+ * request goes out later. Also reports whose core modules `instantiateCore` saw, in order.
+ */
+async function deviceClock(net: Network): Promise<Record<string, string>> {
+  deviceHook = (d) => {
+    if (d.name !== 'client') return undefined;
+    return {
+      'wasi:clocks/monotonic-clock': {
+        waitFor: (ns: bigint) => {
+          const called = d.now();
+          const at = called + ns + LATENCY;
+          return d.sleepUntil(at).then(() => {
+            waits.push(`${called} +${ns} due ${at} fired ${d.now()}`);
+          });
+        },
+      },
+    };
+  };
+  coreSeen.length = 0;
+  await example(net, false, { 'app.http-get.request-delay': '1ms' });
+  const seen = [...coreSeen];
+  const outcome = await net.run();
+  deviceHook = null;
+  return { records: records(net, outcome), waits: waits.join('\n'), cores: seen.join(',') };
+}
+
+/**
+ * The `device-suspends` scenario: the example with its switch made a device whose exports answer
+ * with a promise (`suspendingSwitch`): every frame through it waits inside the simulator's step.
+ */
+async function deviceSuspends(net: Network): Promise<Record<string, string>> {
+  const sw = await net.device('sw', 'switch-suspending', { ports: '4' });
+  const server = await net.device('server', 'node-http-server', { mac: '02:00:00:00:00:01', ipv4: '10.0.0.1/24', 'app.http-server.listen': '0.0.0.0:80' });
+  const client = await net.device('client', 'node-http-get', {
+    mac: '02:00:00:00:00:02',
+    ipv4: '10.0.0.2/24',
+    'hosts.web': '10.0.0.1',
+    'app.http-get.url': 'http://web/',
+    'app.http-get.start': '1ms',
+  });
+  net.link(server.port(0), sw.port(1), 150_000n);
+  net.link(client.port(0), sw.port(2), 100_000n);
+  const answers = JSON.stringify(await net.command(sw, 'paths'));
+  const outcome = await net.run();
+  return { records: records(net, outcome), answers };
 }

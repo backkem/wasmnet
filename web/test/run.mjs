@@ -360,11 +360,53 @@ await step("networks in sequence from an embedder's own export: a seed it comput
 });
 
 await step('what a frame-heavy run costs in the page: a 2 MB fetch through the switch, frames per second', async () => {
-  const runs = [];
-  for (let i = 0; i < 3; i++) runs.push((await page.evaluate(() => window.wasmnetScenario('frames', '42'))).notes);
-  if (!runs[0].done.includes('status=200') || !runs[0].done.includes('body-bytes=2000000')) throw new Error(`the fetch: ${runs[0].done}`);
-  if (runs.some((r) => r.frames !== runs[0].frames)) throw new Error(`frames: ${runs.map((r) => r.frames).join(', ')}`);
-  return { frames: Number(runs[0].frames), ms: runs.map((r) => Number(r.ms)), framesPerSecond: runs.map((r) => Number(r.framesPerSecond)) };
+  const measure = async (scenario) => {
+    const runs = [];
+    for (let i = 0; i < 3; i++) runs.push((await page.evaluate((s) => window.wasmnetScenario(s, '42'), scenario)).notes);
+    if (!runs[0].done.includes('status=200') || !runs[0].done.includes('body-bytes=2000000')) throw new Error(`${scenario}: the fetch: ${runs[0].done}`);
+    if (runs.some((r) => r.frames !== runs[0].frames)) throw new Error(`${scenario}: frames: ${runs.map((r) => r.frames).join(', ')}`);
+    return { frames: Number(runs[0].frames), ms: runs.map((r) => Number(r.ms)), framesPerSecond: runs.map((r) => Number(r.framesPerSecond)) };
+  };
+  // The same run with the switch called through the `Suspending` imports (its exports answer with a promise).
+  return { sync: await measure('frames'), suspending: await measure('frames-suspending') };
+});
+
+/** A run's records (`records` in worker.ts), parsed; its events of `kind` on `device`. */
+const recordsOf = (notes) => JSON.parse(notes.records);
+const eventsIn = (rec, kind, device) => rec.journal.filter((e) => e.record === 'event' && e.kind === kind && e.device === device);
+
+await step("a device's own import answers at a later virtual instant through its clock, the same on every run; instantiateCore sees each device's core modules", async () => {
+  const a = (await page.evaluate(() => window.wasmnetScenario('device-clock', '42'))).notes;
+  const b = (await page.evaluate(() => window.wasmnetScenario('device-clock', '42'))).notes;
+  if (a.records !== b.records) throw new Error(`two runs differ: ${firstDifference(a.records, b.records)}`);
+  if (a.waits !== b.waits) throw new Error(`the waits differ:\n${a.waits}\nvs\n${b.waits}`);
+  const waits = a.waits.split('\n').filter((l) => l);
+  if (waits.length === 0) throw new Error('the client never called its own wait-for');
+  for (const w of waits) {
+    const m = /^(\d+) \+(\d+) due (\d+) fired (\d+)$/.exec(w);
+    if (!m || m[3] !== m[4] || BigInt(m[3]) !== BigInt(m[1]) + BigInt(m[2]) + 2_000_000n) throw new Error(`a wait that did not answer at its instant: ${w}`);
+  }
+  const done = eventsIn(recordsOf(a), 'http-get-done', 'client');
+  if (done.length !== 1 || !done[0].fields.some(([k, v]) => k === 'status' && v === '200')) throw new Error(`http-get-done: ${JSON.stringify(done)}`);
+  // Every core module of a device, in instantiation order: the devices one after another.
+  const seen = a.cores.split(',');
+  const order = seen.filter((d, i) => i === 0 || seen[i - 1] !== d);
+  if (order.join(',') !== '0:sw,1:server,2:client') throw new Error(`instantiateCore was asked for ${a.cores}`);
+  const count = (d) => seen.filter((x) => x === d).length;
+  return { waits, doneAt: done[0].at, cores: { sw: count('0:sw'), server: count('1:server'), client: count('2:client') } };
+});
+
+await step('a device whose exports answer with a promise: the switch waited for inside the step, the same on every run', async () => {
+  const a = (await page.evaluate(() => window.wasmnetScenario('device-suspends', '42'))).notes;
+  const b = (await page.evaluate(() => window.wasmnetScenario('device-suspends', '42'))).notes;
+  if (a.records !== b.records) throw new Error(`two runs differ: ${firstDifference(a.records, b.records)}`);
+  const rec = recordsOf(a);
+  const done = eventsIn(rec, 'http-get-done', 'client');
+  if (done.length !== 1 || !done[0].fields.some(([k, v]) => k === 'status' && v === '200')) throw new Error(`http-get-done: ${JSON.stringify(done)}`);
+  // The same network with the plain switch (the example at this seed): the same records?
+  const plain = await page.evaluate(() => window.wasmnetScenario('example', '42'));
+  const same = JSON.stringify(JSON.parse(a.records).journal) === JSON.stringify(plain.journal);
+  return { entries: rec.journal.length, answers: a.answers, sameJournalAsPlainSwitch: same };
 });
 
 if (process.env.NATIVE_JOURNAL) {
