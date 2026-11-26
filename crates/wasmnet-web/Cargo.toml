@@ -20,6 +20,8 @@ thiserror.workspace = true
 [dev-dependencies]
 # The tests of portable extensions: their fixture.
 wasmnet-pad = { path = "../wasmnet-pad" }
+# The disks on both backends (its typed adapter for the wasmtime side).
+wasmnet-disk = { path = "../wasmnet-disk", features = ["wasmtime"] }
 # Reading pcap packet directions back in the tests.
 wasmnet-wire = { path = "../wasmnet-wire" }
 # `tests/parity.rs`: the same scenarios on the wasmtime backend, and wasmtime standing in for

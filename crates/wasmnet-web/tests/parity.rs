@@ -141,15 +141,21 @@ impl Wasm {
         let mut config = Config::new();
         config.wasm_component_model(true);
         let engine = Engine::new(&config).expect("engine");
-        let components = ["router", "switch", "infra_script", "pad_probe"]
-            .into_iter()
-            .map(|name| {
-                let path = file_of(name);
-                let c = Component::from_file(&engine, &path)
-                    .unwrap_or_else(|e| panic!("{}: {e:?}", path.display()));
-                (name.to_owned(), c)
-            })
-            .collect();
+        let components = [
+            "router",
+            "switch",
+            "infra_script",
+            "pad_probe",
+            "disk_probe",
+        ]
+        .into_iter()
+        .map(|name| {
+            let path = file_of(name);
+            let c = Component::from_file(&engine, &path)
+                .unwrap_or_else(|e| panic!("{}: {e:?}", path.display()));
+            (name.to_owned(), c)
+        })
+        .collect();
         Self {
             engine,
             seed,
@@ -670,6 +676,8 @@ trait Backend {
     ) -> Option<Result<wasmnet_core::export::Answered, String>>;
     /// The interfaces the device reports it exports.
     fn exports(&mut self, device: DeviceId) -> Vec<String>;
+    /// The digest of one of a device's disks, as hex.
+    fn disk_digest(&mut self, device: &str, disk: &str) -> Option<String>;
     fn journal(&self) -> Vec<JournalEntry>;
 }
 
@@ -682,6 +690,7 @@ impl Native {
     fn new(seed: u64) -> Self {
         let mut net = wasmnet_host::Network::new(portable_host(), seed);
         net.add_extension(pad());
+        net.add_extension(wasmnet_disk::Disks::default());
         net.set_component_resolver(Box::new(move |name, instantiate| instantiate(&load(name))));
         net.set_infra_catalog(CATALOG.map(String::from).to_vec());
         Self(net)
@@ -698,6 +707,10 @@ impl Backend for Native {
     }
     fn exports(&mut self, device: DeviceId) -> Vec<String> {
         self.0.device_exports(device).to_vec()
+    }
+    fn disk_digest(&mut self, device: &str, disk: &str) -> Option<String> {
+        let d = self.0.extension::<wasmnet_disk::Disks>()?;
+        d.digest(device, disk).map(|h| wasmnet_disk::digest_hex(&h))
     }
     fn add(
         &mut self,
@@ -750,6 +763,7 @@ impl Web {
         let mut net = wasmnet_web::Network::new(wasm.clone(), seed);
         REGISTRY.set(Some(net.registry().clone()));
         net.sim_mut().add_extension(pad());
+        net.sim_mut().add_extension(wasmnet_disk::Disks::default());
         net.sim_mut()
             .set_infra_catalog(CATALOG.map(String::from).to_vec());
         Self(net)
@@ -766,6 +780,10 @@ impl Backend for Web {
     }
     fn exports(&mut self, device: DeviceId) -> Vec<String> {
         self.0.sim_mut().device_exports(device).to_vec()
+    }
+    fn disk_digest(&mut self, device: &str, disk: &str) -> Option<String> {
+        let d = self.0.sim_mut().extension::<wasmnet_disk::Disks>()?;
+        d.digest(device, disk).map(|h| wasmnet_disk::digest_hex(&h))
     }
     fn add(
         &mut self,
@@ -1307,7 +1325,11 @@ wasmnet_host::portable_adapter!({
 
 thread_local! {
     /// The portable interfaces the page links (what `wn_interfaces` tells it).
-    static PORTABLE: Vec<wasmnet_core::Interface> = wasmnet_pad::Pad::interfaces();
+    static PORTABLE: Vec<wasmnet_core::Interface> = {
+        let mut i = wasmnet_pad::Pad::interfaces();
+        i.extend(wasmnet_disk::Disks::interfaces());
+        i
+    };
 }
 
 /// The fixture as both backends install it: the third append of `q` faults it.
@@ -1317,20 +1339,21 @@ fn pad() -> wasmnet_pad::Pad {
 
 /// The file of a component key (`pad_probe` is an example).
 fn file_of(name: &str) -> std::path::PathBuf {
-    if name == "pad_probe" {
+    if name == "pad_probe" || name == "disk_probe" {
         static BUILT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
         BUILT.get_or_init(|| {
             let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
             let ok = std::process::Command::new(env!("CARGO"))
                 .current_dir(&root)
                 .args(["build", "--release", "--target", "wasm32-wasip2"])
-                .args(["-p", "wasmnet-clock-probe", "--example", "pad-probe"])
+                .args(["-p", "wasmnet-clock-probe"])
+                .args(["--example", "pad-probe", "--example", "disk-probe"])
                 .status()
                 .expect("spawn cargo")
                 .success();
-            assert!(ok, "building pad-probe failed");
+            assert!(ok, "building the probes failed");
         });
-        return support::built().path("examples/pad_probe");
+        return support::built().path(&format!("examples/{name}"));
     }
     support::built().path(name)
 }
@@ -1341,6 +1364,7 @@ fn portable_host() -> &'static wasmnet_host::Host {
     HOST.get_or_init(|| {
         wasmnet_host::Host::builder()
             .extension(PadAdapter)
+            .extension(wasmnet_disk::DiskAdapter)
             .build()
             .expect("host")
     })
@@ -1747,6 +1771,151 @@ fn portable_exports_are_called_alike() {
         assert_eq!(answer(6), None, "{s:?}");
         assert_eq!(field(&s, "pad-written", "size"), ["5", "11", "12"], "{s:?}");
         assert!(field(&s, "device-crashed", "message").is_empty(), "{s:?}");
+        s
+    });
+}
+
+// ---- disks --------------------------------------------------------------------------------
+
+/// A disk fault at a device, timed.
+fn disk_fault(
+    net: &mut dyn Backend,
+    at: Nanos,
+    device: DeviceId,
+    disk: &str,
+    f: wasmnet_disk::DiskFault,
+) {
+    let op = wasmnet_core::ExtensionOp::new(wasmnet_disk::DiskOp::new(disk, f));
+    net.op(Op::extension_at(device, op), Placement::StartOf(at));
+}
+
+/// The disk probe on two disks, through every kind of fault, on either backend; the answers
+/// are the disks' digests after the run.
+fn disks(net: &mut dyn Backend) -> Seen {
+    use wasmnet_disk::{Corruption, DiskFault, DiskOptions, DiskSpec, Durability, Keep};
+    let mut options = DeviceOptions::default().crash_alone(true);
+    options.ext.set(DiskOptions::new(vec![
+        DiskSpec::new("state"),
+        DiskSpec::new("log").durability(Durability::OnSync),
+    ]));
+    let p = net.add(
+        "p",
+        "disk_probe",
+        config(&[("period", "10ms"), ("big", "1048576")]),
+        options,
+    );
+    // An option from a generic value, as a spec or a page gives it.
+    let mut small = DeviceOptions::default().crash_alone(true);
+    small.ext.set_value(net.option(
+        "disks",
+        &Value::List(vec![Value::record(vec![
+            ("name", Value::str("state")),
+            ("quota", Value::U32(2048)),
+        ])]),
+    ));
+    net.add(
+        "q",
+        "disk_probe",
+        config(&[("period", "1000ms"), ("fill", "4096")]),
+        small,
+    );
+    for (at, op) in [
+        (25, Op::stop_device("p")),
+        (30, Op::start_device("p")),
+        (55, Op::crash_device("p", "operator crash")),
+        (58, Op::start_device("p")),
+        (62, Op::start_device("p")),
+        (86, Op::stop_device("p")),
+        (87, Op::start_device("p")),
+    ] {
+        net.op(op, Placement::StartOf(at * MS));
+    }
+    disk_fault(
+        net,
+        35 * MS,
+        p,
+        "log",
+        DiskFault::PowerLoss {
+            keep: Keep::Prefix,
+            tear: true,
+        },
+    );
+    disk_fault(
+        net,
+        56 * MS,
+        p,
+        "state",
+        DiskFault::CrashAt {
+            call: 1,
+            keep: Keep::Prefix,
+        },
+    );
+    disk_fault(net, 60 * MS, p, "log", DiskFault::Lose);
+    disk_fault(
+        net,
+        70 * MS,
+        p,
+        "log",
+        DiskFault::FailCalls {
+            count: 1,
+            text: "a bad sector".into(),
+        },
+    );
+    let garbage = DiskFault::Corrupt {
+        prefix: "boots".into(),
+        how: Corruption::Garbage,
+    };
+    disk_fault(net, 85 * MS, p, "state", garbage);
+    disk_fault(net, 90 * MS, p, "log", DiskFault::Quota(10));
+    net.run_to(100 * MS);
+    let answers = [("p", "state"), ("p", "log"), ("q", "state")]
+        .into_iter()
+        .map(|(d, k)| net.disk_digest(d, k).map(Ok))
+        .collect();
+    seen(
+        net,
+        answers,
+        &[
+            "kv-boot",
+            "kv-big",
+            "kv-check",
+            "kv-fill",
+            "kv-write",
+            "kv-error",
+            "disk-created",
+            "disk-armed",
+            "disk-power-loss",
+            "disk-crash",
+            "disk-lost",
+            "disk-corrupted",
+            "disk-quota",
+            "disk-sync",
+            "device-crashed",
+            "device-started",
+            "device-stopped",
+        ],
+    )
+}
+
+#[test]
+fn disks_are_served_and_faulted_alike() {
+    on_both(|net| {
+        let s = disks(net);
+        assert!(s.answers.iter().all(Option::is_some), "{s:?}");
+        let crashed = field(&s, "device-crashed", "message");
+        assert_eq!(crashed.len(), 2, "{s:?}");
+        assert!(
+            crashed[1].starts_with("disk `state` failed inside write"),
+            "{s:?}"
+        );
+        assert!(field(&s, "kv-fill", "answer")[0].contains("Full"), "{s:?}");
+        assert!(
+            field(&s, "kv-error", "error")
+                .iter()
+                .any(|e| e.contains("a bad sector")),
+            "{s:?}"
+        );
+        assert_eq!(field(&s, "disk-power-loss", "disk").len(), 3, "{s:?}");
         s
     });
 }
