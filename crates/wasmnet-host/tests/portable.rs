@@ -314,11 +314,16 @@ fn an_interface_without_a_server_faults_the_device() {
 
 // ---- a server that blocks ------------------------------------------------------------------
 
+/// Where a waiting server asks (the function it is about to serve), and where it waits for the
+/// answer.
+type Ask = mpsc::Sender<String>;
+type Answers = Arc<Mutex<mpsc::Receiver<()>>>;
+
 /// A server in front of the pad's: before it serves a call of the device, it asks another
 /// thread over a channel and waits for the answer (`waits`), or serves at once.
 struct Waiting {
     inner: Arc<dyn sim::ImportServer>,
-    waits: Option<(Mutex<mpsc::Sender<String>>, Arc<Mutex<mpsc::Receiver<()>>>)>,
+    waits: Option<(Mutex<Ask>, Answers)>,
     served: Arc<Mutex<Vec<String>>>,
 }
 
@@ -339,7 +344,7 @@ impl sim::ImportServer for Waiting {
 
 /// Puts a [`Waiting`] server in front of the pad's for every device (added after the pad).
 struct Gate {
-    waits: Option<(mpsc::Sender<String>, Arc<Mutex<mpsc::Receiver<()>>>)>,
+    waits: Option<(Ask, Answers)>,
     served: Arc<Mutex<Vec<String>>>,
 }
 
