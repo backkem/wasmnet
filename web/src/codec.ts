@@ -340,8 +340,9 @@ export interface LinkOptions {
  * `kind` and the fields the simulator documents for it (`link-state`, `latency`, `impair`,
  * `inject`, `stdin`, `command`, `add-device`, `stop-device`, `pause-device`, `resume-device`,
   * `crash-device`, `start-device`, `remove-device`, `wire`, `unwire`), or an extension's:
- * `{ kind: 'extension', device, op, value }`, timed at `device`, built by the extension that
- * declares `op` (`NetworkExtension::ops`).
+ * `{ kind: 'extension', device, op, value }`, timed at the device called `device` when it applies
+ * (one that an earlier op or a controller creates; none of that name then fails it), built by the
+ * extension that declares `op` (`NetworkExtension::ops`).
  */
 export interface Op {
   kind: string;

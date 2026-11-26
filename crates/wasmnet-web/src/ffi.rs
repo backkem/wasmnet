@@ -504,14 +504,8 @@ pub extern "C" fn wn_add_op(op: *const u8, len: usize) -> i32 {
     };
     // An extension's operator event at a device is built by the extension (`NetworkExtension::ops`).
     let added = with_network(|n| {
-        let sim = n.sim();
-        let (op, placement) = ops::op_with(&value, &|device, kind, v| {
-            let id = sim
-                .live_device(device)
-                .ok_or_else(|| format!("no device `{device}`"))?;
-            Ok(wasmnet_core::Op::extension_at(id, sim.parse_op(kind, v)?))
-        })
-        .map_err(|e| format!("operator event: {e}"))?;
+        let (op, placement) =
+            ops::op_in(n.sim(), &value).map_err(|e| format!("operator event: {e}"))?;
         n.sim_mut().add_op(op, placement).map_err(|e| e.to_string())
     });
     match added {

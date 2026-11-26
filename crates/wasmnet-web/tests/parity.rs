@@ -661,6 +661,9 @@ trait Backend {
         argument: &str,
     ) -> Option<Result<String, String>>;
     fn op(&mut self, op: Op, placement: Placement) -> usize;
+    /// An operator event from a plain object, as the page's `wn_add_op` builds it
+    /// (`wasmnet_web::ops::op_in`).
+    fn op_value(&mut self, op: &Value) -> usize;
     fn op_states(&self) -> Vec<OpState>;
     /// Admits supplied components by their imports.
     fn admit(&mut self, policy: ImportPolicy);
@@ -737,6 +740,10 @@ impl Backend for Native {
     }
     fn op(&mut self, op: Op, placement: Placement) -> usize {
         self.0.add_op(op, placement).expect("op")
+    }
+    fn op_value(&mut self, op: &Value) -> usize {
+        let (op, placement) = wasmnet_web::ops::op_in(&self.0, op).expect("op");
+        self.op(op, placement)
     }
     fn op_states(&self) -> Vec<OpState> {
         self.0.op_states()
@@ -827,6 +834,10 @@ impl Backend for Web {
     }
     fn op(&mut self, op: Op, placement: Placement) -> usize {
         self.0.sim_mut().add_op(op, placement).expect("op")
+    }
+    fn op_value(&mut self, op: &Value) -> usize {
+        let (op, placement) = wasmnet_web::ops::op_in(self.0.sim(), op).expect("op");
+        self.op(op, placement)
     }
     fn op_states(&self) -> Vec<OpState> {
         self.0.sim().op_states()
@@ -1916,6 +1927,113 @@ fn disks_are_served_and_faulted_alike() {
             "{s:?}"
         );
         assert_eq!(field(&s, "disk-power-loss", "disk").len(), 3, "{s:?}");
+        s
+    });
+}
+
+/// Disk faults from the page's plain objects (`wasmnet_web::ops::op_in`), by device name: a
+/// crash-at over any disk, one on a disk disarmed, faults on a device an operator creates
+/// later, and on a name no device has.
+fn disks_by_name(net: &mut dyn Backend) -> Seen {
+    use wasmnet_disk::{DiskOptions, DiskSpec, Durability};
+    let two = || {
+        let mut options = DeviceOptions::default().crash_alone(true);
+        options.ext.set(DiskOptions::new(vec![
+            DiskSpec::new("state"),
+            DiskSpec::new("log").durability(Durability::OnSync),
+        ]));
+        options
+    };
+    net.add("p", "disk_probe", config(&[("period", "10ms")]), two());
+    net.op(
+        Op::add_device("later", "disk_probe")
+            .with_config(config(&[("period", "10ms")]))
+            .with_options(two()),
+        Placement::StartOf(50 * MS),
+    );
+    let fault = |at: Nanos, device: &str, op: &str, value: Vec<(&str, Value)>| {
+        Value::record(vec![
+            ("kind", Value::str("extension")),
+            ("at", Value::U64(at * MS)),
+            ("device", Value::str(device)),
+            ("op", Value::str(op)),
+            ("value", Value::record(value)),
+        ])
+    };
+    let crash = "disk.crash-at";
+    for v in [
+        // The second changing call on any disk (the log write at 30 ms); one on the log, armed
+        // and disarmed between two writes; the one over any disk disarmed after it fired.
+        fault(
+            15,
+            "p",
+            crash,
+            vec![("call", Value::U32(2)), ("keep", Value::str("all"))],
+        ),
+        fault(45, "p", crash, vec![("disk", Value::str("log"))]),
+        fault(
+            46,
+            "p",
+            crash,
+            vec![("disk", Value::str("log")), ("call", Value::U32(0))],
+        ),
+        fault(47, "p", crash, vec![("call", Value::U32(0))]),
+        fault(
+            45,
+            "later",
+            "disk.lose",
+            vec![("disk", Value::str("state"))],
+        ),
+        fault(
+            55,
+            "later",
+            "disk.lose",
+            vec![("disk", Value::str("state"))],
+        ),
+        fault(56, "later", crash, vec![("call", Value::U32(1))]),
+        fault(60, "nobody", "disk.lose", vec![("disk", Value::str("log"))]),
+    ] {
+        net.op_value(&v);
+    }
+    net.op(Op::start_device("p"), Placement::StartOf(33 * MS));
+    net.run_to(80 * MS);
+    let answers = [("p", "state"), ("p", "log"), ("later", "state")]
+        .into_iter()
+        .map(|(d, k)| net.disk_digest(d, k).map(Ok))
+        .collect();
+    seen(
+        net,
+        answers,
+        &[
+            "disk-armed",
+            "disk-disarmed",
+            "disk-crash",
+            "disk-lost",
+            "device-crashed",
+            "device-started",
+            "device-added",
+        ],
+    )
+}
+
+#[test]
+fn disk_faults_by_name_from_plain_objects_apply_alike() {
+    on_both(|net| {
+        let s = disks_by_name(net);
+        assert!(s.answers.iter().all(Option::is_some), "{s:?}");
+        assert_eq!(field(&s, "disk-crash", "disks"), ["any", "any"], "{s:?}");
+        assert_eq!(field(&s, "disk-crash", "disk"), ["log", "log"], "{s:?}");
+        assert_eq!(field(&s, "disk-disarmed", "left"), ["1", "none"], "{s:?}");
+        assert_eq!(field(&s, "disk-lost", "disk"), ["state"], "{s:?}");
+        let failed: Vec<&String> = s.ops.iter().filter(|o| o.starts_with("failed")).collect();
+        assert_eq!(
+            failed,
+            [
+                &format!("failed at {}: no device `later`", 45 * MS),
+                &format!("failed at {}: no device `nobody`", 60 * MS),
+            ],
+            "{s:?}"
+        );
         s
     });
 }

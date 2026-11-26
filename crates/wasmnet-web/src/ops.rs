@@ -322,9 +322,23 @@ pub fn op(v: &Value) -> Result<(Op, Placement), String> {
     })
 }
 
+/// [`op`], with the operator events of `network`'s extensions: `{ kind: 'extension', device,
+/// op, value, at }` is the extension's op from its parser (`Network::parse_op`), timed at the
+/// device called `device` when it applies (`Op::extension_at_named`: a device that an earlier
+/// op or a controller creates is found by its name; none of that name then fails the op). The
+/// page's `wn_add_op` builds every operator event with it.
+pub fn op_in<R: wasmnet_core::Runtime + ?Sized>(
+    network: &wasmnet_core::Network<'_, R>,
+    v: &Value,
+) -> Result<(Op, Placement), String> {
+    op_with(v, &|device, kind, v| {
+        Ok(Op::extension_at_named(device, network.parse_op(kind, v)?))
+    })
+}
+
 /// [`op`], with the operator events of the network's extensions: `{ kind: 'extension',
-/// device, op, value, at }` is built by `extension(device, op, value)` (the network's
-/// `parse_op`, timed at the device: `Op::extension_at`).
+/// device, op, value, at }` is built by `extension(device, op, value)` ([`op_in`] builds the
+/// extension's op timed at the device by name).
 pub fn op_with(
     v: &Value,
     extension: &dyn Fn(&str, &str, &Value) -> Result<Op, String>,
