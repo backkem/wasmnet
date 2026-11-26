@@ -111,6 +111,13 @@ here so that nobody has to find these the hard way. Each entry names where the c
   jco disposes of the object. An embedder that drives a page's run from its own export (instead
   of the binding's `run`, `wn_pad_run` in the fixture's module) does not let JavaScript settle
   between instants, so it suits stepped devices only.
+- **Disks are new** ([design/disk.md](design/disk.md)). A disk call takes no virtual time: slow
+  storage is not modelled, and a `sync` that waits would need an async import, which a served
+  call cannot be yet. In a page the disks live in the simulator's `wasm32` memory, which aborts
+  the whole simulator near 4 GiB: keep the network's total (1 GiB by default) well under it.
+  A disk's unsynced tail keeps the old value of every key it changed until `sync`. Controllers
+  declare disks in specs but see nothing of them (no sizes in the device table). An orderly
+  shutdown does not exist: every stop is a power loss. `wasi:keyvalue/atomics` is not served.
 - **The browser binding reports errors as strings** (`wasmnet_web::Network::link`, the
   `JsHost` methods), where the native API has one typed error. Its TypeScript `Network` reaches
   operator events, device options and link options as plain objects that the simulator reads

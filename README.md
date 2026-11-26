@@ -73,6 +73,7 @@ The full version is [`crates/wasmnet-host/examples/http.rs`](crates/wasmnet-host
 | [`crates/wasmnet-core`](crates/wasmnet-core) | The simulator itself: devices and their lifecycle, virtual clock, event queue, patch panel, link model, pcap taps. No wasmtime. |
 | [`crates/wasmnet-web`](crates/wasmnet-web) | The simulator for a browser, with [`web/`](web): a TypeScript binding and the page behind the link above. |
 | [`crates/wasmnet-artifacts`](crates/wasmnet-artifacts) | A revision's components as files with hashes: their manifest, and fetching a pinned set from a directory or a registry. |
+| [`crates/wasmnet-disk`](crates/wasmnet-disk) | Disks for devices, opt-in: named ordered key-value stores behind `wasi:keyvalue`, with durability modes, faults, quotas and images, on every backend. |
 | [`components/`](components) | `netstack` (smoltcp behind `wasi:sockets@0.3`), `switch`, `router`, `wan-port`. [All of them by name](components/README.md). |
 | [`components/apps/`](components/apps) | DHCP, DNS and mDNS servers (host names and DNS-SD services), a DNS-SD browser, an HTTP server, client and load balancer, ping, traceroute, UDP echo. |
 | [`compositions/`](compositions) | `wac` files that plug apps into a netstack to make a node. |

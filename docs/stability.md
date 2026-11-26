@@ -82,6 +82,12 @@ versions without notice. Rustdoc and the design notes mark it **embedder surface
   `js_export`, `wn_invoke`, `wn_schedule_invoke`, `wn_exports` and `JsHost::export`, and in the
   binding `Network.{invoke, scheduleInvoke, exports}`, `NetworkOptions.{deviceImports, compile,
   instantiateCore}`); the test fixture `wasmnet-pad` is their worked example.
+- the disks (`crates/wasmnet-disk`, [design/disk.md](design/disk.md)): `Disks`, `DiskOptions`,
+  `DiskSpec`, `Durability`, `DiskFault`, `Keep`, `Corruption`, `DiskOp`, `DiskRead`, `DiskStats`,
+  `DiskError`, `Entry`, `Change`, the limits and `IMPORTS`, the option key `disks` and the op
+  kinds `disk.*`, the image format `wasmnet-disk/1` (`image`), the typed adapter `DiskAdapter`
+  (feature `wasmtime`), the page module `wasmnet-disk-page`, and the WIT package
+  `wasmnet:keyvalue-ext@0.1.0` (served beside the vendored `wasi:keyvalue@0.2.0-draft2`);
 - the netstack's snapshot interface (`wasmnet:netstack/state`, `snapshot.paused`);
 - the HTTP apps' event-stream routes and `POST /echo` (`http-server`) and forward proxy
   (`http-get`).

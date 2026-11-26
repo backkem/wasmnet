@@ -40,6 +40,8 @@ For embedders:
 - [design/browser.md](design/browser.md): the same networks in a browser tab: the simulator on
   `wasm32`, devices transpiled with jco, the stepping protocol, and why a browser run repeats
   itself without matching the native run byte for byte.
+- [design/disk.md](design/disk.md): disks for devices (`crates/wasmnet-disk`): the model, the
+  `wasi:keyvalue` contract, durability and faults, lifetime, images and quotas.
 
 What is known to be wrong or unbounded today: [known-issues.md](known-issues.md). Which parts
 of the API are the core and which still move: [stability.md](stability.md).
