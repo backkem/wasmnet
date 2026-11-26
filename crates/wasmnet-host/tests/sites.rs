@@ -7,9 +7,12 @@
 mod support;
 
 use support::{built, config};
-use wasmnet_host::sim::sites::{Msg, SiteSync, Step};
 use wasmnet_host::sim::{DeviceId, EventKey, KeyLevel, LinkId, Origin, RemoteFrame};
 use wasmnet_host::{Network, PortInfo};
+use wasmnet_sites::{Msg, SiteSync, Step};
+
+// The old path, `wasmnet_host::sim::sites`, still names the same crate for one revision.
+const _: fn(u64, Option<u64>) -> wasmnet_host::sim::sites::SiteSync = SiteSync::new;
 
 #[test]
 fn malformed_peer_frames_are_errors_not_panics() {

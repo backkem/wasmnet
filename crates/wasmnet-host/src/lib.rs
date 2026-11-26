@@ -180,8 +180,14 @@ pub fn wall_clock_ns() -> u64 {
         .as_nanos() as u64
 }
 
-/// The runtime-agnostic simulation core this host runs on.
-pub use wasmnet_core as sim;
+/// The runtime-agnostic simulation core this host runs on: all of `wasmnet_core`.
+pub mod sim {
+    pub use wasmnet_core::*;
+
+    /// Multi-site runs, at their old path: the crate `wasmnet-sites` (`wasmnet_sites`), which
+    /// left the core. This re-export is for one revision; name the crate itself.
+    pub use wasmnet_sites as sites;
+}
 pub use wasmnet_core::{
     DEFAULT_WALL_EPOCH, DeviceConfig, DeviceId, DeviceOptions, DropReason, Error, FrameFate,
     FrameRecord, Guard, JournalEntry, Level, LinkId, LinkInfo, LinkMut, LinkStats, LinkTransition,

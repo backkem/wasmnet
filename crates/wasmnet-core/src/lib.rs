@@ -38,11 +38,12 @@
 //! (with [`VirtualClock::poll_by`] and [`VirtualClock::set_poll`]), [`derive_seed`], [`SimRng`]
 //! and [`block_on`]. The contract is `docs/design/runtime-and-extensions.md`.
 //!
-//! **Multi-site runs** (embedder surface, unstable): [`sites`] ([`sites::SiteSync`],
-//! [`sites::Msg`], [`sites::merge`]), with
+//! **Multi-site runs** (embedder surface, unstable): the remote-device hooks
 //! [`Network::remote_device`], [`Network::run_before`], [`Network::take_outbox`],
-//! [`Network::receive_remote`], [`Network::skip_link_state`], [`RemoteFrame`], [`Tap`] and
-//! [`RemoteArrival`]. The protocol and its wire format are `docs/design/sites.md`.
+//! [`Network::check_remote`], [`Network::receive_remote`], [`Network::skip_link_state`],
+//! [`RemoteFrame`], [`SyncError`], [`Tap`] and [`RemoteArrival`]. The driver, the site-sync wire
+//! format and the merge of the sites' records are the crate `wasmnet-sites`, built on these;
+//! the protocol is `docs/design/sites.md`.
 //!
 //! **Extensions** (embedder surface, unstable): [`ext`] ([`NetworkExtension`],
 //! [`ext::CableModel`] with [`CableKind`] and
@@ -66,7 +67,7 @@
 //! [`Runtime`] trait), `ext` (extension points: network extensions, cable kinds, control calls,
 //! extension ops), `commands` (device commands), `journal` (device log records), `output` (captured stdout/stderr), `input`
 //! (stdin), `config` (device configuration), `rng` (seeded PRNG), `pcap` (a small pcap-ng
-//! reader), `digest` (causal digests), `infra` (`wasmnet:infra`), `sites` (multi-site runs).
+//! reader, re-exported from `wasmnet-wire`), `digest` (causal digests), `infra` (`wasmnet:infra`).
 //! `clock`, `exec`, `device`, `link`, `network`, `output`, `input`, `config` and `rng` are
 //! private: their items are re-exported here, and where an item's docs say "see the module
 //! docs" (`clock`'s [`Origin`] and [`EventKey`]), `docs/design/event-order.md` has that
@@ -94,7 +95,6 @@ mod output;
 pub mod pcap;
 pub mod reconfigure;
 mod rng;
-pub mod sites;
 pub mod supply;
 pub mod value;
 

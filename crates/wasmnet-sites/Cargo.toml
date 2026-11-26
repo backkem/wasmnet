@@ -1,0 +1,17 @@
+[package]
+name = "wasmnet-sites"
+version = "0.0.0"
+description = "One network split over sites: the conservative lockstep driver, the site-sync wire format and the merge of the sites' records into what the unsplit network records. Built on wasmnet-core's public API; sans-IO, builds for wasm32-unknown-unknown."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+wasmnet-core = { path = "../wasmnet-core" }
+# The merged captures of WAN links: the pcap-ng encoder and the header reader.
+wasmnet-wire = { path = "../wasmnet-wire" }
+
+[lints]
+workspace = true

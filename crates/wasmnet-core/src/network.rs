@@ -2711,7 +2711,7 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
     /// [`remote_device_with`](Self::remote_device_with) instead, so that every site's table
     /// lists it as its own site does.
     ///
-    /// Embedder surface, unstable (multi-site runs, [`crate::sites`]).
+    /// Embedder surface, unstable (multi-site runs, crate `wasmnet-sites`).
     pub fn remote_device(&mut self, name: &str) -> Result<DeviceId> {
         self.remote_device_with(name, DeviceConfig::new(), DeviceOptions::default())
     }
@@ -2723,7 +2723,7 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
     /// device; its options also tell this site where the network's controllers run
     /// ([`DeviceOptions::infra_prefix`]).
     ///
-    /// Embedder surface, unstable (multi-site runs, [`crate::sites`]).
+    /// Embedder surface, unstable (multi-site runs, crate `wasmnet-sites`).
     pub fn remote_device_with(
         &mut self,
         name: &str,
@@ -2768,7 +2768,7 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
 
     /// Sets a remote device's ports (its `ports()` answer, from its own site).
     ///
-    /// Embedder surface, unstable (multi-site runs, [`crate::sites`]).
+    /// Embedder surface, unstable (multi-site runs, crate `wasmnet-sites`).
     pub fn set_remote_ports(&mut self, device: DeviceId, ports: Vec<PortInfo>) {
         assert!(self.devices[device.0].remote, "only remote devices");
         self.panel.set_ports(device.0, ports);
@@ -2776,7 +2776,7 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
 
     /// Whether the device runs on another site.
     ///
-    /// Embedder surface, unstable (multi-site runs, [`crate::sites`]).
+    /// Embedder surface, unstable (multi-site runs, crate `wasmnet-sites`).
     pub fn is_remote(&self, device: DeviceId) -> bool {
         self.devices[device.0].remote
     }
@@ -2784,7 +2784,7 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
     /// Counts a scripted link change that this site does not schedule (both ends of the link
     /// are on other sites), so setup slots stay aligned with the single-site network.
     ///
-    /// Embedder surface, unstable (multi-site runs, [`crate::sites`]).
+    /// Embedder surface, unstable (multi-site runs, crate `wasmnet-sites`).
     pub fn skip_link_state(&mut self) {
         self.next_action_slot();
     }
@@ -2794,7 +2794,7 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
     /// be queued in between ([`receive_remote`](Self::receive_remote)). While events remain it
     /// returns `Deadline { at: now, .. }`.
     ///
-    /// Embedder surface, unstable (multi-site runs, [`crate::sites`]).
+    /// Embedder surface, unstable (multi-site runs, crate `wasmnet-sites`).
     pub fn run_before(&mut self, horizon: Option<Nanos>) -> Result<Outcome> {
         if self.failed {
             return Err(Error::Halted);
@@ -2807,7 +2807,7 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
     /// Moves the clock to `t` without firing anything (a multi-site run that stopped at its
     /// deadline, like [`run_until`](Self::run_until) does on one site).
     ///
-    /// Embedder surface, unstable (multi-site runs, [`crate::sites`]).
+    /// Embedder surface, unstable (multi-site runs, crate `wasmnet-sites`).
     pub fn advance_to(&mut self, t: Nanos) {
         self.clock.advance_to(t);
     }
@@ -2825,7 +2825,7 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
     /// Frames transmitted towards devices on other sites since the last call, in transmit
     /// order.
     ///
-    /// Embedder surface, unstable (multi-site runs, [`crate::sites`]).
+    /// Embedder surface, unstable (multi-site runs, crate `wasmnet-sites`).
     pub fn take_outbox(&self) -> Vec<RemoteFrame> {
         self.panel.take_outbox()
     }
@@ -2879,10 +2879,10 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
     /// # Panics
     ///
     /// If the frame is not for a WAN link's end on this site, or is due before now (the sites
-    /// are out of lockstep). [`crate::sites::SiteSync::handle`] checks both first and returns
-    /// an error instead.
+    /// are out of lockstep). A site-sync driver checks both first
+    /// ([`check_remote`](Self::check_remote)) and returns an error instead.
     ///
-    /// Embedder surface, unstable (multi-site runs, [`crate::sites`]).
+    /// Embedder surface, unstable (multi-site runs, crate `wasmnet-sites`).
     pub fn receive_remote(&self, frame: RemoteFrame) {
         assert!(
             !self.panel.is_remote(frame.device.0),
@@ -2893,28 +2893,28 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
 
     /// This site's halves of the WAN links' captures, tagged for merging.
     ///
-    /// Embedder surface, unstable (multi-site runs, [`crate::sites`]).
+    /// Embedder surface, unstable (multi-site runs, crate `wasmnet-sites`).
     pub fn taps(&self) -> Vec<Tap> {
         self.panel.taps()
     }
 
     /// Fates of the frames other sites sent here.
     ///
-    /// Embedder surface, unstable (multi-site runs, [`crate::sites`]).
+    /// Embedder surface, unstable (multi-site runs, crate `wasmnet-sites`).
     pub fn remote_arrivals(&self) -> Vec<RemoteArrival> {
         self.panel.arrivals()
     }
 
     /// The tag of every journal entry ([`journal`](Self::journal) order).
     ///
-    /// Embedder surface, unstable (multi-site runs, [`crate::sites`]).
+    /// Embedder surface, unstable (multi-site runs, crate `wasmnet-sites`).
     pub fn journal_tags(&self) -> Vec<Tag> {
         self.journal.tags()
     }
 
     /// The tag of every frame-log record ([`frames`](Self::frames) order).
     ///
-    /// Embedder surface, unstable (multi-site runs, [`crate::sites`]).
+    /// Embedder surface, unstable (multi-site runs, crate `wasmnet-sites`).
     pub fn frame_tags(&self) -> Vec<Tag> {
         self.panel.frame_tags()
     }
@@ -2922,7 +2922,7 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
     /// The devices created while the network ran (operator events, controllers), each with the
     /// tag of the processing context that created it, in creation order.
     ///
-    /// Embedder surface, unstable (multi-site runs, [`crate::sites`]).
+    /// Embedder surface, unstable (multi-site runs, crate `wasmnet-sites`).
     pub fn created_devices(&self) -> Vec<(DeviceId, Tag)> {
         self.devices
             .iter()
@@ -2935,7 +2935,7 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
     /// with the tag of the processing context that created it, in creation order. The others
     /// are the links the network was built with.
     ///
-    /// Embedder surface, unstable (multi-site runs, [`crate::sites`]).
+    /// Embedder surface, unstable (multi-site runs, crate `wasmnet-sites`).
     pub fn created_links(&self) -> Vec<(LinkId, Tag)> {
         self.created_links
             .iter()
@@ -2945,7 +2945,7 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
 
     /// The tag of every link transition ([`link_transitions`](Self::link_transitions) order).
     ///
-    /// Embedder surface, unstable (multi-site runs, [`crate::sites`]).
+    /// Embedder surface, unstable (multi-site runs, crate `wasmnet-sites`).
     pub fn transition_tags(&self) -> Vec<Tag> {
         self.panel.transition_tags()
     }

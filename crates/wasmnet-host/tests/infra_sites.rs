@@ -28,12 +28,12 @@ use sha2::{Digest as _, Sha256};
 use support::{built, config, events, field, transcript};
 use wasmnet_det_cbor::Value;
 use wasmnet_host::sim::infra::{Change, DeviceView};
-use wasmnet_host::sim::sites::{self, Msg, SiteRecords, SiteSync, Step};
 use wasmnet_host::sim::{CREATOR_RANGE, DeviceCommand, Op, OpState, Placement, SupplyLimits};
 use wasmnet_host::{
     DeviceConfig, DeviceId, DeviceOptions, FrameRecord, ImportPolicy, JournalEntry, LinkTransition,
     Nanos, Network, sim,
 };
+use wasmnet_sites::{self as sites, Msg, SiteRecords, SiteSync, Step};
 
 const US: Nanos = 1_000;
 const MS: Nanos = 1_000_000;

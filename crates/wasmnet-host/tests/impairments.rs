@@ -17,9 +17,9 @@ mod support;
 use std::collections::VecDeque;
 
 use support::{built, config, events, field, segment, transcript};
-use wasmnet_host::sim::sites::{self, Msg, SiteRecords, SiteSync, Step};
 use wasmnet_host::sim::{FrameFate, Impairments, Op, OpState, Placement};
 use wasmnet_host::{DeviceId, LinkId, Nanos, Network, Outcome, PortRef, Record};
+use wasmnet_sites::{self as sites, Msg, SiteRecords, SiteSync, Step};
 
 const US: Nanos = 1_000;
 

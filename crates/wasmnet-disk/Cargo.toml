@@ -21,6 +21,7 @@ thiserror.workspace = true
 [dev-dependencies]
 proptest.workspace = true
 wasmnet-host = { path = "../wasmnet-host" }
+wasmnet-sites = { path = "../wasmnet-sites" }
 wasmnet-det-cbor = { path = "../wasmnet-det-cbor" }
 
 [lints]

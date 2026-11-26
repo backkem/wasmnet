@@ -1,10 +1,11 @@
-//! Multi-site networks: site sync, its wire format, and merging the sites' records.
+//! wasmnet-sites: one network split over sites, with site sync, its wire format, and merging
+//! the sites' records.
 //!
 //! A network can be split into **sites** (instances that each run some of its devices). A link
 //! whose ends are on different sites is a **WAN link**. Every site builds the whole network in
 //! the same order, with the other sites' devices as placeholders ([`Network::remote_device`]),
 //! so indices and event keys are global. Frames crossing a WAN link travel as [`RemoteFrame`]s,
-//! each carrying the causal key its delivery gets ([`crate::EventKey`]). The sites stay in
+//! each carrying the causal key its delivery gets ([`EventKey`]). The sites stay in
 //! lockstep with conservative PDES ([`SiteSync`]): the WAN links' smallest latency is the
 //! lookahead, null messages ([`Sync`]) promise lower bounds, and a next-event fixpoint skips
 //! idle stretches. Merging the sites' tagged records ([`merge`]) gives byte for byte what the
@@ -17,21 +18,36 @@
 //! messages between the sites (an in-process channel in tests, or a carrier component), and the
 //! only thing it must provide is one reliable, ordered byte-message channel per peer site.
 //!
+//! This crate is built on `wasmnet-core`'s public API only: the remote-device hooks of
+//! [`Network`] (`remote_device`, `run_before`, `take_outbox`, `check_remote`,
+//! `receive_remote`, `taps`, the record tags, ...) are the core's extension point; the driver,
+//! the wire format and the merge are here.
+//!
 //! Embedder surface, unstable: the driver, the messages and the wire format may change between
 //! versions without notice (the format carries [`VERSION`]).
+
+#![deny(unsafe_code)]
 
 use std::collections::BTreeMap;
 
 use wasmnet_wire::{Direction, PcapNgEncoder};
 
-use crate::clock::{Ctx, EventKey, KeyLevel, Nanos, Origin, Tag};
-use crate::journal::{JournalEntry, Level, Record, Stream};
-use crate::link::{
-    CaptureOptions, DropReason, FrameFate, FrameRecord, Impairments, LinkInfo, LinkKind, LinkStats,
-    LinkTransition, PortInfo, RemoteArrival, RemoteFrame, Tap,
+use wasmnet_core::{
+    CaptureOptions, Ctx, DeviceId, DropReason, EventKey, FrameFate, FrameRecord, Impairments,
+    JournalEntry, KEY_DEPTH, KeyLevel, Level, LinkId, LinkInfo, LinkKind, LinkStats,
+    LinkTransition, Nanos, Network, Origin, Outcome, PortInfo, PortRef, Record, RemoteArrival,
+    RemoteFrame, Result, Runtime, Stream, Tag, Tap,
 };
-use crate::network::{DeviceId, LinkId, Network, PortRef, Runtime};
-use crate::{Outcome, Result};
+
+/// A peer site that broke the lockstep protocol ([`SiteSync::handle`]); the core's type, since
+/// [`Network::check_remote`] returns it and [`wasmnet_core::Error::SiteSync`] carries it.
+pub use wasmnet_core::SyncError;
+
+/// The wire format has no code for a variant the core added after [`VERSION`]: encoding it
+/// needs a new format version. The round-trip tests encode every variant this version knows.
+fn no_code(what: &str) -> ! {
+    panic!("site-sync version {VERSION} has no code for this {what}")
+}
 
 // ---- messages and their wire format (docs/design/sites.md) ----------------------------------
 
@@ -89,9 +105,6 @@ pub enum WireError {
     #[error("site-sync message: Hello for device {0}, not one of the peer's")]
     NotPeerDevice(usize),
 }
-
-/// A peer site that broke the lockstep protocol: the core's type ([`crate::SyncError`]).
-pub use crate::SyncError;
 
 /// Two sites' records that cannot be merged ([`merge`]): records from a peer must name what
 /// exists and be in processing order.
@@ -239,7 +252,7 @@ impl<'b> Reader<'b> {
 
     fn key(&mut self) -> Result<EventKey, WireError> {
         let n = self.usize()?;
-        if n == 0 || n > crate::clock::KEY_DEPTH {
+        if n == 0 || n > KEY_DEPTH {
             return Err(self.err("bad key depth"));
         }
         let mut levels = Vec::with_capacity(n);
@@ -329,8 +342,10 @@ impl Writer {
                     DropReason::Oversize => 1,
                     DropReason::Operator => 2,
                     DropReason::QueueFull => 3,
+                    _ => no_code("drop reason"),
                 });
             }
+            _ => no_code("frame fate"),
         }
     }
 
@@ -340,17 +355,21 @@ impl Writer {
                 at,
                 parked,
                 daemons,
+                ..
             }) => {
                 self.u8(0);
                 self.uv(*at);
                 self.strings(parked);
                 self.strings(daemons);
             }
-            Ok(Outcome::Deadline { at, pending_events }) => {
+            Ok(Outcome::Deadline {
+                at, pending_events, ..
+            }) => {
                 self.u8(1);
                 self.uv(*at);
                 self.uv(*pending_events as u64);
             }
+            Ok(_) => no_code("outcome"),
             Err((at, message)) => {
                 self.u8(2);
                 self.uv(*at);
@@ -405,6 +424,7 @@ impl Writer {
                     self.flag(*stream == Stream::Stderr);
                     self.string(line);
                 }
+                _ => no_code("journal record"),
             }
         }
         self.uv(r.journal_dropped);
@@ -544,15 +564,12 @@ impl Reader<'_> {
 
     fn records(&mut self) -> Result<SiteRecords, WireError> {
         let outcome = match self.u8()? {
-            0 => Ok(Outcome::Quiescent {
-                at: self.uv()?,
-                parked: self.strings()?,
-                daemons: self.strings()?,
-            }),
-            1 => Ok(Outcome::Deadline {
-                at: self.uv()?,
-                pending_events: self.usize()?,
-            }),
+            0 => Ok(Outcome::quiescent(
+                self.uv()?,
+                self.strings()?,
+                self.strings()?,
+            )),
+            1 => Ok(Outcome::deadline(self.uv()?, self.usize()?)),
             2 => Err((self.uv()?, self.string()?)),
             _ => return Err(self.err("bad outcome")),
         };
@@ -609,7 +626,7 @@ impl Reader<'_> {
                 },
                 _ => return Err(self.err("bad journal record")),
             };
-            journal.push((tag, JournalEntry { at, device, record }));
+            journal.push((tag, JournalEntry::new(at, device, record)));
         }
         let journal_dropped = self.uv()?;
         let n = self.usize()?;
@@ -618,15 +635,15 @@ impl Reader<'_> {
             let tag = self.tag()?;
             frames.push((
                 tag,
-                FrameRecord {
-                    link: LinkId::from_index(self.usize()?),
-                    from: self.port_ref()?,
-                    to: self.port_ref()?,
-                    sent_at: self.uv()?,
-                    fate: self.fate()?,
-                    len: self.usize()?,
-                    bytes: self.bytes()?.to_vec(),
-                },
+                FrameRecord::new(
+                    LinkId::from_index(self.usize()?),
+                    self.port_ref()?,
+                    self.port_ref()?,
+                    self.uv()?,
+                    self.fate()?,
+                    self.usize()?,
+                    self.bytes()?.to_vec(),
+                ),
             ));
             if frames.last().is_some_and(|(_, f)| f.bytes.len() > f.len) {
                 return Err(self.err("frame bytes longer than the frame"));
@@ -635,10 +652,7 @@ impl Reader<'_> {
         let n = self.usize()?;
         let mut arrivals = Vec::new();
         for _ in 0..n {
-            arrivals.push(RemoteArrival {
-                frame_id: self.usize()?,
-                fate: self.fate()?,
-            });
+            arrivals.push(RemoteArrival::new(self.usize()?, self.fate()?));
         }
         let n = self.usize()?;
         let mut taps = Vec::new();
@@ -649,15 +663,15 @@ impl Reader<'_> {
             if end > 1 {
                 return Err(self.err("bad link end"));
             }
-            taps.push(Tap {
+            taps.push(Tap::new(
                 tag,
                 link,
                 end,
-                at: self.uv()?,
-                inbound: self.flag()?,
-                len: self.usize()?,
-                bytes: self.bytes()?.to_vec(),
-            });
+                self.uv()?,
+                self.flag()?,
+                self.usize()?,
+                self.bytes()?.to_vec(),
+            ));
             if taps.last().is_some_and(|t| t.bytes.len() > t.len) {
                 return Err(self.err("tap bytes longer than the frame"));
             }
@@ -668,66 +682,47 @@ impl Reader<'_> {
             let tag = self.tag()?;
             transitions.push((
                 tag,
-                LinkTransition {
-                    at: self.uv()?,
-                    link: LinkId::from_index(self.usize()?),
-                    up: self.flag()?,
-                },
+                LinkTransition::new(self.uv()?, LinkId::from_index(self.usize()?), self.flag()?),
             ));
         }
         let n = self.usize()?;
         let mut links = Vec::new();
         for _ in 0..n {
-            let mut info = LinkInfo {
-                name: self.string()?,
-                ends: [self.port_ref()?, self.port_ref()?],
-                latency: self.uv()?,
-                mtu: self.u32()?,
-                up: self.flag()?,
-                removed: self.flag()?,
-                kind: LinkKind::from_code(self.u8()?),
-                impairments: [Impairments::default(); 2],
-                capture: CaptureOptions::default(),
-                capture_notes: Vec::new(),
-            };
+            let mut info = LinkInfo::new(
+                self.string()?,
+                [self.port_ref()?, self.port_ref()?],
+                self.uv()?,
+                self.u32()?,
+            );
+            info.up = self.flag()?;
+            info.removed = self.flag()?;
+            info.kind = LinkKind::from_code(self.u8()?);
             for imp in &mut info.impairments {
-                *imp = Impairments {
-                    rate: self.uv()?,
-                    queue: self.u32()?,
-                    loss_ppm: self.u32()?,
-                    jitter: self.uv()?,
-                };
+                *imp = Impairments::default()
+                    .rate(self.uv()?)
+                    .queue(self.u32()?)
+                    .loss_ppm(self.u32()?)
+                    .jitter(self.uv()?);
             }
-            info.capture = CaptureOptions {
-                record: self.flag()?,
-                snap_len: self.u32()?,
-                name_ends: self.flag()?,
-            };
-            let mut pairs = [[0u64; 2]; 7];
-            for p in &mut pairs {
-                *p = [self.uv()?, self.uv()?];
+            info.capture = CaptureOptions::default()
+                .record(self.flag()?)
+                .snap_len(self.u32()?)
+                .name_ends(self.flag()?);
+            let mut stats = LinkStats::default();
+            for pair in [
+                &mut stats.frames,
+                &mut stats.bytes,
+                &mut stats.dropped_down,
+                &mut stats.oversize,
+                &mut stats.lost,
+                &mut stats.dropped_queue,
+                &mut stats.lost_random,
+            ] {
+                *pair = [self.uv()?, self.uv()?];
             }
-            let [
-                frames,
-                bytes,
-                dropped_down,
-                oversize,
-                lost,
-                dropped_queue,
-                lost_random,
-            ] = pairs;
-            let stats = LinkStats {
-                frames,
-                bytes,
-                dropped_down,
-                oversize,
-                lost,
-                dropped_queue,
-                lost_random,
-            };
             let pcap = self.bytes()?.to_vec();
             // The notes travel in the capture itself, as its section comments.
-            info.capture_notes = crate::pcap::parse_header(&pcap)
+            info.capture_notes = wasmnet_wire::pcap::parse_header(&pcap)
                 .map(|c| c.comments)
                 .unwrap_or_default();
             links.push((info, stats, pcap));
@@ -1367,7 +1362,7 @@ pub fn merge(
             .then(|| sites.iter().position(|s| s.devices.contains(&device)))
             .flatten()
     };
-    let device_name = |e: crate::PortRef| {
+    let device_name = |e: PortRef| {
         names
             .get(e.device.index())
             .map(|n| format!("{n}:{}", e.port))
@@ -1406,7 +1401,7 @@ pub fn merge(
                 // The header the first site wrote for the link (names, snap length,
                 // descriptions, notes; without a readable one, the ends' names and no notes),
                 // then both halves' records, each with its original length.
-                let (header, notes) = crate::pcap::parse_header(&sites[0].links[j].2)
+                let (header, notes) = wasmnet_wire::pcap::parse_header(&sites[0].links[j].2)
                     .map(|c| (c.interfaces, c.comments))
                     .unwrap_or_default();
                 let notes: Vec<&str> = notes.iter().map(String::as_str).collect();
@@ -1505,25 +1500,19 @@ pub fn merge(
                 Outcome::Deadline { pending_events, .. } => {
                     (Vec::new(), Vec::new(), *pending_events)
                 }
+                _ => no_code("outcome"),
             };
             let (pa, da, na) = parts(a);
             let (pb, db, nb) = parts(b);
             if na + nb > 0 {
-                Ok(Outcome::Deadline {
-                    at: deadline.unwrap_or(end),
-                    pending_events: na + nb,
-                })
+                Ok(Outcome::deadline(deadline.unwrap_or(end), na + nb))
             } else {
                 let mut parked: Vec<String> = pa.into_iter().chain(pb).collect();
                 parked.sort_by_key(|n| index_of(n));
                 let mut daemons: Vec<String> = da.into_iter().chain(db).collect();
                 // `<device>: <call>`; the sort is stable, so one device's calls keep their order.
                 daemons.sort_by_key(|d| index_of(d.split(": ").next().unwrap_or("")));
-                Ok(Outcome::Quiescent {
-                    at: end,
-                    parked,
-                    daemons,
-                })
+                Ok(Outcome::quiescent(end, parked, daemons))
             }
         }
     };
@@ -1554,7 +1543,7 @@ mod tests {
             origin,
             slot: 3,
             round: 2,
-            device: crate::clock::HOST_DEVICE,
+            device: wasmnet_core::HOST_DEVICE,
             idx: 1,
             counter: 99_999,
             pre: 0,
@@ -1584,7 +1573,7 @@ mod tests {
                 cause: None,
                 slot: 4,
                 round: 0,
-                device: crate::clock::HOST_DEVICE,
+                device: wasmnet_core::HOST_DEVICE,
             },
             n: 0,
         };
@@ -1592,17 +1581,29 @@ mod tests {
             device: DeviceId::from_index(d),
             port,
         };
-        let entry = |record| JournalEntry {
-            at: 1_500,
-            device: "alice".to_owned(),
-            record,
-        };
+        let entry = |record| JournalEntry::new(1_500, "alice", record);
+        let mut info = LinkInfo::new("alice.0-sw.1", [port(0, 0), port(3, 1)], 100_000, 1500);
+        info.kind = LinkKind::from_code(2);
+        info.impairments[0] = Impairments::default()
+            .rate(10_000_000)
+            .queue(64)
+            .loss_ppm(10_000)
+            .jitter(50_000);
+        info.capture = CaptureOptions::default().snap_len(96).name_ends(true);
+        let mut stats = LinkStats::default();
+        stats.frames = [1, 2];
+        stats.bytes = [3, 4];
+        stats.dropped_down = [5, 6];
+        stats.oversize = [7, 8];
+        stats.lost = [9, 10];
+        stats.dropped_queue = [11, 12];
+        stats.lost_random = [13, 14];
         let mut r = SiteRecords {
-            outcome: Ok(Outcome::Quiescent {
-                at: 9_000,
-                parked: vec!["alice".to_owned()],
-                daemons: vec!["web: app-http-server.run".to_owned()],
-            }),
+            outcome: Ok(Outcome::quiescent(
+                9_000,
+                vec!["alice".to_owned()],
+                vec!["web: app-http-server.run".to_owned()],
+            )),
             now: 9_000,
             devices: vec![0, 3, 4],
             setup_devices: 4,
@@ -1644,70 +1645,36 @@ mod tests {
             .map(|(i, fate)| {
                 (
                     tag(10 + i as u64),
-                    FrameRecord {
-                        link: LinkId::from_index(0),
-                        from: port(0, 0),
-                        to: port(3, 1),
-                        sent_at: 1_000,
+                    FrameRecord::new(
+                        LinkId::from_index(0),
+                        port(0, 0),
+                        port(3, 1),
+                        1_000,
                         fate,
-                        len: 3,
-                        bytes: vec![1, 2, 3],
-                    },
+                        3,
+                        vec![1, 2, 3],
+                    ),
                 )
             })
             .collect(),
-            arrivals: vec![RemoteArrival {
-                frame_id: 5,
-                fate: FrameFate::Dropped(DropReason::Operator),
-            }],
-            taps: vec![Tap {
-                tag: tag(20),
-                link: LinkId::from_index(0),
-                end: 1,
-                at: 1_100,
-                inbound: true,
-                len: 60,
-                bytes: vec![9; 14],
-            }],
+            arrivals: vec![RemoteArrival::new(
+                5,
+                FrameFate::Dropped(DropReason::Operator),
+            )],
+            taps: vec![Tap::new(
+                tag(20),
+                LinkId::from_index(0),
+                1,
+                1_100,
+                true,
+                60,
+                vec![9; 14],
+            )],
             transitions: vec![(
                 setup,
-                LinkTransition {
-                    at: 5_000,
-                    link: LinkId::from_index(0),
-                    up: false,
-                },
+                LinkTransition::new(5_000, LinkId::from_index(0), false),
             )],
-            links: vec![(
-                LinkInfo {
-                    name: "alice.0-sw.1".to_owned(),
-                    ends: [port(0, 0), port(3, 1)],
-                    latency: 100_000,
-                    mtu: 1500,
-                    up: true,
-                    removed: false,
-                    kind: LinkKind::from_code(2),
-                    impairments: [
-                        Impairments::default()
-                            .rate(10_000_000)
-                            .queue(64)
-                            .loss_ppm(10_000)
-                            .jitter(50_000),
-                        Impairments::default(),
-                    ],
-                    capture: CaptureOptions::default().snap_len(96).name_ends(true),
-                    capture_notes: Vec::new(),
-                },
-                LinkStats {
-                    frames: [1, 2],
-                    bytes: [3, 4],
-                    dropped_down: [5, 6],
-                    oversize: [7, 8],
-                    lost: [9, 10],
-                    dropped_queue: [11, 12],
-                    lost_random: [13, 14],
-                },
-                vec![0x0a, 0x0d, 0x0d, 0x0a],
-            )],
+            links: vec![(info, stats, vec![0x0a, 0x0d, 0x0d, 0x0a])],
         };
         // A link `web-1` was created with, to `sw`.
         let mut created = r.links[0].clone();
@@ -1727,7 +1694,7 @@ mod tests {
                 cause: Some(key(n * 1_000)),
                 slot: 0,
                 round: 0,
-                device: crate::clock::HOST_DEVICE,
+                device: wasmnet_core::HOST_DEVICE,
             },
             n: 0,
         };
@@ -1737,37 +1704,25 @@ mod tests {
         };
         let link = |name: &str, a, b| {
             (
-                LinkInfo {
-                    name: name.to_owned(),
-                    ends: [a, b],
-                    latency: 1_000,
-                    mtu: 1500,
-                    up: true,
-                    removed: false,
-                    kind: LinkKind::Ethernet,
-                    impairments: [Impairments::default(); 2],
-                    capture: CaptureOptions::default(),
-                    capture_notes: Vec::new(),
-                },
+                LinkInfo::new(name, [a, b], 1_000, 1500),
                 LinkStats::default(),
                 Vec::new(),
             )
         };
-        let frame = |link, from, to| FrameRecord {
-            link: LinkId::from_index(link),
-            from,
-            to,
-            sent_at: 0,
-            fate: FrameFate::Delivered { at: 1 },
-            len: 1,
-            bytes: vec![1],
+        let frame = |link, from, to| {
+            FrameRecord::new(
+                LinkId::from_index(link),
+                from,
+                to,
+                0,
+                FrameFate::Delivered { at: 1 },
+                1,
+                vec![1],
+            )
         };
         let wan = link("sw-a.0-sw-b.0", port(0, 0), port(1, 0));
         let empty = |devices| SiteRecords {
-            outcome: Ok(Outcome::Deadline {
-                at: 9_000,
-                pending_events: 0,
-            }),
+            outcome: Ok(Outcome::deadline(9_000, 0)),
             now: 9_000,
             devices,
             setup_devices: 2,

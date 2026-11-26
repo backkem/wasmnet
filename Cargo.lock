@@ -1705,6 +1705,7 @@ dependencies = [
  "wasmnet-core",
  "wasmnet-det-cbor",
  "wasmnet-host",
+ "wasmnet-sites",
 ]
 
 [[package]]
@@ -1740,6 +1741,7 @@ dependencies = [
  "wasmnet-det-cbor",
  "wasmnet-host-macros",
  "wasmnet-pad",
+ "wasmnet-sites",
  "wasmnet-wire",
  "wasmtime",
  "wasmtime-wasi",
@@ -1888,6 +1890,15 @@ dependencies = [
  "wasmnet-app-kit",
  "wasmnet-wire",
  "wit-bindgen 0.61.1",
+]
+
+[[package]]
+name = "wasmnet-sites"
+version = "0.0.0"
+dependencies = [
+ "thiserror",
+ "wasmnet-core",
+ "wasmnet-wire",
 ]
 
 [[package]]

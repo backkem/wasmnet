@@ -21,9 +21,9 @@ use support::{built, config, events, field, transcript};
 use wasmnet_host::pcap::{self, Direction, LinkEnd};
 use wasmnet_host::sim::{
     CaptureOptions, DeviceCost, Impairments, LinkStats, Op, Placement, SeriesOptions,
-    sites::{self, Msg, SiteRecords, SiteSync, Step},
 };
 use wasmnet_host::{FrameRecord, JournalEntry, LinkId, Nanos, Network, Outcome};
+use wasmnet_sites::{self as sites, Msg, SiteRecords, SiteSync, Step};
 
 const US: Nanos = 1_000;
 const MS: Nanos = 1_000_000;

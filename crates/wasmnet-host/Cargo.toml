@@ -14,6 +14,8 @@ thiserror.workspace = true
 wasmnet-wire = { path = "../wasmnet-wire" }
 # The runtime-agnostic sim core: this crate is its wasmtime backend.
 wasmnet-core = { path = "../wasmnet-core" }
+# Only for the re-export at `sim::sites`, the old path of multi-site runs (one revision).
+wasmnet-sites = { path = "../wasmnet-sites" }
 # The typed adapters of portable extensions (`portable_adapter!`).
 wasmnet-host-macros = { path = "../wasmnet-host-macros" }
 # Content keys of the precompiled-component cache.

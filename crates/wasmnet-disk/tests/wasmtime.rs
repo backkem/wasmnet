@@ -22,12 +22,12 @@ use std::sync::OnceLock;
 
 use wasmnet_det_cbor::Value as Cbor;
 use wasmnet_disk::{DiskFault, DiskOp, DiskOptions, DiskSpec, Disks, Durability, Keep, image};
-use wasmnet_host::sim::sites::{self, Msg, SiteRecords, SiteSync, Step};
 use wasmnet_host::sim::{ExtensionOp, Op, Placement};
 use wasmnet_host::wasmtime::component::Component;
 use wasmnet_host::{
     DeviceConfig, DeviceId, DeviceOptions, Host, JournalEntry, Nanos, Network, Record, sim,
 };
+use wasmnet_sites::{self as sites, Msg, SiteRecords, SiteSync, Step};
 
 #[cfg(feature = "wasmtime")]
 use wasmnet_disk::DiskAdapter;
