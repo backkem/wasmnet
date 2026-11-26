@@ -29,7 +29,7 @@
 use std::any::{Any, TypeId};
 use std::fmt;
 use std::num::NonZeroU8;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::clock::{Nanos, VirtualClock};
 use crate::journal::{JournalEnd, Record};
@@ -168,14 +168,31 @@ pub struct DeviceSetup<'a> {
 
 /// Per-device handles of the network's extensions, one value per type: what a backend serves
 /// the device's extension imports from ([`crate::DeviceContext::ext`]); and the servers of the
-/// portable interfaces the device is given ([`DeviceExt::serve`]).
+/// portable interfaces the device is given ([`DeviceExt::serve`]), and its fuel span
+/// ([`DeviceExt::fuel_span`]).
 #[derive(Default)]
 pub struct DeviceExt {
     handles: Vec<(TypeId, Box<dyn Any + Send + Sync>)>,
     servers: Vec<(String, Arc<dyn ImportServer>)>,
+    fuel_span: FuelSpan,
 }
 
 impl DeviceExt {
+    /// The handles of a device the network is setting up, with its fuel span.
+    pub(crate) fn with_fuel_span(fuel_span: FuelSpan) -> Self {
+        Self {
+            fuel_span,
+            ..Self::default()
+        }
+    }
+
+    /// The device's fuel span ([`FuelSpan`]): a server keeps a clone to open and close it.
+    /// Every server of the device shares it, and it belongs to this incarnation of the device.
+    /// A `DeviceExt` the network did not make (`default()`) has one that never opens.
+    pub fn fuel_span(&self) -> &FuelSpan {
+        &self.fuel_span
+    }
+
     /// Sets the handle of `value`'s type, replacing an earlier one.
     pub fn insert<T: Any + Send + Sync>(&mut self, value: T) {
         let id = TypeId::of::<T>();
@@ -218,6 +235,126 @@ impl DeviceExt {
     /// Every interface served to this device, with its server, in the order they were set.
     pub fn servers(&self) -> impl Iterator<Item = (&str, &Arc<dyn ImportServer>)> {
         self.servers.iter().map(|(i, s)| (i.as_str(), s))
+    }
+}
+
+// ---- fuel spans ----------------------------------------------------------------------------
+
+/// A device's fuel span: a stretch of one instant in which the device's work costs it no fuel,
+/// for a server that lets a controller work on the device while it is stopped (a debugger's
+/// hold). One per device incarnation, shared by every server of the device
+/// ([`DeviceExt::fuel_span`]).
+///
+/// [`begin`](Self::begin) opens it, [`end`](Self::end) closes it. On a metered backend (wasmtime)
+/// the device's fuel when it ends is what it was when it began, whatever device code ran in
+/// between (the device's own code between two calls of a server, or export calls others made
+/// into it), and that work is in none of its cost figures. While it is open the device runs on
+/// an allowance of its own, its fuel per instant, set when the span opens and again at every
+/// look the backend takes (every served call and every round of the device's actor). A backend
+/// without metering (a page, `fuel(false)`, an unmetered component) changes nothing: the calls
+/// answer the same and the span is only a state. Only fuel is spared: the commands and actor
+/// polls a span's work takes still count in the device's costs and toward
+/// [`crate::Guard::max_polls_per_instant`].
+///
+/// Rules, the same on every backend:
+///
+/// * A span lasts at most to the end of the instant it began in: at a later instant it is
+///   closed, and the device's fuel is that instant's budget, as always.
+/// * A second `begin` while one is open changes nothing (the span keeps the fuel it saved); one
+///   `end` closes it, whoever opened it.
+/// * The device's stop, crash or removal closes it for good: the handle of that incarnation
+///   does nothing after (a device started again has a new one).
+/// * Made from inside a served call, a change applies at once (when the call returns to the
+///   device); made from anywhere else (an operator event, an action, between runs), it applies
+///   at the device's next look, before it runs any code.
+///
+/// It is not a way to give a device unmetered work of its own: everything the device does while
+/// a span is open (its own calls included) is free, so a server opens one only for a stop the
+/// device makes to be inspected, and ends it when the stop ends.
+///
+/// Embedder surface, unstable.
+#[derive(Clone)]
+pub struct FuelSpan {
+    state: Arc<Mutex<SpanState>>,
+    /// `None`: a handle of no device (begins nothing).
+    clock: Option<VirtualClock>,
+}
+
+#[derive(Default)]
+struct SpanState {
+    /// The instant of the open span.
+    open_at: Option<Nanos>,
+    /// The device's incarnation ended.
+    retired: bool,
+}
+
+impl FuelSpan {
+    pub(crate) fn new(clock: VirtualClock) -> Self {
+        Self {
+            state: Arc::default(),
+            clock: Some(clock),
+        }
+    }
+
+    fn state(&self) -> MutexGuard<'_, SpanState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Opens a span at the current instant. `false` if one was open already (nothing changes),
+    /// or the handle's device is gone.
+    pub fn begin(&self) -> bool {
+        let Some(clock) = &self.clock else {
+            return false;
+        };
+        let now = clock.now();
+        let mut s = self.state();
+        if s.retired || s.open_at == Some(now) {
+            return false;
+        }
+        s.open_at = Some(now);
+        true
+    }
+
+    /// Closes the open span. `false` if none was open.
+    pub fn end(&self) -> bool {
+        let open = self.is_open();
+        self.state().open_at = None;
+        open
+    }
+
+    /// A span is open: begun at the current instant, not ended, and the device is still the
+    /// one it was begun for.
+    pub fn is_open(&self) -> bool {
+        let Some(clock) = &self.clock else {
+            return false;
+        };
+        let s = self.state();
+        !s.retired && s.open_at == Some(clock.now())
+    }
+
+    /// The device's incarnation ended (its stop, crash or removal).
+    pub(crate) fn retire(&self) {
+        let mut s = self.state();
+        s.retired = true;
+        s.open_at = None;
+    }
+}
+
+impl Default for FuelSpan {
+    /// A handle of no device: it never opens.
+    fn default() -> Self {
+        Self {
+            state: Arc::default(),
+            clock: None,
+        }
+    }
+}
+
+impl fmt::Debug for FuelSpan {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FuelSpan")
+            .field("open", &self.is_open())
+            .finish()
     }
 }
 
@@ -775,6 +912,9 @@ pub enum Served {
 /// [`Value`]; a resource argument (`borrow` or `own`) arrives as [`Value::Resource`] with the
 /// handle the server gave out, and a resource the server answers is a handle it chose. The
 /// server owns what it keeps; the backend owns nothing of the call once it returned.
+///
+/// A server that lets a controller work on a stopped device keeps the device's [`FuelSpan`]
+/// ([`DeviceExt::fuel_span`]), so that the work costs the device nothing.
 pub trait ImportServer: Send + Sync {
     /// Serves `function` (its component-model name) of `interface` with `args`.
     fn call(&self, interface: &str, function: &str, args: Vec<Value>) -> Served;
@@ -874,4 +1014,42 @@ impl fmt::Debug for ExtOpParser {
 pub(crate) struct Parsers {
     pub(crate) options: std::collections::BTreeMap<String, ExtOption>,
     pub(crate) ops: std::collections::BTreeMap<String, ExtOpParser>,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    #[test]
+    fn a_fuel_span_lasts_one_instant_and_one_incarnation() {
+        let clock = VirtualClock::new(Duration::ZERO);
+        let span = FuelSpan::new(clock.clone());
+        let other = span.clone();
+        assert!(!span.is_open());
+        assert!(!span.end(), "nothing to end");
+        assert!(span.begin());
+        // A second begin, by any holder, changes nothing; one end closes it.
+        assert!(!other.begin());
+        assert!(other.is_open());
+        assert!(other.end());
+        assert!(!span.is_open());
+        assert!(!span.end());
+        // Begun and not ended: closed once the instant is over.
+        assert!(span.begin());
+        clock.advance_to(5);
+        assert!(!span.is_open());
+        assert!(!span.end());
+        assert!(span.begin(), "a new span at the new instant");
+        // The incarnation ends: closed for good.
+        span.retire();
+        assert!(!other.is_open());
+        assert!(!other.begin());
+        // A handle of no device never opens.
+        let none = FuelSpan::default();
+        assert!(!none.begin());
+        assert!(!none.is_open());
+        assert!(!DeviceExt::default().fuel_span().begin());
+    }
 }

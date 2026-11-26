@@ -112,8 +112,8 @@ pub use device::{Command, CostMeter, CountersReply, DeviceCost, Inbox, Snapshot,
 pub use digest::Digest;
 pub use exec::{ActorFuture, Boundary, OpState, Stalled, Stats, Step, block_on};
 pub use ext::{
-    CableKind, Control, DeviceExt, ExtOptions, ExtValue, ExtensionOp, ImportServer, Interface,
-    Invocation, NetworkExtension, Served,
+    CableKind, Control, DeviceExt, ExtOptions, ExtValue, ExtensionOp, FuelSpan, ImportServer,
+    Interface, Invocation, NetworkExtension, Served,
 };
 pub use infra::{Infra, InfraEnd};
 pub use input::InputQueue;

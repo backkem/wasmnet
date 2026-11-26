@@ -500,6 +500,8 @@ struct DeviceRecord {
     apps: Vec<String>,
     stdout: OutputCapture,
     stderr: OutputCapture,
+    /// Its incarnation's fuel span, closed for good when the incarnation ends.
+    fuel_span: crate::ext::FuelSpan,
     /// A placeholder for a device that runs on another site.
     remote: bool,
     /// Its component's catalog name, when known (to start it again after a stop).
@@ -534,6 +536,7 @@ struct Handles {
     status: Status,
     stdout: OutputCapture,
     stderr: OutputCapture,
+    fuel_span: crate::ext::FuelSpan,
 }
 
 /// The rest of instantiating a device: called with the resolved component.
@@ -1223,7 +1226,8 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
             journal: self.journal.clone(),
             device: name.to_owned(),
         };
-        let mut ext = DeviceExt::default();
+        let fuel_span = crate::ext::FuelSpan::new(self.clock.clone());
+        let mut ext = DeviceExt::with_fuel_span(fuel_span.clone());
         let setup = DeviceSetup {
             index: idx,
             name,
@@ -1289,6 +1293,7 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
             status,
             stdout,
             stderr,
+            fuel_span,
         };
         (context, handles)
     }
@@ -1320,6 +1325,7 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
                 .restart_actor(idx, h.inbox.clone(), h.status, instance.actor);
             let d = &mut self.devices[idx];
             d.inbox = h.inbox;
+            d.fuel_span = h.fuel_span;
             d.has_counters = instance.has_counters;
             d.exports = instance.exports;
             d.apps = instance.apps;
@@ -1339,6 +1345,7 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
                 apps: instance.apps,
                 stdout: h.stdout,
                 stderr: h.stderr,
+                fuel_span: h.fuel_span,
                 remote: false,
                 component: None,
                 config,
@@ -1581,6 +1588,13 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
 
     /// Tells the network's extensions about device `idx`'s life (after its journal record).
     fn life(&mut self, idx: usize, at: Nanos, event: LifeEvent<'_>) {
+        // The incarnation ended: its fuel span closes for good, before anyone hears of it.
+        if matches!(
+            event,
+            LifeEvent::Stopped | LifeEvent::Crashed { .. } | LifeEvent::Removed
+        ) {
+            self.devices[idx].fuel_span.retire();
+        }
         if self.extensions.is_empty() {
             return;
         }
@@ -2805,6 +2819,7 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
             apps: Vec::new(),
             stdout: OutputCapture::new(),
             stderr: OutputCapture::new(),
+            fuel_span: crate::ext::FuelSpan::default(),
             remote: true,
             component: None,
             config,
