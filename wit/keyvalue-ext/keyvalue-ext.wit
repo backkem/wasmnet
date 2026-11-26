@@ -1,0 +1,93 @@
+package wasmnet:keyvalue-ext@0.1.0;
+
+/// Ordered access to a disk opened with `wasi:keyvalue/store.open`: what the standard lacks,
+/// shaped to be upstreamed or dropped.
+///
+/// A disk is an ordered map from string keys to byte values that belongs to one device and
+/// outlives its store (a stop, a crash, a start). Keys sort ascending by their UTF-8 bytes,
+/// everywhere. Every function here is synchronous, never yields, takes no virtual time and is
+/// served from the calling device's disk only; the caller owns every list it gets back. A call
+/// that changes the disk changes all of it or nothing (unless an operator's fault tears it on
+/// purpose).
+///
+/// Limits per call: a key of at most 4,096 bytes; a value of at most 16 MiB; a write of at most
+/// 4,096 changes and 32 MiB of keys and values; a scan of 1 to 4,096 entries and at most 8 MiB of
+/// keys and values, but at least one entry if there is one.
+interface ordered {
+    use wasi:keyvalue/store@0.2.0-draft2.{bucket};
+
+    /// Why a call did not do what was asked. Nothing changed, whichever it is.
+    variant error {
+        /// The bucket's disk is gone (the device's disks were declared again without it).
+        no-such-store,
+        /// The call is over a per-call limit: the text says which.
+        too-large(string),
+        /// The disk's quota or the network's total has no room for what the call adds: the text
+        /// says how much is held.
+        full(string),
+        /// The disk failed (a fault an operator injected); the text is for people.
+        failed(string),
+    }
+
+    /// One change of a write.
+    variant change {
+        /// Sets a key to a value, replacing any value it had.
+        set(tuple<string, list<u8>>),
+        /// Deletes a key; deleting a missing key is no error.
+        delete(string),
+    }
+
+    /// One entry of a scan.
+    record entry {
+        key: string,
+        /// The value's length in bytes.
+        size: u64,
+        /// The value, when the scan asked for values.
+        value: option<list<u8>>,
+    }
+
+    /// Applies `changes` in order, all or none. Durable on return in `each-call` mode; joins the
+    /// unsynced tail in `on-sync` mode (see `durable`).
+    write: func(b: borrow<bucket>, changes: list<change>) -> result<_, error>;
+
+    /// Up to `limit` (1 to 4,096) entries whose keys start with `prefix` and sort after `after`
+    /// (from the first such key when `none`), ascending, with their values when `values` is set.
+    /// An empty list means there are no more; the next page starts after the last key returned.
+    scan: func(b: borrow<bucket>, prefix: string, after: option<string>, limit: u32, values: bool) -> result<list<entry>, error>;
+
+    /// Up to `len` bytes (at most 16 MiB) of `key`'s value from byte `offset`: fewer at its end,
+    /// none past it. `none` if the key is missing.
+    get-range: func(b: borrow<bucket>, key: string, offset: u64, len: u32) -> result<option<list<u8>>, error>;
+}
+
+/// When a disk's changes survive a power loss: the device's stop or crash, whatever its cause.
+interface durable {
+    use wasi:keyvalue/store@0.2.0-draft2.{bucket};
+    use ordered.{error};
+
+    /// A disk's durability, as the device's options declared it.
+    enum durability {
+        /// Every call that returned `ok` is durable.
+        each-call,
+        /// Changes are durable once `sync` returned `ok`; a power loss loses the rest.
+        on-sync,
+    }
+
+    /// The disk's durability.
+    mode: func(b: borrow<bucket>) -> durability;
+
+    /// Makes every change so far durable (a no-op in `each-call` mode). Synchronous: when it
+    /// returns `ok`, a power loss at any later point keeps those changes.
+    sync: func(b: borrow<bucket>) -> result<_, error>;
+}
+
+/// What a device that uses disks imports. `wasi:keyvalue/store` and `batch` are served with
+/// stronger guarantees than the standard asks: `list-keys` is ascending and its cursor is the
+/// last key returned; `set-many` and `delete-many` are atomic. `wasi:keyvalue/atomics` is not
+/// served.
+world disk-user {
+    import wasi:keyvalue/store@0.2.0-draft2;
+    import wasi:keyvalue/batch@0.2.0-draft2;
+    import ordered;
+    import durable;
+}
