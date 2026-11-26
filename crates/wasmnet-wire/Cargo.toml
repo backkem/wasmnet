@@ -1,7 +1,7 @@
 [package]
 name = "wasmnet-wire"
 version = "0.0.0"
-description = "I/O-free, no_std helpers shared by host and components: MAC addresses, Ethernet frame views, pcap-ng encoding, DHCP and DNS messages."
+description = "I/O-free, no_std helpers shared by host and components: MAC addresses, Ethernet frame views, pcap-ng encoding and a strict reader, DHCP and DNS messages."
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

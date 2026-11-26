@@ -1,5 +1,5 @@
 //! Minimal, deterministic pcap-ng **encoder** (no clock, no I/O).
-//! A strict reader for checking its output lives in `wasmnet_host::pcap`.
+//! A strict reader for checking its output lives in [`crate::pcap`].
 //!
 //! Writes one little-endian section: a Section Header Block, one Interface Description Block per
 //! interface (linktype 1 = Ethernet, `if_tsresol` = 9 so timestamps are nanoseconds), and

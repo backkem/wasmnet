@@ -18,6 +18,7 @@ pub mod dns;
 pub mod duration;
 pub mod ethernet;
 pub mod mac;
+pub mod pcap;
 pub mod pcapng;
 
 #[cfg(test)]

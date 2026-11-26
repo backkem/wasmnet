@@ -142,7 +142,8 @@ nothing, so a network that sets no option records exactly the bytes it always di
   with empty `bytes`. The records themselves remain: a link that records nothing still adds
   one fixed-size record per transmission.
 - **`name_ends`**: the capture header names the link's two ends. Each interface's
-  `if_description` is a `pcap::LinkEnd`, in the format
+  `if_description` is a `pcap::LinkEnd` (`wasmnet_wire::pcap`, the reader beside the encoder,
+  re-exported as `wasmnet_core::pcap`), in the format
   `wasmnet-link-end/1 link=<link> end=<a|b> device=<device> port=<port> peer-device=<device> peer-port=<port> created-at=<ns>`
   (values percent-encoded; `LinkEnd::parse` reads it, ignoring keys a later version adds). A
   device removed and added again gets new links with new names (`-2`, ...), but their captures
