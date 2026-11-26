@@ -35,14 +35,16 @@
 //! ```
 //!
 //! Build outputs land in `target/wasm32-wasip2/release/` (or under `$CARGO_TARGET_DIR`).
-//! `build` maps every source path out of the components' bytes (`remap.rs`), so the same
-//! source, toolchain and tools give the same bytes in any checkout on the same platform.
+//! `build` maps every source path out of the components' bytes (`remap.rs`) and gives every
+//! crate a `-C metadata` that does not depend on the host (`metadata.rs`), so the same source,
+//! toolchain and tools give the same bytes in any checkout, on Linux and on Windows.
 //! `build` needs `wac` and `wasm-tools` on `PATH`, `test-guest` needs `wasmtime`, `web` needs
 //! Node 24 and npm, and a Chromium for `--test`. The tools' versions are in `tools.toml`; the
 //! components and nodes are listed in `components/README.md`.
 
 mod artifacts;
 mod leaks;
+mod metadata;
 mod remap;
 
 use std::collections::BTreeSet;
@@ -347,6 +349,17 @@ fn build(args: &BuildArgs) -> Result<Built> {
     cmd.current_dir(&root)
         .args(["build", "--release", "--target", TARGET])
         .env("CARGO_ENCODED_RUSTFLAGS", format!("@{}", argfile.display()));
+    // Every crate's `-C metadata` from what it is, not from the host (metadata.rs): this
+    // program is the build's rustc wrapper, and a wrapper set before runs in turn.
+    let this = std::env::current_exe()?;
+    cmd.env("RUSTC_WRAPPER", &this)
+        .env(metadata::WRAPPER_ENV, "1")
+        .env_remove(metadata::INNER_ENV);
+    if let Some(inner) = std::env::var_os("RUSTC_WRAPPER").filter(|w| !w.is_empty())
+        && Path::new(&inner) != this
+    {
+        cmd.env(metadata::INNER_ENV, inner);
+    }
     for c in &selected.crates {
         cmd.args(["-p", &c.package]);
     }
@@ -641,6 +654,13 @@ cargo xtask web [--no-build] [--test]";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // `build` runs cargo with this program as its rustc wrapper (metadata.rs).
+    if std::env::var_os(metadata::WRAPPER_ENV).is_some() {
+        return metadata::wrap(args).unwrap_or_else(|e| {
+            eprintln!("xtask (rustc wrapper): {e}");
+            ExitCode::FAILURE
+        });
+    }
     let result = match args.first().map(String::as_str) {
         Some("build") => build_args(&args[1..]).and_then(|args| build(&args).map(drop)),
         Some("artifacts") => artifacts::command(&args[1..]),

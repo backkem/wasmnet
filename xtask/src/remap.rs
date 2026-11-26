@@ -12,7 +12,8 @@
 //! separators, any other crate's directory `/deps/<name>-<version>/...`. A directory, not a
 //! crate root, because rustc keeps the rest of a path as it found it, separators included,
 //! and appends it to the mapping's target. The flags go through an argument file in the
-//! target directory, named by the hash of its contents.
+//! target directory, named by the hash of its contents and of the metadata scheme
+//! (`metadata.rs`).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -192,7 +193,10 @@ pub fn argfile(root: &Path, target: &Path, wanted: &[&str]) -> Result<PathBuf> {
         .iter()
         .map(|m| format!("--remap-path-prefix={}={}\n", m.from.display(), m.to))
         .collect();
-    let hash = wasmnet_artifacts::sha256_hex(text.as_bytes());
+    // Named for the metadata scheme too: a build with another scheme (or none) has other
+    // flags, so cargo rebuilds its crates instead of reusing them (metadata.rs).
+    let named = format!("{}\n{text}", crate::metadata::SCHEME);
+    let hash = wasmnet_artifacts::sha256_hex(named.as_bytes());
     let dir = target.join("remap");
     fs::create_dir_all(&dir)?;
     let path = dir.join(format!("{}.args", &hash[..16]));
