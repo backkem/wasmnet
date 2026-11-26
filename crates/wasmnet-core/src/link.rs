@@ -362,6 +362,26 @@ pub struct LinkInfo {
     pub capture_notes: Vec<String>,
 }
 
+impl LinkInfo {
+    /// A link called `name` between `ends`, with its latency and MTU: up, not removed, an
+    /// Ethernet link without impairments, with the default [`CaptureOptions`] and no notes.
+    /// For code that rebuilds one it carried elsewhere (a decoder); set the other fields after.
+    pub fn new(name: impl Into<String>, ends: [PortRef; 2], latency: Nanos, mtu: u32) -> Self {
+        Self {
+            name: name.into(),
+            ends,
+            latency,
+            mtu,
+            up: true,
+            removed: false,
+            kind: LinkKind::Ethernet,
+            impairments: [Impairments::default(); 2],
+            capture: CaptureOptions::default(),
+            capture_notes: Vec::new(),
+        }
+    }
+}
+
 /// What a link carries. A cable kind is a registered [`CableModel`] that names its
 /// payload, its timing and its tap; a cable has no pcap and no frame log and never crosses
 /// sites.
@@ -506,6 +526,42 @@ pub struct RemoteFrame {
     pub bytes: Vec<u8>,
 }
 
+/// A frame from a peer site that this site cannot take ([`Network::check_remote`]), or a peer
+/// site that broke the lockstep protocol (the site-sync driver, crate `wasmnet-sites`). Nothing
+/// of the offending message was queued.
+///
+/// Embedder surface, unstable (multi-site runs).
+///
+/// [`Network::check_remote`]: crate::Network::check_remote
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum SyncError {
+    /// A frame on a link this network does not have.
+    #[error("site sync: a WAN frame on link {link}, of {links}")]
+    NoSuchLink { link: usize, links: usize },
+    /// A frame for a link end other than 0 or 1.
+    #[error("site sync: a WAN frame for link end {0}")]
+    NoSuchEnd(usize),
+    /// A frame whose destination is not a WAN link's end on this site.
+    #[error(
+        "site sync: a WAN frame for {device}:{port} on link {link}, not a WAN link's end on this site"
+    )]
+    NotWanEnd {
+        device: usize,
+        port: u32,
+        link: usize,
+    },
+    /// A frame without a causal key.
+    #[error("site sync: a WAN frame without a key")]
+    NoKey,
+    /// A frame due before this site's current time: the sites are out of lockstep.
+    #[error("site sync: lockstep violation: a frame due at t={due} arrived at t={now}")]
+    Overdue { due: Nanos, now: Nanos },
+    /// A Hello or Records message while the sites run in lockstep.
+    #[error("site sync: a {0} message during lockstep")]
+    UnexpectedMessage(&'static str),
+}
+
 /// One pcap record of a WAN link, as one site saw it (its own end only). Merging both sites'
 /// records by `tag` rebuilds the single-site capture.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -540,6 +596,71 @@ pub struct LinkTransition {
     pub at: Nanos,
     pub link: LinkId,
     pub up: bool,
+}
+
+// For code that rebuilds the records it carried elsewhere (a decoder, a merge of sites'
+// records): these types are `#[non_exhaustive]`, so a field added later is never a compile
+// error there.
+impl FrameRecord {
+    /// A transmission on `link` from `from` to `to` at `sent_at`, of `len` bytes, of which the
+    /// record keeps `bytes`.
+    pub fn new(
+        link: LinkId,
+        from: PortRef,
+        to: PortRef,
+        sent_at: Nanos,
+        fate: FrameFate,
+        len: usize,
+        bytes: Vec<u8>,
+    ) -> Self {
+        Self {
+            link,
+            from,
+            to,
+            sent_at,
+            fate,
+            len,
+            bytes,
+        }
+    }
+}
+
+impl Tap {
+    /// A pcap record of `link`'s end `end` at `at`, of a frame of `len` bytes, of which the
+    /// capture keeps `bytes`.
+    pub fn new(
+        tag: Tag,
+        link: LinkId,
+        end: usize,
+        at: Nanos,
+        inbound: bool,
+        len: usize,
+        bytes: Vec<u8>,
+    ) -> Self {
+        Self {
+            tag,
+            link,
+            end,
+            at,
+            inbound,
+            len,
+            bytes,
+        }
+    }
+}
+
+impl RemoteArrival {
+    /// The fate of frame `frame_id` of the sending site's frame log.
+    pub fn new(frame_id: usize, fate: FrameFate) -> Self {
+        Self { frame_id, fate }
+    }
+}
+
+impl LinkTransition {
+    /// `link` went up or down at `at`.
+    pub fn new(at: Nanos, link: LinkId, up: bool) -> Self {
+        Self { at, link, up }
+    }
 }
 
 /// Why two ports could not be wired.

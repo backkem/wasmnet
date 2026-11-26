@@ -5,14 +5,16 @@
 
 use std::time::Duration;
 
+use wasmnet_host::pcap::LinkEnd;
 use wasmnet_host::sim::infra::{Follow, TableSince};
 use wasmnet_host::sim::{
-    Cable, CaptureOptions, Control, DeclaredPort, DeviceCommand, DeviceCost, DeviceInstance,
-    ExtOptions, Fault, Impairments, LinkKind, Op, SeriesOptions, SupplyLimits,
+    Cable, CaptureOptions, Control, Ctx, DeclaredPort, DeviceCommand, DeviceCost, DeviceInstance,
+    ExtOptions, Fault, Impairments, LinkKind, Op, Origin, RemoteArrival, SeriesOptions,
+    SupplyLimits, Tag, Tap,
 };
 use wasmnet_host::{
-    DeviceConfig, DeviceId, DeviceOptions, Guard, JournalEntry, Level, LinkId, LinkStats, Outcome,
-    Record, SimConfig,
+    DeviceConfig, DeviceId, DeviceOptions, FrameFate, FrameRecord, Guard, JournalEntry, Level,
+    LinkId, LinkInfo, LinkStats, LinkTransition, Outcome, Record, SimConfig,
 };
 
 #[test]
@@ -136,6 +138,26 @@ fn every_listed_type_has_a_constructor_outside_its_crate() {
     ));
     assert_eq!(LinkStats::default().frames, [0, 0]);
     assert_eq!(DeviceCost::default().fuel, 0);
+
+    // Records rebuilt from elsewhere (a decoder, a merge of sites' records).
+    let ends = [device.port(0), DeviceId::from_index(1).port(1)];
+    let mut info = LinkInfo::new("a.0-b.1", ends, 100, 1500);
+    info.capture = capture;
+    assert!(info.up && !info.removed && info.capture_notes.is_empty());
+    let frame = FrameRecord::new(link, ends[0], ends[1], 5, FrameFate::Lost, 60, vec![0; 14]);
+    let ctx = Ctx {
+        origin: Origin::Setup,
+        cause: None,
+        slot: 0,
+        round: 0,
+        device: 0,
+    };
+    let tap = Tap::new(Tag { ctx, n: 0 }, link, 1, 7, true, 60, vec![0; 14]);
+    let arrival = RemoteArrival::new(3, FrameFate::Delivered { at: 9 });
+    let transition = LinkTransition::new(11, link, false);
+    let end = LinkEnd::new("a.0-b.1", 0, "a", 0, "b", 1, 5);
+    assert_eq!((frame.len, tap.end, arrival.frame_id), (60, 1, 3));
+    assert_eq!((transition.at, end.peer_port), (11, 1));
 }
 
 /// Portable extensions: what an extension builds to declare and answer an interface.

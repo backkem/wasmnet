@@ -28,7 +28,7 @@ use crate::link::{
 };
 use crate::link::{
     ConnectError, FrameRecord, LinkInfo, LinkStats, LinkTransition, Panel, PortInfo, RemoteArrival,
-    RemoteFrame, Tap, Wire,
+    RemoteFrame, SyncError, Tap, Wire,
 };
 use crate::output::OutputCapture;
 use crate::{Error, Guard, Outcome, Result, SimConfig};
@@ -2832,13 +2832,12 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
 
     /// Why `frame` cannot have come from a peer site in lockstep, if it cannot: its link must
     /// be a WAN link whose `to_end` is `device:port` on this site, and its key must not lie
-    /// before now. [`crate::sites::SiteSync::handle`] checks every frame with it, so a malformed
-    /// or out-of-step message is an error, not a panic.
-    pub(crate) fn check_remote(
-        &self,
-        frame: &RemoteFrame,
-    ) -> std::result::Result<(), crate::sites::SyncError> {
-        use crate::sites::SyncError;
+    /// before now. A site-sync driver checks every frame with it before
+    /// [`receive_remote`](Self::receive_remote), so a malformed or out-of-step message is an
+    /// error, not a panic.
+    ///
+    /// Embedder surface, unstable (multi-site runs).
+    pub fn check_remote(&self, frame: &RemoteFrame) -> std::result::Result<(), SyncError> {
         let links = self.panel.link_count();
         if frame.link.0 >= links {
             return Err(SyncError::NoSuchLink {

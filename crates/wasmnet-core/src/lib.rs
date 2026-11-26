@@ -121,7 +121,7 @@ pub use journal::{JournalEnd, JournalEntry, Level, Record, Stream};
 pub use link::{
     CaptureOptions, DEFAULT_QUEUE, DropReason, FrameAction, FrameFate, FrameRecord, Impairments,
     LinkInfo, LinkKind, LinkStats, LinkTransition, PPM, PortInfo, RemoteArrival, RemoteFrame,
-    SeriesOptions, Tap, Transmit, TransmitHook, Wire,
+    SeriesOptions, SyncError, Tap, Transmit, TransmitHook, Wire,
 };
 pub use memory::MemoryBudget;
 pub use network::{
@@ -207,7 +207,7 @@ pub enum Error {
     NotACommand(String),
     /// The peer site of a multi-site run broke the lockstep protocol.
     #[error(transparent)]
-    SiteSync(#[from] sites::SyncError),
+    SiteSync(#[from] SyncError),
     /// Nothing is queued and every store is idle, yet the host still awaits these calls, given as
     /// `(component, call)`. They can never finish.
     #[error(

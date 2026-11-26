@@ -90,36 +90,8 @@ pub enum WireError {
     NotPeerDevice(usize),
 }
 
-/// A peer site that broke the lockstep protocol ([`SiteSync::handle`]). Nothing of the
-/// offending message was queued.
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-#[non_exhaustive]
-pub enum SyncError {
-    /// A frame on a link this network does not have.
-    #[error("site sync: a WAN frame on link {link}, of {links}")]
-    NoSuchLink { link: usize, links: usize },
-    /// A frame for a link end other than 0 or 1.
-    #[error("site sync: a WAN frame for link end {0}")]
-    NoSuchEnd(usize),
-    /// A frame whose destination is not a WAN link's end on this site.
-    #[error(
-        "site sync: a WAN frame for {device}:{port} on link {link}, not a WAN link's end on this site"
-    )]
-    NotWanEnd {
-        device: usize,
-        port: u32,
-        link: usize,
-    },
-    /// A frame without a causal key.
-    #[error("site sync: a WAN frame without a key")]
-    NoKey,
-    /// A frame due before this site's current time: the sites are out of lockstep.
-    #[error("site sync: lockstep violation: a frame due at t={due} arrived at t={now}")]
-    Overdue { due: Nanos, now: Nanos },
-    /// A Hello or Records message while the sites run in lockstep.
-    #[error("site sync: a {0} message during lockstep")]
-    UnexpectedMessage(&'static str),
-}
+/// A peer site that broke the lockstep protocol: the core's type ([`crate::SyncError`]).
+pub use crate::SyncError;
 
 /// Two sites' records that cannot be merged ([`merge`]): records from a peer must name what
 /// exists and be in processing order.
