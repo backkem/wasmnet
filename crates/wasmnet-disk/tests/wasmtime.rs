@@ -125,7 +125,7 @@ fn spec(period: &str) -> String {
             Cbor::Map(vec![(Cbor::text("period"), Cbor::text(period))]),
         ),
         (
-            Cbor::text("disks"),
+            Cbor::text("disk.specs"),
             Cbor::Array(vec![disk("state", None), disk("log", Some("on-sync"))]),
         ),
     ])
@@ -491,7 +491,7 @@ fn declarations_are_checked() {
         ("durability", sim::value::Value::str("on-sync")),
     ])]);
     let mut options = DeviceOptions::default();
-    net.set_option(&mut options, "disks", &v).unwrap();
+    net.set_option(&mut options, "disk.specs", &v).unwrap();
     assert_eq!(
         options.ext.get::<DiskOptions>(),
         Some(&DiskOptions::new(vec![
@@ -678,4 +678,230 @@ fn supplied_components_with_disks_are_admitted_by_the_disk_patterns() {
     let refused = plain.check(&bytes).unwrap_err();
     assert!(refused.contains("wasi:keyvalue/store"), "{refused}");
     plain.and(wasmnet_disk::IMPORTS).check(&bytes).unwrap();
+}
+
+// ---- the page test's scenario ---------------------------------------------------------------
+
+/// The page test's disk scenario (`web/src/worker.ts`, `disks`), natively and in the same
+/// generic forms the page uses (options and ops from values, a controller's spec, an image
+/// loaded before the run): `p` through stops, starts, a crash and every fault, `q` from images
+/// and over its quota, `r` a controller's device recreated, removed and made again. Writes the
+/// lines and digests the page must match to `target/disk-native.txt` (the page test reads it
+/// with `NATIVE_DISK`).
+#[test]
+fn page_scenario_native() {
+    use sim::value::Value as V;
+    let w = world();
+    let mut net = Network::new(&w.host, 42);
+    net.add_extension(Disks::default());
+    net.set_component_resolver(Box::new(move |name, instantiate| match name {
+        "disk_probe" => instantiate(&w.probe),
+        other => Err(sim::Error::Refused(format!("no component {other}"))),
+    }));
+    net.set_infra_catalog(vec!["disk_probe".to_owned()]);
+    let disk = |name: &str, extra: Vec<(&str, V)>| {
+        let mut f = vec![("name", V::str(name))];
+        f.extend(extra);
+        V::record(f)
+    };
+    let options = |disks: Vec<V>| {
+        let mut o = DeviceOptions::default().crash_alone(true);
+        net.set_option(&mut o, "disk.specs", &V::List(disks))
+            .unwrap();
+        o
+    };
+    let two = options(vec![
+        disk("state", vec![]),
+        disk("log", vec![("durability", V::str("on-sync"))]),
+    ]);
+    let boots = u64_image(&[("boots", 41u64.to_le_bytes().to_vec())]);
+    let small = options(vec![
+        disk(
+            "state",
+            vec![("quota", V::U32(2048)), ("initial", V::Bytes(boots))],
+        ),
+        disk("log", vec![]),
+    ]);
+    let p = net
+        .device_with_options(
+            "p",
+            &w.probe,
+            config(&[("period", "10ms"), ("big", "1048576")]),
+            two,
+        )
+        .unwrap();
+    net.device_with_options(
+        "q",
+        &w.probe,
+        config(&[("period", "1000ms"), ("fill", "4096")]),
+        small,
+    )
+    .unwrap();
+    let spec = |period: &str| {
+        let disk = |name: &str, d: Option<&str>| {
+            let mut m = vec![(Cbor::text("name"), Cbor::text(name))];
+            if let Some(d) = d {
+                m.push((Cbor::text("durability"), Cbor::text(d)));
+            }
+            Cbor::Map(m)
+        };
+        let bytes = Cbor::Map(vec![
+            (Cbor::text("component"), Cbor::text("disk_probe")),
+            (
+                Cbor::text("config"),
+                Cbor::Map(vec![(Cbor::text("period"), Cbor::text(period))]),
+            ),
+            (
+                Cbor::text("disk.specs"),
+                Cbor::Array(vec![disk("state", None), disk("log", Some("on-sync"))]),
+            ),
+        ])
+        .encode();
+        bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
+    };
+    let steps = [
+        ("step.0", format!("0ms apply r {}", spec("10ms"))),
+        ("step.1", format!("45ms apply r {}", spec("20ms"))),
+        ("step.2", "70ms remove r".to_owned()),
+        ("step.3", format!("80ms apply r {}", spec("10ms"))),
+    ];
+    let cfg: Vec<(&str, &str)> = steps.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    net.device_with_options(
+        "ctl",
+        &w.ctl,
+        config(&cfg),
+        DeviceOptions::default().infra(true),
+    )
+    .unwrap();
+    for (at, op) in [
+        (25, Op::stop_device("p")),
+        (30, Op::start_device("p")),
+        (55, Op::crash_device("p", "operator crash")),
+        (58, Op::start_device("p")),
+        (62, Op::start_device("p")),
+        (86, Op::stop_device("p")),
+        (87, Op::start_device("p")),
+    ] {
+        net.add_op(op, Placement::StartOf(at * MS)).unwrap();
+    }
+    #[allow(clippy::type_complexity)]
+    let faults: [(Nanos, &str, Vec<(&str, V)>); 6] = [
+        (
+            35,
+            "disk.power-loss",
+            vec![
+                ("disk", V::str("log")),
+                ("keep", V::str("prefix")),
+                ("tear", V::Bool(true)),
+            ],
+        ),
+        (
+            56,
+            "disk.crash-at",
+            vec![
+                ("disk", V::str("state")),
+                ("call", V::U32(1)),
+                ("keep", V::str("prefix")),
+            ],
+        ),
+        (60, "disk.lose", vec![("disk", V::str("log"))]),
+        (
+            70,
+            "disk.fail",
+            vec![
+                ("disk", V::str("log")),
+                ("count", V::U32(1)),
+                ("text", V::str("a bad sector")),
+            ],
+        ),
+        (
+            85,
+            "disk.corrupt",
+            vec![
+                ("disk", V::str("state")),
+                ("prefix", V::str("boots")),
+                ("how", V::str("garbage")),
+            ],
+        ),
+        (
+            90,
+            "disk.quota",
+            vec![("disk", V::str("log")), ("bytes", V::U32(10))],
+        ),
+    ];
+    for (at, kind, value) in faults {
+        let op = net.parse_op(kind, &V::record(value)).unwrap();
+        net.add_op(Op::extension_at(p, op), Placement::StartOf(at * MS))
+            .unwrap();
+    }
+    let log = u64_image(&[
+        ("e/00000001", vec![1; 64]),
+        ("e/00000002", vec![2; 64]),
+        ("last", 2u64.to_le_bytes().to_vec()),
+    ]);
+    net.extension::<Disks>()
+        .unwrap()
+        .load("q", "log", &log)
+        .unwrap();
+    net.run_until(100 * MS)
+        .unwrap_or_else(|e| panic!("{e}\n{}", lines(&net.journal())));
+    let mut text = lines(&net.journal());
+    let d = net.extension::<Disks>().unwrap();
+    for (dev, name) in [
+        ("p", "state"),
+        ("p", "log"),
+        ("q", "state"),
+        ("q", "log"),
+        ("r", "state"),
+        ("r", "log"),
+    ] {
+        let digest = d.digest(dev, name).map(|h| wasmnet_disk::digest_hex(&h));
+        text.push_str(&format!(
+            "\ndigest {dev} {name} {}",
+            digest.unwrap_or_default()
+        ));
+    }
+    text.push('\n');
+    std::fs::write(target().join("disk-native.txt"), &text).unwrap();
+    assert!(text.contains("p disk-crash"), "{text}");
+    assert!(text.contains("q kv-fill answer=Err(Error::Full("), "{text}");
+    assert!(text.contains("r disk-dropped"), "{text}");
+}
+
+/// What one `set` plus a 16-byte `get-range` costs on wasmtime through the typed adapter, by value
+/// size: a boot with `reps` of them less a boot with one, over `reps - 1`. `--ignored --nocapture`.
+#[test]
+#[ignore = "a measurement"]
+fn call_cost() {
+    let w = world();
+    let time = |size: usize, reps: u64| {
+        let mut best = f64::MAX;
+        for _ in 0..3 {
+            let mut net = Network::new(&w.host, 1);
+            net.add_extension(Disks::default());
+            let cfg = config(&[
+                ("period", "1000ms"),
+                ("big", &size.to_string()),
+                ("reps", &reps.to_string()),
+            ]);
+            let mut o = with_disks(DiskOptions::new(vec![
+                DiskSpec::new("state").quota(1 << 30),
+            ]));
+            o = o.fuel_per_instant(400_000_000_000);
+            net.device_with_options("p", &w.probe, cfg, o).unwrap();
+            let t = std::time::Instant::now();
+            net.run_until(MS).unwrap();
+            best = best.min(t.elapsed().as_secs_f64());
+        }
+        best
+    };
+    for (size, reps) in [
+        (64usize, 2001u64),
+        (4096, 2001),
+        (1 << 20, 41),
+        (16 << 20, 9),
+    ] {
+        let per = (time(size, reps) - time(size, 1)) / (reps - 1) as f64;
+        println!("set + get-range of {size} bytes: {:.1} us", per * 1e6);
+    }
 }

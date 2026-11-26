@@ -23,7 +23,7 @@ export interface Init {
   seed: string;
   simulator: WebAssembly.Module;
   components: Record<string, ComponentSource>;
-  scenario?: 'example' | 'controls' | 'runtime' | 'portable' | 'portable-cost' | 'exports';
+  scenario?: 'example' | 'controls' | 'runtime' | 'portable' | 'portable-cost' | 'exports' | 'disks' | 'disk-cost';
 }
 
 export interface Done {
@@ -40,14 +40,15 @@ export interface Done {
 /** A message the Worker posts while the network runs. */
 export type Progress = { type: 'journal'; entries: JournalEntry[] };
 
-/** Deterministic CBOR (RFC 8949 §4.2) of strings and maps of strings: a device spec. */
-type Cbor = string | { [key: string]: Cbor };
+/** Deterministic CBOR (RFC 8949 §4.2) of strings, arrays and maps: a device spec. */
+type Cbor = string | Cbor[] | { [key: string]: Cbor };
 function cbor(v: Cbor): number[] {
   const head = (major: number, n: number) => (n < 24 ? [(major << 5) | n] : n < 256 ? [(major << 5) | 24, n] : [(major << 5) | 25, n >> 8, n & 0xff]);
   if (typeof v === 'string') {
     const b = [...new TextEncoder().encode(v)];
     return [...head(3, b.length), ...b];
   }
+  if (Array.isArray(v)) return [...head(4, v.length), ...v.flatMap(cbor)];
   // Keys sorted by their encoded bytes.
   const entries = Object.entries(v)
     .map(([k, x]) => [cbor(k), cbor(x)] as const)
@@ -199,6 +200,15 @@ serveRun<Init, Done>(async (init, ctx) => {
       return WebAssembly.instantiate(module, imports);
     },
   });
+  if (init.scenario === 'disk-cost') {
+    const notes = await diskCost(net);
+    return { outcome: notes.outcome as Outcome, links: [], ms: 0, notes: notes.notes };
+  }
+  if (init.scenario === 'disks') {
+    const t0 = performance.now();
+    const notes = await disksScenario(net);
+    return { outcome: notes.outcome as Outcome, links: [], ms: Math.round(performance.now() - t0), notes: notes.notes };
+  }
   if (init.scenario === 'exports') {
     const t0 = performance.now();
     const notes = await exportsScenario(net);
@@ -427,4 +437,128 @@ async function jspiCost(): Promise<Record<string, string>> {
   await suspending(m);
   const suspendingNs = ((performance.now() - t) * 1e6) / m;
   return { jspiPlainNs: plainNs.toFixed(1), jspiSuspendingNs: suspendingNs.toFixed(1) };
+}
+
+/** A `wasmnet-disk/1` image of `pairs` (ascending by key): `crates/wasmnet-disk/src/image.rs`. */
+function diskImage(pairs: [string, Uint8Array][]): Uint8Array {
+  const parts: Uint8Array[] = [new TextEncoder().encode('wasmnet-disk/1\n')];
+  const u32 = (n: number) => { const b = new Uint8Array(4); new DataView(b.buffer).setUint32(0, n); return b; };
+  const u64 = (n: bigint) => { const b = new Uint8Array(8); new DataView(b.buffer).setBigUint64(0, n); return b; };
+  let bytes = 0n;
+  for (const [k, v] of pairs) {
+    const key = new TextEncoder().encode(k);
+    parts.push(u32(key.length), key, u64(BigInt(v.length)), v);
+    bytes += BigInt(key.length + v.length);
+  }
+  parts.push(u32(0xffffffff), u64(BigInt(pairs.length)), u64(bytes));
+  const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+  let at = 0;
+  for (const p of parts) { out.set(p, at); at += p.length; }
+  return out;
+}
+
+const le64 = (n: number) => { const b = new Uint8Array(8); new DataView(b.buffer).setBigUint64(0, BigInt(n), true); return b; };
+
+/**
+ * The `disks` scenario: the disks in the page. The simulator is the embedder's build with the
+ * disks installed (`crates/wasmnet-disk-page`), whose four interfaces the binding links from their
+ * names alone. The same network as the native test `page_scenario_native`
+ * (`crates/wasmnet-disk/tests/wasmtime.rs`), in the same generic forms: the page test compares the
+ * lines and the digests.
+ */
+async function disksScenario(net: Network): Promise<{ outcome: unknown; notes: Record<string, string> }> {
+  net.setCatalog(['disk_probe']);
+  const ms = (n: number) => BigInt(n) * 1_000_000n;
+  await net.device('p', 'disk_probe', { period: '10ms', big: '1048576' }, {
+    crashAlone: true,
+    'disk.specs': [{ name: 'state' }, { name: 'log', durability: 'on-sync' }],
+  });
+  await net.device('q', 'disk_probe', { period: '1000ms', fill: '4096' }, {
+    crashAlone: true,
+    'disk.specs': [{ name: 'state', quota: 2048, initial: diskImage([['boots', le64(41)]]) }, { name: 'log' }],
+  });
+  const spec = (period: string) =>
+    hex(cbor({ component: 'disk_probe', config: { period }, 'disk.specs': [{ name: 'state' }, { name: 'log', durability: 'on-sync' }] }));
+  await net.device(
+    'ctl',
+    'infra_script',
+    {
+      'step.0': `0ms apply r ${spec('10ms')}`,
+      'step.1': `45ms apply r ${spec('20ms')}`,
+      'step.2': '70ms remove r',
+      'step.3': `80ms apply r ${spec('10ms')}`,
+    },
+    { infra: true },
+  );
+  for (const [at, kind] of [[25, 'stop-device'], [30, 'start-device'], [55, 'crash-device'], [58, 'start-device'], [62, 'start-device'], [86, 'stop-device'], [87, 'start-device']] as const) {
+    net.op(kind === 'crash-device' ? { kind, device: 'p', message: 'operator crash', at: ms(at) } : { kind, device: 'p', at: ms(at) });
+  }
+  const faults: [number, string, Record<string, unknown>][] = [
+    [35, 'disk.power-loss', { disk: 'log', keep: 'prefix', tear: true }],
+    [56, 'disk.crash-at', { disk: 'state', call: 1, keep: 'prefix' }],
+    [60, 'disk.lose', { disk: 'log' }],
+    [70, 'disk.fail', { disk: 'log', count: 1, text: 'a bad sector' }],
+    [85, 'disk.corrupt', { disk: 'state', prefix: 'boots', how: 'garbage' }],
+    [90, 'disk.quota', { disk: 'log', bytes: 10 }],
+  ];
+  for (const [at, op, value] of faults) net.op({ kind: 'extension', device: 'p', op, value, at: ms(at) });
+  // An image loaded before the run, through the module's own export.
+  const enc = new TextEncoder();
+  const names = (dev: string, disk: string) => enc.encode(`${dev}\0${disk}`);
+  const log = diskImage([['e/00000001', new Uint8Array(64).fill(1)], ['e/00000002', new Uint8Array(64).fill(2)], ['last', le64(2)]]);
+  const load = new Uint8Array([...names('q', 'log'), 0, ...log]);
+  net.callExport('wn_disk_load', load);
+  const entries: JournalEntry[] = [];
+  const outcome = await net.run({ deadline: ms(100), onJournal: (e) => entries.push(...e) });
+  let text = eventLines(entries, /^(disk-|kv-|device-)/);
+  for (const [dev, disk] of [['p', 'state'], ['p', 'log'], ['q', 'state'], ['q', 'log'], ['r', 'state'], ['r', 'log']]) {
+    let digest = '';
+    try {
+      digest = [...net.callExport('wn_disk_digest', names(dev!, disk!))].map((b) => b.toString(16).padStart(2, '0')).join('');
+    } catch {
+      digest = '';
+    }
+    text += `\ndigest ${dev} ${disk} ${digest}`;
+  }
+  return { outcome, notes: { lines: text } };
+}
+
+/**
+ * The `disk-cost` scenario: what a disk costs in the page. A `set` plus a 16-byte `get-range` by
+ * value size (a device that makes `reps` of them at boot, less one that makes one, over
+ * `reps - 1`), and the digest of a disk of 64 MiB in 64 KiB values (loaded through the module's
+ * export, hashed in the simulator's `wasm32` memory).
+ */
+async function diskCost(net: Network): Promise<{ outcome: unknown; notes: Record<string, string> }> {
+  const notes: Record<string, string> = {};
+  let n = 0;
+  const time = async (size: number, reps: number) => {
+    const name = `c${n++}`;
+    await net.device(name, 'disk_probe', { period: '1000ms', big: String(size), reps: String(reps) }, { 'disk.specs': [{ name: 'state', quota: 1 << 30 }] });
+    const t0 = performance.now();
+    await net.run({ deadline: net.now() + 1_000_000n });
+    return performance.now() - t0;
+  };
+  for (const [size, reps, label] of [[64, 2001, '64B'], [4096, 2001, '4KiB'], [1 << 20, 41, '1MiB'], [16 << 20, 5, '16MiB']] as const) {
+    const per = ((await time(size, reps)) - (await time(size, 1))) / (reps - 1);
+    notes[`call${label}Us`] = (per * 1000).toFixed(1);
+  }
+  const enc = new TextEncoder();
+  await net.device('big', 'disk_probe', { period: '1000ms' }, { 'disk.specs': [{ name: 'state' }, { name: 'store', quota: 128 << 20 }] });
+  const value = new Uint8Array(64 << 10).fill(0x5a);
+  const pairs: [string, Uint8Array][] = [];
+  for (let i = 0; i < 1024; i++) pairs.push([`k/${String(i).padStart(12, '0')}`, value]);
+  const names = enc.encode('big\0store');
+  const img = diskImage(pairs);
+  const load = new Uint8Array(names.length + 1 + img.length);
+  load.set(names);
+  load.set(img, names.length + 1);
+  net.callExport('wn_disk_load', load);
+  let t0 = performance.now();
+  net.callExport('wn_disk_digest', names);
+  notes.digest64MiBMs = (performance.now() - t0).toFixed(0);
+  t0 = performance.now();
+  net.callExport('wn_disk_export', names);
+  notes.export64MiBMs = (performance.now() - t0).toFixed(0);
+  return { outcome: {}, notes };
 }

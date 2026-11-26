@@ -587,6 +587,8 @@ fn web(args: &[String]) -> Result<()> {
             "wasmnet-clock-probe",
             "--example",
             "pad-probe",
+            "--example",
+            "disk-probe",
             "--target",
             "wasm32-wasip2",
         ]))?;
@@ -597,6 +599,15 @@ fn web(args: &[String]) -> Result<()> {
             "wasmnet-pad",
             "--example",
             "pad-page",
+            "--target",
+            "wasm32-unknown-unknown",
+        ]))?;
+        // The disks: the simulator with them installed (`crates/wasmnet-disk-page`).
+        run(cargo().current_dir(&root).args([
+            "build",
+            "--release",
+            "-p",
+            "wasmnet-disk-page",
             "--target",
             "wasm32-unknown-unknown",
         ]))?;

@@ -299,6 +299,37 @@ await step('portable exports in the page: called by name between runs and as an 
   return { exports: n.exports, bigMs: n.bigMs, instants: n.instants, cores: n.cores, jspiPlainNs: n.jspiPlainNs, jspiSuspendingNs: n.jspiSuspendingNs };
 });
 
+await step('disks in the page: an embedder-built simulator serves wasi:keyvalue and the extension, through stops, crashes and every fault, with the native lines and digests', async () => {
+  const r = await page.evaluate(() => window.wasmnetScenario('disks', '42'));
+  const got = r.notes.lines;
+  const wants = [
+    'p disk-power-loss disk=log kept=0 lost=2',
+    'p disk-crash disk=state',
+    'q kv-boot boots=41 entries=2 last=2',
+    'q kv-fill answer=Err(Error::Full(',
+    'r disk-dropped disk=log',
+    'p kv-error what=open log error=Error::Other("a bad sector")',
+  ];
+  for (const want of wants) {
+    if (!got.includes(want)) throw new Error(`no "${want}" in:\n${got}\noutcome: ${JSON.stringify(r.outcome)}\npage errors: ${errors.join(' | ')}`);
+  }
+  // NATIVE_DISK: the same network natively (`page_scenario_native` in crates/wasmnet-disk): the
+  // same lines and the same digests.
+  if (process.env.NATIVE_DISK) {
+    const [a, b] = [fs.readFileSync(process.env.NATIVE_DISK, 'utf8').trimEnd().split('\n'), got.split('\n')];
+    for (let i = 0; i < Math.max(a.length, b.length); i++) {
+      if (a[i] !== b[i]) throw new Error(`line ${i + 1}: native ${JSON.stringify(a[i])}, page ${JSON.stringify(b[i])}\npage:\n${got}`);
+    }
+  }
+  const digests = got.split('\n').filter((l) => l.startsWith('digest ')).length;
+  return { lines: got.split('\n').length, digests, native: Boolean(process.env.NATIVE_DISK), ms: r.ms };
+});
+
+await step('what a disk costs in the page: a call by value size, and the digest and export of 64 MiB', async () => {
+  const r = await page.evaluate(() => window.wasmnetScenario('disk-cost', '42'));
+  return r.notes;
+});
+
 if (process.env.NATIVE_JOURNAL) {
   await step('agrees with the native example', async () => {
     // The native example prints `<t> ns  <device> <kind> k=v ...` for events and

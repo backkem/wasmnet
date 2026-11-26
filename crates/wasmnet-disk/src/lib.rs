@@ -1,7 +1,7 @@
 //! wasmnet-disk: a device's disks, as a portable extension on the library's public extension
 //! points only.
 //!
-//! A device declares named disks in its options ([`DiskOptions`], or the option key `disks`
+//! A device declares named disks in its options ([`DiskOptions`], or the option key `disk.specs`
 //! from a controller's spec or a page's plain object). Each disk is an ordered map from string
 //! keys to byte values that belongs to the device and outlives its store. Guests reach it
 //! through the standard `wasi:keyvalue@0.2.0-draft2` (`store`, `batch`) and
@@ -61,7 +61,7 @@ pub const IMPORTS: [&str; 3] = [
 ];
 
 /// The device option key that declares disks (a list of `{name, quota, durability, initial}`).
-pub const OPTION: &str = "disks";
+pub const OPTION: &str = "disk.specs";
 
 #[cfg(feature = "wasmtime")]
 mod adapter {
@@ -259,7 +259,7 @@ impl NetworkExtension for Disks {
         server::interfaces()
     }
 
-    /// `disks`: a list of `{name, quota, durability, initial}` (all but `name` optional).
+    /// `disk.specs`: a list of `{name, quota, durability, initial}` (all but `name` optional).
     fn options(&self) -> Vec<ExtOption> {
         vec![ExtOption::new(OPTION, parse_options)]
     }

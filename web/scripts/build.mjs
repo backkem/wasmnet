@@ -34,13 +34,15 @@ const release = join(target, 'wasm32-wasip2', 'release');
 const simulator = join(target, 'wasm32-unknown-unknown', 'release', 'wasmnet_web.wasm');
 
 /** The devices the example and its test scenarios use, by the key the Worker names them with. */
-const COMPONENTS = ['switch', 'node-http-server', 'node-http-get', 'router', 'infra_script', 'node-replicas', 'pad_probe'];
+const COMPONENTS = ['switch', 'node-http-server', 'node-http-get', 'router', 'infra_script', 'node-replicas', 'pad_probe', 'disk_probe'];
 /** Components built as examples (`components/clock-probe/examples`): their files live in `examples/`. */
-const EXAMPLES = ['pad_probe'];
+const EXAMPLES = ['pad_probe', 'disk_probe'];
 const wasmOf = (stem) => join(release, ...(EXAMPLES.includes(stem) ? ['examples'] : []), `${stem}.wasm`);
 // The simulator with the test fixture `wasmnet-pad` installed: an embedder's own build of the module
 // (`crates/wasmnet-web/examples/pad_page.rs`), for the page test's portable-extension steps.
 const extended = join(target, 'wasm32-unknown-unknown', 'release', 'examples', 'pad_page.wasm');
+// The simulator with the disks installed (`crates/wasmnet-disk-page`), for the page test's disk step.
+const withDisks = join(target, 'wasm32-unknown-unknown', 'release', 'wasmnet_disk_page.wasm');
 
 const missing = [simulator, ...COMPONENTS.map(wasmOf)].filter((p) => !existsSync(p));
 if (missing.length > 0) {
@@ -79,6 +81,10 @@ const assets = {
 if (existsSync(extended)) {
   cpSync(extended, join(out, 'wasmnet_web_pad.wasm'));
   assets.extended = { file: 'wasmnet_web_pad.wasm', bytes: statSync(extended).size };
+}
+if (existsSync(withDisks)) {
+  cpSync(withDisks, join(out, 'wasmnet_disk_page.wasm'));
+  assets.disks = { file: 'wasmnet_disk_page.wasm', bytes: statSync(withDisks).size };
 }
 
 for (const stem of COMPONENTS) {

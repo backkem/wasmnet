@@ -1807,7 +1807,7 @@ fn disks(net: &mut dyn Backend) -> Seen {
     // An option from a generic value, as a spec or a page gives it.
     let mut small = DeviceOptions::default().crash_alone(true);
     small.ext.set_value(net.option(
-        "disks",
+        "disk.specs",
         &Value::List(vec![Value::record(vec![
             ("name", Value::str("state")),
             ("quota", Value::U32(2048)),

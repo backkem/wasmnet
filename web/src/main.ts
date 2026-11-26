@@ -15,6 +15,8 @@ interface Assets {
   simulator: { file: string; bytes: number };
   /** The simulator built with the test fixture `wasmnet-pad` in it (an embedder's own build), when the build made one. */
   extended?: { file: string; bytes: number };
+  /** The simulator built with the disks in it (`crates/wasmnet-disk-page`), when the build made one. */
+  disks?: { file: string; bytes: number };
   components: Record<string, { module: string; moduleBytes: number; coreModules: { file: string; path: string; bytes: number }[]; imports: string[]; digest: string }>;
 }
 
@@ -142,7 +144,11 @@ async function main(): Promise<void> {
     // The portable-extension scenarios run on the simulator with the test fixture in it.
     const portable = scenario === 'portable' || scenario === 'portable-cost' || scenario === 'exports';
     if (portable && !assets.extended) throw new Error('this build has no simulator with the test fixture');
-    const simulator = portable ? await WebAssembly.compileStreaming(fetch(assets.extended!.file)) : loaded.simulator;
+    // The disk scenario runs on the simulator with the disks in it.
+    const disks = scenario === 'disks' || scenario === 'disk-cost';
+    if (disks && !assets.disks) throw new Error('this build has no simulator with the disks');
+    const file = disks ? assets.disks!.file : portable ? assets.extended!.file : undefined;
+    const simulator = file ? await WebAssembly.compileStreaming(fetch(file)) : loaded.simulator;
     const run = runInWorker<Init, Done>(new URL('worker.js', import.meta.url), {
       init: { seed, scenario, ...loaded, simulator },
       timeoutMs: 120_000,
