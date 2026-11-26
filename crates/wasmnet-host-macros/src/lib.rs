@@ -248,7 +248,7 @@ fn expand(input: &Input) -> R<TokenStream> {
                 ::wasmnet_host::wasmtime::component::bindgen!({
                     path: [#(#paths),*],
                     world: #world_name,
-                    imports: { default: trappable },
+                    imports: { default: trappable | store },
                     exports: { default: async | store },
                     with: { #(#with),* },
                     wasmtime_crate: ::wasmnet_host::wasmtime,
@@ -256,6 +256,8 @@ fn expand(input: &Input) -> R<TokenStream> {
             }
             use ::wasmnet_host::sim::value::Value;
             use ::wasmnet_host::wasmtime::component::Resource;
+            use ::wasmnet_host::wasmtime::AsContextMut as _;
+            type Access<'a> = ::wasmnet_host::wasmtime::component::Access<'a, ::wasmnet_host::HostState, Data>;
             type Trap<T> = ::wasmnet_host::wasmtime::Result<T>;
 
             pub struct View<'a>(pub &'a mut ::wasmnet_host::HostState);
@@ -935,9 +937,10 @@ impl Gen<'_> {
             }
         };
         Ok(quote! {
-            fn #name(&mut self, #(#params),*) -> Trap<#ret> {
+            fn #name(mut host: Access<'_>, #(#params),*) -> Trap<#ret> {
                 let args = ::std::vec![#(#args),*];
-                let served = ::wasmnet_host::portable::call(self.0, #iface, #wit, args)?;
+                // With the store: a fuel span the server begins or ends applies in the call.
+                let served = ::wasmnet_host::portable::call(host.as_context_mut(), #iface, #wit, args)?;
                 #decode
             }
         })
@@ -972,21 +975,33 @@ impl Gen<'_> {
             resources.push(rname.clone());
             let (m, _) = self.marker(tid)?;
             let host = format_ident!("Host{}", rust_camel(rname));
+            let with_store = format_ident!("Host{}WithStore", rust_camel(rname));
             let methods = by_resource.remove(&tid).unwrap_or_default();
             resource_impls.push(quote! {
-                impl #module::#host for View<'_> {
+                impl #module::#host for View<'_> {}
+                impl #module::#with_store<::wasmnet_host::HostState> for Data {
                     #(#methods)*
-                    fn drop(&mut self, r: Resource<markers::#m>) -> Trap<()> {
-                        ::wasmnet_host::portable::drop_resource(self.0, #iface, #rname, r.rep());
+                    fn drop(mut host: Access<'_>, r: Resource<markers::#m>) -> Trap<()> {
+                        ::wasmnet_host::portable::drop_resource(host.data_mut(), #iface, #rname, r.rep());
                         Ok(())
                     }
                 }
             });
         }
-        let imp = quote! {
-            impl #module::Host for View<'_> {
-                #(#free)*
+        // Every function takes the store (`Access`), so it lives in the `*WithStore` traits,
+        // implemented for `Data`; bindgen gives an empty one a blanket impl of its own.
+        let free_impl = if free.is_empty() {
+            quote!()
+        } else {
+            quote! {
+                impl #module::HostWithStore<::wasmnet_host::HostState> for Data {
+                    #(#free)*
+                }
             }
+        };
+        let imp = quote! {
+            impl #module::Host for View<'_> {}
+            #free_impl
             #(#resource_impls)*
         };
         let link = quote! {

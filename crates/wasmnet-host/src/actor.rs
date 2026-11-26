@@ -28,9 +28,7 @@ use std::pin::Pin;
 use std::sync::PoisonError;
 use std::task::{Context, Poll};
 
-use wasmnet_core::{
-    ActorFuture, Command, CostMeter, Fault, Inbox, JournalEnd, Nanos, Status, VirtualClock,
-};
+use wasmnet_core::{ActorFuture, Command, Fault, Inbox, JournalEnd, Status, VirtualClock};
 use wasmtime::AsContextMut;
 use wasmtime::Store;
 use wasmtime::component::{Accessor, TypedFunc};
@@ -91,54 +89,24 @@ impl<'a> Calls<'a> {
     }
 }
 
-/// Fuel per virtual instant: refilled the first time the actor runs at a new instant. Wasmtime
-/// polls the `run_concurrent` closure before every work item, so this runs before any guest code
-/// at that instant, and a compute loop traps deterministically with `Trap::OutOfFuel`.
+/// Fuel per virtual instant, through the store's fuel book ([`crate::fuel`]): refilled the first
+/// time the actor runs at a new instant. Wasmtime polls the `run_concurrent` closure before every
+/// work item, so this runs before any guest code at that instant, and a compute loop traps
+/// deterministically with `Trap::OutOfFuel`.
 struct Fuel {
-    budget: u64,
-    /// The store's engine meters fuel (components with a budget of their own run without).
-    metered: bool,
     clock: VirtualClock,
-    last: Cell<Option<Nanos>>,
-    /// The fuel left when last looked at, and where consumption is reported.
-    left: Cell<u64>,
-    meter: CostMeter,
 }
 
 impl Fuel {
     fn refill(&self, acc: &Accessor<HostState>) -> wasmtime::Result<()> {
-        // Guest work runs between the closure's polls: count it at the next one, under the
-        // instant it ran at (before `last` moves on).
-        self.account(acc)?;
+        // Guest work runs between the closure's polls: the book counts it at the next one,
+        // under the instant it ran at (before the refill moves on).
         let now = self.clock.now();
-        if self.last.get() != Some(now) {
-            self.last.set(Some(now));
-            if self.metered {
-                acc.with(|mut a| a.as_context_mut().set_fuel(self.budget))?;
-            }
-            self.left.set(self.budget);
-        }
-        Ok(())
+        acc.with(|mut a| crate::fuel::refill(a.as_context_mut(), now))
     }
 
-    /// Reports the fuel consumed since the last look (if a host call gave fuel back to the
-    /// store, so more is left than at the last look, that counts as nothing consumed). It was
-    /// all consumed under the budget of the instant of the last refill (`last`), even when it
-    /// is reported at the next instant's first look: only a refill resets the store's fuel.
     fn account(&self, acc: &Accessor<HostState>) -> wasmtime::Result<()> {
-        if !self.metered {
-            return Ok(());
-        }
-        let left = acc.with(|mut a| a.as_context_mut().get_fuel())?;
-        let used = self.left.get().saturating_sub(left);
-        match self.last.get() {
-            Some(at) => self.meter.add_fuel_at(at, used),
-            // Before the first refill (instantiation and `ports()` ran on their own budget,
-            // and the first look sees none of it): nothing.
-            None => self.meter.add_fuel(used),
-        }
-        self.left.set(left);
-        Ok(())
+        acc.with(|mut a| crate::fuel::account(a.as_context_mut()))
     }
 }
 
@@ -166,9 +134,6 @@ pub(crate) struct DeviceActor {
     pub(crate) inbox: Inbox,
     pub(crate) status: Status,
     pub(crate) clock: VirtualClock,
-    pub(crate) fuel_per_instant: u64,
-    /// The store's engine meters fuel.
-    pub(crate) metered: bool,
 }
 
 impl DeviceActor {
@@ -186,16 +151,9 @@ impl DeviceActor {
             inbox,
             status,
             clock,
-            fuel_per_instant,
-            metered,
         } = self;
         let fuel = Fuel {
-            budget: fuel_per_instant,
-            metered,
             clock: clock.clone(),
-            last: Cell::new(None),
-            left: Cell::new(0),
-            meter: inbox.cost().clone(),
         };
         Box::pin(async move {
             let run = async move {

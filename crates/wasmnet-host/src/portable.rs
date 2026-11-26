@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use wasmnet_core::value::Value;
 use wasmnet_core::{DeviceContext, ImportServer, Served, Status};
+use wasmtime::StoreContextMut;
 
 use crate::wasi::HostState;
 
@@ -48,13 +49,15 @@ fn server(state: &HostState, interface: &str) -> Option<Arc<dyn ImportServer>> {
 
 /// Calls `function` of `interface` for the store's device. A fault (or a device that was given
 /// no server of the interface) is a trap: the device faults inside the call, with the server's
-/// message recorded for its crash.
+/// message recorded for its crash. When the server began or ended the device's fuel span
+/// ([`wasmnet_core::FuelSpan`]), that applies here, before the device runs on.
 pub fn call(
-    state: &mut HostState,
+    mut store: StoreContextMut<'_, HostState>,
     interface: &str,
     function: &str,
     args: Vec<Value>,
 ) -> wasmtime::Result<Served> {
+    let state = store.data_mut();
     let Some(server) = server(state, interface) else {
         let message =
             format!("{interface} is not served to this device (no extension gave it a server)");
@@ -63,10 +66,13 @@ pub fn call(
     };
     match server.call(interface, function, args) {
         Served::Fault(message) => {
-            fault(state, &message);
+            fault(store.data(), &message);
             Err(wasmtime::format_err!("{message}"))
         }
-        served => Ok(served),
+        served => {
+            crate::fuel::served(store)?;
+            Ok(served)
+        }
     }
 }
 

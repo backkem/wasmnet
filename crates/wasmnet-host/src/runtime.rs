@@ -49,6 +49,14 @@ impl Runtime for Host {
             ctx.inbox.cost().clone(),
         ));
         store.limiter(|s| s.memory.as_mut().expect("a memory budget"));
+        // Its fuel book: the actor refills and accounts through it, a served call applies the
+        // device's fuel span through it.
+        store.data_mut().fuel = Some(crate::fuel::Book::new(
+            ctx.fuel_per_instant,
+            metered,
+            ctx.inbox.cost().clone(),
+            ctx.ext.fuel_span().clone(),
+        ));
         self.store_created(&mut store);
         if metered {
             store
@@ -146,8 +154,6 @@ impl Runtime for Host {
             inbox: ctx.inbox,
             status: ctx.status,
             clock: ctx.clock,
-            fuel_per_instant: ctx.fuel_per_instant,
-            metered,
         };
         Ok(DeviceInstance::new(ports, actor.into_future())
             .has_counters(has_counters)

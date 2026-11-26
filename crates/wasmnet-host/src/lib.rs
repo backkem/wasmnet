@@ -114,6 +114,7 @@ mod command;
 mod control;
 mod exports;
 mod extension;
+mod fuel;
 mod glue;
 mod infra;
 pub mod portable;

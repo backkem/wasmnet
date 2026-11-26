@@ -68,6 +68,9 @@ pub struct HostState {
     /// The device's memory, measured and (with [`wasmnet_core::DeviceOptions::memory`])
     /// bounded; `None` for a command.
     pub(crate) memory: Option<MemoryBudget>,
+    /// A network device's fuel book (its budget, what it consumed, its fuel span); `None` for
+    /// a command.
+    pub(crate) fuel: Option<crate::fuel::Book>,
 }
 
 /// A device's linear memory, all its memories together: the sim core's [`wasmnet_core::MemoryBudget`]
@@ -214,6 +217,7 @@ impl HostState {
             infra: None,
             stdin,
             memory: None,
+            fuel: None,
         }
     }
 }

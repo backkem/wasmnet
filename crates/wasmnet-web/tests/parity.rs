@@ -1580,6 +1580,137 @@ fn a_portable_extension_is_served_alike() {
     });
 }
 
+// ---- fuel spans ------------------------------------------------------------------------------
+
+/// A server in front of the pad's that opens its device's fuel span after `note.find`, opens it
+/// again after `totals`, ends it after `names` (only on `p`), and journals what each answered
+/// and, at every append, whether a span is open.
+struct SpanServer {
+    inner: Arc<dyn wasmnet_core::ImportServer>,
+    span: wasmnet_core::FuelSpan,
+    ends: bool,
+    journal: wasmnet_core::JournalEnd,
+    clock: wasmnet_core::VirtualClock,
+}
+
+impl SpanServer {
+    fn note(&self, what: &str, result: bool) {
+        self.journal.push(
+            self.clock.now(),
+            Record::Event {
+                kind: "span".into(),
+                fields: vec![
+                    ("what".into(), what.into()),
+                    ("result".into(), result.to_string()),
+                ],
+            },
+        );
+    }
+}
+
+impl wasmnet_core::ImportServer for SpanServer {
+    fn call(
+        &self,
+        interface: &str,
+        function: &str,
+        args: Vec<wasmnet_core::value::Value>,
+    ) -> wasmnet_core::Served {
+        if function == "[method]note.append" {
+            self.note("open", self.span.is_open());
+        }
+        let served = self.inner.call(interface, function, args);
+        match function {
+            "[static]note.find" | "totals" => self.note(function, self.span.begin()),
+            "names" if self.ends => self.note(function, self.span.end()),
+            _ => {}
+        }
+        served
+    }
+
+    fn drop_resource(&self, interface: &str, resource: &str, handle: u32) {
+        self.inner.drop_resource(interface, resource, handle);
+    }
+}
+
+struct SpanExt;
+
+impl wasmnet_core::NetworkExtension for SpanExt {
+    fn device_setup(
+        &mut self,
+        setup: &wasmnet_core::ext::DeviceSetup<'_>,
+        ext: &mut wasmnet_core::DeviceExt,
+    ) {
+        let inner = ext.server(wasmnet_pad::NOTES).expect("the pad's").clone();
+        let server = SpanServer {
+            inner,
+            span: ext.fuel_span().clone(),
+            ends: setup.name == "p",
+            journal: setup.journal.clone(),
+            clock: setup.clock.clone(),
+        };
+        ext.serve(wasmnet_pad::NOTES, Arc::new(server));
+    }
+}
+
+/// A fuel span reads the same on both backends: it is fuel only on wasmtime (in a page nothing
+/// is metered), and its state (a second begin, an end, its close with its instant, with its
+/// device) is the core's.
+#[test]
+fn a_fuel_span_reads_alike() {
+    on_both(|net| {
+        net.extend(Box::new(SpanExt));
+        let alone = DeviceOptions::default().crash_alone(true);
+        net.add(
+            "p",
+            "pad_probe",
+            config(&[("period", "10ms")]),
+            alone.clone(),
+        );
+        net.add("q", "pad_probe", config(&[("period", "10ms")]), alone);
+        net.op(
+            Op::crash_device("q", "operator crash"),
+            Placement::StartOf(25 * MS),
+        );
+        net.op(Op::start_device("q"), Placement::StartOf(30 * MS));
+        net.run_to(45 * MS);
+        let s = seen(net, Vec::new(), &["span", "device-crashed"]);
+        let of = |dev: &str| -> Vec<String> {
+            s.events
+                .iter()
+                .filter(|e| e.1 == dev && e.2 == "span")
+                .map(|e| format!("{}={}", e.3[0].1, e.3[1].1))
+                .collect()
+        };
+        assert_eq!(
+            of("p"),
+            [
+                "[static]note.find=true",
+                "totals=false",
+                "open=true",
+                "names=true",
+                "open=false",
+                "open=false",
+                "open=false",
+                "open=false",
+            ],
+            "{s:?}"
+        );
+        // Never ended: open through its boot, closed at its next instant; a new one after
+        // its crash and start.
+        assert_eq!(
+            of("q")[..4],
+            [
+                "[static]note.find=true",
+                "totals=false",
+                "open=true",
+                "open=false"
+            ],
+            "{s:?}"
+        );
+        s
+    });
+}
+
 // ---- the order of extensions ----------------------------------------------------------------
 
 /// A test extension that journals what it hears, under its own name: the order of two of them
