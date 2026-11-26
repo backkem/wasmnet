@@ -257,6 +257,7 @@ const FLAG_COUNTERS: u32 = 1;
 const FLAG_LIFECYCLE: u32 = 2;
 const FLAG_COMMANDS: u32 = 4;
 const FLAG_RECONFIGURE: u32 = 8;
+const FLAG_SUSPENDS: u32 = 16;
 
 /// The `instance` message: JavaScript's answer to `js_instantiate`.
 pub fn encode_instance(instance: &Instance) -> Vec<u8> {
@@ -271,7 +272,8 @@ pub fn encode_instance(instance: &Instance) -> Vec<u8> {
     let flags = u32::from(instance.counters) * FLAG_COUNTERS
         + u32::from(instance.lifecycle) * FLAG_LIFECYCLE
         + u32::from(instance.commands) * FLAG_COMMANDS
-        + u32::from(instance.reconfigure) * FLAG_RECONFIGURE;
+        + u32::from(instance.reconfigure) * FLAG_RECONFIGURE
+        + u32::from(instance.suspends) * FLAG_SUSPENDS;
     w.u32(flags)
         .strs(&instance.apps)
         .strs(&instance.exports)
@@ -307,6 +309,7 @@ pub fn decode_instance(bytes: &[u8]) -> Result<Instance, DecodeError> {
             lifecycle: flags & FLAG_LIFECYCLE != 0,
             commands: flags & FLAG_COMMANDS != 0,
             reconfigure: flags & FLAG_RECONFIGURE != 0,
+            suspends: flags & FLAG_SUSPENDS != 0,
         })
     })
 }
@@ -818,6 +821,7 @@ mod tests {
             lifecycle: true,
             commands: true,
             reconfigure: false,
+            suspends: true,
             exports: vec!["wasmnet:control/commands".to_owned()],
         };
         assert_eq!(decode_instance(&encode_instance(&instance)), Ok(instance));

@@ -3,7 +3,9 @@
 //! and `wasmnet:reconfigure/reconfigure`), timer completion and `changes.wait` completion.
 //!
 //! Sync exports (`receive`, `link-state`, `poll`, `counters`, `invoke`, `reconfigure`) run to
-//! completion inside the call. Async exports (`start`, an app's `run`) only *start* here:
+//! completion inside the call; for a device whose [`Instance::suspends`], the call may wait
+//! inside (JSPI) for the promise its export answered, and no event of the network is processed
+//! meanwhile. Async exports (`start`, an app's `run`) only *start* here:
 //! JavaScript reports their end later through [`crate::Registry::call_done`], and resolves a
 //! guest's virtual wait when it hears [`JsHost::timer_fire`] or [`JsHost::wait_done`].
 //!
@@ -31,6 +33,9 @@ pub struct Instance {
     pub commands: bool,
     /// It exports `wasmnet:reconfigure/reconfigure` (it takes a config in place). As `commands`.
     pub reconfigure: bool,
+    /// Its device exports (`ports`, `receive`, `link-state`, `poll`, `counters`) may answer with a
+    /// promise, which the call waits for (JSPI): JavaScript calls it through `Suspending` imports.
+    pub suspends: bool,
     /// Every interface it exports, by name without a version (`wasmnet:control/commands`): the
     /// exports control calls reach by name ([`JsHost::export`]).
     pub exports: Vec<String>,
@@ -65,6 +70,12 @@ impl Instance {
     /// Sets [`commands`](Self::commands).
     pub fn commands(mut self, on: bool) -> Self {
         self.commands = on;
+        self
+    }
+
+    /// Sets [`suspends`](Self::suspends).
+    pub fn suspends(mut self, on: bool) -> Self {
+        self.suspends = on;
         self
     }
 

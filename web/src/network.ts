@@ -53,6 +53,41 @@ export interface ComponentSource {
    * supplies with these bytes runs from this source (no `NetworkOptions.supply` needed).
    */
   digest?: string;
+  /**
+   * Its device exports (`ports`, `receive`, `link-state`, `poll`, `counters`) may answer with a
+   * promise: a composition wrapped for JSPI by its transpile, whose sync export waits for a
+   * sibling. Such a device is called through `Suspending` imports, and the simulator waits for
+   * each answer inside its step (docs/design/browser.md, "Exports that answer with a promise"). A
+   * device whose `ports()` answers with a promise is treated so without it. Other devices are
+   * called synchronously, at no extra cost.
+   */
+  suspends?: boolean;
+}
+
+/**
+ * A device as `NetworkOptions.deviceImports` and `instantiateCore` see it: which device, and
+ * its virtual clock, so that an import served to it can answer at a later virtual instant.
+ */
+export interface DeviceDescriptor {
+  /** Its index (creation order). */
+  index: number;
+  name: string;
+  /** The key of `NetworkOptions.components` it is made from. */
+  component: string;
+  /** Virtual time now (ns): what the device's own clock reads. */
+  now(): bigint;
+  /**
+   * Calls `wake` once virtual time reaches `at` (ns; an instant already past fires at the
+   * device's next poll), on the timer table the device's own WASI timers use: inside the
+   * simulator's step, when the device's actor serves its timers. Two timers of the device due at
+   * one instant fire in the order they were set. `wake` should only record what is due and
+   * resolve promises (the guest's code waiting on them runs when the event loop settles, at the
+   * same instant); it may call `now`, `timer` and `sleepUntil`, never a `Network` method. A timer
+   * belongs to its network: one set before a `reset` never fires.
+   */
+  timer(at: bigint, wake: () => void): void;
+  /** `timer` as a promise: resolves at virtual instant `at`. */
+  sleepUntil(at: bigint): Promise<void>;
 }
 
 export interface NetworkOptions {
@@ -79,9 +114,11 @@ export interface NetworkOptions {
    * with a version), asked each time the device is instantiated: an embedder's capability served
    * in JavaScript to the devices it chooses. They are merged over the binding's own, so they can
    * also replace one (the binding's are what the simulator serves alike on wasmtime; a replaced
-   * one is the embedder's, and runs in this page only).
+   * one is the embedder's, and runs in this page only). The descriptor carries the device's
+   * virtual clock (`DeviceDescriptor.now`, `timer`, `sleepUntil`): an import may answer with a
+   * promise that resolves a virtual delay after the call (a WASI 0.3 async function's answer).
    */
-  deviceImports?: (device: { index: number; name: string; component: string }) => Imports | undefined;
+  deviceImports?: (device: DeviceDescriptor) => Imports | undefined;
   /**
    * The kit's hook for compiling a component's core module that `ComponentSource.modules` does not
    * have (default: fetch it next to the component's JS), passed through.
@@ -90,9 +127,11 @@ export interface NetworkOptions {
   /**
    * The kit's hook for instantiating a component's core modules, passed through (default:
    * `WebAssembly.instantiate`). The binding still sees every instance it returns, to count the
-   * device's memories.
+   * device's memories. It is told whose core modules these are (`device`, the descriptor
+   * `deviceImports` gets) and is called for each of them, in the order the component
+   * instantiates them: one device's code tier can keep that device's own instances.
    */
-  instantiateCore?: (module: WebAssembly.Module, imports?: WebAssembly.Imports) => WebAssembly.Instance | Promise<WebAssembly.Instance>;
+  instantiateCore?: (module: WebAssembly.Module, imports: WebAssembly.Imports | undefined, device: DeviceDescriptor) => WebAssembly.Instance | Promise<WebAssembly.Instance>;
 }
 
 /** One end of a link: a device's port. */
@@ -239,6 +278,8 @@ interface Instance {
   exports: string[];
   /** Its export function `<interface>#<function>`, by WIT name (the kit's lookup). */
   exportFn(name: string): (...args: unknown[]) => unknown;
+  /** Its device exports may answer with a promise (`ComponentSource.suspends`, or its `ports()` did). */
+  suspends: boolean;
 }
 
 const encoder = new TextEncoder();
@@ -538,44 +579,29 @@ export class Network {
         delete n().instances[dev];
       },
       js_compile: new jspi.Suspending(((dp: number, dl: number, bp: number, bl: number) => n().compile(dp, dl, bp, bl)) as AnyFn),
-      js_receive: (dev: number, port: number, now: bigint, ptr: number, len: number) => {
-        const self = n();
-        try {
-          self.sync(self.instance(dev).root.device.receive(U64(now), port, self.view(ptr, len).slice()), 'receive');
-          return 0;
-        } catch (err) {
-          return self.fail(err);
-        }
-      },
-      js_link_state: (dev: number, port: number, up: number, now: bigint) => {
-        const self = n();
-        try {
-          self.sync(self.instance(dev).root.device.linkState(U64(now), port, up !== 0), 'link-state');
-          return 0;
-        } catch (err) {
-          return self.fail(err);
-        }
-      },
-      js_poll: (dev: number, now: bigint) => {
-        const self = n();
-        try {
-          const next = self.sync(self.instance(dev).root.device.poll(U64(now)), 'poll');
-          return next === undefined ? -1n : BigInt.asIntN(64, next);
-        } catch (err) {
+      ...Network.deviceCall(n, 'receive', (self, dev: number, port: number, now: bigint, ptr: number, len: number) => {
+        // The frame is copied before anything may wait: the simulator frees it after the call.
+        const frame = self.view(ptr, len).slice();
+        return [self.instance(dev).root.device.receive(U64(now), port, frame), () => 0];
+      }),
+      ...Network.deviceCall(n, 'link_state', (self, dev: number, port: number, up: number, now: bigint) => [
+        self.instance(dev).root.device.linkState(U64(now), port, up !== 0),
+        () => 0,
+      ]),
+      ...Network.deviceCall(
+        n,
+        'poll',
+        (self, dev: number, now: bigint) => [self.instance(dev).root.device.poll(U64(now)), (next) => (next === undefined ? -1n : BigInt.asIntN(64, next as bigint))],
+        (self, err) => {
           self.fail(err);
           return -2n;
-        }
-      },
-      js_counters: (dev: number) => {
-        const self = n();
-        try {
-          const counters = self.instance(dev).root.counters;
-          if (!counters) throw new Error('no counters export');
-          return self.put(codec.encodeCounters(self.sync(counters.counters(), 'counters')));
-        } catch (err) {
-          return self.fail(err);
-        }
-      },
+        },
+      ),
+      ...Network.deviceCall(n, 'counters', (self, dev: number) => {
+        const counters = self.instance(dev).root.counters;
+        if (!counters) throw new Error('no counters export');
+        return [counters.counters(), (v) => self.put(codec.encodeCounters(v as [string, bigint][]))];
+      }),
       js_start: (dev: number, call: number) => {
         const self = n();
         try {
@@ -649,10 +675,48 @@ export class Network {
     };
   }
 
-  /** A sync device export's answer; a promise means it was transpiled for JSPI, which this host does not drive. */
+  /** A sync device export's answer; a promise means it was transpiled for JSPI, and the device was not marked to suspend. */
   private sync<T>(v: T, what: string): T {
-    if (isPromise(v)) throw new Error(`${what} returned a promise: this host calls device exports synchronously`);
+    if (isPromise(v)) throw new Error(`${what} returned a promise: this device is called synchronously (mark its ComponentSource \`suspends\`)`);
     return v;
+  }
+
+  /**
+   * One of a device's sync exports as two imports of the simulator: `js_<name>` calls it and
+   * refuses a promise, `js_<name>_suspending` (`Suspending`) waits for the promise it answers,
+   * driving the event loop as `js_export` does. The simulator calls a device through one or the
+   * other, by whether it suspends (`ComponentSource.suspends`, or a `ports()` that answered with a
+   * promise): devices that do not pay nothing for the others.
+   */
+  private static deviceCall<A extends unknown[]>(
+    n: () => Network,
+    name: string,
+    call: (self: Network, ...args: A) => [unknown, (answer: unknown) => unknown],
+    failed: (self: Network, err: unknown) => unknown = (self, err) => self.fail(err),
+  ): Record<string, (...args: never[]) => unknown> {
+    const what = name.replace('_', '-');
+    const plain = (...args: A) => {
+      const self = n();
+      try {
+        const [answer, done] = call(self, ...args);
+        return done(self.sync(answer, what));
+      } catch (err) {
+        return failed(self, err);
+      }
+    };
+    const suspending = async (...args: A) => {
+      const self = n();
+      try {
+        const [answer, done] = call(self, ...args);
+        return done(isPromise(answer) ? await until(answer) : answer);
+      } catch (err) {
+        return failed(self, err);
+      }
+    };
+    return {
+      [`js_${name}`]: plain as unknown as AnyFn,
+      [`js_${name}_suspending`]: new jspi.Suspending(suspending as unknown as AnyFn),
+    };
   }
 
   /** Reports an async export call's end to the simulator: 0 ok, 1 an app's `err`, 2 a trap. */
@@ -730,14 +794,16 @@ export class Network {
     if (!source) throw new Error(`no component ${component} (known: ${Object.keys(this.sources).join(', ')})`);
     // Every core instance it makes, for its memories: what the simulator counts and bounds.
     const memories = new Set<WebAssembly.Memory>();
+    const clock = this.clock(dev);
+    const device: DeviceDescriptor = { index: dev, name, component, ...clock };
     const own = this.options.instantiateCore;
     const instantiateCore = async (module: WebAssembly.Module, imports?: WebAssembly.Imports) => {
-      const instance = own ? await own(module, imports) : await WebAssembly.instantiate(module, imports);
+      const instance = own ? await own(module, imports, device) : await WebAssembly.instantiate(module, imports);
       for (const e of Object.values(instance.exports)) if (e instanceof WebAssembly.Memory) memories.add(e);
       return instance;
     };
-    const extra = this.options.deviceImports?.({ index: dev, name, component }) ?? {};
-    const imports = { ...this.imports(dev) };
+    const extra = this.options.deviceImports?.(device) ?? {};
+    const imports = { ...this.imports(dev, clock) };
     // By unversioned name, as the kit keys imports, merged over the binding's own.
     for (const [k, v] of Object.entries(extra)) imports[unversioned(k)] = { ...(imports[unversioned(k)] ?? {}), ...v };
     const compile = this.options.compile;
@@ -760,15 +826,30 @@ export class Network {
       const iface = full.get(e.slice(0, hash));
       return loaded.exportFn(iface ? `${iface}${e.slice(hash)}` : e);
     };
-    return { name, component, root, apps, memories, exports, exportFn };
+    return { name, component, root, apps, memories, exports, exportFn, suspends: source.suspends === true };
   }
 
   /** The `instance` message for device `dev`'s instance: its ports and what it exports. */
-  private answer(dev: number, instance: Instance): number {
+  private answer(dev: number, instance: Instance): number | Promise<number> {
     try {
       this.instances[dev] = instance;
+      const ports = instance.root.device.ports();
+      if (!isPromise(ports)) return this.instanceMessage(instance, ports as PortInfo[]);
+      // A device whose `ports()` answers with a promise suspends (`ComponentSource.suspends`):
+      // `js_instantiate` waits for it, as it does for a component it loads.
+      instance.suspends = true;
+      return until(ports).then(
+        (p) => this.instanceMessage(instance, p as PortInfo[]),
+        (err: unknown) => this.fail(err),
+      );
+    } catch (err) {
+      return this.fail(err);
+    }
+  }
+
+  private instanceMessage(instance: Instance, ports: PortInfo[]): number {
+    try {
       const { root, apps } = instance;
-      const ports = this.sync(root.device.ports(), 'ports');
       return this.put(
         codec.encodeInstance(
           ports,
@@ -777,6 +858,7 @@ export class Network {
             lifecycle: root.lifecycle !== undefined,
             commands: root.commands !== undefined,
             reconfigure: root.reconfigure !== undefined,
+            suspends: instance.suspends,
           },
           apps.map((a) => a.name),
           instance.exports,
@@ -789,8 +871,34 @@ export class Network {
 
   // ---- a device's imports ---------------------------------------------------------------------
 
+  /**
+   * Device `dev`'s virtual clock: what its WASI clocks and timers read, and what
+   * `DeviceDescriptor` hands an embedder's per-device imports. One timer table for both; a timer
+   * set after the device's network was replaced never fires.
+   */
+  private clock(dev: number): Pick<DeviceDescriptor, 'now' | 'timer' | 'sleepUntil'> {
+    // The device-side exports of this network only (`deviceSide`): an old guest's call is refused.
+    const x = this.deviceSide();
+    const generation = this.generation;
+    const timer = (at: bigint, wake: () => void) => {
+      touch();
+      if (generation === this.generation) this.timers.set(x.wn_timer(dev, U64(at)), wake);
+    };
+    return {
+      now: () => U64(x.wn_now()),
+      timer,
+      sleepUntil: (at: bigint) =>
+        new Promise<void>((resolve) =>
+          timer(at, () => {
+            touch();
+            resolve();
+          }),
+        ),
+    };
+  }
+
   /** Device `dev`'s world, as the kit's WASI reads it: everything from the simulator. */
-  private world(dev: number): World {
+  private world(dev: number, clock: Pick<DeviceDescriptor, 'now' | 'timer'>): World {
     // The device-side exports of this network only (`deviceSide`): an old guest's call is refused.
     const x = this.deviceSide();
     const generation = this.generation;
@@ -801,13 +909,9 @@ export class Network {
       this.withBytes(bytes, (p, l) => x.wn_output(dev, stderr, p, l));
     };
     return {
-      now: () => U64(x.wn_now()),
+      now: clock.now,
       wallNow: () => U64(x.wn_wall_now()),
-      timer: (at, wake) => {
-        touch();
-        // A timer of a replaced network's guest never fires.
-        if (generation === this.generation) this.timers.set(x.wn_timer(dev, at), wake);
-      },
+      timer: clock.timer,
       randomU64: (s) => U64(x.wn_random_u64(dev, stream(s))),
       randomFill: (s, out) => {
         const ptr = x.wn_alloc(out.length);
@@ -983,7 +1087,7 @@ export class Network {
     return out;
   }
 
-  private imports(dev: number): Imports {
+  private imports(dev: number, clock: Pick<DeviceDescriptor, 'now' | 'timer'>): Imports {
     // The device-side exports of this network only (`deviceSide`): an old guest's call is refused.
     const x = this.deviceSide();
     const infra: Imports = { 'wasmnet:infra/types': {} };
@@ -994,7 +1098,7 @@ export class Network {
       infra[`wasmnet:infra/${iface}`] = Object.fromEntries(fns.map((f) => [f, (...args: unknown[]) => this.infraWait(x, dev, `${iface}.${kebab(f)}`, args)]));
     }
     return {
-      ...wasiImports(this.world(dev)),
+      ...wasiImports(this.world(dev, clock)),
       ...infra,
       ...this.portableImports(x, dev),
       'wasmnet:link/types': {},

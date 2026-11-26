@@ -179,14 +179,14 @@ export function decodePlan(bytes: Uint8Array): { name: string; component: string
 /** What `js_instantiate` answers: the ports, which optional exports exist, the apps in start order. */
 export function encodeInstance(
   ports: readonly PortInfo[],
-  flags: { counters: boolean; lifecycle: boolean; commands: boolean; reconfigure: boolean },
+  flags: { counters: boolean; lifecycle: boolean; commands: boolean; reconfigure: boolean; suspends?: boolean },
   apps: readonly string[],
   exports: readonly string[] = [],
 ): Uint8Array {
   const w = new Writer().u32(ports.length);
   for (const p of ports) w.u32(p.id).str(p.name).raw(p.mac ?? new Uint8Array()).u32(p.mtu);
   return w
-    .u32((flags.counters ? 1 : 0) | (flags.lifecycle ? 2 : 0) | (flags.commands ? 4 : 0) | (flags.reconfigure ? 8 : 0))
+    .u32((flags.counters ? 1 : 0) | (flags.lifecycle ? 2 : 0) | (flags.commands ? 4 : 0) | (flags.reconfigure ? 8 : 0) | (flags.suspends ? 16 : 0))
     .strs(apps)
     .strs(exports)
     .finish();

@@ -49,6 +49,7 @@
 //! | `js_poll(dev, now: u64) -> i64` | `device.poll`: the deadline, `-1` none, `-2` error (its length from `js_stash_len`) |
 //! | `js_stash_len() -> i32` | the length of the error message `js_poll` left |
 //! | `js_counters(dev) -> i32` | `counters.counters`; answers a `counters` message |
+//! | `js_receive_suspending`, `js_link_state_suspending`, `js_poll_suspending`, `js_counters_suspending` | the four above for a device whose `instance` said `suspends` (its exports may answer with a promise): `Suspending` in the page, which waits for the promise; the simulator calls a device through one set or the other, so other devices pay nothing |
 //! | `js_start(dev, call) -> i32` | start `lifecycle.start()`, to end as `wn_call_done(dev, call, ..)`; 0, or a negative error |
 //! | `js_run_app(dev, app, call) -> i32` | start app number `app`'s `run()`, likewise |
 //! | `js_timer_fire(timer)` | the virtual timer `timer` (from `wn_timer`) is due: resolve the guest's wait |
@@ -103,7 +104,42 @@ mod js {
         ) -> i32;
         pub fn js_network_replaced(seed: u64);
         pub fn js_panic(msg: *const u8, len: usize);
+        // The same device calls for a device that suspends: `Suspending` in the page.
+        pub fn js_receive_suspending(
+            dev: u32,
+            port: u32,
+            now: u64,
+            frame: *const u8,
+            len: usize,
+        ) -> i32;
+        pub fn js_link_state_suspending(dev: u32, port: u32, up: u32, now: u64) -> i32;
+        pub fn js_poll_suspending(dev: u32, now: u64) -> i64;
+        pub fn js_counters_suspending(dev: u32) -> i32;
     }
+}
+
+thread_local! {
+    /// The devices of the current network whose exports may answer with a promise (their
+    /// `instance` said `suspends`), by index: called through the `_suspending` imports.
+    static SUSPENDS: RefCell<Vec<bool>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Whether device `dev` is called through the `_suspending` imports.
+fn suspends(dev: u32) -> bool {
+    SUSPENDS.with_borrow(|s| s.get(dev as usize).copied().unwrap_or(false))
+}
+
+fn set_suspends(dev: u32, on: bool) {
+    SUSPENDS.with_borrow_mut(|s| {
+        let i = dev as usize;
+        if s.len() <= i {
+            if !on {
+                return;
+            }
+            s.resize(i + 1, false);
+        }
+        s[i] = on;
+    });
 }
 
 /// Copies the pending answer of `n` bytes out of JavaScript.
@@ -151,22 +187,45 @@ impl JsHost for Js {
         // SAFETY: `plan` is live for the duration of the call; JavaScript only reads it.
         let len = unsafe { js::js_instantiate(dev, plan.as_ptr(), plan.len()) };
         let bytes = answer(len)?;
-        codec::decode_instance(&bytes).map_err(|e| format!("instance: {e}"))
+        let instance = codec::decode_instance(&bytes).map_err(|e| format!("instance: {e}"))?;
+        set_suspends(dev, instance.suspends);
+        Ok(instance)
     }
 
     fn receive(&self, dev: u32, port: u32, now: Nanos, frame: &[u8]) -> Result<(), String> {
+        let (ptr, len) = (frame.as_ptr(), frame.len());
         // SAFETY: `frame` is live for the duration of the call; JavaScript only reads it.
-        status(unsafe { js::js_receive(dev, port, now, frame.as_ptr(), frame.len()) })
+        status(unsafe {
+            if suspends(dev) {
+                js::js_receive_suspending(dev, port, now, ptr, len)
+            } else {
+                js::js_receive(dev, port, now, ptr, len)
+            }
+        })
     }
 
     fn link_state(&self, dev: u32, port: u32, up: bool, now: Nanos) -> Result<(), String> {
+        let up = u32::from(up);
         // SAFETY: plain values.
-        status(unsafe { js::js_link_state(dev, port, u32::from(up), now) })
+        status(unsafe {
+            if suspends(dev) {
+                js::js_link_state_suspending(dev, port, up, now)
+            } else {
+                js::js_link_state(dev, port, up, now)
+            }
+        })
     }
 
     fn poll(&self, dev: u32, now: Nanos) -> Result<Option<Nanos>, String> {
         // SAFETY: plain values.
-        match unsafe { js::js_poll(dev, now) } {
+        let next = unsafe {
+            if suspends(dev) {
+                js::js_poll_suspending(dev, now)
+            } else {
+                js::js_poll(dev, now)
+            }
+        };
+        match next {
             -1 => Ok(None),
             t if t >= 0 => Ok(Some(t.unsigned_abs())),
             _ => {
@@ -180,7 +239,14 @@ impl JsHost for Js {
 
     fn counters(&self, dev: u32) -> Result<Vec<(String, u64)>, String> {
         // SAFETY: plain values.
-        let bytes = answer(unsafe { js::js_counters(dev) })?;
+        let len = unsafe {
+            if suspends(dev) {
+                js::js_counters_suspending(dev)
+            } else {
+                js::js_counters(dev)
+            }
+        };
+        let bytes = answer(len)?;
         codec::decode_counters(&bytes).map_err(|e| format!("counters: {e}"))
     }
 
@@ -235,6 +301,7 @@ impl JsHost for Js {
     }
 
     fn release(&self, dev: u32) {
+        set_suspends(dev, false);
         // SAFETY: a plain value.
         unsafe { js::js_release(dev) }
     }
@@ -257,6 +324,7 @@ impl JsHost for Js {
     }
 
     fn network_replaced(&self, seed: u64) {
+        SUSPENDS.with_borrow_mut(Vec::clear);
         // SAFETY: a plain value.
         unsafe { js::js_network_replaced(seed) }
     }
