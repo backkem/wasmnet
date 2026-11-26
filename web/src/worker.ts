@@ -23,7 +23,7 @@ export interface Init {
   seed: string;
   simulator: WebAssembly.Module;
   components: Record<string, ComponentSource>;
-  scenario?: 'example' | 'controls' | 'runtime' | 'portable' | 'portable-cost' | 'exports' | 'disks' | 'disk-cost' | 'sequence' | 'pad-sequence' | 'pad-fresh';
+  scenario?: 'example' | 'controls' | 'runtime' | 'portable' | 'portable-cost' | 'exports' | 'disks' | 'disk-cost' | 'sequence' | 'pad-sequence' | 'pad-fresh' | 'frames';
 }
 
 export interface Done {
@@ -253,6 +253,10 @@ serveRun<Init, Done>(async (init, ctx) => {
     // The networks after the first take the next seed: a fresh page at that seed is the reference.
     const notes = await sequence(net, BigInt(init.seed) + 1n);
     return { outcome: {} as Outcome, links: [], ms: Math.round(performance.now() - t0), notes };
+  }
+  if (init.scenario === 'frames') {
+    const notes = await frames(net);
+    return { outcome: {} as Outcome, links: [], ms: Number(notes.ms), notes };
   }
   if (init.scenario === 'pad-sequence' || init.scenario === 'pad-fresh') {
     const t0 = performance.now();
@@ -680,5 +684,48 @@ async function padFresh(net: Network): Promise<Record<string, string>> {
   return {
     journal: JSON.stringify(net.journal(), (_k, x: unknown) => (typeof x === 'bigint' ? String(x) : x)),
     notes: new TextDecoder().decode(net.callExport('wn_pad_notes', new TextEncoder().encode('p'))),
+  };
+}
+
+/** The packets (enhanced packet blocks) in a pcap-ng capture. */
+function packets(pcap: Uint8Array): number {
+  const view = new DataView(pcap.buffer, pcap.byteOffset, pcap.byteLength);
+  let n = 0;
+  for (let at = 0; at + 8 <= pcap.byteLength; ) {
+    const len = view.getUint32(at + 4, true);
+    if (view.getUint32(at, true) === 6) n += 1;
+    if (len < 12) break;
+    at += len;
+  }
+  return n;
+}
+
+/**
+ * The `frames` scenario: a frame-heavy run, for what a step costs in the page. The example's
+ * network fetches a 2 MB body (`/big?n=`) through the switch: some 4,000 frames. Reports the
+ * frames on the wire, the run's wall time and frames per second.
+ */
+async function frames(net: Network): Promise<Record<string, string>> {
+  const sw = await net.device('sw', 'switch', { ports: '4' });
+  const server = await net.device('server', 'node-http-server', { mac: '02:00:00:00:00:01', ipv4: '10.0.0.1/24', 'app.http-server.listen': '0.0.0.0:80' });
+  const client = await net.device('client', 'node-http-get', {
+    mac: '02:00:00:00:00:02',
+    ipv4: '10.0.0.2/24',
+    'hosts.web': '10.0.0.1',
+    'app.http-get.url': 'http://web/big?n=2000000',
+    'app.http-get.start': '1ms',
+  });
+  net.link(server.port(0), sw.port(1), 150_000n);
+  net.link(client.port(0), sw.port(2), 100_000n);
+  const t0 = performance.now();
+  await net.run();
+  const ms = performance.now() - t0;
+  const n = net.links().reduce((sum, l) => sum + packets(net.pcap(l)), 0);
+  const done = net.journal().find((e) => e.record === 'event' && e.kind === 'http-get-done');
+  return {
+    frames: String(n),
+    ms: ms.toFixed(0),
+    framesPerSecond: ((n / ms) * 1000).toFixed(0),
+    done: done && done.record === 'event' ? done.fields.map(([k, v]) => `${k}=${v}`).join(' ') : '',
   };
 }

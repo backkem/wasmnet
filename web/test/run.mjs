@@ -359,6 +359,14 @@ await step("networks in sequence from an embedder's own export: a seed it comput
   return { seed: r.notes.seed, replacedAfter: Number(r.notes.before), entries: JSON.parse(r.notes.journal).length, notes: r.notes.notes };
 });
 
+await step('what a frame-heavy run costs in the page: a 2 MB fetch through the switch, frames per second', async () => {
+  const runs = [];
+  for (let i = 0; i < 3; i++) runs.push((await page.evaluate(() => window.wasmnetScenario('frames', '42'))).notes);
+  if (!runs[0].done.includes('status=200') || !runs[0].done.includes('body-bytes=2000000')) throw new Error(`the fetch: ${runs[0].done}`);
+  if (runs.some((r) => r.frames !== runs[0].frames)) throw new Error(`frames: ${runs.map((r) => r.frames).join(', ')}`);
+  return { frames: Number(runs[0].frames), ms: runs.map((r) => Number(r.ms)), framesPerSecond: runs.map((r) => Number(r.framesPerSecond)) };
+});
+
 if (process.env.NATIVE_JOURNAL) {
   await step('agrees with the native example', async () => {
     // The native example prints `<t> ns  <device> <kind> k=v ...` for events and
