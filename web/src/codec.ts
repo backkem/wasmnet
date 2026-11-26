@@ -342,7 +342,10 @@ export interface LinkOptions {
   * `crash-device`, `start-device`, `remove-device`, `wire`, `unwire`), or an extension's:
  * `{ kind: 'extension', device, op, value }`, timed at the device called `device` when it applies
  * (one that an earlier op or a controller creates; none of that name then fails it), built by the
- * extension that declares `op` (`NetworkExtension::ops`).
+ * extension that declares `op` (`NetworkExtension::ops`). Since the device is found by name when
+ * the op applies, `op()` accepts an extension op naming a device that does not exist yet; if none
+ * has that name when it applies, the op fails then (`no device <name>` in its state), not when
+ * added.
  */
 export interface Op {
   kind: string;
