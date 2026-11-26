@@ -47,12 +47,10 @@ jobs:
           RUSTDOCFLAGS: -D warnings
 
   platforms:
-    # Whether a Linux and a Windows build give the same component bytes. Not guaranteed
-    # (docs/design/artifacts.md): this job reports the files that differ and does not fail the
-    # workflow until the two builds agree.
+    # A Linux and a Windows build give the same component bytes (docs/design/artifacts.md,
+    # "Reproducible bytes"): the manifests the test job wrote on each must agree file by file.
     needs: test
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - run: rustup show
