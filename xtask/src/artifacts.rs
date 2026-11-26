@@ -28,6 +28,7 @@ pub const FIXTURES: &[&str] = &[
     "clock-probe",
     "infra-script",
     "reflector",
+    "store-adapter",
     "udp-punch",
 ];
 

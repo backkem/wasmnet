@@ -1,0 +1,28 @@
+[package]
+name = "wasmnet-store-adapter"
+version = "0.0.0"
+description = "Test fixture and worked example: an adapter component that keeps a device's own storage contract (byte keys, objects by hash) and serves it over the device's disks (wasi:keyvalue plus wasmnet:keyvalue-ext)."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Exports `wasmnet-test:bytes-store/{state,objects}` (`wit/test-store`) and imports the disk
+# interfaces; composed in front of a device that imports the two (`wac plug`), the device keeps
+# its own WIT and never names the disk. `src/lib.rs` is the pure logic (the key encoding),
+# unit-tested inside wasmtime with `cargo test --target wasm32-wasip2 -p wasmnet-store-adapter`;
+# `src/component.rs` is the wit-bindgen glue, left out of test builds.
+
+[lib]
+# The artifact is named after the component, not the package: `store_adapter.wasm`.
+name = "store_adapter"
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = { workspace = true, features = ["macros", "realloc"] }
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

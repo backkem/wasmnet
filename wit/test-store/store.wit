@@ -1,0 +1,71 @@
+package wasmnet-test:bytes-store@0.1.0;
+
+/// A test fixture's own storage contract, shaped as an embedder might shape theirs: records under
+/// byte keys, and objects keyed by a 32-byte hash. A device imports these and never names the
+/// disk; the adapter component `components/store-adapter` exports them over a device's disks
+/// (`wasi:keyvalue` plus `wasmnet:keyvalue-ext`). Every function is synchronous and takes no
+/// virtual time; the caller owns every list it gets back.
+interface state {
+    /// Why a call did not do what was asked; nothing changed.
+    variant error {
+        too-large,
+        full,
+        failed(string),
+    }
+
+    /// One change of a write.
+    variant change {
+        set(tuple<list<u8>, list<u8>>),
+        delete(list<u8>),
+    }
+
+    record entry {
+        key: list<u8>,
+        value: list<u8>,
+    }
+
+    /// The value of `key`, if it has one.
+    get: func(key: list<u8>) -> result<option<list<u8>>, error>;
+
+    /// Applies `changes` in order, all or none, durable on return.
+    write: func(changes: list<change>) -> result<_, error>;
+
+    /// Up to `limit` entries whose keys start with `prefix` and sort after `after`, ascending by
+    /// their bytes.
+    scan: func(prefix: list<u8>, after: option<list<u8>>, limit: u32) -> result<list<entry>, error>;
+}
+
+interface objects {
+    use state.{error};
+
+    /// An object held: its hash and size.
+    record object {
+        hash: list<u8>,
+        size: u64,
+    }
+
+    /// Keeps `bytes` under `hash` (32 bytes), durable on return.
+    keep: func(hash: list<u8>, bytes: list<u8>) -> result<_, error>;
+
+    /// Up to `len` bytes of the object from `offset`; `none` if there is no such object.
+    read: func(hash: list<u8>, offset: u64, len: u32) -> result<option<list<u8>>, error>;
+
+    remove: func(hash: list<u8>) -> result<_, error>;
+
+    /// Up to `limit` objects whose hashes sort after `after`, ascending.
+    held: func(after: option<list<u8>>, limit: u32) -> result<list<object>, error>;
+}
+
+/// The adapter: these two over a device's disks `state` and `objects`.
+world adapter {
+    import wasi:keyvalue/store@0.2.0-draft2;
+    import wasmnet:keyvalue-ext/ordered@0.1.0;
+    export state;
+    export objects;
+}
+
+/// What a device that keeps its data this way imports.
+world user {
+    import state;
+    import objects;
+}

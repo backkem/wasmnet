@@ -1891,6 +1891,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "wasmnet-store-adapter"
+version = "0.0.0"
+dependencies = [
+ "proptest",
+ "wit-bindgen 0.61.1",
+]
+
+[[package]]
 name = "wasmnet-switch"
 version = "0.0.0"
 dependencies = [

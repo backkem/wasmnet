@@ -55,5 +55,12 @@ name = "disk-probe"
 path = "examples/disk_probe.rs"
 crate-type = ["cdylib"]
 
+# `examples/store_probe.rs`: a stepped device (no ports) that keeps its data through a contract of
+# its own (`wit/test-store`), composed with `components/store-adapter` over its disks.
+[[example]]
+name = "store-probe"
+path = "examples/store_probe.rs"
+crate-type = ["cdylib"]
+
 [lints]
 workspace = true
