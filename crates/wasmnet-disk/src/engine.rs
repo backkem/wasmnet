@@ -132,7 +132,8 @@ pub enum DiskFault {
     /// Without one, a power loss keeps none of the tail.
     PowerLoss { keep: Keep, tear: bool },
     /// The `call`-th mutating call from now (1: the next) faults the device inside the call,
-    /// keeping none, all or a seeded prefix of its changes.
+    /// keeping none, all or a seeded prefix of its changes. A `call` of 0 disarms the one armed,
+    /// if any (journalled as `disk-disarmed`).
     CrashAt { call: u64, keep: Keep },
     /// The next `count` calls on the disk answer `failed(text)` (`other(text)` from a standard
     /// function) and change nothing.
@@ -370,6 +371,9 @@ impl Disk {
 struct Inner {
     /// Device name -> disk name -> disk.
     devices: BTreeMap<String, BTreeMap<String, Disk>>,
+    /// Device name -> an armed crash-at over all its disks: the changing calls left until it
+    /// fires (1: the next), and what it keeps.
+    any: BTreeMap<String, (u64, Keep)>,
     /// Quota bytes every disk holds together, and the most they may.
     used: u64,
     total: u64,
@@ -525,6 +529,7 @@ impl DiskSet {
         }
         if disks.is_empty() {
             inner.devices.remove(device);
+            inner.any.remove(device);
         }
         inner.recount();
         recs
@@ -541,6 +546,7 @@ impl DiskSet {
         let mut recs = Vec::new();
         let mut inner = self.lock();
         let seed = inner.seed;
+        inner.any.remove(device);
         let Some(disks) = inner.devices.get_mut(device) else {
             return recs;
         };
@@ -615,10 +621,11 @@ impl DiskSet {
                     .with("keep", keep_name(*keep))
                     .with("tear", tear)
             }
+            DiskFault::CrashAt { call: 0, .. } => {
+                let left = d.crash_at.take().map(|(at, _)| at - d.writes);
+                disarmed(Rec::new("disk-disarmed", disk), left)
+            }
             DiskFault::CrashAt { call, keep } => {
-                if *call == 0 {
-                    return Err("crash-at counts writes from 1".to_owned());
-                }
                 d.crash_at = Some((d.writes + call, *keep));
                 Rec::new("disk-armed", disk)
                     .with("fault", "crash-at")
@@ -659,6 +666,33 @@ impl DiskSet {
         };
         inner.recount();
         Ok(rec)
+    }
+
+    /// Applies an operator's fault to every disk of `device` as one ([`crate::AnyDiskOp`]):
+    /// only [`DiskFault::CrashAt`], counted over the changing calls on any of its disks.
+    pub(crate) fn fault_any(&self, device: &str, fault: &DiskFault) -> Result<Rec, String> {
+        let any = |kind| Rec {
+            kind,
+            fields: vec![("disks", "any".to_owned())],
+        };
+        let mut inner = self.lock();
+        match fault {
+            DiskFault::CrashAt { call: 0, .. } => {
+                let left = inner.any.remove(device).map(|(left, _)| left);
+                Ok(disarmed(any("disk-disarmed"), left))
+            }
+            DiskFault::CrashAt { call, keep } => {
+                if !inner.devices.contains_key(device) {
+                    return Err(format!("device `{device}` has no disks"));
+                }
+                inner.any.insert(device.to_owned(), (*call, *keep));
+                Ok(any("disk-armed")
+                    .with("fault", "crash-at")
+                    .with("call", call)
+                    .with("keep", keep_name(*keep)))
+            }
+            _ => Err("only `crash-at` applies to any disk of a device".to_owned()),
+        }
     }
 
     /// Replaces a declared disk's contents with an image (`disk-loaded`).
@@ -717,6 +751,13 @@ impl DiskSet {
     pub(crate) fn calls<'a>(&'a self, device: &'a str) -> Calls<'a> {
         Calls { set: self, device }
     }
+}
+
+/// A `disk-disarmed` record: the fault, and the changing calls it had left (`none`: nothing
+/// was armed).
+fn disarmed(rec: Rec, left: Option<u64>) -> Rec {
+    rec.with("fault", "crash-at")
+        .with("left", left.map_or("none".to_owned(), |n| n.to_string()))
 }
 
 fn keep_name(k: Keep) -> &'static str {
@@ -795,6 +836,7 @@ impl Calls<'_> {
         let mut inner = self.set.lock();
         let Inner {
             devices,
+            any,
             used,
             total,
             seed,
@@ -818,8 +860,16 @@ impl Calls<'_> {
             room: total.saturating_sub(*used),
             seed: *seed,
             device: self.device,
+            any: any.get(self.device).copied(),
         };
+        let armed = ctx.any;
         let r = f(d, &mut ctx);
+        if ctx.any != armed {
+            match ctx.any {
+                Some(a) => any.insert(self.device.to_owned(), a),
+                None => any.remove(self.device),
+            };
+        }
         if r.is_err() {
             d.stats.errors += 1;
         }
@@ -940,10 +990,24 @@ impl Calls<'_> {
             d.writes += 1;
             let mut apply = changes.len();
             let mut faulted = None;
+            // The disk's own crash-at and the device's over all its disks both count this call;
+            // when both fall on it, the disk's own fires (and the crash disarms the other).
+            let mut fire = None;
             if let Some((at, keep)) = d.crash_at
                 && d.writes == at
             {
                 d.crash_at = None;
+                fire = Some((keep, false));
+            }
+            if let Some((left, keep)) = ctx.any {
+                if left <= 1 {
+                    ctx.any = None;
+                    fire.get_or_insert((keep, true));
+                } else {
+                    ctx.any = Some((left - 1, keep));
+                }
+            }
+            if let Some((keep, by_any)) = fire {
                 apply = match keep {
                     Keep::None => 0,
                     Keep::All => changes.len(),
@@ -952,7 +1016,7 @@ impl Calls<'_> {
                         (d.rng(ctx.seed, ctx.device).next_u64() % n.max(1)) as usize
                     }
                 };
-                faulted = Some((d.writes, apply, changes.len()));
+                faulted = Some((d.writes, apply, changes.len(), by_any));
             }
             let mut undo = Undo::new();
             for c in changes.into_iter().take(apply) {
@@ -965,13 +1029,17 @@ impl Calls<'_> {
                 d.tail.push(undo);
             }
             d.note_peak();
-            if let Some((call, kept, of)) = faulted {
+            if let Some((call, kept, of, by_any)) = faulted {
                 let name = d.declared.name.clone();
+                let mut rec = Rec::new("disk-crash", &name)
+                    .with("write", call)
+                    .with("kept", kept)
+                    .with("of", of);
+                if by_any {
+                    rec = rec.with("disks", "any");
+                }
                 *crash = Some(Crash {
-                    rec: Rec::new("disk-crash", &name)
-                        .with("write", call)
-                        .with("kept", kept)
-                        .with("of", of),
+                    rec,
                     message: format!("disk `{name}` failed inside write {call}"),
                 });
                 return Err(DiskError::Fault(format!(
@@ -1076,6 +1144,8 @@ pub(crate) struct Inner2<'a> {
     room: u64,
     seed: u64,
     device: &'a str,
+    /// The device's crash-at over all its disks, if armed (calls left, keep).
+    any: Option<(u64, Keep)>,
 }
 
 #[cfg(test)]
@@ -1289,17 +1359,129 @@ mod tests {
             k.len() < 4 && k.iter().enumerate().all(|(i, x)| *x == format!("k{i}")),
             "{k:?}"
         );
-        assert!(
-            s.fault(
-                "d",
-                "a",
-                &DiskFault::CrashAt {
-                    call: 0,
-                    keep: Keep::None
-                }
-            )
-            .is_err()
+    }
+
+    fn crash_at(call: u64) -> DiskFault {
+        DiskFault::CrashAt {
+            call,
+            keep: Keep::All,
+        }
+    }
+
+    fn fields(r: &Rec) -> Vec<(&str, &str)> {
+        r.fields.iter().map(|(k, v)| (*k, v.as_str())).collect()
+    }
+
+    #[test]
+    fn a_crash_at_is_disarmed_by_a_call_of_zero_and_the_disarm_is_recorded() {
+        let s = set_with(&[DiskSpec::new("a")]);
+        let c = s.calls("d");
+        // Nothing armed: still a record.
+        let r = s.fault("d", "a", &crash_at(0)).unwrap();
+        assert_eq!(r.kind, "disk-disarmed");
+        assert_eq!(
+            fields(&r),
+            [("disk", "a"), ("fault", "crash-at"), ("left", "none")]
         );
+        s.fault("d", "a", &crash_at(3)).unwrap();
+        set(&c, "k1", b"").unwrap();
+        let r = s.fault("d", "a", &crash_at(0)).unwrap();
+        assert_eq!(
+            fields(&r),
+            [("disk", "a"), ("fault", "crash-at"), ("left", "2")]
+        );
+        for i in 0..4 {
+            set(&c, &format!("k{i}"), b"").unwrap();
+        }
+        // Still refused for a disk the device does not have.
+        assert!(s.fault("d", "nope", &crash_at(0)).is_err());
+    }
+
+    #[test]
+    fn a_crash_at_over_any_disk_counts_every_disk_and_yields_to_the_disks_own() {
+        let s = set_with(&[DiskSpec::new("a"), DiskSpec::new("b")]);
+        let c = s.calls("d");
+        let r = s.fault_any("d", &crash_at(3)).unwrap();
+        assert_eq!(r.kind, "disk-armed");
+        assert_eq!(
+            fields(&r),
+            [
+                ("disks", "any"),
+                ("fault", "crash-at"),
+                ("call", "3"),
+                ("keep", "all")
+            ]
+        );
+        set(&c, "k1", b"").unwrap();
+        // A call that changes nothing (failed or full) does not count; one on `b` does.
+        s.fault(
+            "d",
+            "b",
+            &DiskFault::FailCalls {
+                count: 1,
+                text: "x".into(),
+            },
+        )
+        .unwrap();
+        let one = |k: &str| vec![Change::Set(k.into(), vec![])];
+        assert!(matches!(
+            c.write("b", one("x"), &mut None),
+            Err(DiskError::Failed(_))
+        ));
+        c.write("b", one("x"), &mut None).unwrap();
+        let mut crash = None;
+        assert!(matches!(
+            c.write("b", one("y"), &mut crash),
+            Err(DiskError::Fault(_))
+        ));
+        let crash = crash.expect("a crash record");
+        assert_eq!(
+            fields(&crash.rec),
+            [
+                ("disk", "b"),
+                ("write", "2"),
+                ("kept", "1"),
+                ("of", "1"),
+                ("disks", "any")
+            ]
+        );
+        // Once only, and disarmed by a power loss.
+        c.write("b", one("z"), &mut None).unwrap();
+        s.fault_any("d", &crash_at(1)).unwrap();
+        s.power_loss("d");
+        set(&c, "k2", b"").unwrap();
+        // Disarming answers what was left, or none.
+        s.fault_any("d", &crash_at(5)).unwrap();
+        set(&c, "k3", b"").unwrap();
+        let r = s.fault_any("d", &crash_at(0)).unwrap();
+        assert_eq!(r.kind, "disk-disarmed");
+        assert_eq!(
+            fields(&r),
+            [("disks", "any"), ("fault", "crash-at"), ("left", "4")]
+        );
+        let r = s.fault_any("d", &crash_at(0)).unwrap();
+        assert_eq!(fields(&r)[2], ("left", "none"));
+        // Both armed for the same call: the disk's own decides what it keeps; both are spent.
+        s.fault_any("d", &crash_at(1)).unwrap();
+        s.fault(
+            "d",
+            "a",
+            &DiskFault::CrashAt {
+                call: 1,
+                keep: Keep::None,
+            },
+        )
+        .unwrap();
+        let mut crash = None;
+        assert!(c.write("a", one("w"), &mut crash).is_err());
+        let crash = crash.expect("a crash record");
+        assert_eq!(fields(&crash.rec)[2], ("kept", "0"));
+        assert_eq!(crash.rec.fields.len(), 4, "the disk's own: no `disks`");
+        c.write("b", one("v"), &mut None).unwrap();
+        // Only crash-at applies, and only to a device with disks.
+        assert!(s.fault_any("d", &DiskFault::Lose).is_err());
+        assert!(s.fault_any("e", &crash_at(1)).is_err());
+        assert!(s.fault_any("e", &crash_at(0)).is_ok());
     }
 
     #[test]

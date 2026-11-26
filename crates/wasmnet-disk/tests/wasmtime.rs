@@ -21,7 +21,9 @@ use std::process::Command;
 use std::sync::OnceLock;
 
 use wasmnet_det_cbor::Value as Cbor;
-use wasmnet_disk::{DiskFault, DiskOp, DiskOptions, DiskSpec, Disks, Durability, Keep, image};
+use wasmnet_disk::{
+    AnyDiskOp, DiskFault, DiskOp, DiskOptions, DiskSpec, Disks, Durability, Keep, image,
+};
 use wasmnet_host::sim::{ExtensionOp, Op, Placement};
 use wasmnet_host::wasmtime::component::Component;
 use wasmnet_host::{
@@ -554,12 +556,9 @@ fn carry(m: Msg) -> Msg {
     Msg::decode(&m.encode()).expect("a message decodes")
 }
 
-#[test]
-fn a_split_network_applies_disk_faults_on_the_devices_site() {
-    let deadline = 60 * MS;
-    let mut whole = split_network(5, None);
-    whole.run_until(deadline).unwrap();
-    let mut nets: Vec<Network<'static>> = (0..2).map(|s| split_network(5, Some(s))).collect();
+/// Runs two sites in lockstep to `deadline` and merges their records (`names`: the devices the
+/// network was built with).
+fn run_sites(nets: &mut [Network<'static>], deadline: Nanos, names: &[&str]) -> sites::Merged {
     let hellos: Vec<Msg> = nets.iter().map(|n| carry(sites::hello(n))).collect();
     for (s, n) in nets.iter_mut().enumerate() {
         sites::apply_hello(n, &hellos[1 - s]).unwrap();
@@ -608,12 +607,17 @@ fn a_split_network_applies_disk_faults_on_the_devices_site() {
         let outcome = sync[i].finish(&mut nets[i]).unwrap();
         records.push(SiteRecords::collect(&nets[i], Ok(outcome)));
     }
-    let merged = sites::merge(
-        [&records[0], &records[1]],
-        &["a".to_owned(), "b".to_owned()],
-        Some(deadline),
-    )
-    .expect("the records merge");
+    let names: Vec<String> = names.iter().map(|n| (*n).to_owned()).collect();
+    sites::merge([&records[0], &records[1]], &names, Some(deadline)).expect("the records merge")
+}
+
+#[test]
+fn a_split_network_applies_disk_faults_on_the_devices_site() {
+    let deadline = 60 * MS;
+    let mut whole = split_network(5, None);
+    whole.run_until(deadline).unwrap();
+    let mut nets: Vec<Network<'static>> = (0..2).map(|s| split_network(5, Some(s))).collect();
+    let merged = run_sites(&mut nets, deadline, &["a", "b"]);
     assert_eq!(lines(&merged.journal), lines(&whole.journal()));
     assert!(
         merged.journal == whole.journal(),
@@ -635,6 +639,122 @@ fn a_split_network_applies_disk_faults_on_the_devices_site() {
                     .unwrap()
                     .digest(dev, disk)
                     .is_none()
+            );
+        }
+    }
+}
+
+/// `a` on site 0, and on site 1 `ctl`, a controller that creates `r` (two disks) at 0 ms. The
+/// faults name their devices: `a` the network was built with, `r` another site creates while
+/// the network runs, `nobody` no device at all.
+fn by_name_network(seed: u64, site: Option<usize>) -> Network<'static> {
+    let w = world();
+    let mut net = Network::new(&w.host, seed);
+    net.add_extension(Disks::default());
+    net.set_component_resolver(Box::new(move |name, instantiate| match name {
+        "probe" => instantiate(&w.probe),
+        other => Err(sim::Error::Refused(format!("no component {other}"))),
+    }));
+    net.set_infra_catalog(vec!["probe".to_owned()]);
+    let here = |i: usize| site.is_none_or(|s| s == i);
+    let (cfg, options) = (config(&[("period", "10ms")]), with_disks(two_disks()));
+    if here(0) {
+        net.device_with_options("a", &w.probe, cfg, options)
+    } else {
+        net.remote_device_with("a", cfg, options)
+    }
+    .unwrap();
+    let step = format!("0ms apply r {}", spec("10ms"));
+    let (cfg, options) = (
+        config(&[("step.0", step.as_str())]),
+        DeviceOptions::default().infra(true),
+    );
+    if here(1) {
+        net.device_with_options("ctl", &w.ctl, cfg, options)
+    } else {
+        net.remote_device_with("ctl", cfg, options)
+    }
+    .unwrap();
+    let crash = |call| DiskFault::CrashAt {
+        call,
+        keep: Keep::Prefix,
+    };
+    let any = |f| ExtensionOp::new(AnyDiskOp::new(f));
+    let one = |disk: &str, f| ExtensionOp::new(DiskOp::new(disk, f));
+    for (at, device, op) in [
+        (5, "a", any(crash(2))),
+        (6, "r", one("state", DiskFault::Lose)),
+        (7, "r", one("log", crash(1))),
+        (8, "r", one("log", crash(0))),
+        (9, "r", any(crash(3))),
+        (9, "nobody", one("log", DiskFault::Lose)),
+    ] {
+        net.add_op(
+            Op::extension_at_named(device, op),
+            Placement::StartOf(at * MS),
+        )
+        .unwrap();
+    }
+    net
+}
+
+fn states(net: &Network<'_>) -> Vec<String> {
+    net.op_states()
+        .into_iter()
+        .map(|s| match s {
+            sim::OpState::Applied { .. } => "applied".to_owned(),
+            sim::OpState::Pending => "pending".to_owned(),
+            sim::OpState::Failed { message, .. } => message,
+            other => format!("{other:?}"),
+        })
+        .collect()
+}
+
+#[test]
+fn a_split_network_applies_faults_by_name_on_the_site_that_has_the_device() {
+    let deadline = 60 * MS;
+    let mut whole = by_name_network(5, None);
+    whole.run_until(deadline).unwrap();
+    let j = whole.journal();
+    let ctx = lines(&j);
+    // `a` crashes inside its second changing call on any disk; `r`'s crash-at on `log` is
+    // disarmed with one call left, and its crash-at over any disk fires instead.
+    let crash = events(&j, "a", "disk-crash");
+    assert_eq!(crash.len(), 1, "{ctx}");
+    assert_eq!(field(&crash[0], "disks"), "any", "{ctx}");
+    assert_eq!(events(&j, "r", "disk-lost").len(), 1, "{ctx}");
+    let disarmed = events(&j, "r", "disk-disarmed");
+    assert_eq!(field(&disarmed[0], "left"), "1", "{ctx}");
+    let crash = events(&j, "r", "disk-crash");
+    assert_eq!(crash.len(), 1, "{ctx}");
+    assert_eq!(field(&crash[0], "disks"), "any", "{ctx}");
+    let unsplit = states(&whole);
+    let nobody = "no device `nobody`";
+    assert_eq!(
+        unsplit,
+        [
+            "applied", "applied", "applied", "applied", "applied", nobody
+        ]
+    );
+
+    let mut nets: Vec<Network<'static>> = (0..2).map(|s| by_name_network(5, Some(s))).collect();
+    let merged = run_sites(&mut nets, deadline, &["a", "ctl"]);
+    assert_eq!(lines(&merged.journal), ctx);
+    assert!(merged.journal == j, "the merged journal differs");
+    // Each op applies on the site that has its device and stays pending on the other; the name
+    // no device has fails on the site of the controller that could have created it.
+    let p = "pending";
+    assert_eq!(states(&nets[0]), ["applied", p, p, p, p, p]);
+    assert_eq!(
+        states(&nets[1]),
+        [p, "applied", "applied", "applied", "applied", nobody]
+    );
+    for (i, dev) in ["a", "r"].into_iter().enumerate() {
+        for disk in ["state", "log"] {
+            assert_eq!(
+                nets[i].extension::<Disks>().unwrap().digest(dev, disk),
+                whole.extension::<Disks>().unwrap().digest(dev, disk),
+                "{dev} {disk}"
             );
         }
     }

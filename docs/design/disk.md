@@ -72,9 +72,12 @@ controller's recreation. At a power loss the tail is lost, unless a fault says o
 library has no orderly shutdown, so a stop is a power loss too. Calls never run concurrently
 with operator events, so a power loss falls between calls, never inside one.
 
-Faults are operator events timed at a device (`Op::extension_at(device,
-ExtensionOp::new(DiskOp::new(disk, fault)))`, or the op kinds below from a page's plain
-objects). A split network accepts them and applies them on the device's own site. Each is
+Faults are operator events timed at a device: `Op::extension_at(device,
+ExtensionOp::new(DiskOp::new(disk, fault)))` by its id, `Op::extension_at_named(name, ...)` by
+its name (resolved when the op applies, so it reaches a device that an earlier op or a
+controller creates; `no device <name>` fails the op when none has the name then), or the op
+kinds below from a page's plain objects (`{kind: 'extension', device, op, value, at}`, always
+by name). A split network accepts them and applies them on the device's own site. Each is
 journalled on the device when it applies.
 
 | Fault (`DiskFault`) | Op kind and value | Effect | Record |
@@ -82,9 +85,31 @@ journalled on the device when it applies.
 | `Lose` | `disk.lose {disk}` | emptied now: a drive replaced | `disk-lost {disk, records, bytes}` |
 | `PowerLoss {keep, tear}` | `disk.power-loss {disk, keep, tear}` | armed: at the next power loss, none, all or a seeded prefix of the tail survives; with `tear`, the call after the kept ones survives as a seeded prefix of its changes | `disk-armed`, then `disk-power-loss {disk, kept, lost, torn, records, bytes}` |
 | `CrashAt {call, keep}` | `disk.crash-at {disk, call, keep}` | the `call`-th changing call from now faults the device inside the call, keeping none, all or a seeded prefix of its changes | `disk-armed`, then `disk-crash {disk, write, kept, of}` and `device-crashed` with the disk's message |
+| `CrashAt {call: 0, ..}` | `disk.crash-at {disk, call: 0}` | disarms the disk's crash-at; nothing armed is a no-op, still recorded | `disk-disarmed {disk, fault: crash-at, left}`: the changing calls it had left, or `none` |
+| `AnyDiskOp::new(CrashAt {call, keep})` | `disk.crash-at {call, keep}` (no `disk`) | as `CrashAt`, counting the changing calls on any of the device's disks; `call: 0` disarms it | `disk-armed {disks: any, ...}`, then `disk-crash {disk, write, kept, of, disks: any}`; `disk-disarmed {disks: any, ...}` |
 | `FailCalls {count, text}` | `disk.fail {disk, count, text}` | the next `count` calls on the disk answer `failed(text)` (`other(text)` from a standard function) and change nothing | `disk-armed` |
 | `Corrupt {prefix, how}` | `disk.corrupt {disk, prefix, how, bytes}` | values under `prefix` change: `flip-first-byte` (XOR `0x5a`), `seeded-bytes` (`bytes` seeded positions), `garbage` (seeded bytes of the same length) | `disk-corrupted {disk, prefix, how, values}` |
 | `Quota(bytes)` | `disk.quota {disk, bytes}` | the quota changes; below its use every growing call is `full` | `disk-quota {disk, quota, used}` |
+
+A changing call is one that passed its checks (a call answered `full`, `too-large` or an
+injected `failed` changes nothing and is not counted); `sync` is not one. A crash-at is
+disarmed with `call: 0` rather than an op of its own: "the 0th call from now" is no call, as
+`disk.fail` with `count: 0` fails none, so the table keeps one op per fault and the device-wide
+form disarms the same way. A crash-at on one disk and one over any disk count apart, each
+from when it was armed; whichever reaches its call first faults the device, and when both fall
+on the same call the disk's own decides what the call keeps (its record has no `disks: any`).
+The crash is a power loss, which disarms every crash-at of the device, as a stop does. Arming
+again replaces what was armed. `AnyDiskOp` takes only `CrashAt`, and arming one on a device
+without disks is refused.
+
+**A crash fails the whole network unless the device crashes alone.** A device a controller
+creates crashes alone; a device the embedder builds or adds with an op does only when its
+options say so ([the one rule](topology-and-infra.md#one-rule-for-crashes)). Without it a
+`disk.crash-at`, like any trap, ends the run with `Error::Trap`:
+
+```rust
+let options = DeviceOptions::default().crash_alone(true); // then options.ext.set(DiskOptions::new(...))
+```
 
 `keep` is `none`, `all` or `prefix`. Seeded faults draw from the core's seed derivation:
 the `n`-th draw on a disk uses `derive_seed(seed, device, "disk:<name>:<n>")`, so the same
@@ -138,6 +163,25 @@ Natively the disks live in the host process. In a page they live in the simulato
 one device; so in a page the quotas are not optional: the 1 GiB default keeps a network well
 clear of it.
 
+**Choosing the numbers.** Quota bytes track memory: a record costs its key, its value and 64
+bytes, which is what the allocator holds for it natively ([Measurements](#measurements)), a
+little more than in `wasm32`. A spec's `initial` image is kept with the spec as well, outside
+the count.
+
+- **Per disk**: the most one disk may hold, counted that way: a disk of 100,000 records of a
+  20-byte key and a 100-byte value uses 100,000 × (20 + 100 + 64) = 18.4 MB. The 64 MiB default
+  fits a device's state, not its bulk data.
+- **The network's total** is a pool, not a sum of reservations: quotas may add up to more than
+  it. A call that fits its disk's quota but not the pool answers `full` too, so with
+  overcommit the devices that write first get the room, in the same order on every run.
+- **With N devices** of D disks each, start from the total and divide: a per-disk quota of
+  total / (N × D) guarantees every disk its quota; quotas a few times larger overcommit safely
+  when only some devices fill their disks. In a page, keep the total at or under the 1 GiB
+  default (lower when the network also keeps large captures or journals, which share the
+  simulator's memory); natively, size it to the host's spare memory. 200 devices with two
+  disks each get 2.5 MiB per disk guaranteed under the default, or 6 MiB each if at most a third
+  of the disks fill up.
+
 ## Running it
 
 - **wasmtime**: the feature `wasmtime` gives the typed adapter `DiskAdapter`, generated by
@@ -155,9 +199,11 @@ clear of it.
 ([components/clock-probe/examples/disk_probe.rs](../../components/clock-probe/examples/disk_probe.rs))
 on wasmtime at two seeds with byte-identical reruns: stops and starts, every fault, both modes,
 a quota hit, a 16 MiB value, images loaded before the run and exported after, a controller's
-device declared by its spec, and a split network whose merged run equals the unsplit one.
-`crates/wasmnet-web/tests/parity.rs` (`disks_are_served_and_faulted_alike`) requires the same
-records and digests from the browser backend.
+device declared by its spec, and split networks whose merged runs equal the unsplit ones (one
+with faults by name on a device the other site's controller creates, crash-ats over any disk
+and a disarm). `crates/wasmnet-web/tests/parity.rs` (`disks_are_served_and_faulted_alike`, and
+`disk_faults_by_name_from_plain_objects_apply_alike` for the page's plain objects) requires the
+same records and digests from the browser backend.
 
 ## Layers on top
 

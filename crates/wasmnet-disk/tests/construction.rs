@@ -2,7 +2,7 @@
 //! and chainable setters, never a struct literal (most are `#[non_exhaustive]`).
 
 use wasmnet_disk::{
-    Corruption, DiskFault, DiskOp, DiskOptions, DiskSpec, Disks, Durability, Keep, image,
+    AnyDiskOp, Corruption, DiskFault, DiskOp, DiskOptions, DiskSpec, Disks, Durability, Keep, image,
 };
 
 #[test]
@@ -37,6 +37,7 @@ fn every_public_type_has_a_constructor_outside_the_crate() {
     for f in faults {
         let op = DiskOp::new("state", f.clone());
         assert_eq!(op.fault, f);
+        assert_eq!(AnyDiskOp::new(f.clone()).fault, f);
     }
     let disks = Disks::new().total(1 << 20);
     assert_eq!(disks.used(), (0, 1 << 20));

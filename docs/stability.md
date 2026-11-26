@@ -74,7 +74,8 @@ versions without notice. Rustdoc and the design notes mark it **embedder surface
   `NetworkOptions.imports` and `Network.callExport`); extension options and operator events from
   generic values (`ExtOption`, `ExtOpParser`, `NetworkExtension::{options, check_options, ops}`,
   `Network::{parse_option, set_option, option_keys, parse_op}`, `ExtOptions::set_value`,
-  `Op::ExtensionAt`, `OpContext::device`, a spec's extension keys, the page's `extension` ops),
+  `Op::ExtensionAt` and `Op::ExtensionAtNamed`, `OpContext::device`, a spec's extension keys, the
+  page's `extension` ops and `wasmnet_web::ops::op_in`),
   and `Network::register_cable` refusing a kind twice, `Network::try_add_extension` (and
   `try_add_boxed_extension`) refusing a second declaration of an option key or op kind; portable
   exports (`ControlCall::{invocation, invoked}`, `Invocation`, `wasmnet_core::export`:
@@ -85,8 +86,9 @@ versions without notice. Rustdoc and the design notes mark it **embedder surface
   binding `Network.{invoke, scheduleInvoke, exports}`, `NetworkOptions.{deviceImports, compile,
   instantiateCore}`); the test fixture `wasmnet-pad` is their worked example.
 - the disks (`crates/wasmnet-disk`, [design/disk.md](design/disk.md)): `Disks`, `DiskOptions`,
-  `DiskSpec`, `Durability`, `DiskFault`, `Keep`, `Corruption`, `DiskOp`, `DiskRead`, `DiskStats`,
-  `DiskError`, `Entry`, `Change`, the limits and `IMPORTS`, the option key `disk.specs` and the op
+  `DiskSpec`, `Durability`, `DiskFault`, `Keep`, `Corruption`, `DiskOp`, `AnyDiskOp`, `DiskRead`,
+  `DiskStats`, `DiskError`, `Entry`, `Change`, the limits and `IMPORTS`, the option key
+  `disk.specs` and the op
   kinds `disk.*`, the image format `wasmnet-disk/1` (`image`), the typed adapter `DiskAdapter`
   (feature `wasmtime`), the page module `wasmnet-disk-page`, and the WIT package
   `wasmnet:keyvalue-ext@0.1.0` (served beside the vendored `wasi:keyvalue@0.2.0-draft2`);
@@ -151,9 +153,10 @@ from outside the core, so a lost constructor fails the tests.
   `Op::wire(("a", 0), ("b", 1)).with_latency(100_000)`, `Op::stop_device("web")`,
   `Op::add_device("web", "node:http-server").with_config(config).with_cable(cable)`. A `with_*`
   method on an op it does not apply to panics. An op on something that exists takes its id
-  (`Op::stdin(device, bytes)`, `Op::control`, `Op::impair`, `Op::latency`, `Op::link_state`
-  take a `DeviceId` or a `LinkId`); an op on something an earlier op creates takes its name
-  (`Op::stdin_named("web", bytes)`, `Op::control_named`, `Op::impair_named`, `Op::set_link`,
+  (`Op::stdin(device, bytes)`, `Op::control`, `Op::extension_at`, `Op::impair`, `Op::latency`,
+  `Op::link_state` take a `DeviceId` or a `LinkId`); an op on something an earlier op or a
+  controller creates takes its name, resolved when the op applies (`Op::stdin_named("web",
+  bytes)`, `Op::control_named`, `Op::extension_at_named`, `Op::impair_named`, `Op::set_link`,
   and the device ops such as `Op::stop_device("web")`). Match a variant with `..`:
   `Op::Wire { a, b, .. }`. `Outcome`'s two variants are `#[non_exhaustive]` as well
   (`Outcome::Quiescent { at, .. }`); `Outcome::quiescent` and `Outcome::deadline` build them

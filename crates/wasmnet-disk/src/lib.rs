@@ -306,10 +306,15 @@ impl NetworkExtension for Disks {
                     tear: flag(v, "tear")?,
                 })
             }),
-            op("disk.crash-at", |v| {
-                Ok(DiskFault::CrashAt {
+            // Without a `disk`: over all the device's disks.
+            ExtOpParser::new("disk.crash-at", |v| {
+                let fault = DiskFault::CrashAt {
                     call: number(v, "call")?.unwrap_or(1),
                     keep: keep(v)?,
+                };
+                Ok(match text(v, "disk")? {
+                    Some(disk) => ExtensionOp::new(DiskOp::new(disk, fault)),
+                    None => ExtensionOp::new(AnyDiskOp::new(fault)),
                 })
             }),
             op("disk.fail", |v| {
@@ -453,6 +458,47 @@ impl ExtOp for DiskOp {
         let rec = disks
             .set
             .fault(&name, &self.disk, &self.fault)
+            .map_err(OpError::from)?;
+        ctx.journal_event(&name, rec.kind, rec.fields);
+        Ok(())
+    }
+
+    fn same(&self, other: &dyn ExtOp) -> bool {
+        (other as &dyn std::any::Any).downcast_ref::<Self>() == Some(self)
+    }
+}
+
+/// A fault on all the disks of the device the op is timed at, as one:
+/// `Op::extension_at(device, ExtensionOp::new(AnyDiskOp::new(DiskFault::CrashAt { call: 1,
+/// keep: Keep::None })))` faults the device inside its next changing call on any of its disks.
+/// Only [`DiskFault::CrashAt`] applies (a `call` of 0 disarms it); it counts apart from a
+/// crash-at armed on one disk ([`DiskOp`]), and when both fall on the same call the disk's own
+/// decides what the call keeps. Journalled like [`DiskOp`], with `disks = any` in place of
+/// `disk`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct AnyDiskOp {
+    pub fault: DiskFault,
+}
+
+impl AnyDiskOp {
+    pub fn new(fault: DiskFault) -> Self {
+        Self { fault }
+    }
+}
+
+impl ExtOp for AnyDiskOp {
+    fn apply(&self, ctx: &mut OpContext<'_>) -> Result<(), OpError> {
+        let device = ctx
+            .device()
+            .ok_or_else(|| OpError::from("a disk fault is timed at a device"))?;
+        let name = ctx.device_name(device).to_owned();
+        let disks = ctx
+            .extension_mut::<Disks>()
+            .ok_or_else(|| OpError::from("this network has no disks"))?;
+        let rec = disks
+            .set
+            .fault_any(&name, &self.fault)
             .map_err(OpError::from)?;
         ctx.journal_event(&name, rec.kind, rec.fields);
         Ok(())
