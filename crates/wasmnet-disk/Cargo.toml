@@ -1,0 +1,27 @@
+[package]
+name = "wasmnet-disk"
+version = "0.0.0"
+description = "A device's disks: named, ordered key-value stores served as wasi:keyvalue plus wasmnet:keyvalue-ext, with durability modes, faults, quotas and images; a portable extension on the library's public extension points."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+# The typed wasmtime adapter (`DiskAdapter`), for `Host::builder().extension(DiskAdapter)`.
+wasmtime = ["dep:wasmnet-host"]
+
+[dependencies]
+# Only the core's public API: the crate could as well live in another repository.
+wasmnet-core = { path = "../wasmnet-core" }
+wasmnet-host = { path = "../wasmnet-host", optional = true }
+sha2.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+wasmnet-host = { path = "../wasmnet-host" }
+wasmnet-det-cbor = { path = "../wasmnet-det-cbor" }
+
+[lints]
+workspace = true

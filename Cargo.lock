@@ -1696,6 +1696,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "wasmnet-disk"
+version = "0.0.0"
+dependencies = [
+ "proptest",
+ "sha2",
+ "thiserror",
+ "wasmnet-core",
+ "wasmnet-det-cbor",
+ "wasmnet-host",
+]
+
+[[package]]
+name = "wasmnet-disk-page"
+version = "0.0.0"
+dependencies = [
+ "wasmnet-disk",
+ "wasmnet-web",
+]
+
+[[package]]
 name = "wasmnet-dns-server"
 version = "0.0.0"
 dependencies = [
@@ -1938,6 +1958,7 @@ dependencies = [
  "thiserror",
  "wasmnet-core",
  "wasmnet-det-cbor",
+ "wasmnet-disk",
  "wasmnet-host",
  "wasmnet-pad",
  "wasmnet-wire",

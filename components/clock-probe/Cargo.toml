@@ -47,5 +47,13 @@ name = "pad-probe"
 path = "examples/pad_probe.rs"
 crate-type = ["cdylib"]
 
+# `examples/disk_probe.rs`: a stepped device (no ports) that keeps its state on two disks
+# (`crates/wasmnet-disk`: wasi:keyvalue plus wasmnet:keyvalue-ext), for the disk tests on both
+# backends.
+[[example]]
+name = "disk-probe"
+path = "examples/disk_probe.rs"
+crate-type = ["cdylib"]
+
 [lints]
 workspace = true
