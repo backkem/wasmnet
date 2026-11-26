@@ -330,6 +330,35 @@ await step('what a disk costs in the page: a call by value size, and the digest 
   return r.notes;
 });
 
+/** Where two JSON texts first differ, with some context. */
+function firstDifference(a, b) {
+  let i = 0;
+  while (i < a.length && a[i] === b[i]) i++;
+  return `at ${i}: ${JSON.stringify(a.slice(Math.max(0, i - 120), i + 120))} vs ${JSON.stringify(b.slice(Math.max(0, i - 120), i + 120))}`;
+}
+
+await step('networks in sequence: a network replaced in mid-run leaves no trace, and the next equals a fresh page at its seed, twice', async () => {
+  const fresh = await page.evaluate(() => window.wasmnetScenario('example', '8'));
+  const r = await page.evaluate(() => window.wasmnetScenario('sequence', '7'));
+  const want = JSON.stringify({ journal: fresh.journal, outcome: fresh.outcome, links: fresh.links });
+  if (Number(r.notes.before) === 0) throw new Error('the first network journalled nothing before it was replaced');
+  for (const label of ['first', 'second']) {
+    const got = JSON.stringify(JSON.parse(r.notes[label]));
+    if (got !== want) throw new Error(`the ${label} network after the replacement differs from a fresh page: ${firstDifference(got, want)}`);
+  }
+  return { replacedAfter: Number(r.notes.before), entries: fresh.journal.length, links: fresh.links.length };
+});
+
+await step("networks in sequence from an embedder's own export: a seed it computed, devices added from Rust, steps with a wait in its own Suspending import", async () => {
+  const r = await page.evaluate(() => window.wasmnetScenario('pad-sequence', '5'));
+  const fresh = await page.evaluate((seed) => window.wasmnetScenario('pad-fresh', seed), r.notes.seed);
+  if (Number(r.notes.before) === 0) throw new Error('the first network journalled nothing before it was replaced');
+  if (r.notes.pauses !== '6') throw new Error(`the export waited in its import ${r.notes.pauses} times, not 6`);
+  if (r.notes.journal !== fresh.notes.journal) throw new Error(`the embedder's network differs from a fresh page: ${firstDifference(r.notes.journal, fresh.notes.journal)}`);
+  if (r.notes.notes !== fresh.notes.notes) throw new Error(`p's notes: ${r.notes.notes} vs ${fresh.notes.notes}`);
+  return { seed: r.notes.seed, replacedAfter: Number(r.notes.before), entries: JSON.parse(r.notes.journal).length, notes: r.notes.notes };
+});
+
 if (process.env.NATIVE_JOURNAL) {
   await step('agrees with the native example', async () => {
     // The native example prints `<t> ns  <device> <kind> k=v ...` for events and

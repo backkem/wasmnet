@@ -80,8 +80,11 @@ the answers, the switch's events and the page the client fetched, runs the `runt
 restarting a router and reading its events, a `replicas` controller woken by `changes.wait-any`
 and given a line on its stdin, operator events, capture options and a memory limit through the
 generic path, one that supplies a
-component fetched from a store node, and an ungranted `wasmnet:infra` importer refused), and
-checks the message a browser without JSPI gets. With `NATIVE_JOURNAL` pointing at the native example's output
+component fetched from a store node, and an ungranted `wasmnet:infra` importer refused), runs
+networks in sequence on one module instance (the `sequence` scenario: a network replaced in
+mid-run by `Network.reset`, then the example twice, each equal to the example on a fresh page at
+that seed; `pad-sequence`: an embedder's export that opens its own network, against `pad-fresh`),
+and checks the message a browser without JSPI gets. With `NATIVE_JOURNAL` pointing at the native example's output
 (`cargo run -p wasmnet-host --example http > target/http-native.txt`) it also checks that every
 journal line of the native run appears in the browser run, at the same virtual time, and compares
 the captures in `target/http/`. `.github/workflows/pages.yml` does all of this and deploys

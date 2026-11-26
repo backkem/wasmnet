@@ -15,7 +15,7 @@
 // the network runs.
 
 import { serveRun } from './codelib-web/dist/worker/index.js';
-import { Network, type CommandAnswer, type ComponentSource, type JournalEntry, type Outcome } from './network.js';
+import { Network, type CommandAnswer, type ComponentSource, type Device, type JournalEntry, type Outcome } from './network.js';
 
 declare const self: DedicatedWorkerGlobalScope;
 
@@ -23,7 +23,7 @@ export interface Init {
   seed: string;
   simulator: WebAssembly.Module;
   components: Record<string, ComponentSource>;
-  scenario?: 'example' | 'controls' | 'runtime' | 'portable' | 'portable-cost' | 'exports' | 'disks' | 'disk-cost';
+  scenario?: 'example' | 'controls' | 'runtime' | 'portable' | 'portable-cost' | 'exports' | 'disks' | 'disk-cost' | 'sequence' | 'pad-sequence' | 'pad-fresh';
 }
 
 export interface Done {
@@ -183,13 +183,26 @@ async function runtime(net: Network): Promise<Record<string, string>> {
 // What `NetworkOptions.deviceImports` and `instantiateCore` were asked (the `exports` scenario reports them).
 const asked: string[] = [];
 const cores = { n: 0 };
+/** How often the embedder's export waited in its own `Suspending` import (`pad-sequence`). */
+const pauses = { n: 0 };
 
 serveRun<Init, Done>(async (init, ctx) => {
   // The fixture's simulator imports `pad_page.stamp` (an embedder's own import); other modules ignore it.
   const net = await Network.create(init.simulator, {
     seed: BigInt(init.seed),
     components: init.components,
-    imports: { pad_page: { stamp: (n: number) => n + 1 } },
+    imports: {
+      pad_page: {
+        stamp: (n: number) => n + 1,
+        // `Suspending`: the embedder's export waits here, between its steps, for a later turn of
+        // the page's event loop (`pad-sequence`).
+        pause: new (WebAssembly as unknown as { Suspending: new (f: (n: number) => Promise<number>) => unknown }).Suspending(async (n: number) => {
+          pauses.n += 1;
+          await new Promise((wake) => setTimeout(wake, 0));
+          return n;
+        }),
+      },
+    },
     // The per-device imports and the kit's core hook, passed through: what they were asked.
     deviceImports: (d) => {
       asked.push(`${d.name}:${d.component}`);
@@ -235,31 +248,19 @@ serveRun<Init, Done>(async (init, ctx) => {
     notes.snapLen = String(view.getUint32(shb + 12, true));
     return { outcome, links: net.links().map((l) => ({ name: l.name, pcap: net.pcap(l) })), ms: Math.round(performance.now() - t0), notes };
   }
+  if (init.scenario === 'sequence') {
+    const t0 = performance.now();
+    // The networks after the first take the next seed: a fresh page at that seed is the reference.
+    const notes = await sequence(net, BigInt(init.seed) + 1n);
+    return { outcome: {} as Outcome, links: [], ms: Math.round(performance.now() - t0), notes };
+  }
+  if (init.scenario === 'pad-sequence' || init.scenario === 'pad-fresh') {
+    const t0 = performance.now();
+    const notes = init.scenario === 'pad-sequence' ? await padSequence(net, BigInt(init.seed)) : await padFresh(net);
+    return { outcome: {} as Outcome, links: [], ms: Math.round(performance.now() - t0), notes };
+  }
   const controls = init.scenario === 'controls';
-
-  // The same network as examples/http.rs.
-  const sw = await net.device('sw', 'switch', { ports: '4' });
-  const page: Record<string, string> = controls ? { 'app.http-server.route.e.path': '/', 'app.http-server.route.e.body': '{args}|{env:GREETING}' } : {};
-  const server = await net.device(
-    'server',
-    'node-http-server',
-    {
-      mac: '02:00:00:00:00:01',
-      ipv4: '10.0.0.1/24',
-      'app.http-server.listen': '0.0.0.0:80',
-      ...page,
-    },
-    controls ? { args: ['-v', 'two words'], env: [['GREETING', 'hello from the tab']] } : {},
-  );
-  const client = await net.device('client', 'node-http-get', {
-    mac: '02:00:00:00:00:02',
-    ipv4: '10.0.0.2/24',
-    'hosts.web': '10.0.0.1',
-    'app.http-get.url': 'http://web/',
-    'app.http-get.start': '1ms',
-  });
-  net.link(server.port(0), sw.port(1), 150_000n);
-  net.link(client.port(0), sw.port(2), 100_000n);
+  const { sw, server } = await example(net, controls);
 
   const answers: Record<string, CommandAnswer | null> = {};
   if (controls) {
@@ -299,6 +300,14 @@ function eventLines(entries: JournalEntry[], kinds: RegExp): string {
  * created again.
  */
 async function portable(net: Network): Promise<{ outcome: unknown; notes: Record<string, string> }> {
+  await portableDevices(net);
+  const entries: JournalEntry[] = [];
+  const outcome = await net.run({ deadline: ms(120), onJournal: (e) => entries.push(...e) });
+  return portableNotes(net, entries, outcome);
+}
+
+/** The `portable` scenario's devices and operator events. */
+async function portableDevices(net: Network): Promise<void> {
   net.setCatalog(['pad_probe']);
   await net.device('p', 'pad_probe', { period: '10ms', big: '1048576' }, { crashAlone: true });
   // An option of the extension's, from a plain object: `q`'s third append faults it.
@@ -317,15 +326,16 @@ async function portable(net: Network): Promise<{ outcome: unknown; notes: Record
     },
     { infra: true },
   );
-  const ms = (n: number) => BigInt(n) * 1_000_000n;
   net.op({ kind: 'stop-device', device: 'p', at: ms(55) });
   net.op({ kind: 'start-device', device: 'p', at: ms(60) });
   net.op({ kind: 'crash-device', device: 'p', message: 'operator crash', at: ms(85) });
   net.op({ kind: 'start-device', device: 'p', at: ms(90) });
   // An operator event of the extension's, timed at a device, from a plain object.
   net.op({ kind: 'extension', device: 'p', op: 'pad.clear', at: ms(100) });
-  const entries: JournalEntry[] = [];
-  const outcome = await net.run({ deadline: ms(120), onJournal: (e) => entries.push(...e) });
+}
+
+/** What the `portable` scenario reports after its run. */
+function portableNotes(net: Network, entries: JournalEntry[], outcome: Outcome): { outcome: unknown; notes: Record<string, string> } {
   // The embedder's own exports: the extension's state between steps, and its own import.
   const decoder = new TextDecoder();
   const notesOfR = decoder.decode(net.callExport('wn_pad_notes', new TextEncoder().encode('r')));
@@ -561,4 +571,114 @@ async function diskCost(net: Network): Promise<{ outcome: unknown; notes: Record
   net.callExport('wn_disk_export', names);
   notes.export64MiBMs = (performance.now() - t0).toFixed(0);
   return { outcome: {}, notes };
+}
+
+/** The network of examples/http.rs (with `controls`: the server's arguments and environment in its page). */
+async function example(net: Network, controls: boolean): Promise<{ sw: Device; server: Device }> {
+  const sw = await net.device('sw', 'switch', { ports: '4' });
+  const page: Record<string, string> = controls ? { 'app.http-server.route.e.path': '/', 'app.http-server.route.e.body': '{args}|{env:GREETING}' } : {};
+  const server = await net.device(
+    'server',
+    'node-http-server',
+    {
+      mac: '02:00:00:00:00:01',
+      ipv4: '10.0.0.1/24',
+      'app.http-server.listen': '0.0.0.0:80',
+      ...page,
+    },
+    controls ? { args: ['-v', 'two words'], env: [['GREETING', 'hello from the tab']] } : {},
+  );
+  const client = await net.device('client', 'node-http-get', {
+    mac: '02:00:00:00:00:02',
+    ipv4: '10.0.0.2/24',
+    'hosts.web': '10.0.0.1',
+    'app.http-get.url': 'http://web/',
+    'app.http-get.start': '1ms',
+  });
+  net.link(server.port(0), sw.port(1), 150_000n);
+  net.link(client.port(0), sw.port(2), 100_000n);
+  return { sw, server };
+}
+
+const hexOf = (bytes: Uint8Array) => Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+/** A run's records as JSON (times as decimal strings, captures as hex): what two runs compare. */
+function records(net: Network, outcome: Outcome): string {
+  const plain = { journal: net.journal(), outcome, links: net.links().map((l) => ({ name: l.name, pcap: hexOf(net.pcap(l)) })) };
+  return JSON.stringify(plain, (_k, x: unknown) => (typeof x === 'bigint' ? String(x) : x));
+}
+
+/**
+ * The `sequence` scenario: one module instance, networks in sequence. The first network (another
+ * seed than the next ones) runs the `runtime` scenario's devices, and is replaced in the middle of
+ * its run, from `onJournal`: right after a step, before the event loop settled it, so its guests
+ * still have work queued (timer wake-ups and frames just delivered), and controllers wait in
+ * `changes.wait-any`, servers in `accept`, timers are pending. That work runs while the next
+ * network runs, and must not reach it. The example then runs on the new network (seed `seed`),
+ * and again after a second `reset` with the same seed: the page test compares both with the
+ * example on a fresh page at `seed`.
+ */
+async function sequence(net: Network, seed: bigint): Promise<Record<string, string>> {
+  await runtime(net);
+  const notes: Record<string, string> = {};
+  try {
+    await net.run({
+      deadline: 3_000_000_000n,
+      onJournal: (entries) => {
+        if (notes.before === undefined && entries.some((e) => e.at >= 500_000_000n)) {
+          notes.before = String(net.journal().length);
+          net.reset(seed);
+        }
+      },
+    });
+  } catch (err) {
+    notes.stopped = err instanceof Error ? err.message : String(err);
+  }
+  if (notes.before === undefined || !notes.stopped?.includes('was replaced')) throw new Error(`the first run was not stopped by its replacement: ${JSON.stringify(notes)}`);
+  for (const label of ['first', 'second']) {
+    if (label === 'second') net.reset(seed);
+    if (net.journal().length !== 0) throw new Error(`the journal of a fresh network has ${net.journal().length} entries`);
+    await example(net, false);
+    const outcome = await net.run();
+    notes[label] = records(net, outcome);
+  }
+  return notes;
+}
+
+const ms = (n: number) => BigInt(n) * 1_000_000n;
+
+/**
+ * The `pad-sequence` scenario: an embedder's own export opens a network. The first network (the
+ * `portable` scenario's devices) runs to its middle; then the module's `wn_pad_sequence`, called
+ * `promising`, computes a seed from `base`, replaces the network
+ * (`wasmnet_web::install::new_network`), adds two devices from Rust (the page instantiates them,
+ * inside the export) and runs them in steps, waiting in the page's own `Suspending` import
+ * (`pad_page.pause`) between steps. The page test compares the new network's journal with
+ * `pad-fresh` at that seed.
+ */
+async function padSequence(net: Network, base: bigint): Promise<Record<string, string>> {
+  await portableDevices(net);
+  await net.run({ deadline: ms(50) });
+  const before = net.journal().length;
+  const input = new Uint8Array(8);
+  new DataView(input.buffer).setBigUint64(0, base, true);
+  const out = await net.callExport('wn_pad_sequence', input, { promising: true });
+  const seed = new DataView(out.buffer, out.byteOffset, 8).getBigUint64(0, true);
+  return {
+    before: String(before),
+    seed: String(seed),
+    pauses: String(pauses.n),
+    journal: JSON.stringify(net.journal(), (_k, x: unknown) => (typeof x === 'bigint' ? String(x) : x)),
+    notes: new TextDecoder().decode(net.callExport('wn_pad_notes', new TextEncoder().encode('p'))),
+  };
+}
+
+/** The `pad-fresh` scenario: what `wn_pad_sequence` builds and runs, on a fresh page, from TypeScript. */
+async function padFresh(net: Network): Promise<Record<string, string>> {
+  await net.device('p', 'pad_probe', { period: '10ms' }, { crashAlone: true });
+  await net.device('q', 'pad_probe', { period: '15ms' }, { crashAlone: true, 'pad.fault-at': 3 });
+  await net.run({ deadline: ms(60) });
+  return {
+    journal: JSON.stringify(net.journal(), (_k, x: unknown) => (typeof x === 'bigint' ? String(x) : x)),
+    notes: new TextDecoder().decode(net.callExport('wn_pad_notes', new TextEncoder().encode('p'))),
+  };
 }

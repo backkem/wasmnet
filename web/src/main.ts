@@ -142,7 +142,7 @@ async function main(): Promise<void> {
   (window as { wasmnetScenario?: unknown }).wasmnetScenario = async (scenario: Init['scenario'], seed = '42') => {
     const journal: JournalEntry[] = [];
     // The portable-extension scenarios run on the simulator with the test fixture in it.
-    const portable = scenario === 'portable' || scenario === 'portable-cost' || scenario === 'exports';
+    const portable = scenario === 'portable' || scenario === 'portable-cost' || scenario === 'exports' || scenario === 'pad-sequence' || scenario === 'pad-fresh';
     if (portable && !assets.extended) throw new Error('this build has no simulator with the test fixture');
     // The disk scenario runs on the simulator with the disks in it.
     const disks = scenario === 'disks' || scenario === 'disk-cost';
@@ -156,7 +156,9 @@ async function main(): Promise<void> {
     });
     const outcome = await run.outcome;
     if (outcome.status !== 'ok') throw new Error(`the run ended ${outcome.status}`);
-    return plain({ journal, outcome: outcome.value.outcome, answers: outcome.value.answers ?? null, notes: outcome.value.notes ?? null });
+    // The captures as hex, for comparing runs.
+    const links = outcome.value.links.map((l) => ({ name: l.name, pcap: Array.from(l.pcap, (b) => b.toString(16).padStart(2, '0')).join('') }));
+    return plain({ journal, outcome: outcome.value.outcome, answers: outcome.value.answers ?? null, notes: outcome.value.notes ?? null, links });
   };
 
   runButton.addEventListener('click', async () => {
