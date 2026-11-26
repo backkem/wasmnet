@@ -89,8 +89,8 @@ a source path with backslashes.
 
 ## Reproducible bytes
 
-Hashes only mean something if a rebuild gives the same bytes. What was observed, on Windows
-with the pinned toolchain and tools:
+Hashes only mean something if a rebuild gives the same bytes. What was observed, with the
+pinned toolchain and tools, on Windows and on Linux (x86-64 both):
 
 - **Two builds in one checkout** give the same 36 files (components and nodes, fixtures
   included).
@@ -106,30 +106,60 @@ with the pinned toolchain and tools:
   included. The flags reach rustc through an argument file in the target directory, which
   only the components' build uses (`CARGO_ENCODED_RUSTFLAGS`), so `RUSTFLAGS` from the
   environment does not reach them.
-- **Two checkouts at different paths give the same bytes.** A copy of the source (`git
-  archive`) at another path, with its own target directory and a separate, freshly downloaded
-  cargo home, gave the same 30 files as the checkout, byte for byte (`--compare`). Two builds
-  whose argument files differed (one mapped only the published crates' sources, the other
-  every component's) gave the same bytes too: the flags themselves do not reach the output.
+- **Two checkouts at different paths give the same bytes.** On Windows, a copy of the source
+  (`git archive`) at another path, with its own target directory and a separate, freshly
+  downloaded cargo home, gave the same 30 files as the checkout, byte for byte (`--compare`).
+  On Linux, two clones in different directories did too. Two builds whose argument files
+  differed (one mapped only the published crates' sources, the other every component's) gave
+  the same bytes: the flags themselves do not reach the output.
+- **Without the wrapper below, each operating system was reproducible on its own, but Linux
+  and Windows disagreed.** At one revision, a Linux build gave the hashes that CI's Linux runner
+  reported, and a Windows build those of CI's Windows runner (`switch.wasm` `8ee6b213…` and
+  `22d97274…`); all 30 files differed between the two. Only the core module that rustc makes
+  differed: the component's adapter modules, its `producers` section and the source paths left
+  in its data were the same. In `switch.wasm` the 397 functions were the same functions under
+  other symbol names (`_RNvNtCseD8GTKePBbU_6switch…` against `_RNvNtCshNMtWm67Ajj_6switch…`),
+  but one of them (`switch::component::wasmnet::link::log::log`) was at another index and took
+  two parameters on Windows and three on Linux, and data addresses moved by 4 bytes; in
+  `netstack.wasm` the code section differed by 158 bytes.
+- **The cause is cargo's `-C metadata`.** rustc derives a crate's identity (its
+  `StableCrateId`) from it; the identity is in every symbol name, and how rustc splits a crate
+  into codegen units depends on it, so it reaches the code. In `cargo build -v` of one small
+  workspace on both systems, a crates.io crate without dependencies and a workspace crate
+  directly in the root got the same value on both; a workspace crate in a subdirectory (`x/a`)
+  got different values, its relative path being hashed with the platform's separator; and a
+  crates.io crate's build script, with no dependencies, got different values, as did the crate
+  itself, whose value mixes in its build script's. Every value mixes in its dependencies', and
+  every component depends on `wit-bindgen`, which has a build script and a proc macro. A rustc
+  wrapper that changed nothing but the value (a hash of what identifies the crate, below) made
+  all 30 files agree: the value was the whole difference.
+- **`build` gives every crate a value of its own** (`xtask/src/metadata.rs`). It runs cargo
+  with `xtask` itself as `RUSTC_WRAPPER`, which replaces cargo's value with a hash of the
+  package's name and version, the crate's name and types, the target, its `--cfg`s (the
+  features) and its edition, and passes everything else through. With it, a Windows build and
+  two Linux builds in different directories gave the same 30 files, byte for byte.
 - The `producers` sections name only tool versions (rustc, clang of the WASI libc, wit-component,
   wit-bindgen, wac), and `wac compose` adds nothing that depends on paths or time.
 
 What is guaranteed: the same revision, built with `cargo xtask artifacts` with the pinned
 toolchain and tools, gives the same bytes in any checkout directory, for any user and cargo
-home, **on the same operating system**. `--rebuild` checks it. This was observed on Windows
-(two checkouts at different paths, each with a cargo home of its own); on Linux it follows from
-the same mechanism and has not been observed yet: the proposed publishing workflow builds a set
-on two runners and compares them before it publishes.
+home, **on Linux and on Windows**. `--rebuild` checks it, and CI's `platforms` job compares a
+Linux and a Windows build's manifests on every push and pull request and fails when they
+differ. macOS has not been tried.
 
-What is not guaranteed: **the same bytes on Linux and on Windows.** Nobody has compared yet.
-The paths are no longer a reason for them to differ, but one more is likely: cargo derives
-each crate's symbol hash (`-C metadata`) from its package id, and for a crate in the workspace
-from its path relative to the workspace root, written with the platform's separator. If that
-holds, the hashes of this repository's own crates differ between the two, which changes the
-symbol names in the `name` section and may change more. CI's `platforms` job compares a Linux
-and a Windows build's manifests on every push and pull request; it reports and does not fail
-the workflow. It has not run yet. Until it passes, **the published set is built on Linux**, and
-a rebuild to check it must be one on Linux too.
+What the wrapper costs:
+
+- A wrapper that `RUSTC_WRAPPER` already named (a compiler cache) runs in turn, behind ours.
+  One set only in a cargo configuration (`build.rustc-wrapper`) is overridden for the
+  components' build.
+- Cargo does not notice a change of wrapper, and would reuse crates built with its own values.
+  The argument file is therefore named for the scheme too (`metadata::SCHEME`): another scheme,
+  or none, means other flags, and cargo rebuilds.
+- Two crates in one build that agree on everything hashed would get one identity: the same
+  package name and version from two sources. rustc refuses to link two crates with the same
+  `StableCrateId`, so that fails the build; it cannot miscompile.
+- A component built by hand (`cargo build --target wasm32-wasip2 -p ...`) has other bytes
+  than `build` gives, as it already had without the path mapping.
 
 ## Where a revision's set lives
 
@@ -204,8 +234,8 @@ revision and read its `SHA256SUMS`.
 ## Publishing
 
 Nothing is published yet. [artifacts-workflow.yml.example](artifacts-workflow.yml.example) is
-the workflow, as a proposal that does not run: on a push to `main` it builds the set on two
-fresh Linux runners, compares the two manifests, and pushes the first set to
+the workflow, as a proposal that does not run: on a push to `main` it builds the set on a
+fresh Linux and a fresh Windows runner, compares the two manifests, and pushes the Linux set to
 `ghcr.io/<owner>/<repository>/components:<commit>` with `oras` only when they agree.
 
 Enabling it means:

@@ -226,12 +226,9 @@ here so that nobody has to find these the hard way. Each entry names where the c
 ## Tooling
 
 - **The compile cache's stale-lock handling** is only exercised on Linux and Windows.
-- **Component bytes may differ between Linux and Windows.** `cargo xtask build` maps every
-  source path out of the components, so a rebuild in another checkout on the same operating
-  system gives the same bytes, but whether a Linux and a Windows build agree has not been
-  observed: cargo likely derives the symbol hashes of the workspace's own crates from their
-  relative paths with the platform's separator. CI's `platforms` job compares the two and does
-  not fail the workflow; until it passes, a published set is built on Linux
+- **Component bytes are compared on Linux and Windows only.** `cargo xtask build` gives the
+  same bytes in any checkout on both, and CI's `platforms` job fails when a Linux and a
+  Windows build differ; a macOS build has not been compared
   ([design/artifacts.md](design/artifacts.md#reproducible-bytes)).
 - **No set of artifacts is published yet.** The workflow that would push each commit's set to
   the container registry is a proposal

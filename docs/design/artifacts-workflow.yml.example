@@ -1,8 +1,9 @@
 # A proposal, not a workflow: GitHub runs only files in .github/workflows/, and this one stays
 # here until the maintainer decides to publish (docs/design/artifacts.md, "Publishing").
 #
-# On every push to main it builds the published set twice, on two fresh runners, and pushes it
-# to the repository's container registry only when both builds give the same bytes:
+# On every push to main it builds the published set twice, on a fresh Linux and a fresh Windows
+# runner, and pushes the Linux set to the repository's container registry only when both builds
+# give the same bytes:
 #
 #   ghcr.io/<owner>/<repository>/components:<full commit hash>
 #
@@ -23,11 +24,15 @@ env:
 
 jobs:
   build:
-    # Two independent builds: the published hashes are the ones a second build reproduced.
+    # Two independent builds, on two operating systems: the published hashes are the ones a
+    # second build reproduced.
     strategy:
       matrix:
-        build: [first, second]
-    runs-on: ubuntu-latest
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
       # rustup reads rust-toolchain.toml: the pinned compiler and the wasm targets.
@@ -43,7 +48,7 @@ jobs:
         run: grep -qx 'dirty = false' target/artifacts/manifest.toml
       - uses: actions/upload-artifact@v4
         with:
-          name: set-${{ matrix.build }}
+          name: set-${{ matrix.os }}
           path: target/artifacts
           retention-days: 1
 
@@ -61,13 +66,13 @@ jobs:
           path: sets
       - name: Both builds gave the same bytes
         run: |
-          cargo xtask artifacts --verify sets/set-first
-          cargo xtask artifacts --compare sets/set-first/manifest.toml sets/set-second/manifest.toml
+          cargo xtask artifacts --verify sets/set-ubuntu-latest
+          cargo xtask artifacts --compare sets/set-ubuntu-latest/manifest.toml sets/set-windows-latest/manifest.toml
       - uses: oras-project/setup-oras@v1
         with:
           version: 1.2.0
       - name: Push the set, tagged with its commit
-        working-directory: sets/set-first
+        working-directory: sets/set-ubuntu-latest
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
