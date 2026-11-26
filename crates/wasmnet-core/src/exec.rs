@@ -646,6 +646,12 @@ impl Executor {
         }
     }
 
+    /// Leaves operator event `i` to another site of a split network: pending here, as an op at
+    /// another site's device that was never queued.
+    pub(crate) fn leave_op(&mut self, i: usize) {
+        self.ops[i].state = OpState::Pending;
+    }
+
     /// Gives operator event `i` a reply slot (a name-resolved control call, answered in its
     /// rounds).
     pub(crate) fn set_op_reply(&mut self, i: usize, reply: Arc<dyn crate::ext::ControlAnswer>) {

@@ -2263,6 +2263,29 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
                 })
                 .map_err(|e| e.to_string())?;
             }
+            Op::ExtensionAtNamed { device, op: ext } => {
+                let id = match self.live_device(&device) {
+                    Some(id) if !self.devices[id.0].remote => id,
+                    // Another site's device, or one another site's controllers create: that
+                    // site applies it.
+                    Some(_) => {
+                        self.leave_op(op);
+                        return Ok(());
+                    }
+                    None if self.created_elsewhere(&device) => {
+                        self.leave_op(op);
+                        return Ok(());
+                    }
+                    None => return Err(format!("no device `{device}`")),
+                };
+                ext.apply(&mut OpContext {
+                    at,
+                    op,
+                    device: Some(id),
+                    network: self,
+                })
+                .map_err(|e| e.to_string())?;
+            }
             Op::ControlNamed { device, call } => {
                 let id = running(self, &device)?;
                 self.require_export(id, call.export())
@@ -2272,6 +2295,34 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
             other => return Err(format!("not a network op: {other:?}")),
         }
         Ok(())
+    }
+
+    /// Leaves operator event `op` to another site: [`OpState::Pending`] here.
+    fn leave_op(&mut self, op: Option<usize>) {
+        if let Some(i) = op {
+            self.exec.leave_op(i);
+        }
+    }
+
+    /// Whether a device called `name`, which no device has on this site, would be another
+    /// site's: the site of the controller whose `infra_prefix` it starts with, or else of the
+    /// controllers without a prefix (they share a site). `false` when no controller could
+    /// create it, and in a network that is not split.
+    fn created_elsewhere(&self, name: &str) -> bool {
+        let controllers = || {
+            self.devices
+                .iter()
+                .filter(|d| d.options.infra && d.phase != DevicePhase::Removed)
+        };
+        controllers()
+            .find(|d| {
+                d.options
+                    .infra_prefix
+                    .as_deref()
+                    .is_some_and(|p| name.starts_with(p))
+            })
+            .or_else(|| controllers().find(|d| d.options.infra_prefix.is_none()))
+            .is_some_and(|d| d.remote)
     }
 
     /// The link called `name` that is still wired.
@@ -3018,23 +3069,30 @@ impl<'r, R: Runtime + ?Sized> Network<'r, R> {
     /// Places an operator event and returns its index.
     ///
     /// A split network takes only timed ones ([`Placement::StartOf`], [`Placement::EndOf`])
-    /// at a device: [`Op::Stdin`], [`Op::Control`] and [`Op::Inject`]. Every site must add the
-    /// same operator events in the same order: an op at a device of another site is counted
-    /// (so indices and keys agree) but not queued here, and stays [`OpState::Pending`] on this
-    /// site.
+    /// at a device: [`Op::Stdin`], [`Op::Control`], [`Op::Inject`], [`Op::ExtensionAt`] and
+    /// [`Op::ExtensionAtNamed`]. Every site must add the same operator events in the same
+    /// order: an op at a device of another site is counted (so indices and keys agree) but not
+    /// queued here, and stays [`OpState::Pending`] on this site. An op at a device by name is
+    /// queued on every site and resolved when it applies: the site that has the device applies
+    /// it, the others leave it [`OpState::Pending`]; a name no device has then fails on the
+    /// site whose controllers could have created it (by their `infra_prefix`, or the site of
+    /// the controllers without one), and on every site when no controller could have.
     ///
     /// Embedder surface, unstable (operator events).
     pub fn add_op(&mut self, op: Op, placement: Placement) -> Result<usize> {
         let elsewhere = if self.devices.iter().any(|d| d.remote) {
-            let device = match &op {
+            let timed = matches!(placement, Placement::StartOf(_) | Placement::EndOf(_));
+            match &op {
                 Op::Stdin { device, .. }
                 | Op::Control { device, .. }
-                | Op::ExtensionAt { device, .. } => Some(*device),
-                Op::Inject { from, .. } => Some(from.device),
-                _ => None,
-            };
-            match (device, &placement) {
-                (Some(d), Placement::StartOf(_) | Placement::EndOf(_)) => self.devices[d.0].remote,
+                | Op::ExtensionAt { device, .. }
+                    if timed =>
+                {
+                    self.devices[device.0].remote
+                }
+                Op::Inject { from, .. } if timed => self.devices[from.device.0].remote,
+                // Queued on every site: the site that has the device applies it.
+                Op::ExtensionAtNamed { .. } if timed => false,
                 _ => {
                     return Err(Error::Refused(
                         "a split (multi-site) network takes only timed operator events at a \
@@ -3425,6 +3483,12 @@ pub enum Op {
     /// device's own site applies it.
     #[non_exhaustive]
     ExtensionAt { device: DeviceId, op: ExtensionOp },
+    /// [`Op::ExtensionAt`] at the device called `device` when the op applies (a device that an
+    /// earlier op or a controller creates); refused as `no device` when no device of that name
+    /// exists then. A split network takes it timed and applies it on the site that has the
+    /// device ([`Network::add_op`]).
+    #[non_exhaustive]
+    ExtensionAtNamed { device: String, op: ExtensionOp },
 }
 
 /// Constructors, one per variant with fields, taking what the op cannot do without; the rest
@@ -3509,6 +3573,14 @@ impl Op {
     /// [`Op::ExtensionAt`].
     pub fn extension_at(device: DeviceId, op: ExtensionOp) -> Self {
         Op::ExtensionAt { device, op }
+    }
+
+    /// [`Op::ExtensionAtNamed`].
+    pub fn extension_at_named(device: impl Into<String>, op: ExtensionOp) -> Self {
+        Op::ExtensionAtNamed {
+            device: device.into(),
+            op,
+        }
     }
 
     /// [`Op::CrashDevice`].
@@ -3774,6 +3846,7 @@ impl Op {
                 | Op::ControlNamed { .. }
                 | Op::Extension(_)
                 | Op::ExtensionAt { .. }
+                | Op::ExtensionAtNamed { .. }
         )
     }
 }

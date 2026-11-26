@@ -313,6 +313,11 @@ embedder's own formats. Each goes through the extension's own parser, once per o
 - `Op::ExtensionAt { device, op }` is an extension's op timed at a device: it applies at its
   instant like `Op::Extension`, `OpContext::device` names the device, and a split network
   accepts it (only the device's own site applies it), where it refuses `Op::Extension`.
+  `Op::ExtensionAtNamed { device, op }` names the device instead, resolved when the op applies
+  (a device that an earlier op or a controller creates; `no device <name>` fails it when none
+  has the name then), and a split network takes it too: every site queues it, the site that
+  has the device applies it ([sites.md](sites.md) has the rule for a name no site has). The
+  page's `{ kind: 'extension', device, ... }` builds it (`wasmnet_web::ops::op_in`).
 
 No two extensions of a network declare one option key or one operator event kind: adding the
 second is refused (`Network::try_add_extension` answers `Error::Refused` and changes nothing;

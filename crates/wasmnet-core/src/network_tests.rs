@@ -653,3 +653,113 @@ fn det_cbor_spec(component: &str, config: &[(&str, &str)]) -> Vec<u8> {
     ])
     .encode()
 }
+
+/// An extension's op that journals `marked` on the device it is timed at.
+#[derive(Debug, PartialEq)]
+struct Mark;
+
+impl crate::ext::ExtOp for Mark {
+    fn apply(&self, ctx: &mut crate::ext::OpContext<'_>) -> std::result::Result<(), OpError> {
+        let device = ctx.device().ok_or("timed at a device")?;
+        let name = ctx.device_name(device).to_owned();
+        ctx.journal_event(&name, "marked", Vec::new());
+        Ok(())
+    }
+
+    fn same(&self, other: &dyn crate::ext::ExtOp) -> bool {
+        (other as &dyn std::any::Any).is::<Self>()
+    }
+}
+
+fn mark(device: &str) -> Op {
+    Op::extension_at_named(device, ExtensionOp::new(Mark))
+}
+
+fn marks(network: &Network<'_, Fake>) -> Vec<String> {
+    network
+        .journal()
+        .into_iter()
+        .filter(|e| matches!(&e.record, Record::Event { kind, .. } if kind == "marked"))
+        .map(|e| format!("{}@{}", e.device, e.at))
+        .collect()
+}
+
+#[test]
+fn an_extension_op_by_name_resolves_the_device_when_it_applies() {
+    let fake = Fake::new();
+    let mut network = Network::new(&fake, 1);
+    network.set_component_resolver(Box::new(|name, instantiate| instantiate(name)));
+    network.device("a", "").unwrap();
+    let early = add(&mut network, mark("later"), Placement::StartOf(5));
+    add(
+        &mut network,
+        Op::add_device("later", ""),
+        Placement::StartOf(10),
+    );
+    let on_a = add(&mut network, mark("a"), Placement::StartOf(10));
+    let on_later = add(&mut network, mark("later"), Placement::StartOf(20));
+    let nobody = add(&mut network, mark("nobody"), Placement::StartOf(20));
+    // Removed, then made again: the name finds the new device.
+    add(
+        &mut network,
+        Op::remove_device("later"),
+        Placement::StartOf(30),
+    );
+    let removed = add(&mut network, mark("later"), Placement::StartOf(31));
+    add(
+        &mut network,
+        Op::add_device("later", ""),
+        Placement::StartOf(32),
+    );
+    let again = add(&mut network, mark("later"), Placement::EndOf(32));
+    // A stopped device takes it, as by id.
+    add(&mut network, Op::stop_device("a"), Placement::StartOf(40));
+    let stopped = add(&mut network, mark("a"), Placement::StartOf(41));
+    network.run_until(50).unwrap();
+    assert_eq!(marks(&network), ["a@10", "later@20", "later@32", "a@41"]);
+    let states = network.op_states();
+    let failed = |i: usize| match &states[i] {
+        OpState::Failed { message, .. } => message.clone(),
+        other => panic!("op {i}: {other:?}"),
+    };
+    assert_eq!(failed(early), "no device `later`");
+    assert_eq!(failed(nobody), "no device `nobody`");
+    assert_eq!(failed(removed), "no device `later`");
+    for i in [on_a, on_later, again, stopped] {
+        assert!(matches!(states[i], OpState::Applied { .. }), "op {i}");
+    }
+}
+
+#[test]
+fn a_split_network_applies_an_extension_op_by_name_on_the_devices_site() {
+    let fake = Fake::new();
+    let mut network = Network::new(&fake, 1);
+    network.device("a", "").unwrap();
+    network.remote_device("far").unwrap();
+    network
+        .remote_device_with(
+            "ctl",
+            DeviceConfig::new(),
+            DeviceOptions::default().infra(true).infra_prefix("c-"),
+        )
+        .unwrap();
+    let here = add(&mut network, mark("a"), Placement::StartOf(5));
+    let far = add(&mut network, mark("far"), Placement::EndOf(5));
+    // A name the other site's controller would create is that site's to apply or refuse.
+    let created = add(&mut network, mark("c-web"), Placement::StartOf(6));
+    // A name no controller could create fails on every site.
+    let nobody = add(&mut network, mark("nobody"), Placement::StartOf(6));
+    assert!(matches!(
+        network.add_op(mark("a"), Placement::Before(EventKey::operator_at(5, 0))),
+        Err(Error::Refused(_))
+    ));
+    network.run_until(10).unwrap();
+    assert_eq!(marks(&network), ["a@5"]);
+    let states = network.op_states();
+    assert!(matches!(states[here], OpState::Applied { at: 5, .. }));
+    assert_eq!(states[far], OpState::Pending);
+    assert_eq!(states[created], OpState::Pending);
+    assert!(
+        matches!(&states[nobody], OpState::Failed { message, .. } if message == "no device `nobody`")
+    );
+}

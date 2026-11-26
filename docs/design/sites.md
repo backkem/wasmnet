@@ -77,13 +77,22 @@ What does not cross sites:
   runs**: refused as above. A new WAN link would need both sites to agree on it, exchange its
   ports and perhaps shrink the lookahead.
 - **Most operator events.** `Network::add_op` takes only timed operator events at a device
-  (`StartOf` or `EndOf`: `Op::Stdin`, `Op::Control`, `Op::Inject`) once the network has a
+  (`StartOf` or `EndOf`: `Op::Stdin`, `Op::Control`, `Op::Inject`, `Op::ExtensionAt`,
+  `Op::ExtensionAtNamed`) once the network has a
   remote device, and refuses the rest (`Error::Refused`): topology ops (pauses, resumes,
   operator crashes and embedder actions among them), link changes, and
   events anchored before another event, whose pre number is not on the wire
   ([event-order.md](event-order.md)). Every site must add the same operator events in the same
   order; an op at another site's device takes its index and key but is not queued, and stays
   `Pending` there. `OpState::Applied::events` counts only the site's own events.
+- **Ops by device name** (`Op::ExtensionAtNamed`) are queued on every site and resolved when
+  they apply, since the device may be one a controller creates on either site. The site that
+  has a device of that name applies the op; a site that has it as another site's placeholder
+  leaves it `Pending`. A name no device has then belongs to the site of the controller whose
+  `infra_prefix` it starts with, or else to the site of the controllers without a prefix (they
+  share one): that site fails the op with `no device <name>`, the other leaves it `Pending`.
+  With no such controller every site fails it, as the unsplit network does. Nothing about it
+  crosses the wire: each site decides from its own table.
 - **Cables.** A cable ([runtime-and-extensions.md](runtime-and-extensions.md)) between two
   devices of the same site works as usual. A message sent on a cable whose other end is on the
   other site is dropped and counted in that link's `LinkStats::dropped_down`; nothing refuses
