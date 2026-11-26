@@ -327,7 +327,12 @@ devices costs what it did. Every simulator export that may reach those calls (`w
 - **Replaced networks.** A replacement is refused while a step runs, so no export of a replaced
   network is pending when it goes.
 - **Cost.** The page test's step "what a frame-heavy run costs in the page" fetches 2 MB through
-  the switch (some 5,900 frames), with the plain switch and with the wrapped one.
+  the switch (some 5,900 frames), with the plain switch and with the wrapped one. Measured in
+  headless Chromium on one machine, three interleaved runs of three fetches each: the plain
+  switch took 270 to 311 ms per fetch (about 21,400 frames a second at the median), against 264
+  to 285 ms before the suspending path existed, so within the spread between runs; the wrapped
+  switch took 298 to 318 ms (about 19,500 frames a second), some 9% slower than the plain one.
+  That price is why the path is per device.
 
 ## An embedder's own page module
 
